@@ -4,7 +4,7 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**MVP 0.1.0**（2026-11-03），`node --test` 全绿（260 个用例 / 15 个套件），git tag `v0.1.0`。
+当前状态：**MVP 0.1.1**（2026-11-04），`node --test` 全绿（383 个用例 / 16 个套件），git tag `v0.1.1`。
 
 ## 目录结构
 
@@ -122,6 +122,7 @@ node scripts/calibrate/run.mjs
 - **task_run 串行**：worker 全局单槽、忙时排队至多 2 个；软超时 600s 只告警，硬超时 900s 两段式取消（先中止当前轮、再清空排队）。熔断或 RSS 降级时 `task_run` 会在入队前被拒绝（`daily_budget_exceeded` / `memory_pressure`）。
 - **预算/内存保护固定阈值**：每日 3M token 与 RSS 2.95/3.0/3.15GiB 三档不可配置；RSS warn 只记 metric，stop_dispatch 起才停派发；保护读数读取失败时按 `ok` 放行，不会因此中断会话。
 - **subagent 仍见全局人格段**：平台的 system prompt 段没有 per-session 文本；插件只能让 subagent 跳过召回、巩固与写库，无法移除人格 / 记忆提示段。
+- **schema v4 迁移清空 consolidations**：seq 语义切换为 surface 位置序时，开发期迁移会清空 `consolidations` 并重置 `episodes.consolidation_id`；事实、提醒与状态板不受影响。
 - deep-sleep 的「情景→语义」模型抽取尚未实现，MVP 只做规则子步。
 
 ## 隐私
