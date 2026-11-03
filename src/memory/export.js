@@ -66,7 +66,8 @@ function toSeconds(value, fallback) {
 }
 
 /**
- * 文件名时间戳（UTC，YYYY-MM-DD-HHmm）。
+ * 文件名时间戳（UTC，YYYY-MM-DD-HHmmss）。秒级可降低同名概率；同一秒内
+ * 由 writeUniqueExport 追加 -2/-3 递增，绝不覆盖已有文件。
  * @param {number|Date} [now]
  * @returns {string}
  */
@@ -74,7 +75,68 @@ export function formatStamp(now = Date.now()) {
   const date = new Date(toMillis(now));
   const pad = (value) => String(value).padStart(2, '0');
   const day = [date.getUTCFullYear(), pad(date.getUTCMonth() + 1), pad(date.getUTCDate())].join('-');
-  return `${day}-${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}`;
+  return `${day}-${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}`;
+}
+
+/**
+ * 当前 schema 版本（与 store.js 的 SCHEMA_VERSION 保持一致）。store.js 没有
+ * 导出该常量，因此这里仅作为 schema_meta 缺失时的兜底；正常情况下导出应
+ * 读取数据库里的实际版本，而不是猜。
+ */
+const CURRENT_SCHEMA_VERSION = '5';
+
+/**
+ * 读取导出 payload 应写入的 schema_version：优先 store.getMeta，
+ * 其次直接读 schema_meta 表，最后才回退到当前版本。
+ * @param {import('./store.js').Store} store
+ * @returns {string}
+ */
+function schemaVersionOf(store) {
+  let value = null;
+  try {
+    if (store !== null && typeof store?.getMeta === 'function') {
+      value = store.getMeta('schema_version');
+    }
+  } catch {
+    value = null;
+  }
+  if ((value === null || value === undefined || String(value).trim() === '')
+    && typeof store?.db?.prepare === 'function') {
+    try {
+      const row = store.db
+        .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
+        .get();
+      value = row?.value ?? null;
+    } catch {
+      value = null;
+    }
+  }
+  const text = value === null || value === undefined ? '' : String(value).trim();
+  return text === '' ? CURRENT_SCHEMA_VERSION : text;
+}
+
+/**
+ * 以独占方式写导出文件：同一秒重复导出时依次尝试 -2、-3……
+ * 使用 wx 标志避免“检查后写入”之间的竞态与静默覆盖。
+ * @param {string} targetDir
+ * @param {string} stamp
+ * @param {'json'|'md'} format
+ * @param {string} body
+ * @returns {string}
+ */
+function writeUniqueExport(targetDir, stamp, format, body) {
+  for (let sequence = 1; sequence <= 1000; sequence += 1) {
+    const suffix = sequence === 1 ? '' : `-${sequence}`;
+    const path = join(targetDir, `memory-${stamp}${suffix}.${format}`);
+    try {
+      writeFileSync(path, body, { encoding: 'utf8', flag: 'wx' });
+      return path;
+    } catch (error) {
+      if (error?.code === 'EEXIST') continue;
+      throw error;
+    }
+  }
+  throw new Error('[export] 无法分配唯一的导出文件名');
 }
 
 /**
@@ -320,9 +382,7 @@ export function exportAll({ store, scope = 'main', format = 'json', dir, now = D
   const at = toMillis(now);
   const collected = collectExportData(store, { scope });
   const exportedAt = new Date(at).toISOString();
-  const schemaVersion = typeof store.getMeta === 'function'
-    ? (store.getMeta('schema_version') ?? '4')
-    : '4';
+  const schemaVersion = schemaVersionOf(store);
   const data = {
     version: EXPORT_VERSION,
     exported_at: exportedAt,
@@ -340,10 +400,8 @@ export function exportAll({ store, scope = 'main', format = 'json', dir, now = D
 
   const targetDir = dir ?? join(process.cwd(), '.data', EXPORT_DIR_NAME);
   mkdirSync(targetDir, { recursive: true });
-  const fileName = `memory-${formatStamp(at)}.${format}`;
-  const path = join(targetDir, fileName);
   const body = format === 'json' ? `${JSON.stringify(data, null, 2)}\n` : renderMarkdown(data);
-  writeFileSync(path, body, 'utf8');
+  const path = writeUniqueExport(targetDir, formatStamp(at), format, body);
 
   return {
     path,
@@ -600,10 +658,10 @@ export function encryptJson(value, passphrase, { id = null, now = Date.now() } =
     maxmem: 64 * 1024 * 1024,
   });
   const cipher = createCipheriv('aes-256-gcm', key, iv);
-  const plaintext = Buffer.from(JSON.stringify(value), 'utf8');
-  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
-  const tag = cipher.getAuthTag();
+  // v2：magic + header JSON（不含 tag，tag 是 GCM 的输出）作为 AAD，
+  // 绑定 cipher/KDF 参数/salt/iv/id/created_at 等元数据；tag 本身由 GCM 校验。
   const header = {
+    format: 'v2',
     version: EXPORT_VERSION,
     cipher: 'aes-256-gcm',
     kdf: 'scrypt',
@@ -612,11 +670,17 @@ export function encryptJson(value, passphrase, { id = null, now = Date.now() } =
     p: SCRYPT_P,
     salt: salt.toString('base64'),
     iv: iv.toString('base64'),
-    tag: tag.toString('base64'),
     id,
     created_at: new Date(toMillis(now)).toISOString(),
   };
-  return `${ENCRYPTED_MAGIC}\n${JSON.stringify(header)}\n${ciphertext.toString('base64')}\n`;
+  const headerJson = JSON.stringify(header);
+  cipher.setAAD(Buffer.from(`${ENCRYPTED_MAGIC}\n${headerJson}`, 'utf8'));
+  const plaintext = Buffer.from(JSON.stringify(value), 'utf8');
+  const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  // tag 追加在 header 末尾；AAD 重建时删除 tag 后 stringify，字段顺序不变。
+  const fileHeader = { ...header, tag: tag.toString('base64') };
+  return `${ENCRYPTED_MAGIC}\n${JSON.stringify(fileHeader)}\n${ciphertext.toString('base64')}\n`;
 }
 
 /**
@@ -640,6 +704,10 @@ export function decryptJson(text, passphrase) {
   if (header.cipher !== 'aes-256-gcm' || header.kdf !== 'scrypt') {
     throw new Error('[export] 不支持的加密算法');
   }
+  const format = header.format;
+  if (format !== undefined && format !== 'v1' && format !== 'v2') {
+    throw new Error('[export] 不支持的加密文件格式');
+  }
   const salt = Buffer.from(String(header.salt ?? ''), 'base64');
   const iv = Buffer.from(String(header.iv ?? ''), 'base64');
   const tag = Buffer.from(String(header.tag ?? ''), 'base64');
@@ -655,10 +723,16 @@ export function decryptJson(text, passphrase) {
   });
   try {
     const decipher = createDecipheriv('aes-256-gcm', key, iv);
+    if (format === 'v2') {
+      // 与 encryptJson 对称：去掉 tag 后按原字段顺序重建 AAD。
+      const { tag: _tag, ...authenticated } = header;
+      decipher.setAAD(Buffer.from(`${ENCRYPTED_MAGIC}\n${JSON.stringify(authenticated)}`, 'utf8'));
+    }
     decipher.setAuthTag(tag);
     const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
     return JSON.parse(plaintext.toString('utf8'));
-  } catch (error) {
-    throw new Error(`[export] 解密失败（口令错误或文件损坏）: ${error instanceof Error ? error.message : String(error)}`);
+  } catch {
+    // 不拼接底层错误信息，避免把任何与明文/内部结构相关的细节带出去。
+    throw new Error('[export] 解密失败（口令错误、文件损坏或认证失败）');
   }
 }

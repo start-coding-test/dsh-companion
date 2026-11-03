@@ -157,7 +157,7 @@ test('exportAll json：计数、文件名与默认过滤 secret/sensitive/墓碑
   });
 
   const result = exportAll({ store, format: 'json', dir, now: TEST_NOW });
-  assert.match(result.path, /memory-2026-11-05-0900\.json$/u);
+  assert.match(result.path, /memory-2026-11-05-090000\.json$/u);
   const payload = JSON.parse(readFileSync(result.path, 'utf8'));
   assert.equal(payload.version, EXPORT_VERSION);
   assert.equal(payload.scope, 'main');
@@ -197,7 +197,7 @@ test('exportAll md：人读分节，包含正文且不泄漏敏感内容', (t) =
   });
 
   const result = exportAll({ store, format: 'md', dir, now: TEST_NOW });
-  assert.match(result.path, /memory-2026-11-05-0900\.md$/u);
+  assert.match(result.path, /memory-2026-11-05-090000\.md$/u);
   const text = readFileSync(result.path, 'utf8');
   assert.match(text, /# dsh-companion 记忆导出/u);
   assert.match(text, /## 事实 facts（1）/u);
@@ -206,9 +206,10 @@ test('exportAll md：人读分节，包含正文且不泄漏敏感内容', (t) =
   assert.match(text, /## 状态板 state_board（revision 3）/u);
 });
 
-test('formatStamp：UTC 文件名时间戳', () => {
-  assert.equal(formatStamp(Date.UTC(2026, 10, 5, 9, 0, 0)), '2026-11-05-0900');
-  assert.equal(formatStamp(Date.UTC(2026, 0, 1, 0, 5, 0)), '2026-01-01-0005');
+test('formatStamp：UTC 文件名时间戳（秒级）', () => {
+  assert.equal(formatStamp(Date.UTC(2026, 10, 5, 9, 0, 0)), '2026-11-05-090000');
+  assert.equal(formatStamp(Date.UTC(2026, 0, 1, 0, 5, 0)), '2026-01-01-000500');
+  assert.equal(formatStamp(Date.UTC(2026, 0, 1, 0, 5, 7)), '2026-01-01-000507');
 });
 
 test('exportAll：非法格式抛错；写盘失败抛错不吞', (t) => {
@@ -351,6 +352,7 @@ test('encryptJson/decryptJson：AES-256-GCM + scrypt，头含 KDF 参数，错�
   const lines = text.split('\n');
   assert.equal(lines[0], 'DSH-COMPANION-EXPORT-1');
   const header = JSON.parse(lines[1]);
+  assert.equal(header.format, 'v2');
   assert.equal(header.cipher, 'aes-256-gcm');
   assert.equal(header.kdf, 'scrypt');
   assert.equal(header.N, 16384);

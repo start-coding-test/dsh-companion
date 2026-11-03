@@ -137,7 +137,7 @@ test('exportAll：空库计数为 0，文件名仍是 memory-*.json', (t) => {
   assert.equal(payload.counts.episodes, 0);
   assert.equal(payload.counts.reminders, 0);
   assert.equal(payload.counts.threads, 0);
-  assert.match(exported.path, /memory-\d{4}-\d{2}-\d{2}-\d{4}\.json$/u);
+  assert.match(exported.path, /memory-\d{4}-\d{2}-\d{2}-\d{6}\.json$/u);
 });
 
 test('exportAll：只导出 active、未删除事实；dormant/superseded 被排除', (t) => {
