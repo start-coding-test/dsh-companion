@@ -86,12 +86,12 @@
 
 ### `/记忆 导出 [md|json]`
 
-把活跃事实、情景、提醒、线程与状态板导出到 `.data/export/memory-YYYY-MM-DD-HHmm.<fmt>`（缺省 `json`，文件名为 UTC 时间戳），并在回复里给出各表条数与路径：
+把活跃事实、情景、提醒、线程与状态板导出到 `.data/export/memory-YYYY-MM-DD-HHmmss.<fmt>`（缺省 `json`，文件名为 UTC 秒级时间戳；同一秒内重复导出自动追加 `-2`、`-3`，不覆盖已有文件），并在回复里给出各表条数与路径：
 
 ```text
 /记忆 导出 md
 已导出记忆（md）：facts=96 · episodes=120 · reminders=4 · threads=3
-文件：.data/export/memory-2026-11-04-0912.md
+文件：.data/export/memory-2026-11-04-091233.md
 ```
 
 默认**不导出** `secret` / `sensitive`、墓碑（tombstone）、`superseded` 条目；状态板里引用了未导出事实原文的行会被剔除。格式非 `md` / `json` 时返回用法提示。恢复与加密见 [导出、恢复与加密](#导出恢复与加密)。
@@ -383,13 +383,13 @@ const result = exportAll({ store, scope: 'main', format: 'json' });
 // → { path, format, exported_at, scope, counts, bytes }
 ```
 
-文件名形如 `memory-2026-11-04-0912.json`（UTC 时间戳），默认目录 `<cwd>/.data/export`，可用 `dir` / `now` 覆盖。默认**不导出** `sensitive` / `secret`、墓碑与 `superseded`；状态板按「未导出事实的 statement」行级剔除，避免板面泄漏。
+文件名形如 `memory-2026-11-04-091233.json`（UTC 秒级时间戳；同名时依次加 `-2`、`-3` 后缀，绝不覆盖），默认目录 `<cwd>/.data/export`，可用 `dir` / `now` 覆盖。导出 JSON 的 `schema_version` 从库中真实读取（`getMeta` → `schema_meta` 表 → 当前版本兜底）。默认**不导出** `sensitive` / `secret`、墓碑与 `superseded`；状态板按「未导出事实的 statement」行级剔除，避免板面泄漏。
 
 ### 恢复
 
 ```js
 import { importAll } from './src/memory/export.js';
-importAll({ store, file: '.data/export/memory-2026-11-04-0912.json', mode: 'fresh' });
+importAll({ store, file: '.data/export/memory-2026-11-04-091233.json', mode: 'fresh' });
 ```
 
 - `fresh`：目标库五张表必须为空（`Store.open` 建出的空状态板占位行不算），适合新机器或重建。
@@ -404,8 +404,8 @@ node scripts/decrypt-encrypted.mjs secret.enc --out fact.json
 ```
 
 - 口令只从 stdin 读取（TTY 下关闭回显）；空口令、缺 `--out`、事实不存在都以退出码 1 失败。
-- 解密先校验再写文件，错误口令或损坏文件不会留下明文半文件。
-- 格式：AES-256-GCM + scrypt（N=2^14、r=8、p=1），随机 salt(16B) / iv(12B)，magic `DSH-COMPANION-EXPORT-1` + JSON header 保存 KDF 参数与 tag。
+- 解密先校验再写文件，错误口令、损坏文件或认证失败不会留下明文半文件；错误统一为「解密失败（口令错误、文件损坏或认证失败）」。
+- 格式：AES-256-GCM + scrypt（N=2^14、r=8、p=1），随机 salt(16B) / iv(12B)，magic `DSH-COMPANION-EXPORT-1` + JSON header 保存 KDF 参数与 tag。`header.format = "v2"` 起 header 与 magic 行一起作为 AAD 认证，篡改 header / 密文 / tag 都会失败；`v1` 旧文件仍可解，新导出建议用 v2。
 
 ### 向量召回（可选）
 
@@ -493,7 +493,7 @@ vector:
 
 - 备份失败：写 `USED/scheduler_jobs/backup_failed` 审计并抛给调度器记 `job_error`，次日重试；成功时按日期滚动保留最近 7 份。
 - 导出失败（如目录不可写）：命令层抛出错误并在回复里显示原因，不会写半截文件；`fresh` 恢复在目标库非空时直接拒绝，不写入任何行。
-- 导出文件默认落在 `<cwd>/.data/export/`，文件名精确到分钟（同一分钟重复导出会覆盖同名文件）。
+- 导出文件默认落在 `<cwd>/.data/export/`，文件名精确到秒（同一秒重复导出依次追加 `-2`、`-3`，不会覆盖已有文件）。
 - 遗忘到期清理失败：任务错误记账，下次 03:30 继续；冷静期内的行不会被提前删除。
 
 ## 常见问题

@@ -4,7 +4,7 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**MVP 0.3.0**（2026-11-04），`node --test` 全绿（538 个用例 / 16 个套件），git tag `v0.3.0`。
+当前状态：**MVP 0.3.1**（2026-11-04），`node --test` 全绿（546 个用例 / 16 个套件），git tag `v0.3.1`。
 
 ## 目录结构
 
@@ -75,9 +75,9 @@ token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryToke
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
-**每日 token 熔断**：按 `timezone` 的本地日界累计每日 token 用量，达到 `3,000,000` 后进入熔断：拒绝新的 `task_run`、暂停主动消息，`/成本` 与 `/状态` 会显示「已熔断」；本地日界翻篇自动复位。该上限固定为 3M，v0.3.0 不提供配置键。
+**每日 token 熔断**：按 `timezone` 的本地日界累计每日 token 用量，达到 `3,000,000` 后进入熔断：拒绝新的 `task_run`、暂停主动消息，`/成本` 与 `/状态` 会显示「已熔断」；本地日界翻篇自动复位。该上限固定为 3M，v0.3.1 不提供配置键。
 
-**RSS 三档降级**：每 60 秒检查一次进程 RSS，`≥2.95GiB` 记 warn 指标（不降级）、`≥3.0GiB` 停 `task_run` 与主动消息、`≥3.15GiB` 再停线程创建；恢复后自动解除。阈值固定，v0.3.0 不提供配置键。
+**RSS 三档降级**：每 60 秒检查一次进程 RSS，`≥2.95GiB` 记 warn 指标（不降级）、`≥3.0GiB` 停 `task_run` 与主动消息、`≥3.15GiB` 再停线程创建；恢复后自动解除。阈值固定，v0.3.1 不提供配置键。
 
 ## 首次安装自检
 
@@ -132,10 +132,10 @@ node scripts/calibrate/run.mjs
 
 ## 导出、恢复与加密
 
-- `/记忆 导出 [md|json]` 把活跃事实、情景、提醒、线程与状态板写到 `.data/export/memory-YYYY-MM-DD-HHmm.<fmt>`（UTC 时间戳），回显各表条数与路径。默认**不导出** `secret`/`sensitive`、墓碑与被取代条目；状态板若引用了未导出事实的原文，会按行剔除。
+- `/记忆 导出 [md|json]` 把活跃事实、情景、提醒、线程与状态板写到 `.data/export/memory-YYYY-MM-DD-HHmmss.<fmt>`（UTC 秒级时间戳），回显各表条数与路径；同一秒内重复导出自动追加 `-2`、`-3`，不会覆盖已有文件。默认**不导出** `secret`/`sensitive`、墓碑与被取代条目；状态板若引用了未导出事实的原文，会按行剔除。
 - 恢复用 `importAll({ store, file, mode })`：`fresh` 要求目标库五表为空（适合换机器或重建），`merge` 按主键跳过已存在行、不覆盖本地内容；整个导入在单事务内，失败零落库；恢复后自动重建 FTS。
 - 加密导出面向单条事实：`node scripts/export-encrypted.mjs <db> <fact-id> --out <file>`；解密用 `node scripts/decrypt-encrypted.mjs <file> [--out <json>]`。口令**只从 stdin 读取**（TTY 关闭回显），不会出现在命令行、日志或文件名里；空口令、缺参数直接退出 1，解密成功后才写目标文件。
-- 加密格式为 AES-256-GCM + scrypt（N=2^14、r=8、p=1），每次随机 salt/iv，magic `DSH-COMPANION-EXPORT-1`；错误口令与损坏文件统一报「解密失败（口令错误或文件损坏）」。
+- 加密格式为 AES-256-GCM + scrypt（N=2^14、r=8、p=1），每次随机 salt/iv，magic `DSH-COMPANION-EXPORT-1`；`header.format = "v2"` 起 header 与 magic 一起参与 AAD 认证，改任一项都解密失败；`v1` 旧文件仍可解（不校验 AAD）。错误口令、损坏文件与认证失败统一报「解密失败（口令错误、文件损坏或认证失败）」。
 - 细节与示例见 [docs/usage.md](docs/usage.md#导出恢复与加密)。
 
 ## 向量召回（可选）
@@ -158,9 +158,7 @@ node scripts/calibrate/run.mjs
 
 - **FTS 为 bigram 近似**：没有分词器或同义词，召回依赖字面 bigram 与时间衰减；同义改写可能召回不到（可选向量召回可缓解，但见下条）。
 - **向量召回非生产质量（默认关闭）**：`hashEmbed` 是字符 bigram 哈希投影，不是真实 embedding，中文语义召回有限；仓库 bench 的 100%/100%/100% 属合成数据自评口径。离线环境无真实 embedding，`vector.embedder` 仅支持 `hash`/`none`，接入真实 provider 留待 P3。
-- **加密导出 header 未参与认证（L1）**：JSON header（含 KDF 参数、salt/iv/tag）未用 `setAAD` 绑定；篡改 KDF 参数只会导致解密失败，但 `id`/`created_at` 可被伪造，鲁棒性依赖 magic 与算法白名单。计划在 P3 用 AAD 加固。
-- **导出文件同分钟覆盖（L3）**：文件名时间戳精确到分钟，同一分钟内重复导出会覆盖同名文件；不影响恢复语义。
-- **导出 schema_version 兜底（L2）**：store 没有 `getMeta` 时导出文件会标注 `'4'`（当前实际为 `'5'`），仅影响文档性字段。
+- **旧加密文件（v1）不认证 header**：v0.3.0 及更早版本导出的密文没有 AAD 绑定，`id`/`created_at` 等 header 字段仍可被伪造；新文件（`format: "v2"`）已认证。需要时可解密后用同一口令重新导出。
 - **无跨设备备份**：数据库只在本机；backup 任务只在本机按日期滚动保留 7 份。需要搬移时用 `/记忆 导出` 与 `importAll`（见「导出、恢复与加密」）。
 - 平台管理的会话 JSONL 不在插件控制范围内，插件无法删除。
 - **单人模型**：主会话与线程按 `scope` 隔离（线程为 `thread:<key>`），但仍是单人使用，不是多人协作。
