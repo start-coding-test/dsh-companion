@@ -133,13 +133,10 @@ node --test test/e2e   # 只跑端到端
 
 插件入口为 `src/index.js`：`apply(ctx, config)` 注册人格段、`agent/pre-step` 记忆管线、命令、工具与调度器，返回 `{ dispose }`；同一 ctx 重复 apply 幂等。
 
-## 设计文档
+## 设计与评审文档
 
 - [使用手册](docs/usage.md)
 - [平台 API 摘录](docs/platform-api.md)
+- [Gate 0 探针说明](docs/gate0-probe.md)
+- [外部评审报告 v1](docs/review-v1.md)
 - [变更记录](CHANGELOG.md)
-- [记忆系统设计](../memory/docs/06-记忆系统设计.md)
-- [架构设计](../memory/docs/05-架构设计.md)
-- [人格系统](../memory/docs/09-人格系统.md)
-- [主动性与轻任务](../memory/docs/10-主动性与轻任务.md)
-- [开发规划](../memory/开发规划-v2.md)

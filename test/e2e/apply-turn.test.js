@@ -17,7 +17,7 @@ import { basename, dirname, join } from 'node:path';
 
 import { FakeCtx } from '../fakes/ctx.js';
 import { apply } from '../../src/index.js';
-import { TEST_NOW, makeTempStore } from './helpers.js';
+import { TEST_NOW, makeTempStore, settle, waitFor } from './helpers.js';
 
 /** 巩固模型返回的草稿（预算事实，便于召回断言）。 */
 const DRAFT = {
@@ -137,6 +137,8 @@ test('apply 生产路径：巩固 → 下一轮 turn 头压缩 → 发布状态�
       kind: 'enter',
       messages: [],
     });
+    // M3：巩固在 step 之后异步执行，等写库完成再断言。
+    await waitFor(() => temp.store.getWatermark('main') === 1, { label: 'consolidation' });
     assert.equal(temp.store.getWatermark('main'), 1);
     const facts = temp.store.listFacts({ scope: 'main', status: 'active' });
     assert.equal(facts.length, 1);
@@ -298,7 +300,13 @@ async function countConsolidations(overrides) {
   const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4, ...overrides });
   try {
     await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 1, '记录一下这个决定。'), { kind: 'enter', messages: [] });
+    const triggered = (overrides.compactAtTokens ?? 24_000) <= 13_000;
     await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 2, '继续。'), { kind: 'enter', messages: [] });
+    if (triggered) {
+      await waitFor(() => temp.store.getWatermark('main') > 0, { label: 'consolidation' });
+    } else {
+      await settle();
+    }
     const row = temp.store.db
       .prepare("SELECT COUNT(*) AS n FROM consolidations WHERE scope = 'main' AND kind = 'nap'")
       .get();

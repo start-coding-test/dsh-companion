@@ -60,6 +60,36 @@ export function toEpochSeconds(value) {
 }
 
 /**
+ * 轮询等待异步副作用（M3：巩固由 setImmediate 排到 step 之后）完成。
+ *
+ * 使用真实计时器而非 FakeCtx 的手动时钟；predicate 返回真值即返回该值。
+ *
+ * @param {() => any} predicate
+ * @param {{timeoutMs?: number, intervalMs?: number, label?: string}} [options]
+ * @returns {Promise<any>}
+ */
+export async function waitFor(predicate, { timeoutMs = 3000, intervalMs = 10, label = 'condition' } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await predicate();
+    if (value) return value;
+    if (Date.now() >= deadline) {
+      throw new Error(`waitFor timed out after ${timeoutMs}ms: ${label}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+/**
+ * 让出真实事件循环一小段时间，等已排队的后台任务收尾。
+ * @param {number} [ms]
+ * @returns {Promise<void>}
+ */
+export async function settle(ms = 25) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
  * 建一个临时 SQLite 库。
  *
  * 传 `t`（node:test 的 TestContext）时自动注册 `t.after(cleanup)`，测试结束

@@ -184,6 +184,7 @@ export function apply(ctx, rawConfig) {
     dispose() {
       if (disposed) return;
       disposed = true;
+      state.disposed = true;
       for (const disposer of disposers.splice(0).reverse()) {
         try {
           disposer();
@@ -259,6 +260,16 @@ function createWiringState({ host, platform, store, config, metrics }) {
     tokens: 0,
     overCount: 0,
     pendingCompact: null,
+    /** M3：待执行的巩固任务（pre-step 只登记，不 await）。 */
+    pendingConsolidation: null,
+    /** M3：同一时刻只跑一个巩固任务。 */
+    consolidationInFlight: false,
+    /** M3：已把「跑巩固」排进 setImmediate，避免重复排队。 */
+    consolidationScheduled: false,
+    /** M3：上一轮巩固结果，下一轮 pre-step 开头检查（只用于日志）。 */
+    lastConsolidationResult: null,
+    /** dispose 后后台任务不再碰已关闭的 Store。 */
+    disposed: false,
     llmResolved: false,
     llm: null,
     llmRoute: null,
@@ -468,6 +479,12 @@ async function runPreStep(state, payload) {
   const scope = identity.scope ?? SCOPE;
   state.currentScope = scope;
   state.watermarkSeq = watermarkOf(state, scope);
+  if (state.lastConsolidationResult !== null) {
+    // M3：上一轮 step 结束后跑的巩固在这里收账；失败只记录，不影响当前轮。
+    const previous = state.lastConsolidationResult;
+    state.lastConsolidationResult = null;
+    platform.log(previous.ok ? 'debug' : 'warn', '[dsh-companion] previous consolidation finished', previous);
+  }
 
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const turnKey = turnKeyOf(payload);
@@ -502,7 +519,8 @@ async function runPreStep(state, payload) {
   if (isNewTurn) {
     // 先补上一轮写库后未完成的两段式压缩（平台只允许 turn 内压缩）。
     await maybeCompact(state, payload, scope);
-    await maybeConsolidate(state, payload, scope);
+    // M3：只登记巩固，立即返回；模型调用在 step 之后由后台任务执行。
+    scheduleConsolidation(state, payload, scope);
   }
 
   return injectRecall(state, payload, messages, turnKey, scope);
@@ -674,8 +692,16 @@ function recordTokenEvent(state, usage) {
  * @param {object} payload
  * @param {string} [scope] 当前会话作用域
  */
-async function maybeConsolidate(state, payload, scope = SCOPE) {
-  const { store, platform, metrics, config } = state;
+/**
+ * 巩固阶段（M3）：pre-step 只做同步判断，登记 pendingConsolidation 后立即返回；
+ * 真正的模型调用与写库由 setImmediate 排到 step 之后，单飞执行，失败只 warn。
+ * @param {object} state
+ * @param {object} payload
+ * @param {string} [scope] 当前会话作用域
+ */
+function scheduleConsolidation(state, payload, scope = SCOPE) {
+  if (state.disposed) return;
+  const { platform, config } = state;
   const plan = planConsolidation({
     tokens: state.tokens,
     lastHumanAt: state.lastHumanAt,
@@ -688,17 +714,76 @@ async function maybeConsolidate(state, payload, scope = SCOPE) {
   if (!plan.trigger) return;
   if (state.transcript.length === 0) return;
 
-  // H1：窗口按 surface seq 算 —— 水位之后的节点，减去尾部 6,144 tokens 保留区。
-  const snapshot = await refreshSurface(state, payload);
-  if (snapshot === null) return;
+  state.pendingConsolidation = {
+    scope,
+    trigger: plan.trigger,
+    sessionId: sessionIdOf(payload) ?? scope,
+    // H1：窗口按 surface seq 算；快照在 pre-step 已刷新好，这里固定下来，
+    // 避免后台任务运行时被下一轮 pre-step 的新快照覆盖。
+    snapshot: state.surfaceSnapshotByScope.get(scope) ?? state.surfaceSnapshot,
+  };
+  if (state.consolidationScheduled || state.consolidationInFlight) return;
+  state.consolidationScheduled = true;
+  setImmediate(() => {
+    state.consolidationScheduled = false;
+    void runConsolidationJob(state);
+  });
+}
+
+/**
+ * 后台巩固任务：单飞；完成后若有新登记则再排一次。
+ * @param {object} state
+ */
+async function runConsolidationJob(state) {
+  if (state.disposed || state.consolidationInFlight) return;
+  const job = state.pendingConsolidation;
+  state.pendingConsolidation = null;
+  if (job === null) return;
+  state.consolidationInFlight = true;
+  try {
+    await executeConsolidationJob(state, job);
+  } catch (error) {
+    state.lastConsolidationResult = {
+      ok: false,
+      scope: job.scope,
+      trigger: job.trigger,
+      message: error instanceof Error ? error.message : String(error),
+    };
+    state.platform.log('warn', '[dsh-companion] consolidation job failed', {
+      scope: job.scope,
+      trigger: job.trigger,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    state.consolidationInFlight = false;
+    if (!state.disposed && state.pendingConsolidation !== null && !state.consolidationScheduled) {
+      state.consolidationScheduled = true;
+      setImmediate(() => {
+        state.consolidationScheduled = false;
+        void runConsolidationJob(state);
+      });
+    }
+  }
+}
+
+/**
+ * 真正执行一次巩固：水位判断 → 模型草稿 → 单事务写库，成功才登记 pending_compact。
+ * @param {object} state
+ * @param {{scope:string, trigger:string, sessionId:string, snapshot:object|null}} job
+ */
+async function executeConsolidationJob(state, job) {
+  const { store, platform, metrics, config } = state;
+  const snapshot = job.snapshot;
+  if (snapshot === null || snapshot === undefined) return;
+  const watermark = watermarkOf(state, job.scope);
   const { region, reason } = planRegion(snapshot, {
-    afterSeq: state.watermarkSeq,
-    budgetTokens: state.config.retainTokens,
+    afterSeq: watermark,
+    budgetTokens: config.retainTokens,
   });
   if (region === null) {
     platform.log('debug', '[dsh-companion] consolidation window empty', {
       reason,
-      watermark: state.watermarkSeq,
+      watermark,
       nodes: snapshot.seqs.length,
     });
     return;
@@ -724,38 +809,60 @@ async function maybeConsolidate(state, payload, scope = SCOPE) {
   try {
     const result = await consolidate({
       store,
-      scope,
+      scope: job.scope,
       seqFrom: region.startSeq,
       seqTo: region.endSeq,
       llm,
       now: at,
-      trigger: plan.trigger,
-      sessionId: sessionIdOf(payload) ?? scope,
+      trigger: job.trigger,
+      sessionId: job.sessionId,
       // 窗口已在 surface 层选好；水位推进允许跨过旧值。
       guardWatermark: false,
     });
-    if (result?.skipped) return;
+    if (result?.skipped) {
+      state.lastConsolidationResult = {
+        ok: true,
+        skipped: true,
+        scope: job.scope,
+        trigger: job.trigger,
+        upto_seq: result.upto_seq,
+      };
+      return;
+    }
 
-    const consolidation = findConsolidation(store, scope, Number(result.upto_seq));
+    const consolidation = findConsolidation(store, job.scope, Number(result.upto_seq));
     state.pendingCompact = {
       id: consolidation?.id ?? null,
       startSeq: region.startSeq,
       endSeq: region.endSeq,
-      scope,
+      scope: job.scope,
     };
-    setWatermark(state, scope, region.endSeq);
+    setWatermark(state, job.scope, region.endSeq);
     metrics.inc('consolidations');
+    state.lastConsolidationResult = {
+      ok: true,
+      scope: job.scope,
+      trigger: job.trigger,
+      upto_seq: result.upto_seq,
+    };
     platform.log('info', '[dsh-companion] consolidation written', {
       upto_seq: result.upto_seq,
       facts: result.facts ?? 0,
-      trigger: plan.trigger,
+      trigger: job.trigger,
     });
   } catch (error) {
     metrics.inc('consolidationFailures');
+    state.lastConsolidationResult = {
+      ok: false,
+      scope: job.scope,
+      trigger: job.trigger,
+      message: error instanceof Error ? error.message : String(error),
+    };
     platform.log('warn', '[dsh-companion] consolidation failed', {
-      trigger: plan.trigger,
+      trigger: job.trigger,
       message: error instanceof Error ? error.message : String(error),
     });
+    if (state.disposed) return;
     try {
       store.appendEvent({
         at,
@@ -764,7 +871,7 @@ async function maybeConsolidate(state, payload, scope = SCOPE) {
         actor: 'consolidator',
         reason: 'consolidation_failed',
         detail_json: {
-          trigger: plan.trigger,
+          trigger: job.trigger,
           message: error instanceof Error ? error.message : String(error),
         },
       });

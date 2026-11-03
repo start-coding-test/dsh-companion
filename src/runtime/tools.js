@@ -22,6 +22,9 @@ const PRIVACY = new Set(['normal', 'sensitive', 'secret']);
 const REMINDER_KINDS = new Set(['todo', 'schedule', 'repeat', 'commitment']);
 const THREAD_STATUSES = new Set(['active', 'archived', 'retired']);
 
+/** 投递给线程/worker 的目标长度上限（按 Unicode 码点计，L 级）。 */
+const GOAL_MAX_CODEPOINTS = 2000;
+
 const SCOPE_SCHEMA = Object.freeze({ type: 'string', description: '作用域，默认 main' });
 const LIMIT_SCHEMA = Object.freeze({
   type: 'integer', minimum: 1, maximum: 50, description: '最多返回条数',
@@ -318,6 +321,7 @@ export function createTools({
         const key = requireString(args.key, 'thread_run', 'key');
         const name = optionalString(args.name, 'thread_run', 'name');
         const goal = optionalString(args.goal, 'thread_run', 'goal');
+        if (exceedsGoalLimit(goal)) return { ok: false, reason: 'goal_too_long' };
         const plan = planThreadRun(registry, { store, key, name });
         if (plan.action === 'reject') {
           return { ok: false, action: 'reject', key: plan.key ?? key, reason: plan.reason };
@@ -531,6 +535,11 @@ function optionalEnum(value, allowed, tool, field) {
     throw new TypeError(`[tools] ${tool}: ${field} must be one of ${[...allowed].join(', ')}`);
   }
   return value;
+}
+
+/** @param {string|undefined} goal @returns {boolean} */
+function exceedsGoalLimit(goal) {
+  return goal !== undefined && Array.from(goal).length > GOAL_MAX_CODEPOINTS;
 }
 
 /** @param {object} registry @param {{store:object,key:string,name?:string}} input */

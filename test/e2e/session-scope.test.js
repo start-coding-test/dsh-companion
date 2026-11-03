@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 
 import { FakeCtx } from '../fakes/ctx.js';
 import { apply } from '../../src/index.js';
-import { TEST_NOW, makeTempStore } from './helpers.js';
+import { TEST_NOW, makeTempStore, waitFor } from './helpers.js';
 
 const DRAFT = {
   episode: {
@@ -190,6 +190,8 @@ test('thread 巩固只写 thread scope，main 水位与事实不受影响', asyn
       payload(ctx, threadSession, 1, '我下周要把预算调到 8000。'),
       { kind: 'enter', messages: [] },
     );
+    // M3：巩固在 step 之后异步执行，等它落地再断言。
+    await waitFor(() => temp.store.getWatermark('thread:budget') === 1, { label: 'thread consolidation' });
     assert.equal(streams.length, 1, 'thread 的巩固应调用模型一次');
     assert.equal(temp.store.listFacts({ scope: 'main' }).length, 0);
     const threadFacts = temp.store.listFacts({ scope: 'thread:budget' });
@@ -206,6 +208,7 @@ test('thread 巩固只写 thread scope，main 水位与事实不受影响', asyn
       payload(ctx, mainSession, 1, '我下周要把预算调到 9000。'),
       { kind: 'enter', messages: [] },
     );
+    await waitFor(() => temp.store.getWatermark('main') === 1, { label: 'main consolidation' });
     assert.equal(temp.store.listFacts({ scope: 'thread:budget' }).length, 1);
     assert.equal(temp.store.listFacts({ scope: 'main' }).length, 1);
     assert.equal(temp.store.getWatermark('thread:budget'), 1);

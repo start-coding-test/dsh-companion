@@ -15,7 +15,7 @@ import assert from 'node:assert/strict';
 
 import { FakeCtx } from '../fakes/ctx.js';
 import { apply } from '../../src/index.js';
-import { TEST_NOW, makeTempStore } from './helpers.js';
+import { TEST_NOW, makeTempStore, settle, waitFor } from './helpers.js';
 
 const DRAFT = {
   episode: {
@@ -116,6 +116,8 @@ test('巩固/压缩按 surface seq 选区：seq 从 7 开始也不当成 log 下
   try {
     // turn 1：窗口 = 水位之后到 tail 起点，全部按 surface seq。
     await preStep(ctx, session, 1, '我下周要把预算调到 8000。');
+    // M3：巩固在 step 之后异步执行，等它落地再断言。
+    await waitFor(() => temp.store.getWatermark('main') === 9, { label: 'consolidation' });
     const row = temp.store.db
       .prepare("SELECT turn_from, turn_to, upto_seq FROM consolidations WHERE kind = 'nap'")
       .get();
@@ -137,6 +139,7 @@ test('巩固/压缩按 surface seq 选区：seq 从 7 开始也不当成 log 下
     assert.equal(retargeted.status, 'compacted');
     assert.equal(retargeted.upto_seq, 11);
     assert.equal(retargeted.compaction_start_seq, 7);
+    await settle();
   } finally {
     handle.dispose();
     temp.cleanup();
@@ -150,6 +153,7 @@ test('pending 区间被外部压缩替换后丢弃，不重试旧 seq', async ()
   const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
   try {
     await preStep(ctx, session, 1, '第一条消息，用来触发巩固窗口。');
+    await waitFor(() => temp.store.getWatermark('main') === 2, { label: 'consolidation' });
     const pending = temp.store.db
       .prepare("SELECT status FROM consolidations WHERE kind = 'nap'")
       .get();
@@ -161,6 +165,7 @@ test('pending 区间被外部压缩替换后丢弃，不重试旧 seq', async ()
     assert.deepEqual(session.surface.nodes, [100]);
 
     await preStep(ctx, session, 2, '第二条。');
+    await settle();
     assert.equal(ctx.callsOf('compaction.compactRegion').length, 0, '旧区间不应再调用 compactRegion');
     const warned = ctx.logs.find((entry) => /pending compaction region expired/u.test(entry.message));
     assert.ok(warned, '应 warn 丢弃过期 pending');
@@ -183,6 +188,7 @@ test('冷启动：索引为空时用 sessionQuery.readSurface 回填正文后照
   try {
     await preStep(ctx, session, 1, '新的一轮。');
     assert.equal(ctx.callsOf('sessionQuery.readSurface').length, 1, '冷启动应回填一次');
+    await waitFor(() => streams.length === 1, { label: 'consolidation stream' });
     assert.equal(streams.length, 1, '回填后应照常巩固');
     const row = temp.store.db.prepare("SELECT turn_from, turn_to FROM consolidations WHERE kind = 'nap'").get();
     assert.equal(row.turn_from, 3);
@@ -200,10 +206,13 @@ test('正文不可得时降级跳过，不写半截 episode', async () => {
   const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
   try {
     await preStep(ctx, session, 1, '新的一轮。');
+    const debug = await waitFor(
+      () => ctx.logs.find((entry) => /surface text incomplete/u.test(entry.message)),
+      { label: 'surface text incomplete log' },
+    );
     assert.equal(streams.length, 0, '正文缺失时不应调用巩固模型');
     const count = temp.store.db.prepare("SELECT COUNT(*) AS n FROM consolidations WHERE kind = 'nap'").get();
     assert.equal(Number(count.n), 0);
-    const debug = ctx.logs.find((entry) => /surface text incomplete/u.test(entry.message));
     assert.ok(debug, '应 debug 说明跳过原因');
     assert.equal(debug.level, 'debug');
   } finally {
@@ -223,6 +232,7 @@ test('默认尾部保留区 6,144 tokens：超出部分留在 surface', async ()
   const handle = apply(ctx, { dbPath: temp.dbPath }); // 默认 retainTokens = 6,144
   try {
     await preStep(ctx, session, 1, '收个尾。');
+    await waitFor(() => temp.store.getWatermark('main') > 0, { label: 'consolidation' });
     const row = temp.store.db.prepare("SELECT turn_from, turn_to FROM consolidations WHERE kind = 'nap'").get();
     assert.ok(row, '应巩固');
     assert.equal(row.turn_from, 1);
