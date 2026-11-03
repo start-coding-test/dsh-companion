@@ -72,10 +72,12 @@ health | archived | 体检 | 2026-10-20
 
 ```text
 /状态
-状态：entities 8 / episodes 120 / facts 96 / reminders 4 / state_board 2 / state_board_rev 9 / threads 3 / consolidations 21 / memory_events 310 / fts facts 96/episodes 120
+状态：entities 8 / episodes 120 / facts 96 / reminders 4 / state_board 2 / state_board_rev 9 / threads 3 / consolidations 21 / memory_events 310 / fts facts 96/episodes 120 / tokens 本轮 入 8000 出 1200（超预算 0 次）
 水位 main：120
 最近 job：s2-purge ok upto_seq=0（2026-11-03 03:30）
 ```
+
+最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。
 
 ## 工具
 
@@ -146,10 +148,10 @@ health | archived | 体检 | 2026-10-20
 返回：
 
 ```json
-{ "ok": true, "id": "97", "alreadyDeleted": false, "deletedAt": 1793600000 }
+{ "ok": true, "id": "97", "alreadyDeleted": false, "tombstoned": true }
 ```
 
-不存在时返回 `{ "ok": false, "id": "97", "reason": "not-found" }`；已删除时 `alreadyDeleted=true`。
+`ok` 表示这次调用是否成功把行转为 tombstone；`tombstoned=true` 表示本次确实完成了标记。不存在时返回 `{ "ok": false, "id": "97", "reason": "not-found" }`；已删除时返回 `{ "ok": true, "id": "97", "alreadyDeleted": true, "deletedAt": 1793600000 }`；行存在但不是 `active`（如已降级为 `dormant`）时返回 `{ "ok": false, "id": "97", "alreadyDeleted": false, "tombstoned": false, "reason": "not-active" }`。
 
 ### `reminder_add`
 
@@ -203,7 +205,7 @@ health | archived | 体检 | 2026-10-20
 | `key` | string | 是 | 线程 key；新建时传 `new` |
 | `name` | string | 否 | 线程名，`key=new` 时必填 |
 | `goal` | string | 否 | 投递给线程的目标/任务 |
-| `cwd` | string | 否 | 新会话工作目录，默认当前目录 |
+| `cwd` | string | 否 | 新会话工作目录；由接线层从宿主注入，插件不读 `process.cwd()`。宿主未提供时新建返回 `reason: "cwd-unavailable"` |
 
 复用返回：
 
@@ -218,6 +220,13 @@ health | archived | 体检 | 2026-10-20
 ```
 
 拒绝返回 `{ "ok": false, "action": "reject", "key": "new", "reason": "too-many-threads" }`；常见原因还有 `name-required`。
+
+能力缺失时返回 `ok:false`，不会写入半成品：
+
+- `cwd-unavailable`：宿主未提供工作目录（新建分支）。
+- `session-unavailable`：宿主没有 `sessionController.createSession`。
+- `unarchive-unavailable`：复用已归档线程，但宿主没有 `workspaceRegistry.unarchiveSession`。
+- `prompt-unavailable`：宿主没有 `sessionController.prompt`，无法投递目标。
 
 ### `cost_report`
 
@@ -255,6 +264,39 @@ dbPath: "D:/dsh-data/companion.db"
 ```
 
 完整配置项与默认值见 [README](../README.md#配置)。
+
+## 错误与降级
+
+### 启动与配置
+
+- 配置非法：`apply` 前校验，抛 `ConfigError`（带出错字段名），插件不加载；修正后重载 profile。未知配置键只记警告。
+- 数据库只读或不可写：`Store.open` 失败（如 `SQLITE_READONLY`、`SQLITE_CANTOPEN`），`apply` 抛错且不会注册任何命令/工具。请把 `dbPath` 指向可写目录（WAL 需要同目录写权限），或修正文件权限后重启。
+- 同一 ctx 二次 `apply`：返回同一个 `{ dispose }` 句柄，不重复注册；`dispose()` 关闭 Store 并清掉 interval，可安全重复调用。
+
+### 宿主能力缺失
+
+插件按能力降级，不因宿主缺服务而崩溃：
+
+- 无 `systemPrompt`：不注册人格段。
+- 无 `preStep`：不注册召回注入，主对话不受影响。
+- 无 `compaction`：巩固成功但 pending 保留，直到有压缩能力；记忆已落库，不丢数据。
+- 无 `commands` / `tools`：对应命令或工具不注册。
+- 无 `timer`：不启动调度器，提醒与主动消息不推送。
+- 无 `tokenMeter`：`/状态` 的 tokens 段显示 0，其余计数正常。
+- 无 main 会话或 `prompt` 不可用：主动消息发送失败会留在队列等待下个 tick；`thread_run` 返回 `prompt-unavailable`。召回只影响注入，不影响原始对话。
+- 无模型（`ctx.companion.consolidationLlm` 与 `ctx.llm` 都不可用）：巩固跳过并记 debug 日志，不阻塞对话，已有记忆照常检索。
+- 无 `unarchiveSession`：复用归档线程返回 `unarchive-unavailable`。
+
+### 工具错误
+
+- 参数非法：抛 `TypeError`，消息带工具名与字段名；调用方修正后重试。
+- 业务失败：返回 `ok:false` 加 `reason`（如 `not-found`、`not-active`、`too-many-threads`、`cwd-unavailable`）。
+- 检索无命中：返回空列表，不注入、不编造。
+
+### 数据库与文件
+
+- 备份失败：写入 `scheduler_jobs` 审计（`reason=backup_failed`），不影响主流程；成功时按日期滚动保留最近 7 份。
+- 遗忘到期清理失败：任务错误记账，下次 03:30 继续；冷静期内的行不会被提前删除。
 
 ## 常见问题
 
