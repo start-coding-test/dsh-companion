@@ -58,6 +58,47 @@ const EVENT_ACTIONS = new Set([
 const EVENT_ACTORS = new Set(['consolidator', 'user', 'scheduler', 'migrator']);
 const CONSOLIDATION_STATUSES = new Set(['running', 'written', 'compacted', 'failed']);
 const THREAD_STATUSES = new Set(['active', 'archived', 'retired']);
+
+/** t17：BUSY/locked 事务最多重试 3 次（首次 + 3 次重试）与退避上限。 */
+const BUSY_MAX_ATTEMPTS = 4;
+const BUSY_BACKOFF_MAX_MS = 25;
+
+/**
+ * 是否为 SQLite 忙/锁冲突（主库与 WAL 都覆盖）。
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+export function isBusyError(error) {
+  if (error === null || typeof error !== 'object') return false;
+  const code = typeof error.code === 'string' ? error.code : '';
+  if (code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED'
+    || code === 'SQLITE_BUSY_SNAPSHOT' || code === 'SQLITE_LOCKED_SHAREDCACHE') {
+    return true;
+  }
+  const message = typeof error.message === 'string' ? error.message : '';
+  return /database (?:table )?is locked|database is busy|SQLITE_BUSY/i.test(message);
+}
+
+/**
+ * 同步睡眠：退避抖动只用于事务入口，不需要异步。
+ * @param {number} ms
+ */
+function sleepSync(ms) {
+  const wait = Math.max(0, Math.floor(Number(ms)));
+  if (wait === 0) return;
+  const buffer = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(buffer), 0, 0, wait);
+}
+
+/**
+ * 第 attempt 次重试前的抖动（5–25ms 线性增长），保证 ≤50ms。
+ * @param {number} attempt
+ * @returns {number}
+ */
+function busyBackoffMs(attempt) {
+  const base = Math.min(BUSY_BACKOFF_MAX_MS, 5 * attempt);
+  return base + Math.floor(Math.random() * (BUSY_BACKOFF_MAX_MS + 1));
+}
 const EPISODE_STATUSES = new Set(['active', 'dormant', 'tombstoned']);
 const MOOD_VALUES = new Set(['positive', 'neutral', 'tired', 'anxious', 'low', 'excited']);
 const FIDELITY_VALUES = new Set(['full', 'gist', 'index']);
@@ -580,25 +621,39 @@ export class Store {
     if (this.#inTransaction) {
       throw new StoreError('[store] nested transaction is not supported');
     }
-    this.#db.exec('BEGIN IMMEDIATE');
-    this.#inTransaction = true;
-    try {
-      const result = fn();
-      if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
-        throw new StoreError('[store] transaction(fn) requires a synchronous function');
-      }
-      this.#db.exec('COMMIT');
-      return result;
-    } catch (error) {
+    // t17：SQLITE_BUSY/locked 是并发写库的瞬时抖动，入口最多重试 3 次
+    //（首次 + 3 次重试）。每次重试前都已 ROLLBACK，不会留下半开事务；
+    // 最终失败原样重抛，不吞错。
+    let lastError;
+    for (let attempt = 1; attempt <= BUSY_MAX_ATTEMPTS; attempt += 1) {
       try {
-        this.#db.exec('ROLLBACK');
-      } catch {
-        // ROLLBACK 失败时保留原始错误
+        this.#db.exec('BEGIN IMMEDIATE');
+        this.#inTransaction = true;
+        try {
+          const result = fn();
+          if (result !== null && typeof result === 'object' && typeof result.then === 'function') {
+            throw new StoreError('[store] transaction(fn) requires a synchronous function');
+          }
+          this.#db.exec('COMMIT');
+          return result;
+        } catch (error) {
+          try {
+            this.#db.exec('ROLLBACK');
+          } catch {
+            // ROLLBACK 失败时保留原始错误
+          }
+          throw error;
+        } finally {
+          this.#inTransaction = false;
+        }
+      } catch (error) {
+        lastError = error;
+        if (!isBusyError(error) || attempt >= BUSY_MAX_ATTEMPTS) throw error;
+        sleepSync(busyBackoffMs(attempt));
       }
-      throw error;
-    } finally {
-      this.#inTransaction = false;
     }
+    // 理论不可达；保留最终错误，避免吞错。
+    throw lastError;
   }
 
   /**
@@ -1566,6 +1621,42 @@ export class Store {
       throw new TypeError(`[store] invalid consolidations.status: ${status}`);
     }
     const id = input.id ?? newId('cs');
+    const scope = requireString(input.scope, 'consolidations.scope');
+    const kind = requireString(input.kind, 'consolidations.kind');
+    const uptoSeq = Number(input.upto_seq);
+    const turnFrom = input.turn_from ?? null;
+    const compactionStartSeq = input.compaction_start_seq ?? turnFrom ?? null;
+    // t17：重试失败巩固时，同一 (scope, upto_seq, kind) 的唯一键已存在一行 failed。
+    // 就地复用它（改为本次的 running/written/failed），既不新增重复行，也不改 DDL；
+    // 非 failed 行（written/compacted）仍按唯一约束抛错，避免静默覆盖已成功区间。
+    const existing = this.#db
+      .prepare('SELECT id, status FROM consolidations WHERE scope = ? AND upto_seq = ? AND kind = ?')
+      .get(scope, uptoSeq, kind);
+    if (existing && existing.status === 'failed') {
+      this.#db
+        .prepare(
+          `UPDATE consolidations
+              SET session_id = ?, trigger = ?, turn_from = ?, turn_to = ?,
+                  tokens_in = ?, tokens_out = ?, status = ?, error = ?,
+                  started_at = ?, finished_at = ?, compaction_start_seq = ?
+            WHERE id = ?`,
+        )
+        .run(
+          requireString(input.session_id, 'consolidations.session_id'),
+          requireString(input.trigger, 'consolidations.trigger'),
+          turnFrom,
+          input.turn_to ?? null,
+          input.tokens_in ?? null,
+          input.tokens_out ?? null,
+          status,
+          input.error ?? null,
+          epochOr(input.started_at, nowSeconds()),
+          epochOr(input.finished_at, null),
+          compactionStartSeq,
+          existing.id,
+        );
+      return this.getConsolidation(existing.id);
+    }
     this.#db
       .prepare(
         `INSERT INTO consolidations (
@@ -1576,12 +1667,12 @@ export class Store {
       )
       .run(
         id,
-        requireString(input.scope, 'consolidations.scope'),
+        scope,
         requireString(input.session_id, 'consolidations.session_id'),
-        requireString(input.kind, 'consolidations.kind'),
+        kind,
         requireString(input.trigger, 'consolidations.trigger'),
-        Number(input.upto_seq),
-        input.turn_from ?? null,
+        uptoSeq,
+        turnFrom,
         input.turn_to ?? null,
         input.tokens_in ?? null,
         input.tokens_out ?? null,
@@ -1589,7 +1680,7 @@ export class Store {
         input.error ?? null,
         epochOr(input.started_at, nowSeconds()),
         epochOr(input.finished_at, null),
-        input.compaction_start_seq ?? input.turn_from ?? null,
+        compactionStartSeq,
       );
     return this.getConsolidation(id);
   }
@@ -1670,7 +1761,8 @@ export class Store {
         status,
         options.tokensIn ?? current.tokens_in,
         options.tokensOut ?? current.tokens_out,
-        options.error ?? current.error,
+        // t17：重试成功后要能用 error:null 清掉上一次的失败原因。
+        options.error !== undefined ? options.error : current.error,
         finishedAt,
         id,
       );

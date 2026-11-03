@@ -67,6 +67,12 @@ import {
   overDailyBudget,
   recordTurnUsage,
 } from './runtime/budget.js';
+import {
+  MAX_CONSOLIDATION_RETRIES,
+  errorMessage,
+  isCredentialError,
+  retryDelayMs,
+} from './runtime/retry.js';
 import { handleCommand } from './runtime/commands.js';
 import { createMetrics } from './runtime/metrics.js';
 import { createProactive } from './runtime/proactive.js';
@@ -340,6 +346,8 @@ function createWiringState({ host, platform, store, config, metrics }) {
     consolidationScheduled: false,
     /** M3：上一轮巩固结果，下一轮 pre-step 开头检查（只用于日志）。 */
     lastConsolidationResult: null,
+    /** t17：失败巩固的重试登记（job + attempts + nextAt）。 */
+    consolidationRetry: null,
     /** dispose 后后台任务不再碰已关闭的 Store。 */
     disposed: false,
     llmResolved: false,
@@ -1079,34 +1087,58 @@ async function runConsolidationJob(state) {
  */
 async function executeConsolidationJob(state, job) {
   const { store, platform, metrics, config } = state;
-  const snapshot = job.snapshot;
-  if (snapshot === null || snapshot === undefined) return;
-  const watermark = watermarkOf(state, job.scope);
-  const { region, reason } = planRegion(snapshot, {
-    afterSeq: watermark,
-    budgetTokens: config.retainTokens,
-  });
-  if (region === null) {
-    platform.log('debug', '[dsh-companion] consolidation window empty', {
-      reason,
-      watermark,
-      nodes: snapshot.seqs.length,
+  const retrying = typeof job.consolidationId === 'string' && job.consolidationId !== '';
+  let startSeq;
+  let endSeq;
+  let regionText;
+  if (retrying) {
+    // t17：重试固定使用首次登记的区间，不再按已变化的 surface 重选，
+    // 否则会与 failed 行的 (scope, upto_seq, kind) 不匹配。
+    startSeq = Number(job.regionStartSeq);
+    endSeq = Number(job.regionEndSeq);
+    if (!Number.isFinite(startSeq) || !Number.isFinite(endSeq)) {
+      platform.log('warn', '[dsh-companion] consolidation retry has no region; dropping');
+      state.consolidationRetry = null;
+      return;
+    }
+    regionText = typeof job.regionText === 'string' && job.regionText !== '' ? job.regionText : null;
+    platform.log('info', '[dsh-companion] consolidation retry attempt', {
+      attempt: job.attempts ?? 1,
+      startSeq,
+      endSeq,
     });
-    return;
-  }
-  if (region.missing > 0) {
-    platform.log('debug', '[dsh-companion] consolidation skipped: surface text incomplete', {
-      missing: region.missing,
-      count: region.count,
+  } else {
+    const snapshot = job.snapshot;
+    if (snapshot === null || snapshot === undefined) return;
+    const watermark = watermarkOf(state, job.scope);
+    const { region, reason } = planRegion(snapshot, {
+      afterSeq: watermark,
+      budgetTokens: config.retainTokens,
     });
-    return;
+    if (region === null) {
+      platform.log('debug', '[dsh-companion] consolidation window empty', {
+        reason,
+        watermark,
+        nodes: snapshot.seqs.length,
+      });
+      return;
+    }
+    if (region.missing > 0) {
+      platform.log('debug', '[dsh-companion] consolidation skipped: surface text incomplete', {
+        missing: region.missing,
+        count: region.count,
+      });
+      return;
+    }
+    // N1：优先使用登记时固定的选区文本，但只有边界与本次重算完全一致时才复用；
+    // 水位/选区漂移时以当步 region.text 为准，绝不把错位文本交给模型。
+    const sameRegion = job.regionStartSeq === region.startSeq && job.regionEndSeq === region.endSeq;
+    startSeq = region.startSeq;
+    endSeq = region.endSeq;
+    regionText = sameRegion && typeof job.regionText === 'string' && job.regionText !== ''
+      ? job.regionText
+      : region.text;
   }
-  // N1：优先使用登记时固定的选区文本，但只有边界与本次重算完全一致时才复用；
-  // 水位/选区漂移时以当步 region.text 为准，绝不把错位文本交给模型。
-  const sameRegion = job.regionStartSeq === region.startSeq && job.regionEndSeq === region.endSeq;
-  const regionText = sameRegion && typeof job.regionText === 'string' && job.regionText !== ''
-    ? job.regionText
-    : region.text;
   const transcript = Array.isArray(job.transcript) ? job.transcript : state.transcript;
 
   const llm = await resolveConsolidationLlm(state);
@@ -1123,8 +1155,8 @@ async function executeConsolidationJob(state, job) {
     const result = await consolidate({
       store,
       scope: job.scope,
-      seqFrom: region.startSeq,
-      seqTo: region.endSeq,
+      seqFrom: startSeq,
+      seqTo: endSeq,
       // N1：模型输入优先用 surface 选区，transcript 只在选区缺失时兜底。
       regionText,
       transcript,
@@ -1149,11 +1181,12 @@ async function executeConsolidationJob(state, job) {
     const consolidation = findConsolidation(store, job.scope, Number(result.upto_seq));
     state.pendingCompact = {
       id: consolidation?.id ?? null,
-      startSeq: region.startSeq,
-      endSeq: region.endSeq,
+      startSeq,
+      endSeq,
       scope: job.scope,
     };
-    setWatermark(state, job.scope, region.endSeq);
+    setWatermark(state, job.scope, endSeq);
+    state.consolidationRetry = null;
     metrics.inc('consolidations');
     state.lastConsolidationResult = {
       ok: true,
@@ -1167,34 +1200,190 @@ async function executeConsolidationJob(state, job) {
       trigger: job.trigger,
     });
   } catch (error) {
+    const message = errorMessage(error);
     metrics.inc('consolidationFailures');
     state.lastConsolidationResult = {
       ok: false,
       scope: job.scope,
       trigger: job.trigger,
-      message: error instanceof Error ? error.message : String(error),
+      message,
     };
     platform.log('warn', '[dsh-companion] consolidation failed', {
       trigger: job.trigger,
-      message: error instanceof Error ? error.message : String(error),
+      message,
     });
     if (state.disposed) return;
+
+    const attempts = Number(job.attempts ?? 0) + 1;
+    let failedId = typeof job.consolidationId === 'string' ? job.consolidationId : null;
+    try {
+      failedId = recordFailedConsolidation(state, job, { startSeq, endSeq, at, message });
+    } catch (recordError) {
+      // 失败行写不进去时仍要保留原始错误与重试能力。
+      platform.log('warn', '[dsh-companion] failed to record consolidation failure', {
+        message: errorMessage(recordError),
+      });
+    }
     try {
       store.appendEvent({
         at,
         action: 'UPDATE',
         table_name: 'consolidations',
+        row_id: failedId,
         actor: 'consolidator',
         reason: 'consolidation_failed',
-        detail_json: {
-          trigger: job.trigger,
-          message: error instanceof Error ? error.message : String(error),
-        },
+        detail_json: { kind: 'consolidation_failure', trigger: job.trigger, message, attempts },
       });
     } catch {
       // 审计失败不覆盖原始错误。
     }
+
+    const delay = retryDelayMs(attempts);
+    if (!isCredentialError(error) && delay !== null && attempts <= MAX_CONSOLIDATION_RETRIES) {
+      const nextAt = platform.now() + delay;
+      state.consolidationRetry = {
+        job: {
+          ...job,
+          consolidationId: failedId,
+          attempts,
+          regionStartSeq: startSeq,
+          regionEndSeq: endSeq,
+          regionText,
+        },
+        nextAt,
+        scope: job.scope,
+      };
+      try {
+        store.appendEvent({
+          at,
+          action: 'UPDATE',
+          table_name: 'consolidations',
+          row_id: failedId,
+          actor: 'consolidator',
+          reason: 'retry',
+          detail_json: {
+            kind: 'retry',
+            trigger: job.trigger,
+            attempts,
+            nextRetryAt: Math.floor(nextAt / 1000),
+            message,
+            consolidationId: failedId,
+          },
+        });
+      } catch {
+        // 重试审计失败不影响重试本身。
+      }
+      platform.log('warn', '[dsh-companion] consolidation retry scheduled', {
+        attempt: attempts,
+        nextAt,
+        delay,
+      });
+      return;
+    }
+
+    state.consolidationRetry = null;
+    platform.log('error', '[dsh-companion] consolidation failed permanently', {
+      attempts,
+      credential: isCredentialError(error),
+      message,
+    });
+    try {
+      store.appendEvent({
+        at,
+        action: 'UPDATE',
+        table_name: 'consolidations',
+        row_id: failedId,
+        actor: 'consolidator',
+        reason: 'consolidation_failed_final',
+        detail_json: {
+          kind: 'consolidation_final',
+          trigger: job.trigger,
+          attempts,
+          credential: isCredentialError(error),
+          message,
+        },
+      });
+    } catch {
+      // 最终失败日志已可观测；审计失败不覆盖原始错误。
+    }
   }
+}
+
+/**
+ * t17：把一次巩固失败落成 consolidations 的 failed 行（重试复用同一行）。
+ * @param {object} state
+ * @param {object} job
+ * @param {{startSeq:number, endSeq:number, at:number, message:string}} info
+ * @returns {string|null}
+ */
+function recordFailedConsolidation(state, job, { startSeq, endSeq, at, message }) {
+  const { store } = state;
+  if (typeof job.consolidationId === 'string' && job.consolidationId !== '') {
+    const existing = store.getConsolidation(job.consolidationId);
+    if (existing && existing.status !== 'written' && existing.status !== 'compacted') {
+      store.markConsolidated(existing.id, { status: 'failed', finishedAt: at, error: message });
+      return existing.id;
+    }
+  }
+  try {
+    const row = store.insertConsolidation({
+      scope: job.scope,
+      session_id: job.sessionId ?? job.scope,
+      kind: 'nap',
+      trigger: job.trigger,
+      upto_seq: endSeq,
+      turn_from: startSeq,
+      turn_to: endSeq,
+      compaction_start_seq: startSeq,
+      status: 'failed',
+      error: message,
+      started_at: at,
+      finished_at: at,
+    });
+    return row?.id ?? null;
+  } catch (insertError) {
+    const existing = findConsolidation(store, job.scope, endSeq);
+    // 并发/重叠巩固可能已把同一区间写成 written；不得为了记录失败而回退成功行。
+    if (existing !== null && existing !== undefined
+      && existing.status !== 'written' && existing.status !== 'compacted') {
+      store.markConsolidated(existing.id, { status: 'failed', finishedAt: at, error: message });
+      return existing.id;
+    }
+    throw insertError;
+  }
+}
+
+/**
+ * t17：idle 检查是否到了巩固重试时间；到点则把 job 放回待执行槽。
+ * 有新巩固在排队/执行时延后，避免重试覆盖更新的窗口。
+ * @param {object} state
+ * @returns {boolean} 是否已排入执行
+ */
+function maybeRetryConsolidation(state) {
+  const retry = state.consolidationRetry;
+  if (retry === null || state.disposed) return false;
+  if (state.consolidationInFlight || state.consolidationScheduled) return false;
+  if (state.pendingConsolidation !== null) return false;
+  if (state.platform.now() < retry.nextAt) return false;
+  // 后续巩固可能已经推进水位覆盖旧区间；此时重试旧区间会把水位写回退。
+  const retryEnd = Number(retry.job?.regionEndSeq);
+  if (Number.isFinite(retryEnd) && watermarkOf(state, retry.scope) >= retryEnd) {
+    state.consolidationRetry = null;
+    state.platform.log('warn', '[dsh-companion] consolidation retry superseded; dropping', {
+      scope: retry.scope,
+      endSeq: retryEnd,
+      watermark: watermarkOf(state, retry.scope),
+    });
+    return false;
+  }
+  state.consolidationRetry = null;
+  state.pendingConsolidation = retry.job;
+  state.consolidationScheduled = true;
+  setImmediate(() => {
+    state.consolidationScheduled = false;
+    void runConsolidationJob(state);
+  });
+  return true;
 }
 
 /**
@@ -1666,6 +1855,8 @@ function startScheduler(state) {
 
   const jobs = {
     'idle-probe': async () => {
+      // t17：巩固失败的重试优先于闲聊/主动消息，且不受预算降级影响。
+      maybeRetryConsolidation(state);
       // M4：每 60s 读一次 RSS；warn 只记 metric，stop_dispatch/main_only 降级。
       runRssCheck(state);
       if (proactiveBlocked(state)) return;
@@ -2161,9 +2352,11 @@ function backupDatabase(state) {
         detail_json: { message, path: target },
       });
     } catch {
-      // 审计失败不影响任务继续。
+      // 审计失败不影响把错误上抛给调度器。
     }
-    return null;
+    // t17：备份失败必须让 scheduler 记录 job_error/last_error，并在次日重试；
+    // 不能在这里吞掉（只写审计会让调度器误以为成功）。
+    throw error;
   }
 
   try {

@@ -167,6 +167,12 @@ export function createScheduler({
   const suppressed = new Set();
   /** @type {unknown[]} 最近调度/任务错误（诊断用） */
   const errors = [];
+  /**
+   * t17：每个 job 的连续失败状态（失败次数 + 最后错误）。
+   * 从 memory_events 恢复；成功后清空，失败可被 /状态 与 listJobs 观察。
+   * @type {Map<string, {attempts: number, lastError: string, lastErrorAt: number}>}
+   */
+  const failures = new Map();
 
   let started = false;
   /** @type {unknown} */
@@ -197,6 +203,92 @@ export function createScheduler({
     return null;
   }
 
+  /**
+   * t17：从事件里恢复最近一次失败状态。
+   * 最新一条 job_run 代表后来跑过（可能成功），清空失败；job_retry 不是失败本身。
+   * @param {string} id
+   * @returns {{attempts: number, lastError: string, lastErrorAt: number}|null}
+   */
+  function readFailureState(id) {
+    if (typeof store.listEvents !== 'function') return null;
+    let rows;
+    try {
+      rows = store.listEvents({ table_name: JOB_EVENT_TABLE, row_id: id, limit: 50 });
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(rows)) return null;
+    for (const row of rows) {
+      const detail = parseDetail(row?.detail_json);
+      if (detail === null || detail.jobId !== id) continue;
+      if (detail.kind === 'job_run') return null;
+      if (detail.kind !== 'job_error') continue;
+      const attempts = Number(detail.attempts);
+      const seconds = Number(row?.at);
+      return {
+        attempts: Number.isFinite(attempts) && attempts > 0 ? attempts : 1,
+        lastError: typeof detail.message === 'string' ? detail.message : '',
+        lastErrorAt: Number.isFinite(seconds) ? seconds * 1000 : null,
+      };
+    }
+    return null;
+  }
+
+  /**
+   * t17：该 job 下一次按计划触发的时间（失败后用于审计「次日重试」）。
+   * @param {object} spec
+   * @param {number} at
+   * @returns {number}
+   */
+  function nextScheduledAt(spec, at) {
+    if (spec.kind === 'interval') return at + spec.intervalMs;
+    const scheduled = scheduleToday(at, spec.atMinutes, timeZone);
+    return at < scheduled ? scheduled : addLocalDays(scheduled, 1, timeZone);
+  }
+
+  /**
+   * t17：记录一次失败并写 job_error/job_retry 事件。
+   * 失败不抛给调用方；下一次到期（每日任务次日、间隔任务下个周期）自然重试。
+   * @param {object} spec
+   * @param {unknown} error
+   * @param {string} trigger
+   * @param {number} at
+   */
+  function recordFailure(spec, error, trigger, at) {
+    const previous = failures.get(spec.id);
+    const attempts = (previous?.attempts ?? 0) + 1;
+    const message = error instanceof Error ? error.message : String(error);
+    failures.set(spec.id, { attempts, lastError: message, lastErrorAt: at });
+    safePersist(() => persistJobError(spec, error, trigger, at, attempts));
+    safePersist(() => persistJobRetry(spec, at, trigger, attempts));
+  }
+
+  /** 写一条 job_retry 事件（失败不阻断调度）。 */
+  function persistJobRetry(spec, at, trigger, attempts) {
+    const seconds = Math.floor(at / 1000);
+    store.appendEvent({
+      at: seconds,
+      action: 'USED',
+      table_name: JOB_EVENT_TABLE,
+      row_id: spec.id,
+      actor: 'scheduler',
+      reason: `job_retry:${spec.id}`,
+      detail_json: {
+        kind: 'job_retry',
+        jobId: spec.id,
+        trigger,
+        attempts,
+        nextRetryAt: nextScheduledAt(spec, at),
+        at: seconds,
+      },
+    });
+  }
+
+  /** 成功时清空连续失败状态。 @param {string} id */
+  function recordSuccess(id) {
+    failures.delete(id);
+  }
+
   /** 写一条 job_run 事件（失败不阻断调度）。 */
   function persistJobRun(spec, at, trigger) {
     const seconds = Math.floor(at / 1000);
@@ -217,9 +309,10 @@ export function createScheduler({
     });
   }
 
-  /** 写一条 job_error 事件（失败不阻断调度）。 */
-  function persistJobError(spec, error, trigger, at) {
+  /** 写一条 job_error 事件（失败不阻断调度；attempts 供恢复失败状态）。 */
+  function persistJobError(spec, error, trigger, at, attempts = 1) {
     const seconds = Math.floor(at / 1000);
+    const message = error instanceof Error ? error.message : String(error);
     store.appendEvent({
       at: seconds,
       action: 'USED',
@@ -231,7 +324,9 @@ export function createScheduler({
         kind: 'job_error',
         jobId: spec.id,
         trigger,
-        message: error instanceof Error ? error.message : String(error),
+        message,
+        last_error: message,
+        attempts,
         at: seconds,
       },
     });
@@ -273,7 +368,7 @@ export function createScheduler({
     } catch (error) {
       running.delete(spec.id);
       errors.push(error);
-      safePersist(() => persistJobError(spec, error, trigger, at));
+      recordFailure(spec, error, trigger, at);
       return { id: spec.id, status: 'error', error };
     }
 
@@ -281,17 +376,19 @@ export function createScheduler({
       result.then(
         () => {
           running.delete(spec.id);
+          recordSuccess(spec.id);
         },
         (error) => {
           running.delete(spec.id);
           errors.push(error);
-          safePersist(() => persistJobError(spec, error, trigger, at));
+          recordFailure(spec, error, trigger, at);
         },
       );
       return { id: spec.id, status: 'started' };
     }
 
     running.delete(spec.id);
+    recordSuccess(spec.id);
     return { id: spec.id, status: 'ran' };
   }
 
@@ -395,11 +492,15 @@ export function createScheduler({
     const at = normalizeNow(now);
     return JOB_SPECS.map((spec) => {
       const last = lastRunAt.get(spec.id) ?? null;
+      const failure = failures.get(spec.id) ?? null;
       const base = {
         id: spec.id,
         kind: spec.kind,
         lastRunAt: last,
         running: running.has(spec.id),
+        attempts: failure?.attempts ?? 0,
+        lastError: failure?.lastError ?? null,
+        lastErrorAt: failure?.lastErrorAt ?? null,
       };
       if (spec.kind === 'interval') {
         return {
@@ -434,6 +535,8 @@ export function createScheduler({
     const persisted = readLastRunAt(spec.id);
     if (persisted !== null) lastRunAt.set(spec.id, persisted);
     else if (spec.kind === 'interval') lastRunAt.set(spec.id, initAt);
+    const failure = readFailureState(spec.id);
+    if (failure !== null) failures.set(spec.id, failure);
   }
   for (const spec of JOB_SPECS) {
     if (spec.kind !== 'daily') continue;

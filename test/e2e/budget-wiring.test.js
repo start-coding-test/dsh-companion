@@ -137,6 +137,10 @@ test('每日 token 熔断：拒绝 task_run、停主动、命令展示、跨日�
   const recovered = command(ctx, 'cost');
   assert.doesNotMatch(recovered.text, /已熔断/u);
   assert.match(recovered.text, /今日配额 0 \/ 3000000/u);
+
+  // 熔断解除后任务入口恢复：不再因日预算被拒。
+  const recoveredTask = await tool(ctx, 'task_run').execute({ goal: '跨日恢复后的任务' });
+  assert.notEqual(recoveredTask.reason, 'daily_budget_exceeded');
 });
 
 test('RSS main_only：停 task_run/线程创建，恢复后自动解除', async (t) => {

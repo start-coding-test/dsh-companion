@@ -417,7 +417,81 @@ function formatStatus(store, scope, metrics, timeZone, budget) {
     : '无';
   const fts = `fts ${stats.fts_facts ?? 0}/${stats.fts_episodes ?? 0}`;
   const tokenText = formatTokenSnapshot(metrics, budget);
-  return `状态：${counts} / ${fts}${tokenText}\n水位 ${scope}：${watermark}\n最近 job：${jobText}`;
+  const failureText = formatFailureStatus(store, timeZone);
+  return `状态：${counts} / ${fts}${tokenText}\n水位 ${scope}：${watermark}\n最近 job：${jobText}\n${failureText}`;
+}
+
+/**
+ * t17：从审计事件里找最近一次失败/重试/job 失败，供 /状态 展示。
+ * 只读、异常安全；事件不存在时显示「无」。
+ * @param {object} store
+ * @param {string} timeZone
+ * @returns {string}
+ */
+function formatFailureStatus(store, timeZone) {
+  let rows = [];
+  try {
+    rows = typeof store?.listEvents === 'function' ? store.listEvents({ limit: 200 }) : [];
+  } catch {
+    rows = [];
+  }
+  let lastError = null;
+  let lastRetry = null;
+  let lastJobFailed = null;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    const detail = parseDetailJson(row?.detail_json);
+    const reason = String(row?.reason ?? '');
+    const kind = typeof detail?.kind === 'string' ? detail.kind : '';
+    if (lastError === null && (reason === 'consolidation_failed' || reason === 'consolidation_failed_final')) {
+      lastError = describeFailure(row, detail, timeZone, '巩固失败');
+    }
+    if (lastRetry === null && (reason === 'retry' || reason.startsWith('job_retry') || kind === 'retry' || kind === 'job_retry')) {
+      lastRetry = describeRetry(row, detail, timeZone);
+    }
+    if (lastJobFailed === null && (reason.startsWith('job_error') || reason === 'backup_failed' || kind === 'job_error')) {
+      lastJobFailed = describeFailure(row, detail, timeZone, 'job 失败');
+    }
+    if (lastError !== null && lastRetry !== null && lastJobFailed !== null) break;
+  }
+  return `最近失败：${lastError ?? '无'}\n最近重试：${lastRetry ?? '无'}\n最近 job 失败：${lastJobFailed ?? '无'}`;
+}
+
+/** @param {object} row @param {object|null} detail @param {string} timeZone @param {string} label */
+function describeFailure(row, detail, timeZone, label) {
+  const message = truncateText(detail?.message ?? detail?.last_error ?? '', 100);
+  const at = formatDateTime(row?.at, timeZone);
+  return `${label}${message === '' ? '' : `：${message}`}（${at}）`;
+}
+
+/** @param {object} row @param {object|null} detail @param {string} timeZone */
+function describeRetry(row, detail, timeZone) {
+  const attempt = Number(detail?.attempts);
+  const prefix = Number.isFinite(attempt) && attempt > 0 ? `第 ${attempt} 次重试` : '重试';
+  const next = Number(detail?.nextRetryAt);
+  const when = Number.isFinite(next) && next > 0
+    ? formatDateTime(toMillis(next) / 1000, timeZone)
+    : formatDateTime(row?.at, timeZone);
+  return `${prefix} → ${when}`;
+}
+
+/** @param {unknown} value */
+function parseDetailJson(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'object') return value;
+  if (typeof value !== 'string') return null;
+  try {
+    const parsed = JSON.parse(value);
+    return parsed !== null && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/** @param {unknown} value @param {number} max */
+function truncateText(value, max) {
+  const text = String(value ?? '').replace(/\s+/g, ' ').trim();
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}…`;
 }
 
 /**
