@@ -41,6 +41,7 @@ import {
   isSensitiveText,
   scan as scanGovernance,
 } from './memory/govern.js';
+import { exportAll } from './memory/export.js';
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections } from './persona/sections.js';
 import { DEFAULT_CARD } from './persona/card.js';
@@ -440,6 +441,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
               now: platform.now(),
               scope,
               timeZone: config.timezone,
+              cwd: typeof platform.cwd === 'function' ? platform.cwd() : undefined,
             });
             if (custom !== null) return { kind: 'success', text: custom };
           }
@@ -2832,10 +2834,19 @@ export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date
 /**
  * `/记忆` 的新子命令；返回 null 时交给旧 handleCommand（忘掉/置顶等）。
  *
- * @param {{text: string, store: Store, now?: number, scope?: string, timeZone?: string}} input
+ * @param {{text: string, store: Store, now?: number, scope?: string, timeZone?: string,
+ *          cwd?: string, dir?: string}} input
  * @returns {string|null}
  */
-export function handleMemoryCommand({ text, store, now = Date.now(), scope = SCOPE, timeZone } = {}) {
+export function handleMemoryCommand({
+  text,
+  store,
+  now = Date.now(),
+  scope = SCOPE,
+  timeZone,
+  cwd,
+  dir,
+} = {}) {
   const body = String(text ?? '').replace(/^\/记忆/u, '').trim();
   const [verb] = body.split(/\s+/u);
   if (body === '' || verb === '列表' || verb === 'list') {
@@ -2853,6 +2864,24 @@ export function handleMemoryCommand({ text, store, now = Date.now(), scope = SCO
   if (verb === '治理' || verb === 'govern') {
     const dryRun = body.includes('--dry-run');
     return formatGovernance({ store, scope, now: toMillis(now), dryRun });
+  }
+  if (verb === '导出' || verb === 'export') {
+    const format = body.slice(verb.length).trim();
+    if (format !== '' && format !== 'md' && format !== 'json') {
+      return '用法：/记忆 导出 [md|json]';
+    }
+    const targetDir = dir ?? join(cwd ?? process.cwd(), '.data', 'export');
+    const result = exportAll({
+      store,
+      scope,
+      format: format === 'md' ? 'md' : 'json',
+      dir: targetDir,
+      now: toMillis(now),
+    });
+    return [
+      `已导出记忆（${result.format}）：facts=${result.counts.facts} · episodes=${result.counts.episodes} · reminders=${result.counts.reminders} · threads=${result.counts.threads}`,
+      `文件：${result.path}`,
+    ].join('\n');
   }
   if (LEGACY_MEMORY_VERBS.includes(verb)) return null;
   return formatMemoryList({ store, scope, text: body, timeZone: timeZone ?? 'Asia/Shanghai' });
