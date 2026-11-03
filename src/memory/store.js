@@ -32,6 +32,7 @@ import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { toBigrams, toMatchQuery } from './bigram.js';
 import { DEFAULT_ALPHA, decayOf, reinforce } from './reinforce.js';
+import { boardFragments, renderBoard, scrubBoardText } from './state-board.js';
 
 /** schema 版本（06 v3.3 §8.2 初始值）。 */
 const SCHEMA_VERSION = '3';
@@ -303,6 +304,29 @@ function toEpoch(value) {
  */
 function epochOr(value, fallback) {
   return value === null || value === undefined ? fallback : toEpoch(value);
+}
+
+/**
+ * 物删/清洗的 id 列表：只接受非空字符串，去重并保持顺序。
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function normalizeIdList(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new TypeError('[store] ids must be an array of non-empty strings');
+  }
+  const seen = new Set();
+  const out = [];
+  for (const id of value) {
+    if (typeof id !== 'string' || id === '') {
+      throw new TypeError('[store] ids must be an array of non-empty strings');
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
 }
 
 /**
@@ -1183,7 +1207,9 @@ export class Store {
   }
 
   /**
-   * 发布 staged → rendered（四个发布时机之一由调用方保证）。
+   * 发布 staged → rendered。调用方须先经 state-board.js 的
+   * PUBLISH_REASONS 白名单判定（compact/restart/thread-unarchive/
+   * persona-edit/forget）。
    * @param {string} [scope]
    * @returns {number|null} 新 revision；无 staged 时返回 null
    */
@@ -1203,6 +1229,79 @@ export class Store {
       .run(nowSeconds(), scope);
     if (info.changes === 0) return null;
     return this.getBoardState(scope).revision;
+  }
+
+  /**
+   * 遗忘后清洗状态板（H4）：删除引用被遗忘 episode 的行，并从
+   * rendered / staged_rendered 文本中移除包含被遗忘正文的渲染行。
+   * 若行级定位不到任何残留，则按当前 active 记忆重新渲染并写 staged
+   * （renderBoard 的 5 区块/预算口径保持不变）。
+   * @param {{scope?: string, ids?: string[], now?: number|Date,
+   *          rerender?: boolean}} [options]
+   * @returns {{scope: string, removedRows: number, located: boolean,
+   *            rerendered: boolean, rendered: string, staged: string|null,
+   *            fragments: number}}
+   */
+  scrubStateBoard(options = {}) {
+    const scope = options.scope ?? 'main';
+    if (typeof scope !== 'string' || scope === '') {
+      throw new TypeError('[store] scrubStateBoard scope must be a non-empty string');
+    }
+    const ids = normalizeIdList(options.ids);
+    const at = epochOr(options.now, nowSeconds());
+    return this.#atomic(() => {
+      const fragments = boardFragments(this, ids);
+      let removedRows = 0;
+      for (const row of this.listBoardLines(scope)) {
+        const referenced =
+          row.ref_episode_id !== null &&
+          row.ref_episode_id !== undefined &&
+          ids.includes(row.ref_episode_id);
+        const residual = scrubBoardText(row.line, fragments) !== row.line;
+        if (!referenced && !residual) continue;
+        if (this.deleteBoardLine(row.id)) removedRows += 1;
+      }
+
+      const state = this.getBoardState(scope);
+      const rendered = scrubBoardText(state.rendered, fragments);
+      let staged =
+        state.staged_rendered === null ? null : scrubBoardText(state.staged_rendered, fragments);
+      let located =
+        removedRows > 0 || rendered !== state.rendered || staged !== state.staged_rendered;
+      let rerendered = false;
+      if (!located && options.rerender !== false) {
+        staged = scrubBoardText(this.#renderBoardText(scope), fragments);
+        rerendered = true;
+      }
+      if (rendered !== state.rendered || (staged ?? null) !== (state.staged_rendered ?? null)) {
+        this.#db
+          .prepare(
+            `UPDATE state_board_rev
+                SET rendered = ?, staged_rendered = ?, updated_at = ?
+              WHERE scope = ?`,
+          )
+          .run(rendered, staged, at, scope);
+      }
+      return {
+        scope,
+        removedRows,
+        located,
+        rerendered,
+        rendered,
+        staged,
+        fragments: fragments.length,
+      };
+    });
+  }
+
+  /** 按当前 active 记忆重新渲染状态板（遗忘清洗兜底）。 */
+  #renderBoardText(scope) {
+    return renderBoard({
+      recent: this.listEpisodes({ scope, limit: 6 }),
+      facts: this.listFacts({ scope, status: 'active', limit: 10 }),
+      threads: this.listThreads({ status: 'active', limit: 10 }),
+      reminders: this.listReminders({ scope, limit: 12 }),
+    });
   }
 
   /**
@@ -1615,72 +1714,117 @@ export class Store {
             WHERE deleted_at IS NOT NULL AND deleted_at <= ?`,
         )
         .all(cutoff);
-
-      const factIds = facts.map((row) => row.id);
-      const episodeIds = episodes.map((row) => row.id);
-
-      // 先断开幸存行指向待删行的外键（DDL 为 NO ACTION），否则 FK 会阻塞物理删除：
-      // facts.source_episode_id / reminders.source_episode_id / state_board.ref_episode_id
-      // → episodes；facts.superseded_by → facts。只清指针，不动正文与审计。
-      if (episodeIds.length > 0) {
-        const marks = episodeIds.map(() => '?').join(',');
-        this.#db
-          .prepare(
-            `UPDATE facts SET source_episode_id = NULL, updated_at = unixepoch()
-              WHERE source_episode_id IN (${marks})`,
-          )
-          .run(...episodeIds);
-        this.#db
-          .prepare(
-            `UPDATE reminders SET source_episode_id = NULL, updated_at = unixepoch()
-              WHERE source_episode_id IN (${marks})`,
-          )
-          .run(...episodeIds);
-        this.#db
-          .prepare(
-            `UPDATE state_board SET ref_episode_id = NULL, updated_at = unixepoch()
-              WHERE ref_episode_id IN (${marks})`,
-          )
-          .run(...episodeIds);
-      }
-      if (factIds.length > 0) {
-        const marks = factIds.map(() => '?').join(',');
-        this.#db
-          .prepare(
-            `UPDATE facts SET superseded_by = NULL, updated_at = unixepoch()
-              WHERE superseded_by IN (${marks})`,
-          )
-          .run(...factIds);
-      }
-
-      for (const row of facts) {
-        this.#db.prepare('DELETE FROM fts_facts WHERE rowid = ?').run(row.rid);
-        this.#db.prepare('DELETE FROM facts WHERE rowid = ?').run(row.rid);
-        this.appendEvent({
-          at,
-          action: 'PURGED',
-          table_name: 'facts',
-          row_id: row.id,
-          actor: 'scheduler',
-          reason: 'purge',
-          detail_json: { salience: row.salience },
-        });
-      }
-      for (const row of episodes) {
-        this.#db.prepare('DELETE FROM fts_episodes WHERE rowid = ?').run(row.rid);
-        this.#db.prepare('DELETE FROM episodes WHERE rowid = ?').run(row.rid);
-        this.appendEvent({
-          at,
-          action: 'PURGED',
-          table_name: 'episodes',
-          row_id: row.id,
-          actor: 'scheduler',
-          reason: 'purge',
-          detail_json: { salience: row.salience },
-        });
-      }
-      return { facts: facts.length, episodes: episodes.length };
+      return this.#purgeRows({ facts, episodes, at, actor: 'scheduler', reason: 'purge' });
     });
+  }
+
+  /**
+   * H4 立即物删：跳过 7 天冷静期，只删除调用方点名且已 tombstoned
+   * （deleted_at 非空）的行。外键断开、FTS 清理与审计口径同 purge()，
+   * 但 actor='user'、reason='forget'。未标记删除的行一律忽略，避免误删。
+   * @param {{facts?: string[], episodes?: string[], at?: number|Date, now?: number|Date}} [options]
+   * @returns {{facts: number, episodes: number}}
+   */
+  purgeIds(options = {}) {
+    const at = epochOr(options.at ?? options.now, nowSeconds());
+    const factIds = normalizeIdList(options.facts);
+    const episodeIds = normalizeIdList(options.episodes);
+    if (factIds.length === 0 && episodeIds.length === 0) return { facts: 0, episodes: 0 };
+    return this.#atomic(() => {
+      const facts = this.#selectTombstonedByIds('facts', factIds);
+      const episodes = this.#selectTombstonedByIds('episodes', episodeIds);
+      return this.#purgeRows({ facts, episodes, at, actor: 'user', reason: 'forget' });
+    });
+  }
+
+  /**
+   * 按 id 选取已标记删除的行（active 行不参与物删）。
+   * @param {'facts'|'episodes'} table
+   * @param {string[]} ids
+   * @returns {Array<{rid:number,id:string,salience:string}>}
+   */
+  #selectTombstonedByIds(table, ids) {
+    if (ids.length === 0) return [];
+    const marks = ids.map(() => '?').join(',');
+    return this.#db
+      .prepare(
+        `SELECT rowid AS rid, id, salience FROM ${table}
+          WHERE id IN (${marks}) AND deleted_at IS NOT NULL`,
+      )
+      .all(...ids);
+  }
+
+  /**
+   * 物理删除一组行并写 PURGED 审计（purge / purgeIds 共用）。
+   * @param {{facts: object[], episodes: object[], at: number,
+   *          actor: 'scheduler'|'user', reason: string}} input
+   * @returns {{facts: number, episodes: number}}
+   */
+  #purgeRows({ facts, episodes, at, actor, reason }) {
+    const factIds = facts.map((row) => row.id);
+    const episodeIds = episodes.map((row) => row.id);
+
+    // 先断开幸存行指向待删行的外键（DDL 为 NO ACTION），否则 FK 会阻塞物理删除：
+    // facts.source_episode_id / reminders.source_episode_id / state_board.ref_episode_id
+    // → episodes；facts.superseded_by → facts。只清指针，不动正文与审计。
+    if (episodeIds.length > 0) {
+      const marks = episodeIds.map(() => '?').join(',');
+      this.#db
+        .prepare(
+          `UPDATE facts SET source_episode_id = NULL, updated_at = unixepoch()
+            WHERE source_episode_id IN (${marks})`,
+        )
+        .run(...episodeIds);
+      this.#db
+        .prepare(
+          `UPDATE reminders SET source_episode_id = NULL, updated_at = unixepoch()
+            WHERE source_episode_id IN (${marks})`,
+        )
+        .run(...episodeIds);
+      this.#db
+        .prepare(
+          `UPDATE state_board SET ref_episode_id = NULL, updated_at = unixepoch()
+            WHERE ref_episode_id IN (${marks})`,
+        )
+        .run(...episodeIds);
+    }
+    if (factIds.length > 0) {
+      const marks = factIds.map(() => '?').join(',');
+      this.#db
+        .prepare(
+          `UPDATE facts SET superseded_by = NULL, updated_at = unixepoch()
+            WHERE superseded_by IN (${marks})`,
+        )
+        .run(...factIds);
+    }
+
+    for (const row of facts) {
+      this.#db.prepare('DELETE FROM fts_facts WHERE rowid = ?').run(row.rid);
+      this.#db.prepare('DELETE FROM facts WHERE rowid = ?').run(row.rid);
+      this.appendEvent({
+        at,
+        action: 'PURGED',
+        table_name: 'facts',
+        row_id: row.id,
+        actor,
+        reason,
+        detail_json: { salience: row.salience },
+      });
+    }
+    for (const row of episodes) {
+      this.#db.prepare('DELETE FROM fts_episodes WHERE rowid = ?').run(row.rid);
+      this.#db.prepare('DELETE FROM episodes WHERE rowid = ?').run(row.rid);
+      this.appendEvent({
+        at,
+        action: 'PURGED',
+        table_name: 'episodes',
+        row_id: row.id,
+        actor,
+        reason,
+        detail_json: { salience: row.salience },
+      });
+    }
+    return { facts: facts.length, episodes: episodes.length };
   }
 
   /**

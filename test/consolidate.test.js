@@ -489,9 +489,15 @@ test('stageBoard：只写 staged，staged_revision 恒为 revision+1', (t) => {
   assert.equal(store.getBoard('main'), '');
 });
 
-test('publishBoard：只认四个 reason，且每次把 revision +1', (t) => {
+test('publishBoard：只认白名单 reason（含 forget），且每次把 revision +1', (t) => {
   const store = openStore(t);
-  assert.deepEqual(PUBLISH_REASONS, ['compact', 'restart', 'thread-unarchive', 'persona-edit']);
+  assert.deepEqual(PUBLISH_REASONS, [
+    'compact',
+    'restart',
+    'thread-unarchive',
+    'persona-edit',
+    'forget',
+  ]);
 
   let revision = 0;
   for (const reason of PUBLISH_REASONS) {
@@ -513,10 +519,10 @@ test('publishBoard：只认四个 reason，且每次把 revision +1', (t) => {
   assert.equal(after.revision, before.revision);
   assert.equal(after.staged_revision, before.staged_revision);
   assert.equal(after.staged_rendered, '待发布');
-  assert.equal(after.rendered, '板-persona-edit');
+  assert.equal(after.rendered, '板-forget');
 });
 
-test('publishBoard：没有 staged 时返回 null（四个合法 reason 也一样）', (t) => {
+test('publishBoard：没有 staged 时返回 null（白名单 reason 也一样）', (t) => {
   const store = openStore(t);
   for (const reason of PUBLISH_REASONS) {
     assert.equal(publishBoard(store, 'main', reason), null);

@@ -3,8 +3,9 @@
  *
  * 设计约束：
  * - 状态板是 system 段（order 160）里「我们现在处在什么局面」的一段文本；
- *   巩固时只写 `state_board_rev.staged_*`，真正翻进 system 要等四个发布
- *   时机之一（压缩成功 / 进程重启与会话重载 / 线程 unarchive / 人格编辑）。
+ *   巩固时只写 `state_board_rev.staged_*`，真正翻进 system 要等发布时机
+ *   （压缩成功 / 进程重启与会话重载 / 线程 unarchive / 人格编辑 /
+ *   显式遗忘）。显式遗忘是用户主动要求的「立即停读」，允许缓存失效。
  * - 总预算 ≤800 token。token 估算按卡上口径 `Math.ceil(text.length / 2)`；
  *   超限按「最后提及时间」从最旧的行开始挤掉，被挤掉的内容本身已在
  *   episode / facts 里，不会丢。
@@ -24,12 +25,19 @@ import { DEFAULT_TIMEZONE, zonedParts } from '../time.js';
 /** 状态板总预算（token，按 Math.ceil(len / 2) 估算）。 */
 export const BOARD_TOKEN_LIMIT = 800;
 
-/** 允许发布状态板的四个时机（06 v3.3 §8.2）。 */
+/**
+ * 允许发布状态板的时机（06 v3.3 §8.2 的四个 + H4 显式遗忘）。
+ *
+ * `forget` 是用户显式遗忘后的安全发布点：遗忘必须立即停读，状态板正文
+ * 里可能仍有被遗忘内容的渲染行，不能等下一个压缩/重启时机。该发布允许
+ * 主动失效装配缓存。
+ */
 export const PUBLISH_REASONS = Object.freeze([
   'compact',
   'restart',
   'thread-unarchive',
   'persona-edit',
+  'forget',
 ]);
 
 /** 区块标题（顺序即渲染顺序）。 */
@@ -276,6 +284,103 @@ export function renderBoard(input = {}) {
   return text;
 }
 
+// ------------------------------------------------------------ 遗忘清洗（H4）
+
+/** 归一化：去掉空白与标点，只留下可用于行级比对的实义字符。 */
+const BOARD_TEXT_NOISE = /[\s\p{P}\p{S}]+/gu;
+
+/**
+ * 归一化一段状态板文本，供行级定位使用（大小写不敏感）。
+ * @param {unknown} value
+ * @returns {string}
+ */
+export function normalizeBoardText(value) {
+  return String(value ?? '').replace(BOARD_TEXT_NOISE, '').toLowerCase();
+}
+
+/**
+ * 从事实/情景行提取状态板定位片段。
+ *
+ * - 事实行渲染为 `- statement`（超过 70 字截断），因此按前缀匹配；
+ * - 情景行渲染为 `- MM-DD 标题：摘要`，标题与摘要按包含匹配。
+ *
+ * @param {{getFact?: Function, getEpisode?: Function}} store
+ * @param {string[]} ids
+ * @returns {Array<{text: string, mode: 'prefix'|'contain'}>}
+ */
+export function boardFragments(store, ids = []) {
+  const fragments = [];
+  if (!store || !Array.isArray(ids)) return fragments;
+  for (const id of ids) {
+    if (typeof id !== 'string' || id === '') continue;
+    const fact = typeof store.getFact === 'function' ? store.getFact(id) : null;
+    if (fact) {
+      if (typeof fact.statement === 'string' && fact.statement.trim() !== '') {
+        fragments.push({ text: fact.statement, mode: 'prefix' });
+      }
+      continue;
+    }
+    const episode = typeof store.getEpisode === 'function' ? store.getEpisode(id) : null;
+    if (!episode) continue;
+    if (typeof episode.title === 'string' && episode.title.trim() !== '') {
+      fragments.push({ text: episode.title, mode: 'contain' });
+    }
+    if (typeof episode.summary === 'string' && episode.summary.trim() !== '') {
+      fragments.push({ text: episode.summary, mode: 'contain' });
+    }
+  }
+  return fragments;
+}
+
+/** @param {string} line @param {{text: string, mode: string}} fragment */
+function lineMatchesFragment(line, fragment) {
+  const core = normalizeBoardText(String(line).replace(/^-\s*/u, ''));
+  const target = normalizeBoardText(fragment.text);
+  if (core === '' || target === '') return false;
+  if (core === target) return true;
+  // 事实行正文可能被截断到 70 字（核心是 statement 的前缀）；其它行
+  // （如情景标题/摘要）可能完整包含 statement，两者都要按残留处理。
+  if (core.length >= 4 && target.startsWith(core)) return true;
+  return target.length >= 2 && core.includes(target);
+}
+
+/** 清洗后若某区块被清空，补回与 renderBoard 一致的「（暂无）」。 */
+function fillEmptySections(lines) {
+  const out = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    out.push(line);
+    if (!line.trim().startsWith('【')) continue;
+    const next = lines[index + 1];
+    if (next === undefined || next.trim() === '' || next.trim().startsWith('【')) {
+      out.push('- （暂无）');
+    }
+  }
+  return out;
+}
+
+/**
+ * 从渲染文本中按行移除被遗忘内容；区块标题保留，空区块补「（暂无）」。
+ * @param {string} text
+ * @param {Array<{text: string, mode: 'prefix'|'contain'}>} fragments
+ * @returns {string}
+ */
+export function scrubBoardText(text, fragments = []) {
+  if (typeof text !== 'string' || text === '') return typeof text === 'string' ? text : '';
+  if (!Array.isArray(fragments) || fragments.length === 0) return text;
+  const kept = [];
+  for (const line of text.split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '' || trimmed.startsWith('【')) {
+      kept.push(line);
+      continue;
+    }
+    if (fragments.some((fragment) => lineMatchesFragment(line, fragment))) continue;
+    kept.push(line);
+  }
+  return fillEmptySections(kept).join('\n');
+}
+
 /**
  * 暂存状态板渲染（巩固事务内调用）：只写 `staged_*`，不发布。
  * staged_revision 恒为当前 revision + 1（反复覆盖不变，由 Store 保证）。
@@ -296,9 +401,10 @@ export function stageBoard(store, scope, text) {
 }
 
 /**
- * 发布 staged → rendered。只有四个时机允许发布：
+ * 发布 staged → rendered。只有 PUBLISH_REASONS 里的时机允许发布：
  * compact（压缩成功）/ restart（进程重启或会话重载）/
- * thread-unarchive（线程 unarchive）/ persona-edit（人格编辑）。
+ * thread-unarchive（线程 unarchive）/ persona-edit（人格编辑）/
+ * forget（显式遗忘后的安全发布，允许缓存失效）。
  * 其余 reason 一律返回 null 且不动库。
  * @param {{publishBoard: Function}} store
  * @param {string} scope main / thread:<key>

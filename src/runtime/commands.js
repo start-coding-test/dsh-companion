@@ -4,11 +4,13 @@
  * 设计约束：
  * - 只读写注入的 Store，不直接持有全局单例，便于测试与后续多会话接线；
  * - 所有 SQL 都走 store.db 的参数绑定（store.js 未提供按 kind 计数等聚合方法，
- *   本卡不允许改 store.js，因此这里只做只读聚合与 S1 tombstone）；
+ *   因此这里只做只读聚合；显式遗忘统一走 memory/forget.js 的 forgetMemory，
+ *   命令层不再直接调用 forgetFact/deleteFact）；
  * - 未知命令返回 { handled: false }，由调用方决定是否交给模型；
  * - 命令回复是给人看的短文本，不塞 JSON。
  */
 
+import { forgetMemory } from '../memory/forget.js';
 import {
   DEFAULT_TIMEZONE,
   isValidTimeZone,
@@ -116,12 +118,18 @@ function handleMemoryCommand(args, ctx) {
   }
 
   const sub = args[0];
-  if (sub === '忘掉') {
-    const target = args.slice(1).join(' ').trim();
+  if (sub === '忘掉' || sub === '彻底忘掉') {
+    const immediate = sub === '彻底忘掉';
+    const rest = args.slice(1);
+    const confirmed = rest.length > 0 && rest[rest.length - 1] === '确认';
+    const target = (confirmed ? rest.slice(0, -1) : rest).join(' ').trim();
     if (target === '') {
-      return { handled: true, reply: '用法：/记忆 忘掉 <id|关键词>' };
+      return { handled: true, reply: `用法：/记忆 ${sub} <id|关键词>${immediate ? ' [确认]' : ''}` };
     }
-    return { handled: true, reply: forgetMemory(ctx.store, target, ctx) };
+    return {
+      handled: true,
+      reply: forgetReply(ctx, target, { immediate, confirm: confirmed }),
+    };
   }
 
   if (sub === '置顶' || sub === '取消置顶') {
@@ -198,46 +206,88 @@ function factCounts(store, scope) {
 }
 
 /**
- * S1 显式遗忘：id 直接转 tombstoned；否则按关键词找 active 事实，
- * 最多标记 MAX_FORGET 条。行与 FTS 保留到满 7 天后的 S2 purge。
- * @param {object} store
+ * 命令层遗忘入口：id 直接走 forgetMemory；否则按关键词找 active 事实。
+ * 显式遗忘的 S1 / 状态板清洗 / 物删（可选）全部在 memory/forget.js 内完成；
+ * 命令层不传 llm，因此定向巩固在命令路径上是 skipped（不阻塞 S1）。
+ * @param {{store: object, now: number|Date, scope: string}} ctx
  * @param {string} target
- * @param {{now:number|Date, scope:string}} ctx
+ * @param {{immediate: boolean, confirm: boolean}} options
  * @returns {string}
  */
-function forgetMemory(store, target, ctx) {
-  // Store 的时间参数按 Unix 秒处理；命令层允许 Date/毫秒，这里统一换算。
-  const at = Math.floor(toMillis(ctx.now) / 1000);
-  const exact = typeof store.getFact === 'function' ? store.getFact(target) : null;
+function forgetReply(ctx, target, options) {
+  const exact = typeof ctx.store.getFact === 'function' ? ctx.store.getFact(target) : null;
   if (exact) {
-    if (exact.status === 'tombstoned' || exact.deleted_at) {
-      return `已标记为遗忘：${exact.id}（7 天后物理删除）`;
-    }
-    const forgotten = store.forgetFact(exact.id, {
-      at,
-      payload: { statement: exact.statement, kind: exact.kind, scope: exact.scope },
+    const result = forgetMemory({
+      store: ctx.store,
+      kind: 'fact',
+      id: exact.id,
+      at: ctx.now,
+      scope: ctx.scope,
+      immediate: options.immediate,
+      confirm: options.confirm,
     });
-    if (forgotten || store.getFact(exact.id)?.status === 'tombstoned') {
-      return `已标记为遗忘：${exact.id}（7 天后物理删除）`;
-    }
-    return `未找到事实：${target}`;
+    return formatForgetReply(result, exact.id, options);
   }
+  return forgetByKeyword(ctx, target, options);
+}
 
-  const hits = store.searchBigram(target, { scope: ctx.scope, limit: 10 });
+/**
+ * 关键词遗忘：最多标记 MAX_FORGET 条 active 事实，避免一条命令清空整库。
+ * @param {{store: object, now: number|Date, scope: string}} ctx
+ * @param {string} target
+ * @param {{immediate: boolean, confirm: boolean}} options
+ * @returns {string}
+ */
+function forgetByKeyword(ctx, target, options) {
+  const hits = ctx.store.searchBigram(target, { scope: ctx.scope, limit: 10 });
   const ids = [];
   for (const hit of hits) {
     if (hit.type !== 'fact') continue;
     if (ids.length >= MAX_FORGET) break;
-    const row = store.getFact(hit.id);
+    const row = ctx.store.getFact(hit.id);
     if (!row || row.status === 'tombstoned' || row.deleted_at) continue;
-    const forgotten = store.forgetFact(row.id, {
-      at,
-      payload: { statement: row.statement, kind: row.kind, scope: row.scope },
+    const result = forgetMemory({
+      store: ctx.store,
+      kind: 'fact',
+      id: row.id,
+      at: ctx.now,
+      scope: ctx.scope,
+      immediate: options.immediate,
+      confirm: options.confirm,
     });
-    if (forgotten) ids.push(row.id);
+    if (result.reason === 'needs_confirm') {
+      // 彻底忘掉未带「确认」：只提示第一个目标，命中集合保持不变。
+      return `回复 /记忆 彻底忘掉 ${row.id} 确认 立即删除`;
+    }
+    if (result.ok) ids.push(row.id);
   }
   if (ids.length === 0) return `没有找到可遗忘的事实：${target}`;
+  if (options.immediate) return `已彻底遗忘：${ids.join('、')}（已物理删除）`;
   return `已标记为遗忘：${ids.join('、')}（7 天后物理删除）`;
+}
+
+/**
+ * @param {object} result forgetMemory 的结构化结果
+ * @param {string} id
+ * @param {{immediate: boolean}} options
+ * @returns {string}
+ */
+function formatForgetReply(result, id, options) {
+  switch (result.reason) {
+    case 'needs_confirm':
+      return `回复 /记忆 彻底忘掉 ${id} 确认 立即删除`;
+    case 'not_found':
+    case 'not_active':
+      return `未找到事实：${id}`;
+    case 'already_deleted':
+      return options.immediate
+        ? `已彻底遗忘：${id}（此前已删除）`
+        : `已标记为遗忘：${id}（7 天后物理删除）`;
+    default:
+      if (result.ok && result.purged) return `已彻底遗忘：${id}（已物理删除）`;
+      if (result.ok) return `已标记为遗忘：${id}（7 天后物理删除）`;
+      return `未找到事实：${id}`;
+  }
 }
 
 /**

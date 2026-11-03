@@ -40,6 +40,30 @@ const DUE_GRANULARITIES = new Set(['exact', 'day', 'week', 'month', 'none']);
 const REMINDER_STATUSES = new Set([
   'pending', 'fired', 'snoozed', 'done', 'cancelled', 'expired',
 ]);
+const CONSOLIDATION_KINDS = new Set(['nap', 'deep', 'forget_flush']);
+
+/** 语句归一化：去掉空白/标点，供遗忘排除做保守比对。 */
+const STATEMENT_NOISE = /[\s\p{P}\p{S}]+/gu;
+
+/** @param {unknown} value @returns {string} */
+function normalizeStatement(value) {
+  return String(value ?? '').replace(STATEMENT_NOISE, '').toLowerCase();
+}
+
+/**
+ * 草稿事实是否命中被遗忘语句：相同、包含目标语句、或被目标语句包含都算。
+ * 保守策略优先保护遗忘语义；目标已被 tombstone，不会写回。
+ * @param {string} statement
+ * @param {string[]} excluded 归一化后的目标语句
+ * @returns {boolean}
+ */
+function matchesExcludedStatement(statement, excluded) {
+  const normalized = normalizeStatement(statement);
+  if (normalized === '') return false;
+  return excluded.some(
+    (target) => target !== '' && (normalized === target || normalized.includes(target) || target.includes(normalized)),
+  );
+}
 
 /**
  * 巩固链路的可识别错误。code 目前只有 'bad-draft'（模型产出不合法）；
@@ -299,6 +323,29 @@ function requireNow(now) {
   return Math.trunc(num);
 }
 
+/**
+ * 可选排除 id 列表：缺省为空；非数组或含非空字符串以外元素时抛 TypeError。
+ * @param {unknown} value
+ * @returns {string[]}
+ */
+function normalizeExcludeIds(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    throw new TypeError('[consolidate] excludeFactIds must be an array of strings');
+  }
+  const seen = new Set();
+  const out = [];
+  for (const id of value) {
+    if (typeof id !== 'string' || id === '') {
+      throw new TypeError('[consolidate] excludeFactIds must be an array of strings');
+    }
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(id);
+  }
+  return out;
+}
+
 /** 去重键：subject_text + predicate + object_text 完全相同视为同一条。 */
 function factKey(fact) {
   return `${fact.subject_text}\u0000${fact.predicate}\u0000${fact.object_text ?? ''}`;
@@ -317,7 +364,11 @@ function factKey(fact) {
  * @param {number|Date} [input.now] 巩固时刻（Unix 秒）；默认当前时间
  * @param {string} [input.trigger='idle'] 归因，写入 consolidations.trigger
  * @param {string} [input.sessionId] 归属会话；默认同 scope（main 即 'main'）
- * @returns {Promise<{skipped: boolean, upto_seq: number, episodeId?: string, facts?: number}>}
+ * @param {string} [input.kind='nap'] 巩固类型（nap/deep/forget_flush）
+ * @param {string[]} [input.excludeFactIds] 定向巩固排除的事实 id：其 statement
+ *   相同/包含/被包含的草稿事实一律不写回（遗忘闭环用）
+ * @returns {Promise<{skipped: boolean, upto_seq: number, episodeId?: string,
+ *                    facts?: number, kind?: string, excluded?: number}>}
  */
 export async function consolidate(input = {}) {
   const { store, seqFrom, seqTo, llm } = input;
@@ -329,9 +380,16 @@ export async function consolidate(input = {}) {
     throw new RangeError('[consolidate] seqTo must be greater than or equal to seqFrom');
   }
 
+  const kind = nonEmptyString(input.kind) ?? 'nap';
+  if (!CONSOLIDATION_KINDS.has(kind)) {
+    throw new TypeError(`[consolidate] invalid kind: ${String(kind)}`);
+  }
+
   // 1) 水位线：这段是否已经巩固过。skipped 路径绝不调用模型、绝不写库。
+  // forget_flush 例外：遗忘后的定向重巩固本来就是「同一区间再蒸馏一次」，
+  // 新事实会排除被遗忘目标；水位取 MAX，不会被这次重跑推回去。
   const watermark = Number(store.getWatermark(scope)) || 0;
-  if (to <= watermark) {
+  if (to <= watermark && kind !== 'forget_flush') {
     return { skipped: true, upto_seq: watermark };
   }
 
@@ -342,16 +400,29 @@ export async function consolidate(input = {}) {
   const trigger = nonEmptyString(input.trigger) ?? 'idle';
   const sessionId = nonEmptyString(input.sessionId) ?? scope;
 
+  // 定向巩固（遗忘闭环）：先把目标事实的 statement 归一化成排除集，
+  // 草稿里相同/包含/被包含的事实不写回。目标已 tombstone，getFact 仍可读。
+  const excludedStatements = [];
+  for (const factId of normalizeExcludeIds(input.excludeFactIds)) {
+    const row = typeof store.getFact === 'function' ? store.getFact(factId) : null;
+    const normalized = row ? normalizeStatement(row.statement) : '';
+    if (normalized !== '') excludedStatements.push(normalized);
+  }
+
   // 2) 模型切分 + 校验。校验失败在事务之前抛出，库内不产生任何行。
   const draft = await llm({ scope, seqFrom: from, seqTo: to });
-  const { episode, facts, reminders } = normalizeDraft(draft);
+  const { episode, facts: draftedFacts, reminders } = normalizeDraft(draft);
+  const facts = draftedFacts.filter(
+    (fact) => !matchesExcludedStatement(fact.statement, excludedStatements),
+  );
+  const excludedFacts = draftedFacts.length - facts.length;
 
   // 3) 单事务写库（含水位 consolidations.upto_seq）；抛错整体回滚。
   const written = store.transaction(() => {
     const consolidation = store.insertConsolidation({
       scope,
       session_id: sessionId,
-      kind: 'nap',
+      kind,
       trigger,
       upto_seq: to,
       turn_from: from,
@@ -457,7 +528,9 @@ export async function consolidate(input = {}) {
   return {
     skipped: false,
     upto_seq: to,
+    kind,
     episodeId: written.episodeId,
     facts: written.facts,
+    excluded: excludedFacts,
   };
 }

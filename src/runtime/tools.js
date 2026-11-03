@@ -11,6 +11,7 @@
  *   新建时 createSession(preset='companion-thread') 并写 threads 行。
  */
 
+import { forgetMemory } from '../memory/forget.js';
 import { summarizeCost } from './commands.js';
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
 
@@ -127,11 +128,16 @@ export function createTools({
 
     {
       name: 'memory_forget',
-      description: '按 id 把一条事实标记为遗忘（S1；7 天后物理删除）。',
+      description: '按 id 遗忘一条事实：默认 S1（7 天后物理删除）；immediate+confirm 时立即物删。',
       parameters: {
         type: 'object',
         properties: {
           id: { type: 'string', description: '事实 id' },
+          immediate: {
+            type: 'boolean',
+            description: '跳过 7 天冷静期立即物理删除（需 confirm=true）',
+          },
+          confirm: { type: 'boolean', description: '确认立即删除（immediate 的二次确认）' },
         },
         required: ['id'],
         additionalProperties: false,
@@ -139,20 +145,16 @@ export function createTools({
       execute(args = {}) {
         assertArgs(args, 'memory_forget');
         const id = requireString(args.id, 'memory_forget', 'id');
-        const row = store.getFact(id);
-        if (!row) return { ok: false, id, reason: 'not-found' };
-        if (row.deleted_at) return { ok: true, id, alreadyDeleted: true, deletedAt: row.deleted_at };
-        const forgotten = store.forgetFact(id, {
-          at: Math.floor(nowMs() / 1000),
-          payload: { statement: row.statement, kind: row.kind, scope: row.scope },
-        });
-        return {
-          ok: forgotten,
+        const immediate = optionalBoolean(args.immediate, 'memory_forget', 'immediate') ?? false;
+        const confirm = optionalBoolean(args.confirm, 'memory_forget', 'confirm') ?? false;
+        return forgetMemory({
+          store,
+          kind: 'fact',
           id,
-          alreadyDeleted: false,
-          tombstoned: forgotten,
-          reason: forgotten ? undefined : 'not-active',
-        };
+          at: nowMs(),
+          immediate,
+          confirm,
+        });
       },
     },
 
@@ -424,6 +426,15 @@ function optionalInt(value, tool, field, min, max) {
     throw new TypeError(`[tools] ${tool}: ${field} must be an integer in [${min}, ${max}]`);
   }
   return n;
+}
+
+/** @param {unknown} value @param {string} tool @param {string} field */
+function optionalBoolean(value, tool, field) {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== 'boolean') {
+    throw new TypeError(`[tools] ${tool}: ${field} must be a boolean`);
+  }
+  return value;
 }
 
 /** @param {unknown} value @param {Set<string>} allowed @param {string} tool @param {string} field */
