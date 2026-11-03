@@ -300,7 +300,7 @@ function formatThreads(rows) {
 function formatStatus(store, scope) {
   const stats = store.stats();
   const tables = [
-    'entities', 'episodes', 'facts', 'reminders', 'state_board',
+    'entities', 'episodes', 'facts', 'reminders', 'state_board', 'state_board_rev',
     'threads', 'consolidations', 'memory_events',
   ];
   const counts = tables.map((table) => `${table} ${stats[table] ?? 0}`).join(' / ');
