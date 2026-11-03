@@ -17,6 +17,7 @@ const EXPECTED_TOOLS = [
   'cost_report',
   'memory_forget',
   'memory_search',
+  'memory_update',
   'memory_write',
   'reminder_add',
   'reminder_done',
@@ -106,7 +107,7 @@ test('注册的命令与工具真的连到 Store', async () => {
   const memoryCommand = ctx.commands.registrations.find((definition) => definition.name === 'memory');
   const emptyReply = memoryCommand.handler({ rawInput: '' });
   assert.equal(emptyReply.kind, 'success');
-  assert.match(emptyReply.text, /记忆：/);
+  assert.match(emptyReply.text, /记忆（共 0 条）/);
 
   const writeTool = ctx.tools.registrations.find((definition) => definition.name === 'memory_write');
   const written = writeTool.execute({ statement: '每周五要交周报。', kind: 'project' });

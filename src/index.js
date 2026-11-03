@@ -34,6 +34,13 @@ import {
   overlapRatio,
 } from './memory/reinforce.js';
 import { buildConsolidationPrompt, consolidate, planConsolidation } from './memory/consolidate.js';
+import {
+  appendEventWithAction,
+  apply as applyGovernance,
+  exportMirror,
+  isSensitiveText,
+  scan as scanGovernance,
+} from './memory/govern.js';
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections } from './persona/sections.js';
 import { DEFAULT_CARD } from './persona/card.js';
@@ -369,13 +376,25 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
       description: alias.description,
       handler: (invocation) => {
         const rawInput = typeof invocation?.rawInput === 'string' ? invocation.rawInput : '';
+        const routedScope = currentScope ? currentScope() : undefined;
+        const scope = routedScope === undefined ? SCOPE : routedScope;
         let result;
         try {
+          if (alias.name === 'memory') {
+            const custom = handleMemoryCommand({
+              text: `${alias.prefix}${rawInput}`,
+              store,
+              now: platform.now(),
+              scope,
+              timeZone: config.timezone,
+            });
+            if (custom !== null) return { kind: 'success', text: custom };
+          }
           result = handleCommand({
             text: `${alias.prefix}${rawInput}`,
             store,
             now: platform.now(),
-            scope: currentScope?.() ?? SCOPE,
+            scope,
             metrics,
             timeZone: config.timezone,
             budget: typeof budgetInfo === 'function' ? budgetInfo() : undefined,
@@ -430,6 +449,32 @@ function registerTools(platform, store, config, track, currentScope, budgetGate)
       execute: (args) => tool.execute(args ?? {}),
     }));
   }
+  track(platform.registerTool({
+    name: 'memory_update',
+    description: '修改一条已有长期记忆：旧条标记为 superseded，新内容以新 id 继续生效。',
+    parameters: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: '要修改的记忆 id（fact id）' },
+        statement: { type: 'string', description: '修改后的完整陈述' },
+      },
+      required: ['id', 'statement'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: true },
+      render: (_args, value) => [{ type: 'text', text: renderToolValue(value) }],
+    },
+    execute: (args) => {
+      const routedScope = currentScope ? currentScope() : undefined;
+      return updateMemoryTool({
+        store,
+        scope: routedScope === undefined ? SCOPE : routedScope,
+        args: args ?? {},
+        now: platform.now(),
+      });
+    },
+  }));
 }
 
 // -------------------------------------------------------------- 主管线
@@ -1909,6 +1954,280 @@ function toMillis(value) {
   const num = Number(value);
   if (!Number.isFinite(num)) return null;
   return Math.abs(num) < 1e11 ? Math.round(num * 1000) : Math.round(num);
+}
+
+// -------------------------------------------------------------- P1-a 记忆治理
+
+/** `/记忆` 每页条数。 */
+const MEMORY_PAGE_SIZE = 20;
+/** `/记忆` 旧子命令：拦截器返回 null，交给 commands.js 保持原行为。 */
+const LEGACY_MEMORY_VERBS = Object.freeze(['忘掉', '彻底忘掉', '置顶', '取消置顶']);
+
+/**
+ * 删除某条 fact 的 FTS 行（治理/编辑后调用；updateFact 会重刷 FTS）。
+ * @param {Store} store
+ * @param {string} id
+ */
+function deleteFactFtsRow(store, id) {
+  store.db
+    .prepare('DELETE FROM fts_facts WHERE rowid = (SELECT rowid FROM facts WHERE id = ?)')
+    .run(id);
+}
+
+/**
+ * 按需追加 sensitive 列（幂等；只加列，不动既有列）。
+ * @param {Store} store
+ */
+function ensureSensitiveColumn(store) {
+  const columns = store.db.prepare('PRAGMA table_info(facts)').all();
+  if (columns.some((column) => column.name === 'sensitive')) return;
+  store.db.exec('ALTER TABLE facts ADD COLUMN sensitive INTEGER NOT NULL DEFAULT 0');
+}
+
+/**
+ * 解析 `/记忆` 的参数：页码 + 关键词。
+ * @param {string} text
+ * @returns {{page: number, keyword: string}}
+ */
+function parseMemoryPage(text) {
+  const words = [];
+  let page = 1;
+  const tokens = String(text ?? '').split(/\s+/u).filter(Boolean);
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    const inline = /^--page=(\d+)$/u.exec(token);
+    if (inline !== null) {
+      page = Math.max(1, Number(inline[1]));
+      continue;
+    }
+    if (token === '--page') {
+      const next = Number(tokens[index + 1]);
+      if (Number.isFinite(next)) {
+        page = Math.max(1, Math.trunc(next));
+        index += 1;
+      }
+      continue;
+    }
+    const chinese = /^第(\d+)页$/u.exec(token);
+    if (chinese !== null) {
+      page = Math.max(1, Number(chinese[1]));
+      continue;
+    }
+    words.push(token);
+  }
+  return { page, keyword: words.join(' ').trim() };
+}
+
+/**
+ * 记忆列表文本：按 kind 分组、关键词过滤、每页最多 20 条。
+ * @param {{store: Store, scope: string, text: string, timeZone: string}} input
+ * @returns {string}
+ */
+function formatMemoryList({ store, scope, text, timeZone }) {
+  const { page, keyword } = parseMemoryPage(text);
+  const needle = keyword.toLowerCase();
+  const rows = store.db
+    .prepare(
+      `SELECT * FROM facts
+        WHERE scope = ? AND status = 'active' AND deleted_at IS NULL
+        ORDER BY kind ASC, observed_at DESC, id ASC`,
+    )
+    .all(scope);
+  const matched = needle === ''
+    ? rows
+    : rows.filter((fact) => [
+      fact.statement,
+      fact.subject_text,
+      fact.predicate,
+      fact.object_text,
+    ].some((part) => String(part ?? '').toLowerCase().includes(needle)));
+
+  const title = keyword === ''
+    ? `记忆（共 ${matched.length} 条）`
+    : `记忆（匹配「${keyword}」共 ${matched.length} 条）`;
+  if (matched.length === 0) {
+    return keyword === '' ? `${title}\n\n还没有记忆。` : `${title}\n\n没有匹配的记忆。`;
+  }
+
+  const pages = Math.max(1, Math.ceil(matched.length / MEMORY_PAGE_SIZE));
+  const current = Math.min(page, pages);
+  const start = (current - 1) * MEMORY_PAGE_SIZE;
+  const pageRows = matched.slice(start, start + MEMORY_PAGE_SIZE);
+  const lines = [`${title} · 第 ${current}/${pages} 页`];
+  let lastKind = null;
+  for (const fact of pageRows) {
+    const kind = String(fact.kind ?? 'other');
+    if (kind !== lastKind) {
+      lines.push('', `[${kind}]`);
+      lastKind = kind;
+    }
+    const source = String(fact.source_kind ?? 'unknown');
+    const at = zonedDayKey(toMillis(fact.observed_at), timeZone);
+    const marks = [];
+    if (fact.sensitive === 1) marks.push('敏感');
+    if (fact.privacy === 'secret') marks.push('secret');
+    const suffix = marks.length === 0 ? '' : `（${marks.join('/')}）`;
+    lines.push(`- ${fact.id} · ${source} · ${at}${suffix}`);
+    lines.push(`  ${String(fact.statement ?? '').replace(/\s+/gu, ' ').trim()}`);
+  }
+  const remaining = matched.length - start - pageRows.length;
+  if (remaining > 0) {
+    lines.push('', `还有 ${remaining} 条；用关键词或 --page 继续查看。`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * `/记忆 治理` 的摘要文本。
+ * @param {{store: Store, scope: string, now: number, dryRun: boolean}} input
+ * @returns {string}
+ */
+function formatGovernance({ store, scope, now, dryRun }) {
+  const result = applyGovernance({ store, scope, now, dryRun });
+  const lines = [
+    `记忆治理（${dryRun ? 'dry-run，不写库' : '已应用'}）`,
+    `重复 ${result.counts.duplicates} 组 · 冲突 ${result.counts.conflicts} 组 · 过期 ${result.counts.stale} 条 · 敏感 ${result.counts.sensitive} 条`,
+  ];
+  if (result.duplicates.length > 0) {
+    lines.push('重复（保留 ← 降级）：');
+    for (const item of result.duplicates) lines.push(`- ${item.keepId} ← ${item.dropId}（${item.score.toFixed(2)}）`);
+  }
+  if (result.conflicts.length > 0) {
+    lines.push('冲突：');
+    for (const item of result.conflicts) {
+      lines.push(`- ${item.subject ?? '(无 subject)'} / ${item.predicate ?? '(无 predicate)'}：${item.factIds.join(', ')}`);
+    }
+  }
+  if (result.applied.superseded.length > 0) lines.push(`已降级：${result.applied.superseded.join(', ')}`);
+  if (result.applied.sensitive.length > 0) lines.push(`已标记敏感：${result.applied.sensitive.join(', ')}`);
+  if (dryRun) lines.push('加 --dry-run 之外的写法（/记忆 治理）才会真正应用。');
+  return lines.join('\n');
+}
+
+/**
+ * 编辑一条长期记忆：新内容以新 id 生效，旧条 superseded_by 指向新条。
+ *
+ * @param {{store: Store, scope?: string, id: string, statement: string,
+ *          now?: number|Date}} input
+ * @returns {{ok: boolean, id?: string, supersededId?: string, reason?: string, message?: string}}
+ */
+export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date.now() } = {}) {
+  if (typeof id !== 'string' || id.trim() === '') {
+    return { ok: false, reason: 'invalid_id', message: '记忆 id 不能为空' };
+  }
+  if (typeof statement !== 'string' || statement.trim() === '') {
+    return { ok: false, reason: 'invalid_statement', message: '新内容不能为空' };
+  }
+  const confidence = store.getFact?.(id);
+  if (confidence === null || confidence === undefined) {
+    return { ok: false, reason: 'not_found', message: `没有找到记忆 ${id}` };
+  }
+  if (confidence.scope !== scope) {
+    return { ok: false, reason: 'scope_denied', message: `记忆 ${id} 不在当前作用域` };
+  }
+  if (confidence.deleted_at !== null || confidence.status !== 'active') {
+    return { ok: false, reason: 'not_active', message: `记忆 ${id} 不是 active 状态` };
+  }
+
+  const nowMs = toMillis(now);
+  const atSeconds = Math.floor(nowMs / 1000);
+  const nextStatement = statement.trim();
+  const markSensitive = confidence.sensitive === 1 || isSensitiveText(nextStatement);
+  let newId = null;
+  try {
+    store.transaction(() => {
+      const inserted = store.insertFact({
+        scope,
+        kind: confidence.kind,
+        subject_id: confidence.subject_id,
+        subject_text: confidence.subject_text,
+        predicate: confidence.predicate,
+        object_text: confidence.object_text,
+        statement: nextStatement,
+        source_kind: confidence.source_kind,
+        source_episode_id: confidence.source_episode_id,
+        source_excerpt: confidence.source_excerpt,
+        salience: confidence.salience,
+        privacy: confidence.privacy,
+        observed_at: atSeconds,
+        valid_from: atSeconds,
+        strength_days: confidence.salience === 'pinned' ? null : confidence.strength_days,
+        last_reinforced_at: confidence.last_reinforced_at ?? null,
+        recall_count: 0,
+        fidelity: confidence.fidelity,
+        status: 'active',
+      });
+      newId = inserted.id;
+      store.updateFact(id, { status: 'superseded', superseded_by: newId });
+      deleteFactFtsRow(store, id);
+      if (markSensitive) {
+        ensureSensitiveColumn(store);
+        store.db.prepare('UPDATE facts SET sensitive = 1 WHERE id = ?').run(newId);
+        deleteFactFtsRow(store, newId);
+      }
+      appendEventWithAction(store, {
+        action: 'EDIT',
+        tableName: 'facts',
+        rowId: newId,
+        actor: 'user',
+        reason: 'memory_update',
+        at: nowMs,
+        detail: { from: id, to: newId },
+      });
+    });
+  } catch (error) {
+    return {
+      ok: false,
+      reason: 'error',
+      message: error instanceof Error ? error.message : String(error),
+    };
+  }
+  return { ok: true, id: newId, supersededId: id };
+}
+
+/**
+ * `/记忆` 的新子命令；返回 null 时交给旧 handleCommand（忘掉/置顶等）。
+ *
+ * @param {{text: string, store: Store, now?: number, scope?: string, timeZone?: string}} input
+ * @returns {string|null}
+ */
+export function handleMemoryCommand({ text, store, now = Date.now(), scope = SCOPE, timeZone } = {}) {
+  const body = String(text ?? '').replace(/^\/记忆/u, '').trim();
+  const [verb] = body.split(/\s+/u);
+  if (body === '' || verb === '列表' || verb === 'list') {
+    const keyword = body === '' ? '' : body.slice(verb.length).trim();
+    return formatMemoryList({ store, scope, text: keyword, timeZone: timeZone ?? 'Asia/Shanghai' });
+  }
+  if (verb === '改' || verb === 'edit') {
+    const rest = body.slice(verb.length).trim();
+    const matched = /^(\S+)\s+([\s\S]+)$/u.exec(rest);
+    if (matched === null) return '用法：/记忆 改 <id> <新内容>';
+    const result = editMemoryFact({ store, scope, id: matched[1], statement: matched[2], now });
+    if (result.ok) return `已更新记忆：${result.supersededId} → ${result.id}`;
+    return `修改失败：${result.message ?? result.reason}`;
+  }
+  if (verb === '治理' || verb === 'govern') {
+    const dryRun = body.includes('--dry-run');
+    return formatGovernance({ store, scope, now: toMillis(now), dryRun });
+  }
+  if (LEGACY_MEMORY_VERBS.includes(verb)) return null;
+  return formatMemoryList({ store, scope, text: body, timeZone: timeZone ?? 'Asia/Shanghai' });
+}
+
+/**
+ * memory_update 工具执行体。
+ * @param {{store: Store, scope: string|null|undefined, args: object, now?: number}} input
+ * @returns {object}
+ */
+export function updateMemoryTool({ store, scope, args, now = Date.now() } = {}) {
+  if (scope === null) return { ok: false, reason: 'scope_denied', message: 'subagent 会话不能修改记忆' };
+  return editMemoryFact({
+    store,
+    scope: scope ?? SCOPE,
+    id: args?.id,
+    statement: args?.statement,
+    now,
+  });
 }
 
 /**
