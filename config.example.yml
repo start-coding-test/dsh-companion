@@ -1,0 +1,53 @@
+# dsh-companion 配置示例（13 个配置键）
+#
+# 用法：
+#   1. 复制本文件为 config.yml（或把需要的键并入你的 profile patch）。
+#   2. 首次安装先跑一次自检：
+#        node scripts/calibrate/run.mjs
+#      它会写出 .data/config.suggested.yml；按建议值修改 config.yml，而不是
+#      直接让建议文件生效。
+#   3. 内存/上下文差异较大时，以自检建议为准；下面括号里是默认值与单位。
+#
+# 注意：token 四档必须满足
+#   0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens
+# 未知键只会记 warning，不会阻断启动。
+
+# 工作记忆装配上限（token，默认 32000；建议 = min(32000, contextWindow×0.25)）
+workingMemoryTokens: 32000
+
+# 连续两轮超过该值触发巩固（token，默认 24000；建议 = round(0.75×workingMemoryTokens)）
+compactAtTokens: 24000
+
+# 安全阀：装配不得越过该值（token，默认 40000；建议 = min(1.25×working, contextWindow×0.6)）
+compactHardTokens: 40000
+
+# 距最后一条人类消息多久后允许「空闲巩固」（毫秒，默认 1800000 = 30 分钟）
+idleMs: 1800000
+
+# 压缩时保留的最近对话尾部（token，默认 6144；MVP 固定值）
+retainTokens: 6144
+
+# 线程空闲多少天后冻结（天，默认 14，>= 1）
+threadIdleDays: 14
+
+# 同时活跃的线程上限（个，默认 6，>= 1）
+threadMaxActive: 6
+
+# 每日主动消息上限（条，默认 3，>= 0；0 表示关闭主动消息）
+proactiveDailyCap: 3
+
+# 安静时段开始（HH:MM，默认 23:00，按 timezone 解释）
+quietStart: "23:00"
+
+# 安静时段结束（HH:MM，默认 08:00，按 timezone 解释）
+quietEnd: "08:00"
+
+# 墙上时间所用 IANA 时区（默认 Asia/Shanghai；影响安静时段、每日任务、
+# 日界线与备份文件名，不读取进程 TZ 环境变量）
+timezone: "Asia/Shanghai"
+
+# 遗忘冷静期：标记忘掉后多少天物理删除（天，默认 7，范围 1–30）
+purgeAfterDays: 7
+
+# SQLite 数据库路径（默认 ./.data/companion.db；必须是可写目录下的非空路径）
+dbPath: "./.data/companion.db"

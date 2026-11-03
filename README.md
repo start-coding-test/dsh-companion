@@ -69,6 +69,29 @@ token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryToke
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
+## 首次安装自检
+
+默认配置是 32K 工作记忆；机器内存或模型上下文不同，建议先跑一次自检：
+
+```bash
+cd dsh-companion
+node scripts/calibrate/run.mjs
+```
+
+它用临时 `DSH_HOME` 跑一次 headless，写出：
+
+- `.data/calibration.json`：node/electron/dsh 版本、SQLite、CPU、内存、RSS 中位、
+  `tokenMeter` 节点数、contextWindow 来源与建议值；
+- `.data/config.suggested.yml`：13 个配置键的建议值，头部带 `generated_at` 与
+  `source`（node/electron/dsh/rss_median）。
+
+自检**不会**自动合并配置、不会写人格卡或记忆库；核对后把需要的键复制到
+`config.yml`。也可以手动把 `scripts/calibrate/calibrate.patch.yml` 叠加到 profile。
+公式、告警线（`min(user, totalmem×0.75−512MB)`）、15% 误差口径与平台限制见
+[docs/calibration.md](docs/calibration.md)。
+
+示例配置与人格卡见 `config.example.yml`、`persona.example.md`。
+
 ## 命令与工具
 
 命令：`/记忆`、`/记忆 忘掉`、`/记忆 置顶`、`/记忆 取消置顶`、`/成本`、`/线程`、`/状态`。

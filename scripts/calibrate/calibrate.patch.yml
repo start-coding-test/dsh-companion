@@ -1,0 +1,15 @@
+# dsh-companion 安装自检 overlay
+#
+# 用法（见 docs/calibration.md）：
+#   dsh --profile headless --patch <repo>\scripts\calibrate\calibrate.patch.yml "Reply with exactly: ok"
+#
+# `./calibrate-plugin.js` 是相对本 patch 文件的路径；DSH loader 会把它锚定到
+# 本目录，因此无需安装或软链。插件只写 `.data/calibration.json` 与
+# `.data/config.suggested.yml`，不合并配置、不写人格卡/记忆库。
+- insert:
+    - id: dsh-companion-calibrate
+      name: ./calibrate-plugin.js
+      config:
+        # 当前模型的上下文窗口（tokens）。平台未上报时用此值兜底；
+        # 按实际模型修改，例如 128000 / 64000 / 200000。
+        contextWindowTokens: 128000
