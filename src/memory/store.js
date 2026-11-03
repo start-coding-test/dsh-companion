@@ -232,6 +232,8 @@ CREATE TABLE IF NOT EXISTS threads (
   status          TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','archived','retired')),
   created_at      INTEGER NOT NULL DEFAULT (unixepoch())
 );
+-- H3：一个线程会话只对应一条线程目录行；按 session_id 反查 scope 依赖唯一性。
+CREATE UNIQUE INDEX IF NOT EXISTS ux_threads_session ON threads(session_id);
 
 CREATE TABLE IF NOT EXISTS memory_events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -491,6 +493,34 @@ export class Store {
     const from = row ? String(row.value) : 'missing';
     if (from !== SCHEMA_VERSION) this.#migrateFrom(from);
     this.#ensureScopeRow('main');
+  }
+
+  /**
+   * 读取 schema_meta 的字符串值。
+   * @param {string} key
+   * @returns {string|null}
+   */
+  getMeta(key) {
+    const row = this.#db.prepare('SELECT value FROM schema_meta WHERE key = ?').get(key);
+    return row === undefined ? null : String(row.value);
+  }
+
+  /**
+   * 写入/覆盖 schema_meta 的字符串值（幂等）。
+   * @param {string} key
+   * @param {string} value
+   * @returns {string}
+   */
+  setMeta(key, value) {
+    const metaKey = requireString(key, 'schema_meta.key');
+    const metaValue = requireString(value, 'schema_meta.value');
+    this.#db
+      .prepare(
+        `INSERT INTO schema_meta (key, value) VALUES (?, ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+      )
+      .run(metaKey, metaValue);
+    return metaValue;
   }
 
   /**
@@ -1475,6 +1505,16 @@ export class Store {
    */
   getThread(key) {
     return this.#db.prepare('SELECT * FROM threads WHERE key = ?').get(key) ?? null;
+  }
+
+  /**
+   * H3：按平台 session id 反查线程目录行（用于 pre-step 路由）。
+   * @param {string} sessionId
+   * @returns {object|null}
+   */
+  getThreadBySessionId(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return null;
+    return this.#db.prepare('SELECT * FROM threads WHERE session_id = ?').get(sessionId) ?? null;
   }
 
   /**

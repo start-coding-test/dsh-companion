@@ -135,8 +135,11 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 ## 3. 未纳入本期适配层的能力
 
 - `workspaceRegistry.unarchiveSession(sessionId)`（`dsh-workspace/lib/index.js:553`）：
-  线程重新激活需要先取消归档。当前卡只封装归档；线程卡实现激活流程时再补，
-  或由调用方经 `ctx` 直接调用。
+  适配层已封装（`platform.unarchiveSession`），并在线程复用前调用；调用成功后
+  按 `threads.session_id` 反查 `thread:<key>` 并发布状态板。
+- **人格 / 记忆提示段是全局的**：`systemPrompt.section` 没有 per-session 文本，
+  subagent 仍会看到人格段与记忆提示段。H3 只能保证 subagent 不召回、不巩固、
+  不压缩、不写长期记忆，不能从提示层移除这些段。
 - `systemPrompt.context()`、`systemPrompt.variables()` 等提示装配扩展点：本期
   人格与记忆统一走 `section()`，不额外封装。
 - `compaction.compactIfNeeded` / 配置项 `retainTokens`：本插件自算阈值与保留尾部，

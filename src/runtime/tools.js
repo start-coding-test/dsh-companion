@@ -35,6 +35,8 @@ const LIMIT_SCHEMA = Object.freeze({
  * @param {() => number} [deps.clock] 可注入时钟（毫秒），默认 Date.now
  * @param {string} [deps.cwd] thread_run 新建会话的默认工作目录
  * @param {string} [deps.timeZone=DEFAULT_TIMEZONE] cost_report 日界线所用 IANA 时区
+ * @param {() => (string|null|undefined)} [deps.currentScope] 当前会话 scope
+ *   （pre-step 记录）；undefined=尚未路由（按 main），null=subagent（拒绝记忆工具）。
  * @returns {Array<{name:string, description:string, parameters:object, execute:Function}>}
  */
 export function createTools({
@@ -45,6 +47,7 @@ export function createTools({
   clock = Date.now,
   cwd,
   timeZone = DEFAULT_TIMEZONE,
+  currentScope,
 } = {}) {
   if (store === null || store === undefined) {
     throw new TypeError('createTools: store is required');
@@ -57,6 +60,30 @@ export function createTools({
   }
   const nowMs = () => Number(clock());
   const defaultCwd = typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined;
+
+  /**
+   * 当前会话 scope：undefined=尚未路由（兼容旧调用，按 main）；null=subagent，
+   * 没有长期记忆作用域，记忆工具一律拒绝。
+   * @returns {string|null|undefined}
+   */
+  const scopeNow = () => (typeof currentScope === 'function' ? currentScope() : undefined);
+
+  /**
+   * 解析并校验请求 scope：默认当前 session scope；显式 scope 必须与之相同。
+   * @param {string|undefined} requested
+   * @returns {{ok:true, scope:string}|{ok:false, reason:'scope_denied', scope:string|null}}
+   */
+  const resolveScope = (requested) => {
+    const current = scopeNow();
+    if (current === null) {
+      return { ok: false, reason: 'scope_denied', scope: null };
+    }
+    const scope = current === undefined ? (requested ?? 'main') : current;
+    if (requested !== undefined && requested !== scope) {
+      return { ok: false, reason: 'scope_denied', scope: requested };
+    }
+    return { ok: true, scope };
+  };
 
   return [
     {
@@ -78,9 +105,11 @@ export function createTools({
           return { ok: false, reason: 'retrieve-unavailable' };
         }
         const query = requireString(args.query, 'memory_search', 'query');
-        const scope = optionalString(args.scope, 'memory_search', 'scope') ?? 'main';
+        const requested = optionalString(args.scope, 'memory_search', 'scope');
+        const resolved = resolveScope(requested);
+        if (!resolved.ok) return resolved;
         const limit = optionalInt(args.limit, 'memory_search', 'limit', 1, 50) ?? 20;
-        return retrieve({ store, query, scope, limit });
+        return retrieve({ store, query, scope: resolved.scope, limit });
       },
     },
 
@@ -109,9 +138,11 @@ export function createTools({
         const kind = optionalEnum(args.kind, FACT_KINDS, 'memory_write', 'kind') ?? 'other';
         const salience = optionalEnum(args.salience, SALIENCE, 'memory_write', 'salience') ?? 'normal';
         const privacy = optionalEnum(args.privacy, PRIVACY, 'memory_write', 'privacy') ?? 'normal';
-        const scope = optionalString(args.scope, 'memory_write', 'scope') ?? 'main';
+        const requested = optionalString(args.scope, 'memory_write', 'scope');
+        const resolved = resolveScope(requested);
+        if (!resolved.ok) return resolved;
         const row = store.insertFact({
-          scope,
+          scope: resolved.scope,
           kind,
           subject_text: optionalString(args.subject, 'memory_write', 'subject') ?? '我',
           predicate: optionalString(args.predicate, 'memory_write', 'predicate') ?? '记住',
@@ -147,6 +178,12 @@ export function createTools({
         const id = requireString(args.id, 'memory_forget', 'id');
         const immediate = optionalBoolean(args.immediate, 'memory_forget', 'immediate') ?? false;
         const confirm = optionalBoolean(args.confirm, 'memory_forget', 'confirm') ?? false;
+        const current = scopeNow();
+        if (current === null) return { ok: false, reason: 'scope_denied', scope: null };
+        const fact = store.getFact(id);
+        if (fact && current !== undefined && fact.scope !== current) {
+          return { ok: false, reason: 'scope_denied', scope: fact.scope };
+        }
         return forgetMemory({
           store,
           kind: 'fact',
@@ -154,6 +191,7 @@ export function createTools({
           at: nowMs(),
           immediate,
           confirm,
+          ...(current === undefined ? {} : { scope: current }),
         });
       },
     },
@@ -179,9 +217,11 @@ export function createTools({
         const title = requireString(args.title, 'reminder_add', 'title');
         const kind = optionalEnum(args.kind, REMINDER_KINDS, 'reminder_add', 'kind') ?? 'todo';
         const dueAt = optionalInt(args.due_at, 'reminder_add', 'due_at', 0, Number.MAX_SAFE_INTEGER);
-        const scope = optionalString(args.scope, 'reminder_add', 'scope') ?? 'main';
+        const requested = optionalString(args.scope, 'reminder_add', 'scope');
+        const resolved = resolveScope(requested);
+        if (!resolved.ok) return resolved;
         const row = store.insertReminder({
-          scope,
+          scope: resolved.scope,
           kind,
           title,
           detail: optionalString(args.detail, 'reminder_add', 'detail') ?? null,

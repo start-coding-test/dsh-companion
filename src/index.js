@@ -38,6 +38,7 @@ import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections } from './persona/sections.js';
 import { DEFAULT_CARD } from './persona/card.js';
 import { createAdapter } from './platform/adapter.js';
+import { MAIN_SCOPE, classifySession, threadScope } from './session/identity.js';
 import { handleCommand } from './runtime/commands.js';
 import { createMetrics } from './runtime/metrics.js';
 import { createProactive } from './runtime/proactive.js';
@@ -54,8 +55,8 @@ import { zonedDayKey } from './time.js';
 
 export const name = 'dsh-companion';
 
-/** 默认作用域。 */
-const SCOPE = 'main';
+/** 默认/主会话作用域。 */
+const SCOPE = MAIN_SCOPE;
 
 /** 召回预算（R-SES-07：注入 ≤2050 tokens；总量由 config.workingMemoryTokens 控制）。 */
 const RECALL_BUDGET_TOKENS = 2050;
@@ -142,6 +143,7 @@ export function apply(ctx, rawConfig) {
     }
     state.pendingCompact = recoverPendingCompact(store, SCOPE);
     state.watermarkSeq = Number(store.getWatermark(SCOPE)) || 0;
+    state.watermarkByScope.set(SCOPE, state.watermarkSeq);
     // H1：surface 索引。优先用 session/event 增量维护；宿主没有该事件时靠
     // readSurface 冷启动回填（每次 O(整段 log)，只在缺失时触发）。
     state.surface = createSurfaceIndex({ platform, tailTokens: state.config.retainTokens });
@@ -158,8 +160,8 @@ export function apply(ctx, rawConfig) {
     if (platform.capabilities.preStep) {
       track(platform.onPreStep((payload) => runPreStep(state, payload)));
     }
-    registerCommands(platform, store, config, metrics, track);
-    registerTools(platform, store, config, track);
+    registerCommands(platform, store, config, metrics, track, () => state.currentScope);
+    registerTools(platform, store, config, track, () => state.currentScope);
     track(startScheduler(state));
   } catch (error) {
     for (const disposer of disposers.splice(0).reverse()) {
@@ -221,23 +223,38 @@ function createWiringState({ host, platform, store, config, metrics }) {
     metrics,
     scheduler: null,
     proactive: null,
-    /** 上一轮 turn 标识（platform payload.turn）。 */
+    /** 上一轮 turn 标识（platform payload.turn）；按 scope 分开，避免线程共用 turn 号。 */
     lastTurn: null,
+    /** H3：每个 scope 的上一轮 turn 标识。 */
+    lastTurnByScope: new Map(),
     /** H1：surface seq 索引（session/event 增量 + readSurface 冷启动回填）。 */
     surface: null,
     /** 最近一次 pre-step 的 surface 快照（timer/审计复用）。 */
     surfaceSnapshot: null,
+    /** H3：每个 scope 最近一次 surface 快照；deep-sleep 用 main 的。 */
+    surfaceSnapshotByScope: new Map(),
     /** 巩固水位：最近一次成功巩固的 surface seq；0 = 尚未巩固任何节点。 */
     watermarkSeq: 0,
-    /** 已注入召回的 turn 集合（同一 turn 只注入一次）。 */
+    /** H3：每个 scope 各自的水位（切换 main/thread 时恢复）。 */
+    watermarkByScope: new Map(),
+    /** H3：当前 pre-step 路由到的记忆作用域；null=subagent。 */
+    currentScope: SCOPE,
+    /** H3：最近一次身份路由结果（诊断用）。 */
+    currentSession: null,
+    /** 已注入召回的 turn 集合（同一 scope 的同一 turn 只注入一次）。 */
     turnSeen: new Set(),
     /** 本轮注入的 fact id（H5：下一轮判断是否被用上）。 */
     lastRecalledIds: [],
+    /** H5：注入 fact 所属的 scope；跨 scope 的下一轮不误强化。 */
+    lastRecallScope: SCOPE,
     /** 注入时转录里最近一条 assistant 文本 / assistant 条数，用于判断是否出现新回复。 */
     lastRecallAssistant: '',
     assistantCountAtRecall: 0,
-    /** 最近一段转录（用于巩固模型草稿）。 */
+    /** 最近一段转录（用于巩固模型草稿）；当前激活 scope 的视图。 */
     transcript: [],
+    /** H3：每个 scope 各自的转录，切换会话时恢复，避免跨会话串味。 */
+    transcriptByScope: new Map(),
+    transcriptScope: SCOPE,
     lastHumanAt: null,
     tokens: 0,
     overCount: 0,
@@ -284,7 +301,9 @@ function publishOnThreadUnarchive(platform, store) {
   platform.unarchiveSession = async (sessionId, ...rest) => {
     const result = await original(sessionId, ...rest);
     try {
-      publishBoard(store, SCOPE, 'thread-unarchive');
+      const thread = store.getThreadBySessionId(sessionId);
+      const scope = thread === null || thread === undefined ? SCOPE : threadScope(thread.key);
+      publishBoard(store, scope, 'thread-unarchive');
     } catch (error) {
       platform.log('warn', '[dsh-companion] publish on thread unarchive failed', {
         message: error instanceof Error ? error.message : String(error),
@@ -301,8 +320,9 @@ function publishOnThreadUnarchive(platform, store) {
  * @param {Readonly<Record<string, unknown>>} config
  * @param {object} metrics
  * @param {(disposer: Function) => void} track
+ * @param {() => (string|null)} [currentScope]
  */
-function registerCommands(platform, store, config, metrics, track) {
+function registerCommands(platform, store, config, metrics, track, currentScope) {
   if (!platform.capabilities.commands) return;
   for (const alias of COMMAND_ALIASES) {
     track(platform.registerCommand({
@@ -317,7 +337,7 @@ function registerCommands(platform, store, config, metrics, track) {
             text: `${alias.prefix}${rawInput}`,
             store,
             now: platform.now(),
-            scope: SCOPE,
+            scope: currentScope?.() ?? SCOPE,
             metrics,
             timeZone: config.timezone,
           });
@@ -343,8 +363,9 @@ function registerCommands(platform, store, config, metrics, track) {
  * @param {Store} store
  * @param {Readonly<Record<string, unknown>>} config
  * @param {(disposer: Function) => void} track
+ * @param {() => (string|null)} [currentScope]
  */
-function registerTools(platform, store, config, track) {
+function registerTools(platform, store, config, track, currentScope) {
   if (!platform.capabilities.tools) return;
   const tools = createTools({
     store,
@@ -354,6 +375,7 @@ function registerTools(platform, store, config, track) {
     clock: platform.now,
     cwd: typeof platform.cwd === 'function' ? platform.cwd() : undefined,
     timeZone: config.timezone,
+    currentScope,
   });
   for (const tool of tools) {
     track(platform.registerTool({
@@ -372,6 +394,68 @@ function registerTools(platform, store, config, track) {
 // -------------------------------------------------------------- 主管线
 
 /**
+ * H3：把当前 pre-step 的 agent 路由到 main / thread / subagent。
+ * 没有 payload.agent 的旧调用按 main 处理，保持既有测试行为。
+ * @param {object} state
+ * @param {object} payload
+ * @returns {{kind:'main'|'thread'|'subagent', scope:string|null, sessionId:string|null}}
+ */
+function routeSession(state, payload) {
+  if (payload?.agent === null || payload?.agent === undefined) {
+    state.currentSession = { kind: 'main', scope: SCOPE, sessionId: null, legacy: true };
+    state.currentScope = SCOPE;
+    return state.currentSession;
+  }
+  const identity = classifySession(payload.agent, {
+    store: state.store,
+    logger: (level, message, meta) => state.platform.log(level, message, meta),
+  });
+  state.currentSession = identity;
+  if (identity.kind === 'subagent') {
+    state.currentScope = null;
+    state.metrics.inc('subagentSkips');
+    state.platform.log('debug', '[dsh-companion] subagent session skipped', {
+      sessionId: identity.sessionId,
+    });
+    return identity;
+  }
+  state.currentScope = identity.scope ?? SCOPE;
+  state.platform.log('debug', '[dsh-companion] session routed', {
+    kind: identity.kind,
+    scope: state.currentScope,
+    sessionId: identity.sessionId,
+    threadKey: identity.key ?? null,
+  });
+  return identity;
+}
+
+/**
+ * 读取/初始化某个 scope 的水位。
+ * @param {object} state
+ * @param {string} scope
+ * @returns {number}
+ */
+function watermarkOf(state, scope) {
+  if (!(state.watermarkByScope instanceof Map)) state.watermarkByScope = new Map();
+  if (!state.watermarkByScope.has(scope)) {
+    state.watermarkByScope.set(scope, Number(state.store.getWatermark(scope)) || 0);
+  }
+  return Number(state.watermarkByScope.get(scope)) || 0;
+}
+
+/**
+ * 写入某个 scope 的水位，并同步当前作用域的快捷字段。
+ * @param {object} state
+ * @param {string} scope
+ * @param {number} seq
+ */
+function setWatermark(state, scope, seq) {
+  if (!(state.watermarkByScope instanceof Map)) state.watermarkByScope = new Map();
+  state.watermarkByScope.set(scope, seq);
+  if (state.currentScope === scope) state.watermarkSeq = seq;
+}
+
+/**
  * agent/pre-step 主处理：度量 → 巩固/压缩 → 召回注入（每 turn 一次）。
  * @param {object} state
  * @param {object} payload {agent, messages, turn, step, signal}
@@ -379,15 +463,27 @@ function registerTools(platform, store, config, track) {
  */
 async function runPreStep(state, payload) {
   const { platform, config } = state;
+  const identity = routeSession(state, payload);
+  if (identity.kind === 'subagent') return null;
+  const scope = identity.scope ?? SCOPE;
+  state.currentScope = scope;
+  state.watermarkSeq = watermarkOf(state, scope);
+
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const turnKey = turnKeyOf(payload);
-  const isNewTurn = turnKey !== null && turnKey !== state.lastTurn;
-  if (isNewTurn) state.lastTurn = turnKey;
+  // turn 号只保证同一会话内唯一；多个 main 会话共用 main scope 时不能互相抑制。
+  const turnScope = sessionIdOf(payload) ?? scope;
+  const lastTurn = state.lastTurnByScope.get(turnScope) ?? null;
+  const isNewTurn = turnKey !== null && turnKey !== lastTurn;
+  if (isNewTurn) state.lastTurnByScope.set(turnScope, turnKey);
+  state.lastTurn = turnKey;
 
+  activateScopeTranscript(state, scope);
   captureTranscript(state, messages);
+  state.transcriptByScope.set(scope, state.transcript);
   // H5：先根据「上一轮 assistant 是否复述了上轮注入的 fact」做强化，
   // 再处理本轮注入（注入会覆盖 lastRecalledIds）。
-  reinforceOnUse(state, messages, isNewTurn);
+  reinforceOnUse(state, messages, isNewTurn, scope);
   const human = lastUserText(messages);
   if (human !== '') state.lastHumanAt = platform.now();
 
@@ -405,11 +501,11 @@ async function runPreStep(state, payload) {
 
   if (isNewTurn) {
     // 先补上一轮写库后未完成的两段式压缩（平台只允许 turn 内压缩）。
-    await maybeCompact(state, payload);
-    await maybeConsolidate(state, payload);
+    await maybeCompact(state, payload, scope);
+    await maybeConsolidate(state, payload, scope);
   }
 
-  return injectRecall(state, payload, messages, turnKey);
+  return injectRecall(state, payload, messages, turnKey, scope);
 }
 
 /**
@@ -429,6 +525,9 @@ async function refreshSurface(state, payload, measuredNodes = null, options = {}
       forceRebuild: options.forceRebuild === true,
     });
     state.surfaceSnapshot = snapshot;
+    if (typeof state.currentScope === 'string' && state.currentScope !== '') {
+      state.surfaceSnapshotByScope.set(state.currentScope, snapshot);
+    }
     return snapshot;
   } catch (error) {
     state.platform.log('debug', '[dsh-companion] surface snapshot failed', {
@@ -453,10 +552,21 @@ async function refreshSurface(state, payload, measuredNodes = null, options = {}
  * @param {object} state
  * @param {unknown[]} messages
  * @param {boolean} isNewTurn
+ * @param {string} [scope] 当前会话 scope
  */
-function reinforceOnUse(state, messages, isNewTurn) {
+function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
   const ids = Array.isArray(state.lastRecalledIds) ? state.lastRecalledIds : [];
   if (ids.length === 0) return;
+
+  const recallScope = state.lastRecallScope ?? SCOPE;
+  if (recallScope !== scope) {
+    // 上轮注入属于另一个会话作用域：不跨 scope 强化；换轮时丢弃。
+    if (isNewTurn) {
+      state.lastRecalledIds = [];
+      state.lastRecallScope = scope;
+    }
+    return;
+  }
 
   const assistantText = lastAssistantText(state.transcript);
   const assistantCount = countAssistantRows(state.transcript);
@@ -464,7 +574,10 @@ function reinforceOnUse(state, messages, isNewTurn) {
     && (assistantText !== state.lastRecallAssistant
       || assistantCount > state.assistantCountAtRecall);
   if (!hasNewReply) {
-    if (isNewTurn) state.lastRecalledIds = [];
+    if (isNewTurn) {
+      state.lastRecalledIds = [];
+      state.lastRecallScope = scope;
+    }
     return;
   }
 
@@ -486,7 +599,7 @@ function reinforceOnUse(state, messages, isNewTurn) {
       if (fact.status !== 'active') continue;
       if (overlapRatio(fact.statement, assistantText) < USE_OVERLAP_THRESHOLD) continue;
 
-      const result = applyReinforcement(state.store, { scope: SCOPE, factId: id, at, alpha });
+      const result = applyReinforcement(state.store, { scope: recallScope, factId: id, at, alpha });
       if (!result?.ok) {
         state.platform.log('warn', '[dsh-companion] reinforcement skipped', {
           id,
@@ -559,8 +672,9 @@ function recordTokenEvent(state, usage) {
  * 巩固阶段：水位判断 → 模型草稿 → 单事务写库，成功才登记 pending_compact。
  * @param {object} state
  * @param {object} payload
+ * @param {string} [scope] 当前会话作用域
  */
-async function maybeConsolidate(state, payload) {
+async function maybeConsolidate(state, payload, scope = SCOPE) {
   const { store, platform, metrics, config } = state;
   const plan = planConsolidation({
     tokens: state.tokens,
@@ -610,25 +724,26 @@ async function maybeConsolidate(state, payload) {
   try {
     const result = await consolidate({
       store,
-      scope: SCOPE,
+      scope,
       seqFrom: region.startSeq,
       seqTo: region.endSeq,
       llm,
       now: at,
       trigger: plan.trigger,
-      sessionId: sessionIdOf(payload) ?? SCOPE,
+      sessionId: sessionIdOf(payload) ?? scope,
       // 窗口已在 surface 层选好；水位推进允许跨过旧值。
       guardWatermark: false,
     });
     if (result?.skipped) return;
 
-    const consolidation = findConsolidation(store, SCOPE, Number(result.upto_seq));
+    const consolidation = findConsolidation(store, scope, Number(result.upto_seq));
     state.pendingCompact = {
       id: consolidation?.id ?? null,
       startSeq: region.startSeq,
       endSeq: region.endSeq,
+      scope,
     };
-    state.watermarkSeq = region.endSeq;
+    setWatermark(state, scope, region.endSeq);
     metrics.inc('consolidations');
     platform.log('info', '[dsh-companion] consolidation written', {
       upto_seq: result.upto_seq,
@@ -663,8 +778,9 @@ async function maybeConsolidate(state, payload) {
  * 两段式压缩：只在 open turn 内调用；终点 ≤ 巩固水位，成功后发布状态板。
  * @param {object} state
  * @param {object} payload
+ * @param {string} [scope] 当前会话作用域
  */
-async function maybeCompact(state, payload) {
+async function maybeCompact(state, payload, scope = SCOPE) {
   const { platform, store } = state;
   if (state.pendingCompact === null) return;
   if (!platform.capabilities.compaction) {
@@ -673,6 +789,10 @@ async function maybeCompact(state, payload) {
   }
 
   const pending = state.pendingCompact;
+  if (pending.scope !== undefined && pending.scope !== scope) {
+    // 另一个作用域登记的待压缩区间：留给对应会话的 turn 头处理。
+    return;
+  }
   const snapshot = await refreshSurface(state, payload);
   if (snapshot === null) return;
   const seqs = snapshot.seqs;
@@ -707,10 +827,10 @@ async function maybeCompact(state, payload) {
       oldSeqs: seqs,
       startIdx,
     });
-    state.watermarkSeq = watermark;
+    setWatermark(state, scope, watermark);
     if (pending.id) store.retargetConsolidation(pending.id, { uptoSeq: watermark });
     state.pendingCompact = null;
-    const revision = publishBoard(store, SCOPE, 'compact');
+    const revision = publishBoard(store, scope, 'compact');
     platform.log('info', '[dsh-companion] compacted and published state board', {
       start,
       end,
@@ -733,11 +853,12 @@ async function maybeCompact(state, payload) {
  * @param {object} payload
  * @param {unknown[]} messages
  * @param {string|null} turnKey
+ * @param {string} [scope] 当前会话作用域
  * @returns {Promise<object|null>}
  */
-async function injectRecall(state, payload, messages, turnKey) {
+async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
   const { store, platform, metrics, config } = state;
-  const key = turnKey ?? `step:${String(payload?.step ?? 'unknown')}`;
+  const key = `${sessionIdOf(payload) ?? scope}:${turnKey ?? `step:${String(payload?.step ?? 'unknown')}`}`;
   if (state.turnSeen.has(key)) return null;
   if (isToolTail(messages)) {
     state.turnSeen.add(key);
@@ -751,7 +872,7 @@ async function injectRecall(state, payload, messages, turnKey) {
     recalled = await retrieve({
       store,
       query,
-      scope: SCOPE,
+      scope,
       now: platform.now(),
       budgetTokens: RECALL_BUDGET_TOKENS,
     });
@@ -789,7 +910,7 @@ async function injectRecall(state, payload, messages, turnKey) {
 
   const injection = extractRecallBlock(assembled?.messages);
   if (injection === '') return null;
-  recordRecalledFacts(state, recalled, assembled);
+  recordRecalledFacts(state, recalled, assembled, scope);
   return { inject: [{ type: 'text', text: injection }] };
 }
 
@@ -799,8 +920,9 @@ async function injectRecall(state, payload, messages, turnKey) {
  * @param {object} state
  * @param {{items: object[]}} recalled
  * @param {object} assembled
+ * @param {string} [scope] 本轮注入所属的会话作用域
  */
-function recordRecalledFacts(state, recalled, assembled) {
+function recordRecalledFacts(state, recalled, assembled, scope = SCOPE) {
   const dropped = Array.isArray(assembled?.dropped?.recall) ? assembled.dropped.recall : [];
   const droppedIds = new Set(
     dropped
@@ -815,6 +937,7 @@ function recordRecalledFacts(state, recalled, assembled) {
     if (!ids.includes(item.id)) ids.push(item.id);
   }
   state.lastRecalledIds = ids;
+  state.lastRecallScope = scope;
   state.lastRecallAssistant = lastAssistantText(state.transcript);
   state.assistantCountAtRecall = countAssistantRows(state.transcript);
 }
@@ -944,6 +1067,8 @@ function parseDraftJson(text) {
  */
 async function runDeepSleep(state) {
   const { store, platform, config } = state;
+  // deep-sleep 是主会话的维护任务：使用 main 的转录视图，避免把线程会话串进来。
+  activateScopeTranscript(state, SCOPE);
   const now = platform.now();
   const consolidated = await deepConsolidate(state);
   const dormant = decayFacts(state, now);
@@ -966,7 +1091,7 @@ async function runDeepSleep(state) {
       // 日粒度记在 session_id 与审计 detail 里。
       kind: 'deep',
       trigger: 'deep-sleep',
-      upto_seq: Number(store.getWatermark(SCOPE)) || 0,
+      upto_seq: watermarkOf(state, SCOPE),
       status: 'written',
       started_at: at,
       finished_at: at,
@@ -998,13 +1123,14 @@ async function runDeepSleep(state) {
 async function deepConsolidate(state) {
   const { store, platform } = state;
   if (state.transcript.length === 0) return { written: false, reason: 'nothing-to-consolidate' };
-  // 定时器没有 payload：用最近一次 pre-step 的快照（无快照说明本轮没跑过 agent）。
-  const snapshot = state.surfaceSnapshot;
+  // 定时器没有 payload：用 main 最近一次 pre-step 的快照（无快照说明没跑过 agent）。
+  const snapshot = state.surfaceSnapshotByScope.get(SCOPE)
+    ?? (state.currentScope === SCOPE ? state.surfaceSnapshot : null);
   if (snapshot === null || snapshot.seqs.length === 0) {
     return { written: false, reason: 'no-surface' };
   }
   const { region, reason } = planRegion(snapshot, {
-    afterSeq: state.watermarkSeq,
+    afterSeq: watermarkOf(state, SCOPE),
     budgetTokens: state.config.retainTokens,
   });
   if (region === null) return { written: false, reason };
@@ -1025,8 +1151,13 @@ async function deepConsolidate(state) {
     });
     if (result?.skipped) return { written: false, reason: 'skipped' };
     const row = findConsolidation(store, SCOPE, Number(result.upto_seq));
-    state.pendingCompact = { id: row?.id ?? null, startSeq: region.startSeq, endSeq: region.endSeq };
-    state.watermarkSeq = region.endSeq;
+    state.pendingCompact = {
+      id: row?.id ?? null,
+      startSeq: region.startSeq,
+      endSeq: region.endSeq,
+      scope: SCOPE,
+    };
+    setWatermark(state, SCOPE, region.endSeq);
     state.metrics.inc('consolidations');
     return { written: true, upto_seq: result.upto_seq, facts: result.facts ?? 0 };
   } catch (error) {
@@ -1281,7 +1412,7 @@ async function freezeThreads(store, platform, config) {
  * 重启后恢复未完成的两段式压缩（只认 nap：deep 行的 upto_seq 是审计水位）。
  * @param {Store} store
  * @param {string} scope
- * @returns {{id: string, startSeq: number, endSeq: number}|null}
+ * @returns {{id: string, startSeq: number, endSeq: number, scope: string}|null}
  */
 function recoverPendingCompact(store, scope) {
   const row = store.db.prepare(
@@ -1292,7 +1423,7 @@ function recoverPendingCompact(store, scope) {
   if (!row) return null;
   const endSeq = Number(row.upto_seq);
   const startSeq = Number(row.compaction_start_seq ?? row.turn_from ?? endSeq);
-  return { id: row.id, startSeq, endSeq };
+  return { id: row.id, startSeq, endSeq, scope };
 }
 
 /**
@@ -1412,6 +1543,19 @@ function isToolTail(messages) {
   if (last.type === 'tool-result' || last.type === 'tool-call') return true;
   const blocks = Array.isArray(last.content) ? last.content : [];
   return blocks.some((block) => block?.type === 'tool-result' || block?.type === 'tool-call');
+}
+
+/**
+ * 切换当前 scope 的转录视图：先把上一个 scope 的转录存回 Map。
+ * @param {object} state
+ * @param {string} scope
+ */
+function activateScopeTranscript(state, scope) {
+  if (!(state.transcriptByScope instanceof Map)) state.transcriptByScope = new Map();
+  if (state.transcriptScope === scope) return;
+  state.transcriptByScope.set(state.transcriptScope ?? SCOPE, state.transcript);
+  state.transcript = state.transcriptByScope.get(scope) ?? [];
+  state.transcriptScope = scope;
 }
 
 /**
