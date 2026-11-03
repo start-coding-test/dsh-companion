@@ -1,0 +1,11 @@
+# Gate 0 进程内探针 overlay（只读，不写业务库）。
+#
+# 用法：把本文件作为 `--patch` 叠加到任意 profile：
+#   dsh probe --from-default-profile headless --patch <repo>\scripts\probe\probe.patch.yml "hi"
+#
+# `./probe-plugin.js` 是相对本 patch 文件的路径；DSH 的 loader 会把 insert
+# 条目里的相对 name 锚定到 patch 文件所在目录，因此无需提前安装/软链。
+# 输出默认是仓库 `.data/probe.json`，可用环境变量 DSH_PROBE_OUT 覆盖。
+- insert:
+    - id: gate0-probe
+      name: ./probe-plugin.js

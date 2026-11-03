@@ -6,7 +6,8 @@
   "main": "./src/index.js",
   "exports": "./src/index.js",
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "probe:headless": "node scripts/probe/run-headless.mjs"
   },
   "engines": {
     "node": ">=24"
