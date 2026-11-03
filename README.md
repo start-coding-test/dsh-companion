@@ -4,7 +4,7 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**MVP 0.1.1**（2026-11-04），`node --test` 全绿（383 个用例 / 16 个套件），git tag `v0.1.1`。
+当前状态：**MVP 0.2.0**（2026-11-04），`node --test` 全绿（465 个用例 / 16 个套件），git tag `v0.2.0`。
 
 ## 目录结构
 
@@ -13,11 +13,13 @@ dsh-companion/
 ├─ src/
 │  ├─ index.js        # 插件入口：apply/dispose、生产接线、pre-step 主链路
 │  ├─ config.js       # 配置默认值与校验
-│  ├─ memory/         # store、bigram、retrieve、consolidate、state-board、assemble
-│  ├─ persona/        # 人格卡与 system prompt 段
+│  ├─ memory/         # store、bigram、retrieve、consolidate、state-board、assemble、govern
+│  ├─ persona/        # 人格卡、system prompt 段与轻闲聊
 │  ├─ platform/       # DSH 适配层与 PlatformError
-│  ├─ runtime/        # commands、tools、metrics、scheduler、proactive
-│  ├─ task/           # 任务 worker 与回执
+│  ├─ runtime/        # commands、tools、metrics、scheduler、proactive、retry
+│  ├─ scheduler/      # 承诺跟进（commitment follow-up）
+│  ├─ session/        # 会话身份（main/thread/subagent）与 surface 索引
+│  ├─ task/           # worker、串行执行槽与回执
 │  └─ thread/         # 线程目录（命名、上限、冻结）
 ├─ test/              # node:test 单测与 e2e（含 apply 驱动的生产路径）
 ├─ docs/              # usage、platform-api、review 报告
@@ -65,13 +67,13 @@ dsh-companion/
 | `purgeAfterDays` | `7` | 遗忘冷静期，到期物理删除 | `1`–`30` |
 | `dbPath` | `"./.data/companion.db"` | SQLite 数据库路径 | 非空字符串 |
 
-token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`。未知配置键只记警告，不阻断启动。
+token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`。未知配置键只记警告，不阻断启动。v0.2.0 不新增配置键（仍为 13 个）：治理/编辑、承诺跟进、轻闲聊与失败自愈都由既有配置与固定阈值控制。
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
-**每日 token 熔断**：按 `timezone` 的本地日界累计每日 token 用量，达到 `3,000,000` 后进入熔断：拒绝新的 `task_run`、暂停主动消息，`/成本` 与 `/状态` 会显示「已熔断」；本地日界翻篇自动复位。该上限固定为 3M，v0.1.1 不提供配置键。
+**每日 token 熔断**：按 `timezone` 的本地日界累计每日 token 用量，达到 `3,000,000` 后进入熔断：拒绝新的 `task_run`、暂停主动消息，`/成本` 与 `/状态` 会显示「已熔断」；本地日界翻篇自动复位。该上限固定为 3M，v0.2.0 不提供配置键。
 
-**RSS 三档降级**：每 60 秒检查一次进程 RSS，`≥2.95GiB` 记 warn 指标（不降级）、`≥3.0GiB` 停 `task_run` 与主动消息、`≥3.15GiB` 再停线程创建；恢复后自动解除。阈值固定，v0.1.1 不提供配置键。
+**RSS 三档降级**：每 60 秒检查一次进程 RSS，`≥2.95GiB` 记 warn 指标（不降级）、`≥3.0GiB` 停 `task_run` 与主动消息、`≥3.15GiB` 再停线程创建；恢复后自动解除。阈值固定，v0.2.0 不提供配置键。
 
 ## 首次安装自检
 
@@ -98,11 +100,31 @@ node scripts/calibrate/run.mjs
 
 ## 命令与工具
 
-命令：`/记忆`、`/记忆 忘掉`、`/记忆 置顶`、`/记忆 取消置顶`、`/成本`、`/线程`、`/状态`。
+命令：`/记忆`（`列表 [关键词]`、`忘掉`、`改 <id> <内容>`、`治理 [--dry-run]`、`置顶`、`取消置顶`）、`/成本`、`/线程`、`/状态`、`/别闲聊`、`/恢复闲聊`。
 
-工具：`memory_search`、`memory_write`、`memory_forget`、`reminder_add`、`reminder_done`、`thread_list`、`thread_run`、`task_run`、`cost_report`。
+工具（10 个）：`memory_search`、`memory_write`、`memory_update`、`memory_forget`、`reminder_add`、`reminder_done`、`thread_list`、`thread_run`、`task_run`、`cost_report`。
 
 参数、返回与降级行为见 [docs/usage.md](docs/usage.md)。
+
+## 记忆治理与编辑
+
+- `/记忆 列表 [关键词]` 按 kind 分组分页列出活跃事实（每页 20 条）；`/记忆 改 <id> <内容>` 用新 id 生效新内容，旧条标记 `superseded` 并保留审计。
+- `/记忆 治理 --dry-run` 只出报告：重复（Jaccard ≥ 0.92）、冲突（同 subject + predicate）、过期（R < 0.05）、敏感条目；去掉 `--dry-run` 才真正应用。
+- 应用**只降级、不物理删除**：重复项标 `superseded`（保留可回溯），敏感命中标 `sensitive=1` 并移出 FTS 召回；治理与编辑都写审计事件。
+- 模型侧用 `memory_update` 修改记忆，语义与 `/记忆 改` 相同；`subagent` 会话不可写。
+
+## 承诺跟进与轻闲聊
+
+- 到期且未完成的 **commitment** 提醒，会在 reminders tick 内每天至多跟进 1 次；安静时段只积压，时段结束后补发一次（不会丢），已完成/已删除的不再打扰。
+- **轻闲聊**是低频主动消息：需同时满足「闲聊开启、非安静时段、当日有过互动、非周末、距上次 ≥ 3 天、当日 ≤ 1 条、最近 7 天 ≤ 3 条」，内容限定为 5–10 句陈述句且经过违禁词过滤；任一条不满足就不发送。
+- `/别闲聊` 关闭、`/恢复闲聊` 恢复，开关写入数据库，重启后仍生效。闲聊与提醒共用 `proactiveDailyCap` 与安静时段。
+
+## 失败自愈
+
+- **巩固失败**：写入 `consolidations` 失败行并按 1/2/4 tick 退避重试，最多 3 次；重试复用同一行，成功后正常推进水位，最终失败写 `consolidation_failed_final`。凭据缺失（`MISSING_CREDENTIAL`）不重试，避免无意义调用。
+- **定时任务失败**：写 `job_error` 并在次日 17:03 重试（`job_retry`）；重启后会从历史失败态恢复。备份失败不再被吞掉，交由调度器记账并在次日重试。
+- **数据库繁忙**：事务入口对 `SQLITE_BUSY` 最多重试 3 次（5–25ms 线性抖动、上限 50ms），非 BUSY 错误原样抛出。
+- `/状态` 末尾会显示「最近失败 / 最近重试 / 最近 job 失败」，便于判断自愈是否在推进。
 
 ## 记忆与遗忘
 
@@ -121,6 +143,7 @@ node scripts/calibrate/run.mjs
 - **单人模型**：主会话与线程按 `scope` 隔离（线程为 `thread:<key>`），但仍是单人使用，不是多人协作。
 - **task_run 串行**：worker 全局单槽、忙时排队至多 2 个；软超时 600s 只告警，硬超时 900s 两段式取消（先中止当前轮、再清空排队）。熔断或 RSS 降级时 `task_run` 会在入队前被拒绝（`daily_budget_exceeded` / `memory_pressure`）。
 - **预算/内存保护固定阈值**：每日 3M token 与 RSS 2.95/3.0/3.15GiB 三档不可配置；RSS warn 只记 metric，stop_dispatch 起才停派发；保护读数读取失败时按 `ok` 放行，不会因此中断会话。
+- **自愈重试受调度 tick 约束**：巩固重试与轻闲聊都挂在 idle-probe（60s）上；熔断或 RSS ≥ stop_dispatch 期间重试会被顺延（事件与失败态保留，只是延后），恢复后继续推进。
 - **subagent 仍见全局人格段**：平台的 system prompt 段没有 per-session 文本；插件只能让 subagent 跳过召回、巩固与写库，无法移除人格 / 记忆提示段。
 - **schema v4 迁移清空 consolidations**：seq 语义切换为 surface 位置序时，开发期迁移会清空 `consolidations` 并重置 `episodes.consolidation_id`；事实、提醒与状态板不受影响。
 - deep-sleep 的「情景→语义」模型抽取尚未实现，MVP 只做规则子步。
@@ -144,5 +167,8 @@ node --test test/e2e   # 只跑端到端
 - [使用手册](docs/usage.md)
 - [平台 API 摘录](docs/platform-api.md)
 - [Gate 0 探针说明](docs/gate0-probe.md)
+- [安装自检与校准](docs/calibration.md)
 - [外部评审报告 v1](docs/review-v1.md)
+- [v0.1.1 关闭核验](docs/review-v2.md)
+- [P1 批复审（v0.2.0）](docs/review-v3.md)
 - [变更记录](CHANGELOG.md)
