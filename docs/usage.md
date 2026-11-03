@@ -81,7 +81,7 @@ health | archived | 体检 | 2026-10-20
 
 ## 工具
 
-插件向模型注册 8 个工具。必填字段缺失、类型错误或取值越界时，工具抛出 `TypeError`，消息里带工具名与字段名；调用方应修正参数后重试。
+插件向模型注册 9 个工具。必填字段缺失、类型错误或取值越界时，工具抛出 `TypeError`，消息里带工具名与字段名；调用方应修正参数后重试。
 
 ### `memory_search`
 
@@ -227,6 +227,45 @@ health | archived | 体检 | 2026-10-20
 - `session-unavailable`：宿主没有 `sessionController.createSession`。
 - `unarchive-unavailable`：复用已归档线程，但宿主没有 `workspaceRegistry.unarchiveSession`。
 - `prompt-unavailable`：宿主没有 `sessionController.prompt`，无法投递目标。
+
+### `task_run`
+
+把一件独立任务交给串行 worker 执行。worker 是独立会话（不注入长期记忆），
+产出只有 ≤300 字回执。
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `goal` | string | 是 | 任务目标，1–2000 码点；必须自包含（worker 不读记忆） |
+| `title` | string | 否 | 任务标题，≤80 码点；只用于回执与审计 |
+
+返回：
+
+```json
+{
+  "ok": true,
+  "taskId": "task-m4x2-1",
+  "status": "done",
+  "receipt": "状态：成功｜结论：周报已生成｜产物：无｜耗时：12.3s",
+  "sessionId": "session-...",
+  "durationMs": 12345
+}
+```
+
+`status` 为 `done` / `timeout` / `failed`；执行失败不回滚成异常，而是返回
+`status:"failed"` 并在回执里写「失败」。
+
+并发与超时：
+
+- **全局单槽**：同一时刻只有 1 个 worker；忙时最多再排队 2 个。
+  队列满时立即返回 `{ "ok": false, "reason": "busy", "queue": 2 }`，不建会话。
+- **软超时 600s**：只写一条 `warn` 日志与耗时，不打断 worker。
+- **硬超时 900s**：两段式回收——先 `cancel({sessionId, keepInbox:true})` 只中止
+  当前轮，再 `cleanInbox(sessionId)` 清空排队；终态 `timeout`，回执写「超时」。
+- 宿主没有 `sessionController` 时返回 `{ "ok": false, "reason": "session-unavailable" }`。
+
+审计：收尾写两条 `memory_events`（append-only）：`USED` + `kind:"task_receipt"`
+（回执正文）与 `USED` + `kind:"task_run"`（任务生命周期）。`action` 词表里没有
+`TASK`，所以用后者表达，避免为内部事件升级 schema。
 
 ### `cost_report`
 

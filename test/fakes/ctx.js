@@ -32,6 +32,9 @@ export class FakeCtx {
     this.sections = [];
     this.agents = [];
     this.sessions = new Map();
+    // task_run 用：deferIdle=true 时 agent.whenIdle() 挂起，直到 releaseIdle(id)。
+    this.deferIdle = options.deferIdle === true;
+    this.idleWaiters = new Map();
     this.returns = options.returns ?? {};
     this.failures = new Map(Object.entries(options.fail ?? {}));
     this.missing = new Set(options.missing ?? []);
@@ -124,9 +127,21 @@ export class FakeCtx {
           const agent = {
             id: sessionId,
             session: { id: sessionId },
+            inbox: {
+              cleared: 0,
+              clear() {
+                this.cleared += 1;
+                return true;
+              },
+            },
             whenIdle: async () => {
               this._record('agent.whenIdle', []);
               this._failAt('agent.whenIdle');
+              if (this.deferIdle) {
+                return new Promise((resolve) => {
+                  this.idleWaiters.set(sessionId, resolve);
+                });
+              }
               return { id: sessionId };
             },
           };
@@ -236,6 +251,19 @@ export class FakeCtx {
    */
   fail(key, error = new Error(`injected failure: ${key}`)) {
     this.failures.set(key, error);
+  }
+
+  /**
+   * 放行一个被 deferIdle 挂起的 agent.whenIdle()。
+   * @param {string} sessionId
+   * @returns {boolean} 是否真的有一个等待者
+   */
+  releaseIdle(sessionId) {
+    const resolve = this.idleWaiters.get(sessionId);
+    if (resolve === undefined) return false;
+    this.idleWaiters.delete(sessionId);
+    resolve({ id: sessionId });
+    return true;
   }
 
   /**

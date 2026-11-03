@@ -96,7 +96,7 @@ node scripts/calibrate/run.mjs
 
 命令：`/记忆`、`/记忆 忘掉`、`/记忆 置顶`、`/记忆 取消置顶`、`/成本`、`/线程`、`/状态`。
 
-工具：`memory_search`、`memory_write`、`memory_forget`、`reminder_add`、`reminder_done`、`thread_list`、`thread_run`、`cost_report`。
+工具：`memory_search`、`memory_write`、`memory_forget`、`reminder_add`、`reminder_done`、`thread_list`、`thread_run`、`task_run`、`cost_report`。
 
 参数、返回与降级行为见 [docs/usage.md](docs/usage.md)。
 
@@ -115,6 +115,7 @@ node scripts/calibrate/run.mjs
 - **无跨设备备份**：数据库只在本机；backup 任务只在本机按日期滚动保留 7 份。
 - 平台管理的会话 JSONL 不在插件控制范围内，插件无法删除。
 - **单人模型**：主会话与线程按 `scope` 隔离（线程为 `thread:<key>`），但仍是单人使用，不是多人协作。
+- **task_run 串行**：worker 全局单槽、忙时排队至多 2 个；软超时 600s 只告警，硬超时 900s 两段式取消（先中止当前轮、再清空排队）。
 - **subagent 仍见全局人格段**：平台的 system prompt 段没有 per-session 文本；插件只能让 subagent 跳过召回、巩固与写库，无法移除人格 / 记忆提示段。
 - deep-sleep 的「情景→语义」模型抽取尚未实现，MVP 只做规则子步。
 

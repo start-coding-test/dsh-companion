@@ -325,6 +325,7 @@ test('capabilities 反映宿主能力', () => {
     tokenEstimator: true,
     sessionEvent: true,
     sessionQuery: true,
+    inbox: true,
     logger: true,
     commands: false,
     tools: false,

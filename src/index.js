@@ -357,7 +357,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope)
 }
 
 /**
- * 注册 8 个模型工具。工具的 parameters 已是 JSON Schema，直接按平台裸注册
+ * 注册 9 个模型工具。工具的 parameters 已是 JSON Schema，直接按平台裸注册
  * 契约补齐 output（宽 schema + 文本 render），不做 defineTool 依赖。
  * @param {object} platform
  * @param {Store} store

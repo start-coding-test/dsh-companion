@@ -139,6 +139,10 @@ export function createAdapter(ctx, opts = {}) {
     get sessionQuery() {
       return typeof ctx.sessionQuery?.readSurface === 'function';
     },
+    get inbox() {
+      // 清空排队输入需要拿到 agent 句柄（ctx.agents.get）再走 agent.inbox。
+      return typeof ctx.agents?.get === 'function' || Array.isArray(ctx.agents);
+    },
     get logger() {
       return typeof ctx.logger?.info === 'function';
     },
@@ -286,16 +290,66 @@ export function createAdapter(ctx, opts = {}) {
   }
 
   /**
+   * 把 agent 句柄 / createSession 返回值 / 会话 id 归一成 agent 句柄。
+   * @param {unknown} target
+   * @returns {object|null}
+   */
+  function resolveAgent(target) {
+    let candidate = target;
+    if (typeof candidate === 'string') {
+      if (typeof ctx.agents?.get === 'function') {
+        candidate = ctx.agents.get(candidate);
+      } else if (Array.isArray(ctx.agents)) {
+        candidate = ctx.agents.find(
+          (agent) => agent?.id === target || agent?.session?.id === target,
+        );
+      } else {
+        candidate = null;
+      }
+      return candidate ?? null;
+    }
+    if (candidate !== null && typeof candidate === 'object' && candidate.agent !== undefined) {
+      candidate = candidate.agent;
+    }
+    return candidate !== null && typeof candidate === 'object' ? candidate : null;
+  }
+
+  /**
    * 等待 agent 静默。whenIdle 属于 agent 句柄而非 sessionController。
-   * @param {object} target agent 句柄，或 createSession 的返回值 { agent }
+   * @param {object|string} target agent 句柄、会话 id，或 createSession 的返回值 { agent }
    * @returns {Promise<unknown>}
    */
   function whenIdle(target) {
-    const agent = target?.agent ?? target;
+    const agent = resolveAgent(target);
     if (agent !== null && typeof agent === 'object' && typeof agent.whenIdle === 'function') {
       return agent.whenIdle();
     }
     throw unavailable('no-when-idle', 'agent.whenIdle()');
+  }
+
+  /**
+   * 清空一个会话的排队输入（硬超时后的第二段回收）。
+   *
+   * 平台公开面没有 `cleanInbox`：`sessionController.cancel()` 内部固定用
+   * `agent.cancel({keepInbox:true})`，只中止当前轮。队列清空必须走
+   * `agent.inbox.clear()`（README 公开的 Inbox 结构接口）。
+   * 会话已结束/找不到 agent 时返回 false（幂等，不抛）。
+   *
+   * @param {string} sessionId
+   * @returns {Promise<boolean>} 是否真的清空了 inbox
+   */
+  async function cleanInbox(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') {
+      throw new TypeError('cleanInbox(sessionId): sessionId must be a non-empty string');
+    }
+    const agent = resolveAgent(sessionId);
+    if (agent === null || typeof agent !== 'object') return false;
+    const inbox = agent.inbox;
+    if (inbox === null || typeof inbox !== 'object' || typeof inbox.clear !== 'function') {
+      return false;
+    }
+    await inbox.clear();
+    return true;
   }
 
   /**
@@ -518,6 +572,7 @@ export function createAdapter(ctx, opts = {}) {
     prompt,
     cancel,
     whenIdle,
+    cleanInbox,
     archiveSession,
     measure,
     estimateMessage,

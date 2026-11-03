@@ -1,5 +1,5 @@
 /**
- * 模型工具面（05 §7.5、t11 卡）：8 个工具的描述符 + 执行层。
+ * 模型工具面（05 §7.5、t11 卡）：9 个工具的描述符 + 执行层。
  *
  * 约束：
  * - `createTools` 只接收依赖（store/retrieve/registry/platform/clock/cwd），execute 不读全局单例；
@@ -12,6 +12,7 @@
  */
 
 import { forgetMemory } from '../memory/forget.js';
+import { runTask as runBackgroundTask } from '../task/run.js';
 import { summarizeCost } from './commands.js';
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
 
@@ -417,6 +418,52 @@ export function createTools({
           prompted,
           thread,
         };
+      },
+    },
+
+    {
+      name: 'task_run',
+      description:
+        '把一件独立任务交给串行 worker 执行：全局单槽（同一时刻 1 个），'
+        + '忙时排队最多 2 个，超出直接返回 busy；软超时 600s 只告警，'
+        + '硬超时 900s 两段式取消。返回 ≤300 字回执。',
+      parameters: {
+        type: 'object',
+        properties: {
+          goal: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 2000,
+            description: '任务目标（自包含，worker 不读长期记忆）',
+          },
+          title: {
+            type: 'string',
+            maxLength: 80,
+            description: '任务标题（可选，只用于回执与审计）',
+          },
+        },
+        required: ['goal'],
+        additionalProperties: false,
+      },
+      async execute(args = {}) {
+        assertArgs(args, 'task_run');
+        const goal = requireString(args.goal, 'task_run', 'goal');
+        const title = optionalString(args.title, 'task_run', 'title');
+        if (typeof platform?.createSession !== 'function'
+          || typeof platform?.prompt !== 'function'
+          || typeof platform?.whenIdle !== 'function') {
+          return { ok: false, reason: 'session-unavailable' };
+        }
+        const scope = scopeNow();
+        return runBackgroundTask({
+          platform,
+          store,
+          goal,
+          title,
+          at: nowMs(),
+          scope: typeof scope === 'string' && scope !== '' ? scope : 'main',
+          cwd: defaultCwd,
+        });
       },
     },
 
