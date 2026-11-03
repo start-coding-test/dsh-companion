@@ -358,3 +358,44 @@ test('apply 生产路径：备份文件名用 config.timezone 的本地日期（
     temp.cleanup();
   }
 });
+
+test('N1：巩固提示词来自 surface 选区（旧事实不在转录窗口，尾部保留内容不进入）', async () => {
+  const temp = makeTempStore();
+  const { ctx, streams, session } = makeApplyCtx();
+  // retainTokens 同时是选区尾部预算：20 让最后几条消息（含尾部标记）留在 surface，
+  // 而第 1 条旧事实仍落在选区里。
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 20 });
+  try {
+    const all = [];
+    for (let index = 0; index < 45; index += 1) {
+      let text = `补充消息 ${index}`;
+      if (index === 0) text = '旧事实：用户把预算调到 8000。';
+      if (index === 44) text = '尾部保留标记XYZ，不应进入巩固提示词。';
+      const message = { role: 'user', content: [{ type: 'text', text }] };
+      all.push(message);
+      ctx.emitSessionEvent(session.id, { type: 'user/message', data: message });
+    }
+
+    // 真实窗口只保留最近 40 条：首次出现的旧事实不在 transcript 里。
+    const payload = {
+      agent: { id: session.id, session },
+      messages: all.slice(-40),
+      turn: 1,
+      step: 1,
+    };
+    await ctx.dispatch('agent/pre-step', payload, { kind: 'enter', messages: [] });
+    await waitFor(() => streams.length === 1, { label: 'consolidation model call' });
+
+    const prompt = streams[0].messages
+      .flatMap((message) => (Array.isArray(message.content) ? message.content : []))
+      .filter((block) => block?.type === 'text')
+      .map((block) => block.text)
+      .join('\n');
+    assert.match(prompt, /旧事实：用户把预算调到 8000/u, '选区内的旧事实应进入提示词');
+    assert.doesNotMatch(prompt, /尾部保留标记XYZ/u, '尾部预算内的内容不应进入巩固提示词');
+    await waitFor(() => temp.store.getWatermark('main') > 0, { label: 'region consolidation' });
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});

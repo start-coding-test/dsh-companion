@@ -352,6 +352,53 @@ function factKey(fact) {
 }
 
 /**
+ * 允许的选区文本：非空字符串才采用；空串/纯空白视为「没有选区文本」。
+ * 非字符串（且非 null/undefined）直接报编程错误，避免把对象拼进提示词。
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function normalizeRegionText(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') {
+    throw new TypeError('[consolidate] regionText must be a string');
+  }
+  return value.trim() === '' ? null : value;
+}
+
+/**
+ * 构造巩固模型提示词。N1：优先使用 surface 选区文本（已含 role 标注），
+ * 缺失时回退最近转录；选区文本与 seqFrom/seqTo 的对齐由调用方保证。
+ *
+ * @param {object} input
+ * @param {string} [input.scope='main']
+ * @param {number} [input.seqFrom]
+ * @param {number} [input.seqTo]
+ * @param {{role:string,text:string}[]|null} [input.transcript]
+ * @param {string|null} [input.regionText]
+ * @returns {string}
+ */
+export function buildConsolidationPrompt(input = {}) {
+  const scope = nonEmptyString(input.scope) ?? 'main';
+  const regionText = normalizeRegionText(input.regionText);
+  const rows = regionText === null
+    ? (Array.isArray(input.transcript) ? input.transcript : [])
+      .map((row) => `${row?.role ?? 'unknown'}: ${String(row?.text ?? '')}`)
+    : [regionText];
+  const body = rows.join('\n');
+  return [
+    '你是私人管家的记忆巩固器。把下面这段对话压缩成一条情景记忆与若干长期事实。',
+    '只输出一个 JSON 对象，不要解释，不要 Markdown 代码块。格式：',
+    '{"episode":{"title":"...","summary":"..."},',
+    ' "facts":[{"kind":"identity|relation|preference|project|knowledge|other",',
+    '           "subject_text":"...","predicate":"...","object_text":"...","statement":"..."}],',
+    ' "reminders":[{"kind":"todo","title":"..."}]}',
+    `scope=${scope} seq=${input.seqFrom}-${input.seqTo}`,
+    '对话：',
+    body,
+  ].join('\n');
+}
+
+/**
  * 巩固一段对话（一个 seq 区间）。
  *
  * @param {object} input
@@ -359,8 +406,13 @@ function factKey(fact) {
  * @param {string} [input.scope='main']
  * @param {number} input.seqFrom 本段第一条 seq（含）
  * @param {number} input.seqTo 本段最后一条 seq（含，成为新水位）
- * @param {(input: {scope: string, seqFrom: number, seqTo: number}) => Promise<object>|object} input.llm
+ * @param {(input: {scope: string, seqFrom: number, seqTo: number,
+ *   regionText: string, textSource: 'region'|'transcript',
+ *   transcript: object[]}) => Promise<object>|object} input.llm
  *   模型回调：返回 {episode:{title,summary,...}, facts:[...], reminders?:[...]}
+ * @param {string} [input.regionText] N1：surface 选区文本（含 role 标注），
+ *   非空时优先于 transcript；调用方保证与 seqFrom/seqTo 对齐
+ * @param {{role:string,text:string}[]} [input.transcript] 最近转录；选区缺失时兜底
  * @param {number|Date} [input.now] 巩固时刻（Unix 秒）；默认当前时间
  * @param {string} [input.trigger='idle'] 归因，写入 consolidations.trigger
  * @param {string} [input.sessionId] 归属会话；默认同 scope（main 即 'main'）
@@ -369,8 +421,9 @@ function factKey(fact) {
  *   相同/包含/被包含的草稿事实一律不写回（遗忘闭环用）
  * @param {boolean} [input.guardWatermark=true] 是否做「段已巩固过」守卫；
  *   index.js 已在 surface 层面选好窗口，传 false 以允许水位从射线外推进
- * @returns {Promise<{skipped: boolean, upto_seq: number, episodeId?: string,
- *                    facts?: number, kind?: string, excluded?: number}>}
+ * @returns {Promise<{skipped: boolean, upto_seq: number, textSource: string,
+ *                    episodeId?: string, facts?: number, kind?: string,
+ *                    excluded?: number}>}
  */
 export async function consolidate(input = {}) {
   const { store, seqFrom, seqTo, llm } = input;
@@ -378,6 +431,9 @@ export async function consolidate(input = {}) {
   const scope = requireScope(input.scope ?? 'main');
   const from = requireSeq(seqFrom, 'seqFrom');
   const to = requireSeq(seqTo, 'seqTo');
+  const regionText = normalizeRegionText(input.regionText);
+  const textSource = regionText === null ? 'transcript' : 'region';
+  const transcript = Array.isArray(input.transcript) ? input.transcript : [];
   // 不校验 seqFrom <= seqTo：surface 位置不等于数值顺序，压缩后的可见 seq
   // 可能非单调（catalog:627-632）。
 
@@ -392,7 +448,7 @@ export async function consolidate(input = {}) {
   const guardWatermark = input.guardWatermark !== false;
   const watermark = Number(store.getWatermark(scope)) || 0;
   if (guardWatermark && to <= watermark && kind !== 'forget_flush') {
-    return { skipped: true, upto_seq: watermark };
+    return { skipped: true, upto_seq: watermark, textSource };
   }
 
   if (typeof llm !== 'function') {
@@ -412,7 +468,15 @@ export async function consolidate(input = {}) {
   }
 
   // 2) 模型切分 + 校验。校验失败在事务之前抛出，库内不产生任何行。
-  const draft = await llm({ scope, seqFrom: from, seqTo: to });
+  // N1：选区文本优先，transcript 仅作兜底；模型回调原样收到 textSource 便于审计。
+  const draft = await llm({
+    scope,
+    seqFrom: from,
+    seqTo: to,
+    regionText: regionText ?? '',
+    textSource,
+    transcript,
+  });
   const { episode, facts: draftedFacts, reminders } = normalizeDraft(draft);
   const facts = draftedFacts.filter(
     (fact) => !matchesExcludedStatement(fact.statement, excludedStatements),
@@ -531,6 +595,7 @@ export async function consolidate(input = {}) {
   return {
     skipped: false,
     upto_seq: to,
+    textSource,
     kind,
     episodeId: written.episodeId,
     facts: written.facts,

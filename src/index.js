@@ -33,7 +33,7 @@ import {
   applyReinforcement,
   overlapRatio,
 } from './memory/reinforce.js';
-import { consolidate, planConsolidation } from './memory/consolidate.js';
+import { buildConsolidationPrompt, consolidate, planConsolidation } from './memory/consolidate.js';
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections } from './persona/sections.js';
 import { DEFAULT_CARD } from './persona/card.js';
@@ -897,13 +897,26 @@ function scheduleConsolidation(state, payload, scope = SCOPE) {
   if (!plan.trigger) return;
   if (state.transcript.length === 0) return;
 
+  const snapshot = state.surfaceSnapshotByScope.get(scope) ?? state.surfaceSnapshot;
+  // N1：登记时就把当前选区的文本与边界固定下来，后台任务执行时仍会按
+  // 最新水位重算；只有边界完全一致才复用这份文本，避免选区漂移。
+  const { region } = planRegion(snapshot, {
+    afterSeq: watermarkOf(state, scope),
+    budgetTokens: config.retainTokens,
+  });
   state.pendingConsolidation = {
     scope,
     trigger: plan.trigger,
     sessionId: sessionIdOf(payload) ?? scope,
     // H1：窗口按 surface seq 算；快照在 pre-step 已刷新好，这里固定下来，
     // 避免后台任务运行时被下一轮 pre-step 的新快照覆盖。
-    snapshot: state.surfaceSnapshotByScope.get(scope) ?? state.surfaceSnapshot,
+    snapshot,
+    // N1：surface 选区文本（含 role 标注），执行时交给 consolidate。
+    regionText: region?.text ?? '',
+    regionStartSeq: region?.startSeq ?? null,
+    regionEndSeq: region?.endSeq ?? null,
+    // 后台执行时当前转录可能已经换轮，固定一份供选区缺失时兜底。
+    transcript: state.transcript.map((row) => ({ role: row.role, text: row.text })),
   };
   if (state.consolidationScheduled || state.consolidationInFlight) return;
   state.consolidationScheduled = true;
@@ -952,7 +965,9 @@ async function runConsolidationJob(state) {
 /**
  * 真正执行一次巩固：水位判断 → 模型草稿 → 单事务写库，成功才登记 pending_compact。
  * @param {object} state
- * @param {{scope:string, trigger:string, sessionId:string, snapshot:object|null}} job
+ * @param {{scope:string, trigger:string, sessionId:string, snapshot:object|null,
+ *   regionText?:string, regionStartSeq?:number|null, regionEndSeq?:number|null,
+ *   transcript?:object[]}} job
  */
 async function executeConsolidationJob(state, job) {
   const { store, platform, metrics, config } = state;
@@ -978,6 +993,13 @@ async function executeConsolidationJob(state, job) {
     });
     return;
   }
+  // N1：优先使用登记时固定的选区文本，但只有边界与本次重算完全一致时才复用；
+  // 水位/选区漂移时以当步 region.text 为准，绝不把错位文本交给模型。
+  const sameRegion = job.regionStartSeq === region.startSeq && job.regionEndSeq === region.endSeq;
+  const regionText = sameRegion && typeof job.regionText === 'string' && job.regionText !== ''
+    ? job.regionText
+    : region.text;
+  const transcript = Array.isArray(job.transcript) ? job.transcript : state.transcript;
 
   const llm = await resolveConsolidationLlm(state);
   if (typeof llm !== 'function') {
@@ -995,6 +1017,9 @@ async function executeConsolidationJob(state, job) {
       scope: job.scope,
       seqFrom: region.startSeq,
       seqTo: region.endSeq,
+      // N1：模型输入优先用 surface 选区，transcript 只在选区缺失时兜底。
+      regionText,
+      transcript,
       llm,
       now: at,
       trigger: job.trigger,
@@ -1266,11 +1291,14 @@ async function resolveConsolidationLlm(state) {
 
   const hook = state.host?.companion?.consolidationLlm;
   if (typeof hook === 'function') {
-    state.llm = async ({ scope, seqFrom, seqTo }) => hook({
+    state.llm = async ({ scope, seqFrom, seqTo, regionText, textSource, transcript }) => hook({
       scope,
       seqFrom,
       seqTo,
-      transcript: state.transcript,
+      // N1：选区文本透传给宿主注入的模型；transcript 保留为兜底。
+      regionText: regionText ?? '',
+      textSource: textSource ?? (regionText ? 'region' : 'transcript'),
+      transcript: Array.isArray(transcript) ? transcript : state.transcript,
     });
     return state.llm;
   }
@@ -1291,8 +1319,14 @@ async function resolveConsolidationLlm(state) {
     return null;
   }
 
-  state.llm = async ({ scope, seqFrom, seqTo }) => {
-    const prompt = buildConsolidationPrompt(state, { scope, seqFrom, seqTo });
+  state.llm = async ({ scope, seqFrom, seqTo, regionText, transcript }) => {
+    const prompt = buildConsolidationPrompt({
+      scope,
+      seqFrom,
+      seqTo,
+      regionText: regionText ?? '',
+      transcript: Array.isArray(transcript) ? transcript : state.transcript,
+    });
     const text = await state.platform.complete({
       provider: state.llmRoute.provider,
       model: state.llmRoute.model,
@@ -1303,26 +1337,6 @@ async function resolveConsolidationLlm(state) {
   return state.llm;
 }
 
-/**
- * 巩固提示词：把转录转成草稿 JSON。只保留文本，不含工具参数。
- * @param {object} state
- * @param {{scope: string, seqFrom: number, seqTo: number}} segment
- * @returns {string}
- */
-function buildConsolidationPrompt(state, segment) {
-  const lines = state.transcript.map((row) => `${row.role}: ${row.text}`);
-  return [
-    '你是私人管家的记忆巩固器。把下面这段对话压缩成一条情景记忆与若干长期事实。',
-    '只输出一个 JSON 对象，不要解释，不要 Markdown 代码块。格式：',
-    '{"episode":{"title":"...","summary":"..."},',
-    ' "facts":[{"kind":"identity|relation|preference|project|knowledge|other",',
-    '           "subject_text":"...","predicate":"...","object_text":"...","statement":"..."}],',
-    ' "reminders":[{"kind":"todo","title":"..."}]}',
-    `scope=${segment.scope} seq=${segment.seqFrom}-${segment.seqTo}`,
-    '对话：',
-    lines.join('\n'),
-  ].join('\n');
-}
 
 /**
  * 解析模型返回的草稿 JSON；容忍 ```json 代码块包裹。

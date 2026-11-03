@@ -231,7 +231,14 @@ test('helpers：假模型草稿合法，可被巩固链路消费且同段不重�
   assert.equal(result.skipped, false);
   assert.equal(result.upto_seq, 2);
   assert.equal(llm.calls.length, 1);
-  assert.deepEqual(llm.calls[0], { scope: 'main', seqFrom: 1, seqTo: 2 });
+  assert.deepEqual(llm.calls[0], {
+    scope: 'main',
+    seqFrom: 1,
+    seqTo: 2,
+    regionText: '',
+    textSource: 'transcript',
+    transcript: [],
+  });
   assert.ok(store.getEpisode(result.episodeId));
   assert.equal(store.listFacts({ scope: 'main' }).length, 1);
   assert.equal(store.listReminders({ scope: 'main' }).length, 1);

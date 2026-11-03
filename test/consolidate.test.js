@@ -11,9 +11,11 @@ import assert from 'node:assert/strict';
 import { Store } from '../src/memory/store.js';
 import {
   ConsolidationError,
+  buildConsolidationPrompt,
   consolidate,
   planConsolidation,
 } from '../src/memory/consolidate.js';
+import { planRegion } from '../src/session/surface.js';
 import {
   BOARD_TOKEN_LIMIT,
   PUBLISH_REASONS,
@@ -158,10 +160,130 @@ test('consolidate：seqTo ≤ watermark 时 skipped，不调模型、不写任�
     now: BASE + 60,
   });
 
-  assert.deepEqual(result, { skipped: true, upto_seq: 5 });
+  assert.deepEqual(result, { skipped: true, upto_seq: 5, textSource: 'transcript' });
   assert.equal(llm.calls.length, 0, 'skipped 不应调用模型');
   assert.deepEqual(counts(store), before, 'skipped 不应写任何行');
   assert.equal(store.getBoardState('main').staged_revision, null);
+});
+
+// ------------------------------------------------------------ N1 选区文本
+
+test('buildConsolidationPrompt：regionText 优先于 transcript，并保留 role 标注', () => {
+  const prompt = buildConsolidationPrompt({
+    scope: 'main',
+    seqFrom: 1,
+    seqTo: 9,
+    regionText: 'user: 旧事实：预算额度是 8000。\nassistant: 收到，已记住。',
+    transcript: [{ role: 'assistant', text: '最近的转录不应出现在提示词里' }],
+  });
+  assert.match(prompt, /user: 旧事实：预算额度是 8000。/u);
+  assert.match(prompt, /assistant: 收到，已记住。/u);
+  assert.match(prompt, /scope=main seq=1-9/u);
+  assert.doesNotMatch(prompt, /最近的转录不应出现在提示词里/u);
+});
+
+test('buildConsolidationPrompt：regionText 为空白时回退 transcript', () => {
+  const prompt = buildConsolidationPrompt({
+    scope: 'thread:budget',
+    seqFrom: 3,
+    seqTo: 4,
+    regionText: '   \n ',
+    transcript: [
+      { role: 'user', text: '转录里的事实' },
+      { role: 'assistant', text: '好的' },
+    ],
+  });
+  assert.match(prompt, /user: 转录里的事实/u);
+  assert.match(prompt, /assistant: 好的/u);
+  assert.match(prompt, /scope=thread:budget seq=3-4/u);
+});
+
+test('consolidate：regionText 透传模型并返回 textSource=region', async (t) => {
+  const store = openStore(t);
+  const transcript = [{ role: 'assistant', text: '转录兜底' }];
+  const llm = fakeLlm(makeDraft({ episode: { title: '预算', summary: '预算 8000' }, facts: [], reminders: [] }));
+  const result = await consolidate({
+    store,
+    scope: 'main',
+    seqFrom: 1,
+    seqTo: 4,
+    regionText: 'user: 旧事实：预算额度是 8000。',
+    transcript,
+    llm,
+    now: BASE,
+  });
+
+  assert.equal(result.textSource, 'region');
+  assert.equal(llm.calls.length, 1);
+  assert.equal(llm.calls[0].regionText, 'user: 旧事实：预算额度是 8000。');
+  assert.equal(llm.calls[0].textSource, 'region');
+  assert.deepEqual(llm.calls[0].transcript, transcript);
+  assert.equal(store.getWatermark('main'), 4);
+});
+
+test('consolidate：regionText 为空白时用 transcript 并返回 textSource=transcript', async (t) => {
+  const store = openStore(t);
+  const transcript = [{ role: 'user', text: '转录里的事实' }];
+  const llm = fakeLlm(makeDraft({ facts: [], reminders: [] }));
+  const result = await consolidate({
+    store,
+    scope: 'main',
+    seqFrom: 1,
+    seqTo: 2,
+    regionText: '  ',
+    transcript,
+    llm,
+    now: BASE,
+  });
+
+  assert.equal(result.textSource, 'transcript');
+  assert.equal(llm.calls[0].textSource, 'transcript');
+  assert.equal(llm.calls[0].regionText, '');
+  assert.deepEqual(llm.calls[0].transcript, transcript);
+});
+
+test('consolidate：regionText 非字符串立即报编程错误，不调模型不写库', async (t) => {
+  const store = openStore(t);
+  const llm = fakeLlm(makeDraft({ facts: [], reminders: [] }));
+  const before = counts(store);
+  await assert.rejects(
+    () => consolidate({
+      store,
+      scope: 'main',
+      seqFrom: 1,
+      seqTo: 2,
+      regionText: { text: 'user: 不是字符串' },
+      llm,
+      now: BASE,
+    }),
+    /regionText must be a string/u,
+  );
+  assert.equal(llm.calls.length, 0);
+  assert.deepEqual(counts(store), before);
+});
+
+test('planRegion：选区边界不包含尾部预留内容', () => {
+  const snapshot = {
+    seqs: [1, 2, 3],
+    nodes: [{ tokens: 5 }, { tokens: 5 }, { tokens: 5 }],
+    records: [
+      { role: 'user', text: '旧事实一' },
+      { role: 'user', text: '旧事实二' },
+      { role: 'assistant', text: '尾部保留内容' },
+    ],
+  };
+  const { region } = planRegion(snapshot, { afterSeq: 0, budgetTokens: 5 });
+  assert.deepEqual([region.startSeq, region.endSeq], [1, 2]);
+  assert.match(region.text, /旧事实一[\s\S]*旧事实二/u);
+  assert.doesNotMatch(region.text, /尾部保留内容/u);
+  const prompt = buildConsolidationPrompt({
+    scope: 'main',
+    seqFrom: region.startSeq,
+    seqTo: region.endSeq,
+    regionText: region.text,
+  });
+  assert.match(prompt, /旧事实一/u);
+  assert.doesNotMatch(prompt, /尾部保留内容/u);
 });
 
 // ------------------------------------------------------------ 坏草稿
@@ -284,7 +406,14 @@ test('consolidate：成功写 episode/facts/reminders/consolidation 并只 stage
     now: BASE + 300,
   });
 
-  assert.deepEqual(llm.calls, [{ scope: 'main', seqFrom: 1, seqTo: 10 }]);
+  assert.deepEqual(llm.calls, [{
+    scope: 'main',
+    seqFrom: 1,
+    seqTo: 10,
+    regionText: '',
+    textSource: 'transcript',
+    transcript: [],
+  }]);
   assert.equal(result.skipped, false);
   assert.equal(result.upto_seq, 10);
   assert.equal(result.facts, 1);
@@ -364,8 +493,8 @@ test('consolidate：水位单调推进，重复同一段不产生重复 episode'
   const repeatedOld = await consolidate({ store, scope: 'main', seqFrom: 1, seqTo: 10, llm, now: BASE + 120 });
   const repeatedCurrent = await consolidate({ store, scope: 'main', seqFrom: 11, seqTo: 20, llm, now: BASE + 120 });
 
-  assert.deepEqual(repeatedOld, { skipped: true, upto_seq: 20 });
-  assert.deepEqual(repeatedCurrent, { skipped: true, upto_seq: 20 });
+  assert.deepEqual(repeatedOld, { skipped: true, upto_seq: 20, textSource: 'transcript' });
+  assert.deepEqual(repeatedCurrent, { skipped: true, upto_seq: 20, textSource: 'transcript' });
   assert.equal(calls.length, 2, '重复段不应再次调用模型');
   assert.deepEqual(counts(store), before, '重复段不应写库');
   assert.equal(store.listEpisodes({ scope: 'main' }).length, 2);

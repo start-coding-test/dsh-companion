@@ -116,7 +116,16 @@ test('V15 正常路径：写库成功、水位推进、状态板只 staged 不�
   assert.equal(result.upto_seq, SEQ_TO);
   assert.equal(result.facts, 2);
   assert.match(result.episodeId, /^ep_/);
-  assert.deepEqual(llm.calls, [{ scope: 'main', seqFrom: SEQ_FROM, seqTo: SEQ_TO }]);
+  assert.deepEqual(llm.calls, [
+    {
+      scope: 'main',
+      seqFrom: SEQ_FROM,
+      seqTo: SEQ_TO,
+      regionText: '',
+      textSource: 'transcript',
+      transcript: [],
+    },
+  ]);
 
   // consolidations：恰好一行 written，水位推进到本次 upto_seq。
   const rows = store.db
@@ -332,7 +341,7 @@ test('V15 重试：恢复插入后成功，水位只推进到本次 upto_seq，f
     llm,
     now: BASE + 300,
   });
-  assert.deepEqual(replay, { skipped: true, upto_seq: SEQ_TO });
+  assert.deepEqual(replay, { skipped: true, upto_seq: SEQ_TO, textSource: 'transcript' });
   assert.deepEqual(counts(store), afterRetry);
   assert.equal(store.listFacts({ scope: 'main' }).length, 2);
   assert.equal(llm.calls.length, 2, '失败一次 + 重试一次，skipped 不再调模型');
