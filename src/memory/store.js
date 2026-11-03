@@ -31,6 +31,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { toBigrams, toMatchQuery } from './bigram.js';
+import { DEFAULT_ALPHA, decayOf, reinforce } from './reinforce.js';
 
 /** schema 版本（06 v3.3 §8.2 初始值）。 */
 const SCHEMA_VERSION = '3';
@@ -857,6 +858,81 @@ export class Store {
       .run(...fields.values(), id);
     this.#refreshFactsFts(id);
     return this.getFact(id);
+  }
+
+  /**
+   * 强化一条事实（H5「被用上才强化」）。
+   *
+   * 单事务内完成：校验 active 且 salience≠pinned → 按遗忘曲线算 R →
+   * UPDATE strength_days / last_reinforced_at / recall_count+1 →
+   * appendEvent({action:'REINFORCE', table_name:'facts', detail_json:{alpha, from, to}})。
+   *
+   * 能力约定：缺行 / 墓碑（deleted_at 非空）/ pinned / 非 active 一律返回
+   * {ok:false, reason}，不抛；只有参数类型错误才抛 TypeError。
+   *
+   * @param {{id: string, scope?: string, at?: number|Date, alpha?: number}} input
+   * @returns {{ok: boolean, id?: string, strengthDays?: number,
+   *            recallCount?: number, alpha?: number, reason?: string}}
+   */
+  reinforceFact({ id, scope = 'main', at, alpha = DEFAULT_ALPHA } = {}) {
+    if (typeof id !== 'string' || id === '') {
+      throw new TypeError('[store] reinforceFact requires a non-empty id');
+    }
+    let effectiveAlpha = Number(alpha);
+    if (!Number.isFinite(effectiveAlpha) || effectiveAlpha < 0) effectiveAlpha = DEFAULT_ALPHA;
+
+    const run = () => {
+      const row = this.#db
+        .prepare('SELECT * FROM facts WHERE id = ? AND scope = ?')
+        .get(id, scope);
+      if (!row) return { ok: false, reason: 'not_found' };
+      if (row.deleted_at !== null && row.deleted_at !== undefined) {
+        return { ok: false, reason: 'deleted' };
+      }
+      if (row.salience === 'pinned') return { ok: false, reason: 'pinned' };
+      if (row.status !== 'active') return { ok: false, reason: 'inactive' };
+
+      const from = Number(row.strength_days);
+      if (!Number.isFinite(from) || from < 0) {
+        return { ok: false, reason: 'invalid_strength' };
+      }
+      const atSeconds = epochOr(at, nowSeconds());
+      const R = decayOf({
+        strengthDays: from,
+        lastReinforcedAt: row.last_reinforced_at,
+        now: atSeconds,
+      });
+      const to = reinforce({ strengthDays: from, R, alpha: effectiveAlpha });
+
+      this.#db
+        .prepare(
+          `UPDATE facts
+              SET strength_days = ?, last_reinforced_at = ?,
+                  recall_count = recall_count + 1, updated_at = unixepoch()
+            WHERE id = ? AND scope = ?`,
+        )
+        .run(to, atSeconds, id, scope);
+      this.appendEvent({
+        at: atSeconds,
+        action: 'REINFORCE',
+        table_name: 'facts',
+        row_id: id,
+        actor: 'consolidator',
+        reason: 'used_in_reply',
+        detail_json: { alpha: effectiveAlpha, from, to },
+      });
+      const updated = this.getFact(id);
+      return {
+        ok: true,
+        id,
+        strengthDays: Number(updated?.strength_days ?? to),
+        recallCount: Number(updated?.recall_count ?? 0),
+        alpha: effectiveAlpha,
+      };
+    };
+
+    // 已经是事务上下文时直接复用，避免嵌套 BEGIN 报错。
+    return this.inTransaction ? run() : this.transaction(run);
   }
 
   /**

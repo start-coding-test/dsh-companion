@@ -26,6 +26,13 @@ import { normalizeConfig } from './config.js';
 import { Store } from './memory/store.js';
 import { retrieve } from './memory/retrieve.js';
 import { assemble } from './memory/assemble.js';
+import {
+  CONFIRM_ALPHA,
+  DEFAULT_ALPHA,
+  USE_OVERLAP_THRESHOLD,
+  applyReinforcement,
+  overlapRatio,
+} from './memory/reinforce.js';
 import { consolidate, planConsolidation } from './memory/consolidate.js';
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections } from './persona/sections.js';
@@ -53,6 +60,9 @@ const TRANSCRIPT_MAX_CHARS = 6000;
 
 /** 备份保留份数（t23 L2：按日期滚动）。 */
 const BACKUP_KEEP = 7;
+
+/** H5 确认词：本轮 user 文本带这些词且上一轮 assistant 复述过 fact → α=4。 */
+const CONFIRMATION_WORDS = Object.freeze(['对', '是的', '没错', '记住了', '确实', '就是']);
 
 const DAY_MS = 86_400_000;
 
@@ -202,6 +212,11 @@ function createWiringState({ host, platform, store, config, metrics }) {
     turnSeq: 0,
     /** 已注入召回的 turn 集合（同一 turn 只注入一次）。 */
     turnSeen: new Set(),
+    /** 本轮注入的 fact id（H5：下一轮判断是否被用上）。 */
+    lastRecalledIds: [],
+    /** 注入时转录里最近一条 assistant 文本 / assistant 条数，用于判断是否出现新回复。 */
+    lastRecallAssistant: '',
+    assistantCountAtRecall: 0,
     /** 最近一段转录（用于巩固模型草稿）。 */
     transcript: [],
     lastHumanAt: null,
@@ -355,6 +370,9 @@ async function runPreStep(state, payload) {
   }
 
   captureTranscript(state, messages);
+  // H5：先根据「上一轮 assistant 是否复述了上轮注入的 fact」做强化，
+  // 再处理本轮注入（注入会覆盖 lastRecalledIds）。
+  reinforceOnUse(state, messages, isNewTurn);
   const human = lastUserText(messages);
   if (human !== '') state.lastHumanAt = platform.now();
 
@@ -374,6 +392,79 @@ async function runPreStep(state, payload) {
   }
 
   return injectRecall(state, payload, messages, turnKey);
+}
+
+/**
+ * H5「被用上才强化」：检查上一轮注入的 fact 是否被最近一条 assistant 文本
+ * 复述（二元组重合 ≥0.6），是则按 α 强化并写 REINFORCE 审计。
+ *
+ * 判定细节（卡片 t3）：
+ * - 只认「注入之后出现的新 assistant」：注入时记录最近 assistant 文本/条数，
+ *   同一 turn 的后续 step 若还没有新回复，则保留 pending 到下一次 pre-step；
+ *   进入新 turn 仍无新回复（历史缺失）则放弃，避免陈旧注入误强化。
+ * - 本轮 user 文本含确认词（对/是的/没错/记住了/确实/就是）且复述成立 → α=4，
+ *   否则 α=2。
+ * - 每条 fact 每批注入只强化一次；pinned/已删/非 active 跳过；失败只 warn。
+ *
+ * @param {object} state
+ * @param {unknown[]} messages
+ * @param {boolean} isNewTurn
+ */
+function reinforceOnUse(state, messages, isNewTurn) {
+  const ids = Array.isArray(state.lastRecalledIds) ? state.lastRecalledIds : [];
+  if (ids.length === 0) return;
+
+  const assistantText = lastAssistantText(state.transcript);
+  const assistantCount = countAssistantRows(state.transcript);
+  const hasNewReply = assistantText !== ''
+    && (assistantText !== state.lastRecallAssistant
+      || assistantCount > state.assistantCountAtRecall);
+  if (!hasNewReply) {
+    if (isNewTurn) state.lastRecalledIds = [];
+    return;
+  }
+
+  state.lastRecalledIds = [];
+  const userText = lastUserText(messages);
+  const confirmed = CONFIRMATION_WORDS.some((word) => userText.includes(word));
+  const alpha = confirmed ? CONFIRM_ALPHA : DEFAULT_ALPHA;
+  const at = Math.floor(state.platform.now() / 1000);
+
+  const seen = new Set();
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    try {
+      const fact = state.store.getFact(id);
+      if (!fact) continue;
+      if (fact.deleted_at !== null && fact.deleted_at !== undefined) continue;
+      if (fact.salience === 'pinned') continue;
+      if (fact.status !== 'active') continue;
+      if (overlapRatio(fact.statement, assistantText) < USE_OVERLAP_THRESHOLD) continue;
+
+      const result = applyReinforcement(state.store, { scope: SCOPE, factId: id, at, alpha });
+      if (!result?.ok) {
+        state.platform.log('warn', '[dsh-companion] reinforcement skipped', {
+          id,
+          reason: result?.reason ?? 'unknown',
+        });
+        continue;
+      }
+      state.metrics.inc('reinforcements');
+      state.platform.log('debug', '[dsh-companion] reinforced recalled fact', {
+        id,
+        alpha,
+        strengthDays: result.strengthDays,
+        recallCount: result.recallCount,
+      });
+    } catch (error) {
+      // 强化失败不阻断本轮 turn。
+      state.platform.log('warn', '[dsh-companion] reinforcement failed', {
+        id,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
 }
 
 /** @param {object} state @param {object} payload @returns {number|null} */
@@ -599,7 +690,35 @@ async function injectRecall(state, payload, messages, turnKey) {
   state.turnSeen.add(key);
 
   const injection = extractRecallBlock(assembled?.messages);
-  return injection === '' ? null : { inject: [{ type: 'text', text: injection }] };
+  if (injection === '') return null;
+  recordRecalledFacts(state, recalled, assembled);
+  return { inject: [{ type: 'text', text: injection }] };
+}
+
+/**
+ * 记录本轮真正进入注入块的 fact id（预算裁切丢掉的召回不算），
+ * 以及注入时刻的 assistant 快照，供下一轮「用上」判定。
+ * @param {object} state
+ * @param {{items: object[]}} recalled
+ * @param {object} assembled
+ */
+function recordRecalledFacts(state, recalled, assembled) {
+  const dropped = Array.isArray(assembled?.dropped?.recall) ? assembled.dropped.recall : [];
+  const droppedIds = new Set(
+    dropped
+      .map((item) => (item !== null && typeof item === 'object' ? item.id : null))
+      .filter((id) => typeof id === 'string'),
+  );
+  const ids = [];
+  for (const item of recalled.items) {
+    if (item === null || typeof item !== 'object') continue;
+    if (item.kind !== 'fact' || typeof item.id !== 'string') continue;
+    if (droppedIds.has(item.id)) continue;
+    if (!ids.includes(item.id)) ids.push(item.id);
+  }
+  state.lastRecalledIds = ids;
+  state.lastRecallAssistant = lastAssistantText(state.transcript);
+  state.assistantCountAtRecall = countAssistantRows(state.transcript);
 }
 
 /**
@@ -1149,6 +1268,36 @@ function lastUserText(messages) {
     return text;
   }
   return '';
+}
+
+/**
+ * 转录里最近一条非空 assistant 文本。
+ * @param {{role: string, text: string}[]} transcript
+ * @returns {string}
+ */
+function lastAssistantText(transcript) {
+  if (!Array.isArray(transcript)) return '';
+  for (let index = transcript.length - 1; index >= 0; index -= 1) {
+    const row = transcript[index];
+    if (row?.role !== 'assistant') continue;
+    const text = typeof row.text === 'string' ? row.text.trim() : '';
+    if (text !== '') return text;
+  }
+  return '';
+}
+
+/**
+ * 转录里 assistant 消息条数（用于判断注入后是否出现了新回复）。
+ * @param {{role: string}[]} transcript
+ * @returns {number}
+ */
+function countAssistantRows(transcript) {
+  if (!Array.isArray(transcript)) return 0;
+  let count = 0;
+  for (const row of transcript) {
+    if (row?.role === 'assistant') count += 1;
+  }
+  return count;
 }
 
 /**
