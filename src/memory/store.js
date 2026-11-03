@@ -33,9 +33,14 @@ import { DatabaseSync } from 'node:sqlite';
 import { toBigrams, toMatchQuery } from './bigram.js';
 import { DEFAULT_ALPHA, decayOf, reinforce } from './reinforce.js';
 import { boardFragments, renderBoard, scrubBoardText } from './state-board.js';
+import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
 
-/** schema 版本（v4：consolidations 改 surface seq 口径，见 docs/h1-h3-probe.md）。 */
-const SCHEMA_VERSION = '4';
+/**
+ * schema 版本。
+ * v4：consolidations 改 surface seq 口径（见 docs/h1-h3-probe.md）。
+ * v5：新增 fact_vectors（P2-b 可选向量召回），只建表、不动既有数据。
+ */
+const SCHEMA_VERSION = '5';
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
 
@@ -216,6 +221,16 @@ CREATE INDEX IF NOT EXISTS ix_facts_key ON facts(subject_text, predicate, status
 CREATE INDEX IF NOT EXISTS ix_facts_scope ON facts(scope, status) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS ix_facts_decay ON facts(status, last_reinforced_at) WHERE strength_days IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_facts_purge ON facts(deleted_at) WHERE deleted_at IS NOT NULL;
+
+-- P2-b：可选向量召回。hashEmbed 的离线向量投影；只随 facts 生命周期维护，
+-- 关闭向量时表为空也不会影响检索。FK 级联保证物理删除后不留孤儿。
+CREATE TABLE IF NOT EXISTS fact_vectors (
+  fact_id    TEXT PRIMARY KEY REFERENCES facts(id) ON DELETE CASCADE,
+  dim        INTEGER NOT NULL,
+  vec        BLOB NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_fact_vectors_dim ON fact_vectors(dim);
 
 CREATE TABLE IF NOT EXISTS reminders (
   id                TEXT PRIMARY KEY,
@@ -468,6 +483,8 @@ export class Store {
   /** @type {string} */
   #dbPath;
   #inTransaction = false;
+  /** P2-b：向量投影维度；关闭向量时不会写入 fact_vectors。 */
+  #vectorDim = DEFAULT_VECTOR_DIM;
 
   /**
    * 请用 Store.open(path) 创建实例。
@@ -501,6 +518,28 @@ export class Store {
   /** 底层连接（仅供诊断/测试/迁移；业务读写请走本类方法）。 */
   get db() {
     return this.#db;
+  }
+
+  /** 当前向量投影维度。 @returns {number} */
+  get vectorDim() {
+    return this.#vectorDim;
+  }
+
+  /**
+   * 设置向量投影维度。维度变化时清掉旧维度投影（下次写入会按新维度重建），
+   * 避免 searchVector 按 dim 过滤后静默丢召回。
+   * @param {number} dim
+   * @returns {number}
+   */
+  setVectorDim(dim) {
+    if (!Number.isInteger(dim) || dim < 8 || dim > 4096) {
+      throw new TypeError(`[store] invalid vector dim: ${String(dim)}`);
+    }
+    if (dim !== this.#vectorDim) {
+      this.#db.prepare('DELETE FROM fact_vectors WHERE dim <> ?').run(dim);
+      this.#vectorDim = dim;
+    }
+    return this.#vectorDim;
   }
 
   /** 数据库文件路径。 */
@@ -565,14 +604,23 @@ export class Store {
   }
 
   /**
-   * 升级旧库；只支持 v3 → v4。
+   * 升级旧库；支持 v3 → v4 → v5。
    *
    * v3 的 `consolidations.upto_seq` 是插件自增 turn 计数，与平台 surface seq
    * 不可比（H1）。开发期尚无用户数据，直接清空巩固行（facts/episodes 保留），
    * 并把 episodes.consolidation_id 置空以免外键阻断删除。
+   *
+   * v4 → v5 只新增 fact_vectors，DDL 已由 migrate() 的 SCHEMA_SQL 幂等建好；
+   * 这里只推进版本号，不改任何既有数据。旧事实的向量由后续写入/编辑补齐。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
+    if (from === '4') {
+      this.#db
+        .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
+        .run(SCHEMA_VERSION);
+      return;
+    }
     if (from !== '3') {
       throw new StoreError(
         `[store] unsupported schema_version: ${from} (expected ${SCHEMA_VERSION})`,
@@ -692,6 +740,53 @@ export class Store {
     const parts = [row.statement, row.subject_text, row.predicate];
     if (row.fidelity === 'full') parts.push(row.object_text);
     this.#replaceFts('fts_facts', row.rid, parts.filter(Boolean).join('\n'));
+  }
+
+  /**
+   * P2-b：维护 fact_vectors 投影。
+   *
+   * 只有 active + normal + 未删除的事实保留向量；tombstone/superseded/
+   * sensitive/secret/物理删除都会清掉。这里用 hashEmbed 的离线向量，
+   * 真实 embedding 接入时应替换本方法的 embed 来源。
+   * @param {string} id
+   */
+  #syncFactVector(id) {
+    // P1-a 的治理会在命中敏感文本时按需 ALTER TABLE 加 sensitive 列；
+    // 该列不在基础 schema 里，存在时必须一并排除，避免治理后仍从向量通道召回。
+    const hasSensitive = this.#db
+      .prepare("SELECT 1 AS present FROM pragma_table_info('facts') WHERE name = 'sensitive'")
+      .get() !== undefined;
+    const row = this.#db
+      .prepare(
+        `SELECT id, statement, subject_text, predicate, object_text,
+                privacy, status, deleted_at${hasSensitive ? ', sensitive' : ''}
+           FROM facts WHERE id = ?`,
+      )
+      .get(id);
+    const keep = row !== undefined
+      && row.deleted_at === null
+      && row.status === 'active'
+      && row.privacy === 'normal'
+      && (!hasSensitive || Number(row.sensitive) === 0);
+    if (!keep) {
+      this.#db.prepare('DELETE FROM fact_vectors WHERE fact_id = ?').run(id);
+      return;
+    }
+    const text = [row.statement, row.subject_text, row.predicate, row.object_text]
+      .filter((part) => typeof part === 'string' && part !== '')
+      .join(' ');
+    const vec = hashEmbed(text, this.#vectorDim);
+    const bytes = new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength);
+    this.#db
+      .prepare(
+        `INSERT INTO fact_vectors (fact_id, dim, vec, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(fact_id) DO UPDATE SET
+           dim = excluded.dim,
+           vec = excluded.vec,
+           updated_at = excluded.updated_at`,
+      )
+      .run(id, this.#vectorDim, bytes, nowSeconds());
   }
 
   /** @param {string} id */
@@ -942,6 +1037,7 @@ export class Store {
         input.purge_payload ?? null,
       );
     this.#refreshFactsFts(id);
+    this.#syncFactVector(id);
     return this.getFact(id);
   }
 
@@ -1003,6 +1099,7 @@ export class Store {
       .prepare(`UPDATE facts SET ${assignments.join(', ')} WHERE id = ?`)
       .run(...fields.values(), id);
     this.#refreshFactsFts(id);
+    this.#syncFactVector(id);
     return this.getFact(id);
   }
 
@@ -1092,7 +1189,11 @@ export class Store {
     const info = this.#db
       .prepare('UPDATE facts SET deleted_at = ?, updated_at = unixepoch() WHERE id = ? AND deleted_at IS NULL')
       .run(at, id);
-    return info.changes > 0 ? this.getFact(id) : null;
+    if (Number(info.changes) > 0) {
+      this.#syncFactVector(id);
+      return this.getFact(id);
+    }
+    return null;
   }
 
   /**
@@ -1114,6 +1215,7 @@ export class Store {
           WHERE id = ? AND status = 'active'`,
       )
       .run(at, payload, id);
+    if (Number(info.changes) > 0) this.#syncFactVector(id);
     return Number(info.changes) > 0;
   }
 
@@ -1993,6 +2095,7 @@ export class Store {
 
     for (const row of facts) {
       this.#db.prepare('DELETE FROM fts_facts WHERE rowid = ?').run(row.rid);
+      this.#db.prepare('DELETE FROM fact_vectors WHERE fact_id = ?').run(row.id);
       this.#db.prepare('DELETE FROM facts WHERE rowid = ?').run(row.rid);
       this.appendEvent({
         at,

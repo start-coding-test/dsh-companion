@@ -503,7 +503,8 @@ function truncateText(value, max) {
  * @returns {string}
  */
 function formatTokenSnapshot(metrics, budget) {
-  if (!metrics || typeof metrics.snapshot !== 'function') return ' / tokens 本轮 0';
+  const vectorText = formatVectorText(budget);
+  if (!metrics || typeof metrics.snapshot !== 'function') return ` / tokens 本轮 0${vectorText}`;
   try {
     const snapshot = metrics.snapshot();
     const tokensIn = Number(snapshot.tokensIn) || 0;
@@ -516,10 +517,22 @@ function formatTokenSnapshot(metrics, budget) {
     const rssMB = Number(budget?.rssMB ?? snapshot.rssMB) || 0;
     return ` / tokens 本轮 入 ${tokensIn} 出 ${tokensOut}（超预算 ${overBudget} 次）`
       + `｜今日 ${daily}/${DAILY_TOKEN_LIMIT}${tripped ? '（已熔断）' : ''}`
-      + `｜RSS ${rssName} ${rssMB}MB`;
+      + `｜RSS ${rssName} ${rssMB}MB`
+      + vectorText;
   } catch {
-    return ' / tokens 本轮 0';
+    return ` / tokens 本轮 0${vectorText}`;
   }
+}
+
+/**
+ * 向量召回状态片段（P2-b）：关闭时只显示「关」，开启时显示维度与最近命中。
+ * @param {object} [budget]
+ * @returns {string}
+ */
+function formatVectorText(budget) {
+  const vector = budget?.vector;
+  if (vector === undefined || vector === null || vector.enabled !== true) return '｜向量：关';
+  return `｜向量：开·dim ${Number(vector.dim) || 0}·最近命中 ${Number(vector.lastHits) || 0}`;
 }
 
 /** @param {object} store @param {string} scope */

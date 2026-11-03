@@ -22,6 +22,7 @@
  */
 
 import { toBigrams } from './bigram.js';
+import { DEFAULT_VECTOR_DIM, hashEmbed, hybridSearch, searchVector } from './vector.js';
 
 const DAY_MS = 86_400_000;
 const RECENT_WINDOW_MS = 7 * DAY_MS;
@@ -236,6 +237,7 @@ export async function retrieve({
   now = Date.now(),
   budgetTokens = DEFAULT_BUDGET_TOKENS,
   limit = DEFAULT_LIMIT,
+  vector = null,
 } = {}) {
   if (!store || typeof store.searchBigram !== 'function'
     || typeof store.getFact !== 'function' || typeof store.getEpisode !== 'function') {
@@ -252,13 +254,52 @@ export async function retrieve({
     : DEFAULT_LIMIT;
   const textQuery = typeof query === 'string' ? query : String(query ?? '');
   const queryTokens = [...new Set(splitTokens(toBigrams(textQuery)))];
+  // P2-b：只有显式开启且嵌入器可用时才走向量；关闭时以下路径与 v0.2.0 一致。
+  const vectorEnabled = vector !== null
+    && typeof vector === 'object'
+    && vector.enabled === true
+    && vector.embedder !== 'none';
+  const vectorDim = Number.isInteger(vector?.dim) && vector.dim > 0
+    ? vector.dim
+    : DEFAULT_VECTOR_DIM;
 
   /** @type {Map<string, {type:'fact'|'episode', id:string}>} */
   const candidates = new Map();
   const searchLimit = Math.max(1, maxItems * 2);
-  for (const hit of store.searchBigram(textQuery, { scope, limit: searchLimit }) ?? []) {
-    if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
-    candidates.set(`${hit.type}:${hit.id}`, { type: hit.type, id: hit.id });
+  let vectorScores = new Map();
+  if (vectorEnabled) {
+    // 单独取一次向量命中，用于 /状态 的「最近命中」统计；融合本身走 hybridSearch。
+    vectorScores = new Map(
+      searchVector({
+        store,
+        scope,
+        query: textQuery,
+        embed: (text) => hashEmbed(text, vectorDim),
+        limit: searchLimit,
+        now: nowMs,
+      }).map((hit) => [hit.factId, hit.score]),
+    );
+    for (const hit of hybridSearch({
+      store,
+      scope,
+      query: textQuery,
+      embed: (text) => hashEmbed(text, vectorDim),
+      limit: searchLimit,
+      now: nowMs,
+    })) {
+      if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
+      candidates.set(`${hit.type}:${hit.id}`, {
+        type: hit.type,
+        id: hit.id,
+        rrf: hit.score,
+        vector: hit.type === 'fact' && vectorScores.has(hit.id),
+      });
+    }
+  } else {
+    for (const hit of store.searchBigram(textQuery, { scope, limit: searchLimit }) ?? []) {
+      if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
+      candidates.set(`${hit.type}:${hit.id}`, { type: hit.type, id: hit.id });
+    }
   }
 
   // recency 补位：最近 7 天（按发生时间）未命中的 top3。
@@ -288,6 +329,9 @@ export async function retrieve({
 
   /** @type {Array<{kind:'fact'|'episode', id:string, text:string,
    *   fidelity:'full'|'gist'|'index', score:number, R:number}>} */
+  const maxRrf = vectorEnabled
+    ? Math.max(0, ...[...candidates.values()].map((candidate) => Number(candidate.rrf) || 0))
+    : 0;
   const scored = [];
   for (const candidate of candidates.values()) {
     const row = candidate.type === 'fact'
@@ -318,12 +362,16 @@ export async function retrieve({
       id: row.id,
       text,
       fidelity,
-      score: 0.6 * rel + 0.4 * R,
+      score: 0.6 * rel + 0.4 * R
+        + (candidate.vector === true && maxRrf > 0 ? 0.1 * (Number(candidate.rrf) / maxRrf) : 0),
       R,
     });
   }
 
-  scored.sort((a, b) => b.score - a.score || b.R - a.R || a.id.localeCompare(b.id));
+  scored.sort((a, b) => b.score - a.score
+    || b.R - a.R
+    || Number(b.vector) - Number(a.vector)
+    || a.id.localeCompare(b.id));
 
   const items = [];
   const usedIds = [];
@@ -347,5 +395,9 @@ export async function retrieve({
     tokens += cost;
   }
 
-  return { items, tokens, usedIds, truncated };
+  const result = { items, tokens, usedIds, truncated };
+  if (vectorEnabled) {
+    result.vectorHits = usedIds.filter((id) => vectorScores.has(id)).length;
+  }
+  return result;
 }

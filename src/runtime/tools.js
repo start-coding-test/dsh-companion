@@ -55,6 +55,7 @@ export function createTools({
   timeZone = DEFAULT_TIMEZONE,
   currentScope,
   budgetGate,
+  vector,
 } = {}) {
   if (store === null || store === undefined) {
     throw new TypeError('createTools: store is required');
@@ -131,7 +132,7 @@ export function createTools({
         const resolved = resolveScope(requested);
         if (!resolved.ok) return resolved;
         const limit = optionalInt(args.limit, 'memory_search', 'limit', 1, 50) ?? 20;
-        return retrieve({ store, query, scope: resolved.scope, limit });
+        return retrieve({ store, query, scope: resolved.scope, limit, vector });
       },
     },
 

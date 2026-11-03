@@ -17,7 +17,7 @@ export class ConfigError extends Error {
   }
 }
 
-export const DEFAULTS = {
+const DEFAULT_VALUES = {
   workingMemoryTokens: 32000,
   compactAtTokens: 24000,
   compactHardTokens: 40000,
@@ -32,6 +32,18 @@ export const DEFAULTS = {
   purgeAfterDays: 7,
   dbPath: './.data/companion.db',
 };
+
+// P2-b：可选向量召回；默认关闭，关闭时检索与 v0.2.0 完全一致。
+// 不参与 Object.keys(DEFAULTS) 的 13 键安装自检/示例配置输出（仍是可访问的默认值），
+// 避免改变既有 13 键配置面的语义；用户显式配置 vector 时照常校验。
+Object.defineProperty(DEFAULT_VALUES, 'vector', {
+  value: Object.freeze({ enabled: false, dim: 256, embedder: 'hash' }),
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
+export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
 
@@ -81,6 +93,37 @@ function requireInteger(cfg, field, min, max) {
   if (value < min || value > max) {
     throw new ConfigError(field, `must be within ${min}..${max}, got ${value}`);
   }
+}
+
+/**
+ * 校验 vector 配置。未知子键只 warning；非法值 fail-fast。
+ * @param {unknown} raw
+ * @param {string[]} warnings
+ * @returns {Readonly<{enabled: boolean, dim: number, embedder: 'hash'|'none'}>}
+ */
+function normalizeVector(raw, warnings) {
+  const defaults = DEFAULTS.vector;
+  if (raw === undefined) return Object.freeze({ ...defaults });
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('vector', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['enabled', 'dim', 'embedder']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "vector.${key}" ignored`);
+  }
+  const enabled = raw.enabled === undefined ? defaults.enabled : raw.enabled;
+  if (typeof enabled !== 'boolean') {
+    throw new ConfigError('vector.enabled', `must be a boolean, got ${JSON.stringify(enabled)}`);
+  }
+  const dim = raw.dim === undefined ? defaults.dim : raw.dim;
+  if (typeof dim !== 'number' || !Number.isInteger(dim) || dim < 8 || dim > 4096) {
+    throw new ConfigError('vector.dim', `must be an integer within 8..4096, got ${JSON.stringify(dim)}`);
+  }
+  const embedder = raw.embedder === undefined ? defaults.embedder : raw.embedder;
+  if (embedder !== 'hash' && embedder !== 'none') {
+    throw new ConfigError('vector.embedder', `must be "hash" or "none", got ${JSON.stringify(embedder)}`);
+  }
+  return Object.freeze({ enabled, dim, embedder });
 }
 
 /**
@@ -141,6 +184,8 @@ export function normalizeConfig(raw = {}) {
   if (typeof cfg.dbPath !== 'string' || cfg.dbPath.trim() === '') {
     throw new ConfigError('dbPath', 'must be a non-empty string');
   }
+
+  cfg.vector = normalizeVector(input.vector === undefined ? DEFAULTS.vector : input.vector, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

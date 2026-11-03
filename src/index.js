@@ -189,6 +189,8 @@ export function apply(ctx, rawConfig) {
 
   const platform = createAdapter(host, { now: () => host.now?.() ?? Date.now() });
   const store = Store.open(config.dbPath);
+  // P2-b：向量维度在校验后固定；关闭向量时只是不写投影，不改变检索路径。
+  store.setVectorDim(config.vector.dim);
   const metrics = createMetrics({ clock: platform.now });
   const state = createWiringState({ host, platform, store, config, metrics });
 
@@ -349,6 +351,8 @@ function createWiringState({ host, platform, store, config, metrics }) {
     lastConsolidationResult: null,
     /** t17：失败巩固的重试登记（job + attempts + nextAt）。 */
     consolidationRetry: null,
+    /** P2-b：最近一次召回注入里由向量路命中并实际注入的条数。 */
+    lastVectorHits: 0,
     /** dispose 后后台任务不再碰已关闭的 Store。 */
     disposed: false,
     llmResolved: false,
@@ -504,6 +508,7 @@ function registerTools(platform, store, config, track, currentScope, budgetGate)
     timeZone: config.timezone,
     currentScope,
     budgetGate,
+    vector: config.vector,
   });
   for (const tool of tools) {
     track(platform.registerTool({
@@ -918,6 +923,11 @@ function budgetInfo(state) {
     rssLevel: state.rss.level,
     rssLevelCode: state.rss.code,
     rssMB: state.rss.rssMB,
+    vector: {
+      enabled: state.config.vector.enabled && state.config.vector.embedder !== 'none',
+      dim: state.config.vector.dim,
+      lastHits: state.lastVectorHits,
+    },
   };
 }
 
@@ -1489,6 +1499,7 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
       scope,
       now: platform.now(),
       budgetTokens: RECALL_BUDGET_TOKENS,
+      vector: config.vector,
     });
   } catch (error) {
     platform.log('warn', '[dsh-companion] recall injection failed', {
@@ -1501,6 +1512,7 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
     state.turnSeen.add(key);
     return null;
   }
+  if (Number.isInteger(recalled.vectorHits)) state.lastVectorHits = recalled.vectorHits;
 
   const assembled = assemble({
     sections: [],
@@ -2183,6 +2195,7 @@ async function runLightChat(state) {
         now,
         budgetTokens: 600,
         limit: 3,
+        vector: config.vector,
       });
       recallSummary = recalled.items
         .map((item) => item.text)
