@@ -1,11 +1,12 @@
 /**
  * 用户命令测试（t11）：/记忆、/记忆 忘掉、/记忆 置顶、/成本、/线程、/状态。
- * 使用真实 Store（内存库）验证 SQL 聚合、S1 标记删除与置顶联动。
+ * 使用真实 Store（内存库）验证 SQL 聚合、S1 tombstone 与置顶联动。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { Store } from '../src/memory/store.js';
+import { retrieve } from '../src/memory/retrieve.js';
 import { handleCommand } from '../src/runtime/commands.js';
 
 const NOW_MS = Date.UTC(2026, 10, 3, 12, 0, 0); // 2026-11-03 12:00 UTC
@@ -65,21 +66,50 @@ test('/记忆：按 kind 计数并给出置顶数', () => {
   }
 });
 
-test('/记忆 忘掉 <id>：调用 deleteFact 标记删除并提示 7 天', () => {
+test('/记忆 忘掉 <id>：S1 tombstone（status/purge_payload）且 7 天后 purge', async () => {
   const store = makeStore();
   try {
     const fact = addFact(store);
+    const atSec = Math.floor(NOW_MS / 1000);
+    const rowid = store.db.prepare('SELECT rowid AS r FROM facts WHERE id = ?').get(fact.id).r;
     const { handled, reply } = run(store, `/记忆 忘掉 ${fact.id}`);
     assert.equal(handled, true);
     assert.match(reply, /标记为遗忘/);
     assert.match(reply, /7 天后物理删除/);
-    assert.ok(store.getFact(fact.id).deleted_at);
+
+    const tomb = store.getFact(fact.id);
+    assert.equal(tomb.status, 'tombstoned');
+    assert.equal(tomb.deleted_at, atSec);
+    const payload = JSON.parse(tomb.purge_payload);
+    assert.equal(payload.statement, '我妈生日是五月');
+    assert.equal(payload.kind, 'preference');
+    assert.equal(payload.scope, 'main');
+
+    // 检索/注入入口都不应再返回已 tombstoned 的事实
+    assert.equal(store.searchBigram('生日').length, 0);
+    assert.equal(store.listFacts({ scope: 'main' }).length, 0);
+    const recalled = await retrieve({ store, query: '生日', now: NOW_MS });
+    assert.equal(recalled.items.length, 0);
+
+    // 重复忘掉：已 tombstoned 时幂等，不重置 deleted_at / purge_payload
+    const second = run(store, `/记忆 忘掉 ${fact.id}`);
+    assert.equal(second.handled, true);
+    assert.match(second.reply, /标记为遗忘/);
+    assert.equal(store.getFact(fact.id).status, 'tombstoned');
+    assert.equal(store.getFact(fact.id).deleted_at, atSec);
+    assert.equal(store.getFact(fact.id).purge_payload, tomb.purge_payload);
+
+    // 满 7 天后 S2 purge：主表与 FTS 都没有残留
+    const result = store.purge({ now: atSec + 8 * 86_400, cutoffDays: 7 });
+    assert.equal(result.facts, 1);
+    assert.equal(store.getFact(fact.id), null);
+    assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM fts_facts WHERE rowid = ?').get(rowid).n, 0);
   } finally {
     store.close();
   }
 });
 
-test('/记忆 忘掉 <关键词>：只删除命中的事实', () => {
+test('/记忆 忘掉 <关键词>：只 tombstone 命中的事实', () => {
   const store = makeStore();
   try {
     const may = addFact(store, { statement: '我妈生日是五月', object_text: '五月' });
@@ -95,8 +125,14 @@ test('/记忆 忘掉 <关键词>：只删除命中的事实', () => {
     const { handled, reply } = run(store, '/记忆 忘掉 生日');
     assert.equal(handled, true);
     assert.match(reply, /已标记为遗忘/);
-    assert.ok(store.getFact(may.id).deleted_at);
-    assert.ok(store.getFact(june.id).deleted_at);
+
+    for (const id of [may.id, june.id]) {
+      const row = store.getFact(id);
+      assert.equal(row.status, 'tombstoned');
+      assert.equal(row.deleted_at, Math.floor(NOW_MS / 1000));
+      assert.equal(JSON.parse(row.purge_payload).statement, row.statement);
+    }
+    assert.equal(store.getFact(other.id).status, 'active');
     assert.equal(store.getFact(other.id).deleted_at, null);
     assert.equal(store.searchBigram('生日').length, 0);
   } finally {

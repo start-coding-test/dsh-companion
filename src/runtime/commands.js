@@ -4,7 +4,7 @@
  * 设计约束：
  * - 只读写注入的 Store，不直接持有全局单例，便于测试与后续多会话接线；
  * - 所有 SQL 都走 store.db 的参数绑定（store.js 未提供按 kind 计数等聚合方法，
- *   本卡不允许改 store.js，因此这里只做只读聚合与 S1 标记删除）；
+ *   本卡不允许改 store.js，因此这里只做只读聚合与 S1 tombstone）；
  * - 未知命令返回 { handled: false }，由调用方决定是否交给模型；
  * - 命令回复是给人看的短文本，不塞 JSON。
  */
@@ -173,20 +173,29 @@ function factCounts(store, scope) {
 }
 
 /**
- * S1 显式遗忘：id 直接标记；否则按关键词找事实，最多标记 MAX_FORGET 条。
+ * S1 显式遗忘：id 直接转 tombstoned；否则按关键词找 active 事实，
+ * 最多标记 MAX_FORGET 条。行与 FTS 保留到满 7 天后的 S2 purge。
  * @param {object} store
  * @param {string} target
  * @param {{now:number|Date, scope:string}} ctx
  * @returns {string}
  */
 function forgetMemory(store, target, ctx) {
+  // Store 的时间参数按 Unix 秒处理；命令层允许 Date/毫秒，这里统一换算。
+  const at = Math.floor(toMillis(ctx.now) / 1000);
   const exact = typeof store.getFact === 'function' ? store.getFact(target) : null;
   if (exact) {
-    if (exact.deleted_at) {
+    if (exact.status === 'tombstoned' || exact.deleted_at) {
       return `已标记为遗忘：${exact.id}（7 天后物理删除）`;
     }
-    store.deleteFact(exact.id, { now: ctx.now });
-    return `已标记为遗忘：${exact.id}（7 天后物理删除）`;
+    const forgotten = store.forgetFact(exact.id, {
+      at,
+      payload: { statement: exact.statement, kind: exact.kind, scope: exact.scope },
+    });
+    if (forgotten || store.getFact(exact.id)?.status === 'tombstoned') {
+      return `已标记为遗忘：${exact.id}（7 天后物理删除）`;
+    }
+    return `未找到事实：${target}`;
   }
 
   const hits = store.searchBigram(target, { scope: ctx.scope, limit: 10 });
@@ -194,7 +203,13 @@ function forgetMemory(store, target, ctx) {
   for (const hit of hits) {
     if (hit.type !== 'fact') continue;
     if (ids.length >= MAX_FORGET) break;
-    if (store.deleteFact(hit.id, { now: ctx.now })) ids.push(hit.id);
+    const row = store.getFact(hit.id);
+    if (!row || row.status === 'tombstoned' || row.deleted_at) continue;
+    const forgotten = store.forgetFact(row.id, {
+      at,
+      payload: { statement: row.statement, kind: row.kind, scope: row.scope },
+    });
+    if (forgotten) ids.push(row.id);
   }
   if (ids.length === 0) return `没有找到可遗忘的事实：${target}`;
   return `已标记为遗忘：${ids.join('、')}（7 天后物理删除）`;
