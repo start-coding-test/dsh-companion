@@ -12,7 +12,7 @@ import assert from 'node:assert/strict';
 import { FakeCtx } from '../fakes/ctx.js';
 import { apply, name as pluginName } from '../../src/index.js';
 
-const EXPECTED_COMMANDS = ['cost', 'memory', 'status', 'threads'];
+const EXPECTED_COMMANDS = ['chat-off', 'chat-on', 'cost', 'memory', 'status', 'threads'];
 const EXPECTED_TOOLS = [
   'cost_report',
   'memory_forget',

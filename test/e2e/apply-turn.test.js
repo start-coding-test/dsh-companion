@@ -210,7 +210,7 @@ test('同一 ctx 二次 apply 幂等，dispose 关闭 Store 并清掉 interval',
   const second = apply(ctx, { dbPath: ':memory:' });
 
   assert.equal(first, second, '二次 apply 应返回同一个句柄');
-  assert.equal(ctx.commands.registrations.length, 4);
+  assert.equal(ctx.commands.registrations.length, 6);
   assert.equal(ctx.tools.registrations.length, 10);
   assert.equal((ctx.listeners.get('agent/pre-step') ?? []).length, 1);
   assert.equal(ctx.callsOf('interval').length, 1);

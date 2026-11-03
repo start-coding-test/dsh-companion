@@ -22,7 +22,7 @@
 import { copyFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
-import { normalizeConfig } from './config.js';
+import { isQuietAt, normalizeConfig } from './config.js';
 import { Store } from './memory/store.js';
 import { retrieve } from './memory/retrieve.js';
 import { assemble } from './memory/assemble.js';
@@ -44,6 +44,18 @@ import {
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections } from './persona/sections.js';
 import { DEFAULT_CARD } from './persona/card.js';
+import {
+  buildChatPrompt,
+  chatEligibility,
+  normalizeChatText,
+} from './persona/chat.js';
+import {
+  COMMITMENT_FOLLOWUP_REASON,
+  commitmentAuditDetail,
+  commitmentOverdueDays,
+  followUpText,
+  scanCommitmentFollowups,
+} from './scheduler/commitments.js';
 import { createAdapter } from './platform/adapter.js';
 import { MAIN_SCOPE, classifySession, threadScope } from './session/identity.js';
 import {
@@ -67,7 +79,7 @@ import {
   watermarkAfterCompact,
 } from './session/surface.js';
 import * as threadRegistry from './thread/registry.js';
-import { zonedDayKey } from './time.js';
+import { zonedDayKey, zonedParts } from './time.js';
 
 export const name = 'dsh-companion';
 
@@ -88,6 +100,21 @@ const BACKUP_KEEP = 7;
 const CONFIRMATION_WORDS = Object.freeze(['对', '是的', '没错', '记住了', '确实', '就是']);
 
 const DAY_MS = 86_400_000;
+
+/** P1-b：闲聊状态持久化键（schema_meta，JSON/字符串都能存活重启）。 */
+const CHAT_META = Object.freeze({
+  enabled: 'p1b.chat.enabled',
+  lastAt: 'p1b.chat.last_at',
+  sent: 'p1b.chat.sent',
+  lastTryDay: 'p1b.chat.last_try_day',
+  interactionDay: 'p1b.interaction.day',
+});
+
+/** P1-b：单次提醒 job 最多跟进多少条承诺，避免一次刷屏。 */
+const COMMITMENT_MAX_FOLLOWUPS = 20;
+
+/** P1-b：闲聊历史保留 7 天（与每周上限同窗口）。 */
+const CHAT_HISTORY_SECONDS = 7 * 86_400;
 
 /**
  * 平台命令名必须是小写 ASCII（`/^[a-z][a-z0-9_-]*$/`），
@@ -117,6 +144,18 @@ const COMMAND_ALIASES = Object.freeze([
     definitionId: 'dsh-companion/command-status',
     description: '查看记忆库与调度状态（对应 /状态）',
     prefix: '/状态',
+  }),
+  Object.freeze({
+    name: 'chat-off',
+    definitionId: 'dsh-companion/command-chat-off',
+    description: '关闭主动闲聊（对应 /别闲聊）',
+    prefix: '/别闲聊',
+  }),
+  Object.freeze({
+    name: 'chat-on',
+    definitionId: 'dsh-companion/command-chat-on',
+    description: '恢复主动闲聊（对应 /恢复闲聊）',
+    prefix: '/恢复闲聊',
   }),
 ]);
 
@@ -183,7 +222,7 @@ export function apply(ctx, rawConfig) {
         if (usage !== null) recordUsage(state, usage, sessionIdOf(payload));
       }));
     }
-    registerCommands(platform, store, config, metrics, track, () => state.currentScope, () => budgetInfo(state));
+    registerCommands(platform, store, config, metrics, track, () => state.currentScope, () => budgetInfo(state), state);
     registerTools(platform, store, config, track, () => state.currentScope, () => toolBudgetGate(state));
     track(startScheduler(state));
   } catch (error) {
@@ -307,6 +346,11 @@ function createWiringState({ host, platform, store, config, metrics }) {
     llm: null,
     llmRoute: null,
     warnedNoLlm: false,
+    /** P1-b：闲聊模型单独解析/缓存，不复用巩固模型（提示词与输出都不同）。 */
+    chatLlmResolved: false,
+    chatLlm: null,
+    chatLlmRoute: null,
+    warnedNoChatLlm: false,
   };
 }
 
@@ -358,7 +402,7 @@ function publishOnThreadUnarchive(platform, store) {
 }
 
 /**
- * 注册 4 个 ASCII 命令；handler 统一转给 handleCommand。
+ * 注册 6 个 ASCII 命令；handler 统一转给 handleCommand 或 P1-b 闲聊开关。
  * @param {object} platform
  * @param {Store} store
  * @param {Readonly<Record<string, unknown>>} config
@@ -366,8 +410,9 @@ function publishOnThreadUnarchive(platform, store) {
  * @param {(disposer: Function) => void} track
  * @param {() => (string|null)} [currentScope]
  * @param {() => object|undefined} [budgetInfo] 命令展示用的预算/RSS 快照
+ * @param {object} [state] 闲聊开关/最近一次需要读写 state.store 的 schema_meta
  */
-function registerCommands(platform, store, config, metrics, track, currentScope, budgetInfo) {
+function registerCommands(platform, store, config, metrics, track, currentScope, budgetInfo, state) {
   if (!platform.capabilities.commands) return;
   for (const alias of COMMAND_ALIASES) {
     track(platform.registerCommand({
@@ -390,6 +435,16 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             });
             if (custom !== null) return { kind: 'success', text: custom };
           }
+          if (alias.name === 'chat-off' || alias.name === 'chat-on') {
+            return {
+              kind: 'success',
+              text: handleChatCommand({
+                state,
+                mode: alias.name === 'chat-on' ? 'on' : 'off',
+                now: platform.now(),
+              }),
+            };
+          }
           result = handleCommand({
             text: `${alias.prefix}${rawInput}`,
             store,
@@ -408,7 +463,10 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
         if (!result.handled) {
           return { kind: 'error', text: `未识别的命令参数；用法：${alias.prefix} [参数]` };
         }
-        return { kind: 'success', text: result.reply };
+        const text = alias.name === 'status'
+          ? `${result.reply}\n${formatChatStatus(state, platform.now())}`
+          : result.reply;
+        return { kind: 'success', text };
       },
     }));
   }
@@ -577,7 +635,12 @@ async function runPreStep(state, payload) {
   // 再处理本轮注入（注入会覆盖 lastRecalledIds）。
   reinforceOnUse(state, messages, isNewTurn, scope);
   const human = lastUserText(messages);
-  if (human !== '') state.lastHumanAt = platform.now();
+  if (human !== '') {
+    state.lastHumanAt = platform.now();
+    recordInteractionDay(state, platform.now());
+    // R-PRO-08：用户一句「今天不想聊」也算明确叫停，不必等命令。
+    if (human.includes('今天不想聊')) setChatEnabled(state, false);
+  }
 
   const usage = measureTokens(state, payload);
   if (usage !== null) {
@@ -1606,13 +1669,18 @@ function startScheduler(state) {
       // M4：每 60s 读一次 RSS；warn 只记 metric，stop_dispatch/main_only 降级。
       runRssCheck(state);
       if (proactiveBlocked(state)) return;
-      await proactive.flush();
+      await runLightChat(state);
+      const report = await proactive.flush();
+      recordChatDelivery(state, report);
     },
     reminders: async () => {
       // 降级/熔断期间不把提醒标记 fired，恢复后仍可补投。
       if (proactiveBlocked(state)) return;
+      // P1-b：承诺跟进先入队，逾期久的排前面；通用提醒不重复播报 commitment。
+      runCommitmentFollowups(state);
       fireDueReminders(state);
-      await proactive.flush();
+      const report = await proactive.flush();
+      recordChatDelivery(state, report);
     },
     'deep-sleep': async () => {
       await runDeepSleep(state);
@@ -1662,6 +1730,8 @@ function fireDueReminders(state) {
       WHERE id = ? AND status IN ('pending', 'snoozed')`,
   );
   for (const row of due) {
+    // 承诺由 runCommitmentFollowups 单独处理（每日最多一次、文案不同）。
+    if (row.kind === 'commitment') continue;
     mark.run(String(seconds), row.id);
     proactive?.enqueue({
       kind: 'reminder',
@@ -1671,6 +1741,387 @@ function fireDueReminders(state) {
     });
   }
   return due.length;
+}
+
+/* ------------------------------------------------------------------------- */
+/* P1-b：承诺跟进 + 轻量闲聊                                                   */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * 读 schema_meta 里的 JSON；损坏/缺失都退回默认值，不影响调度。
+ * @param {Store} store
+ * @param {string} key
+ * @param {unknown} fallback
+ * @returns {unknown}
+ */
+function readMetaJson(store, key, fallback) {
+  try {
+    const raw = store.getMeta(key);
+    if (raw === null || raw === undefined || raw === '') return fallback;
+    return JSON.parse(raw);
+  } catch {
+    return fallback;
+  }
+}
+
+/**
+ * 写 schema_meta；失败只 warn（重启后最多丢一次闲聊开关/历史）。
+ * @param {Store} store
+ * @param {string} key
+ * @param {string} value
+ * @returns {boolean}
+ */
+function writeMeta(store, key, value) {
+  try {
+    store.setMeta(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 读出闲聊开关、上次闲聊时间（ms）与最近发送历史（Unix 秒）。
+ * @param {object} state
+ * @returns {{enabled: boolean, lastAt: number|null, sentTimes: number[],
+ *            interactionDay: string|null}}
+ */
+function chatStateOf(state) {
+  const store = state?.store;
+  let enabled = true;
+  let lastAt = null;
+  let sentTimes = [];
+  let interactionDay = null;
+  try {
+    if (store.getMeta(CHAT_META.enabled) === '0') enabled = false;
+    const rawLast = Number(store.getMeta(CHAT_META.lastAt));
+    if (Number.isFinite(rawLast) && rawLast > 0) lastAt = rawLast * 1000;
+    const rawSent = readMetaJson(store, CHAT_META.sent, []);
+    sentTimes = Array.isArray(rawSent)
+      ? rawSent.map(Number).filter((value) => Number.isFinite(value) && value > 0)
+      : [];
+    const rawDay = store.getMeta(CHAT_META.interactionDay);
+    interactionDay = typeof rawDay === 'string' && rawDay !== '' ? rawDay : null;
+  } catch {
+    // 读失败按「默认开启、无历史」处理，不阻断任何调度。
+  }
+  return { enabled, lastAt, sentTimes, interactionDay };
+}
+
+/**
+ * 记录今天有过用户互动（当天只写一次）。
+ * @param {object} state
+ * @param {number} now
+ */
+function recordInteractionDay(state, now) {
+  try {
+    const day = zonedDayKey(now, state.config.timezone);
+    if (state.store.getMeta(CHAT_META.interactionDay) === day) return;
+    writeMeta(state.store, CHAT_META.interactionDay, day);
+  } catch {
+    // 互动记录失败不影响本轮对话。
+  }
+}
+
+/**
+ * 持久化闲聊开关（/别闲聊、/恢复闲聊）。
+ * @param {object} state
+ * @param {boolean} enabled
+ */
+function setChatEnabled(state, enabled) {
+  if (state?.store) writeMeta(state.store, CHAT_META.enabled, enabled ? '1' : '0');
+}
+
+/**
+ * 处理 /别闲聊 与 /恢复闲聊；返回给用户的确认文案。
+ * @param {{state?: object, mode: 'on'|'off', now?: number}} input
+ * @returns {string}
+ */
+function handleChatCommand({ state, mode } = {}) {
+  const enabled = mode === 'on';
+  setChatEnabled(state, enabled);
+  return enabled ? '已恢复主动闲聊。' : '已关闭主动闲聊。';
+}
+
+/**
+ * 补零。
+ * @param {number} value
+ * @returns {string}
+ */
+function pad2(value) {
+  return String(value).padStart(2, '0');
+}
+
+/**
+ * 按配置时区格式化日期时间（状态命令展示用）。
+ * @param {number} ms
+ * @param {string} timeZone
+ * @returns {string}
+ */
+function formatDateTime(ms, timeZone) {
+  const parts = zonedParts(ms, timeZone);
+  return `${parts.year}-${pad2(parts.month)}-${pad2(parts.day)} ${pad2(parts.hour)}:${pad2(parts.minute)}`;
+}
+
+/**
+ * /状态 里的闲聊行：开关 + 最近一次时间。
+ * @param {object} state
+ * @param {number} now
+ * @returns {string}
+ */
+function formatChatStatus(state, now) {
+  const chat = chatStateOf(state);
+  const last = chat.lastAt === null ? '无' : formatDateTime(chat.lastAt, state.config.timezone);
+  return `闲聊：${chat.enabled ? '已开启' : '已关闭'} · 最近一次：${last}`;
+}
+
+/**
+ * 扫描到期承诺并入队：每条每天最多一次，逾期久的先入队。
+ * @param {object} state
+ * @returns {number} 本次入队条数
+ */
+function runCommitmentFollowups(state) {
+  const { store, platform, proactive, config, metrics } = state;
+  const now = platform.now();
+  const timeZone = config.timezone;
+  let rows;
+  try {
+    rows = scanCommitmentFollowups({ store, now, timeZone, scope: SCOPE });
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] commitment scan failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return 0;
+  }
+  if (rows.length === 0) return 0;
+
+  // 安静时段不打扰：行保持 pending/snoozed（相当于留在待跟进 backlog），
+  // 等安静结束后的第一个 reminders tick 再补发，避免跨日重复。
+  if (isQuietAt(new Date(now), config)) {
+    platform.log('debug', '[dsh-companion] commitment follow-ups deferred by quiet hours', {
+      pending: rows.length,
+    });
+    return 0;
+  }
+
+  const dayKey = zonedDayKey(now, timeZone);
+  const mark = store.db.prepare(
+    'UPDATE reminders SET last_fire_key = ?, updated_at = unixepoch() WHERE id = ?',
+  );
+  let count = 0;
+  for (const row of rows) {
+    if (count >= COMMITMENT_MAX_FOLLOWUPS) break;
+    const overdueDays = commitmentOverdueDays(row, { now });
+    proactive?.enqueue({
+      kind: 'reminder',
+      text: followUpText({ card: DEFAULT_CARD, reminder: row, overdueDays }),
+      dedupeKey: `commitment:${row.id}:${dayKey}`,
+      at: now,
+    });
+    mark.run(dayKey, row.id);
+    try {
+      store.appendEvent({
+        at: Math.floor(now / 1000),
+        action: 'USED',
+        table_name: 'reminders',
+        row_id: row.id,
+        actor: 'scheduler',
+        reason: COMMITMENT_FOLLOWUP_REASON,
+        detail_json: commitmentAuditDetail(row),
+      });
+    } catch {
+      // 审计失败不影响已经入队的跟进。
+    }
+    metrics?.inc('commitmentFollowups');
+    count += 1;
+  }
+  if (count > 0) {
+    platform.log('debug', '[dsh-companion] commitment follow-ups queued', { count, day: dayKey });
+  }
+  return count;
+}
+
+/**
+ * 判断此刻能否发起轻量闲聊，并生成一条 5..10 句的主动消息。
+ * 所有失败只记日志，绝不向外抛。
+ * @param {object} state
+ * @returns {Promise<{queued: boolean, reason?: string, sentences?: number}>}
+ */
+async function runLightChat(state) {
+  const { store, platform, config, metrics } = state;
+  const now = platform.now();
+  const timeZone = config.timezone;
+  const dayKey = zonedDayKey(now, timeZone);
+  try {
+    if (store.getMeta(CHAT_META.lastTryDay) === dayKey) {
+      return { queued: false, reason: 'already_tried' };
+    }
+    const chat = chatStateOf(state);
+    const verdict = chatEligibility({
+      now,
+      timeZone,
+      enabled: chat.enabled,
+      interactionDay: chat.interactionDay,
+      lastChatAt: chat.lastAt === null ? null : Math.floor(chat.lastAt / 1000),
+      sentTimes: chat.sentTimes,
+      quiet: isQuietAt(new Date(now), config),
+    });
+    if (!verdict.ok) {
+      platform.log('debug', '[dsh-companion] light chat skipped', { reason: verdict.reason });
+      return { queued: false, reason: verdict.reason };
+    }
+
+    let recentTopics = [];
+    try {
+      recentTopics = store.listEpisodes({ scope: SCOPE, limit: 5 }).map((row) => ({
+        title: typeof row.title === 'string' ? row.title : '',
+        summary: typeof row.summary === 'string' ? row.summary : '',
+      }));
+    } catch {
+      recentTopics = [];
+    }
+
+    let recallSummary = '';
+    try {
+      const recalled = await retrieve({
+        store,
+        query: recentTopics[0]?.title ?? '',
+        scope: SCOPE,
+        now,
+        budgetTokens: 600,
+        limit: 3,
+      });
+      recallSummary = recalled.items
+        .map((item) => item.text)
+        .filter((text) => typeof text === 'string' && text !== '')
+        .join('\n');
+    } catch {
+      recallSummary = '';
+    }
+
+    const llm = await resolveChatLlm(state);
+    if (typeof llm !== 'function') {
+      if (!state.warnedNoChatLlm) {
+        state.warnedNoChatLlm = true;
+        platform.log('warn', '[dsh-companion] no LLM available for light chat');
+      }
+      return { queued: false, reason: 'no_llm' };
+    }
+
+    let raw;
+    try {
+      raw = await llm({ card: DEFAULT_CARD, recentTopics, recallSummary, messageCount: 8 });
+    } catch (error) {
+      platform.log('warn', '[dsh-companion] light chat generation failed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+      return { queued: false, reason: 'llm_failed' };
+    }
+
+    const normalized = normalizeChatText(typeof raw === 'string' ? raw : raw?.text, {
+      bannedPhrases: DEFAULT_CARD.bannedPhrases,
+    });
+    if (!normalized.ok) {
+      platform.log('debug', '[dsh-companion] light chat rejected', {
+        reason: normalized.reason,
+        sentences: normalized.sentences,
+      });
+      writeMeta(store, CHAT_META.lastTryDay, dayKey);
+      return { queued: false, reason: normalized.reason };
+    }
+
+    state.proactive?.enqueue({
+      kind: 'chat',
+      text: normalized.text,
+      dedupeKey: `chat:${dayKey}`,
+      at: now,
+    });
+    writeMeta(store, CHAT_META.lastTryDay, dayKey);
+    metrics?.inc('lightChatAttempts');
+    platform.log('debug', '[dsh-companion] light chat queued', {
+      sentences: normalized.sentences,
+    });
+    return { queued: true, sentences: normalized.sentences };
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] light chat failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return { queued: false, reason: 'error' };
+  }
+}
+
+/**
+ * 统计 proactive 实际投出的聊天，更新最近一次时间与 7 天历史。
+ * @param {object} state
+ * @param {unknown} report proactive.flush 的返回值
+ * @returns {number}
+ */
+function recordChatDelivery(state, report) {
+  try {
+    const items = Array.isArray(report?.items) ? report.items : [];
+    if (!items.some((item) => item?.kind === 'chat')) return 0;
+    const { store, platform, metrics } = state;
+    const nowSeconds = Math.floor(platform.now() / 1000);
+    const rawSent = readMetaJson(store, CHAT_META.sent, []);
+    const sent = Array.isArray(rawSent)
+      ? rawSent.map(Number).filter((value) => Number.isFinite(value) && value > 0)
+      : [];
+    sent.push(nowSeconds);
+    const pruned = sent.filter((value) => value >= nowSeconds - CHAT_HISTORY_SECONDS);
+    writeMeta(store, CHAT_META.lastAt, String(nowSeconds));
+    writeMeta(store, CHAT_META.sent, JSON.stringify(pruned));
+    metrics?.inc('lightChats');
+    return 1;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 解析闲聊模型：优先宿主 hook，其次平台 LLM 路由。
+ * @param {object} state
+ * @returns {Promise<Function|null>}
+ */
+async function resolveChatLlm(state) {
+  if (state.chatLlmResolved) return state.chatLlm;
+  state.chatLlmResolved = true;
+  const hook = state.host?.companion?.chatLlm;
+  if (typeof hook === 'function') {
+    state.chatLlm = async (input) => hook(input);
+    state.chatLlmRoute = { kind: 'hook' };
+    return state.chatLlm;
+  }
+  const { platform } = state;
+  if (!platform?.capabilities?.llm) {
+    state.chatLlm = null;
+    return null;
+  }
+  try {
+    const providers = (await platform.listProviders()) ?? [];
+    let provider = null;
+    let model = null;
+    for (const candidate of providers) {
+      const models = (await platform.listModels(candidate.id)) ?? [];
+      if (models.length > 0) {
+        provider = candidate.id;
+        model = models[0].id ?? models[0];
+        break;
+      }
+    }
+    if (provider === null || model === null) {
+      state.chatLlm = null;
+      return null;
+    }
+    state.chatLlmRoute = { provider, model };
+    state.chatLlm = async (input) => state.platform.complete({
+      provider,
+      model,
+      messages: [{ role: 'user', content: [{ type: 'text', text: buildChatPrompt(input) }] }],
+    });
+  } catch {
+    state.chatLlm = null;
+  }
+  return state.chatLlm;
 }
 
 /**
@@ -2243,3 +2694,10 @@ function renderToolValue(value) {
     return String(value);
   }
 }
+
+export {
+  formatChatStatus,
+  handleChatCommand,
+  runCommitmentFollowups,
+  runLightChat,
+};
