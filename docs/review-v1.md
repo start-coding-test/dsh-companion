@@ -122,3 +122,54 @@ proactive.js:228-312 两遍循环实现全部 6 道：`isQuietAt` 安静期整�
 代码质量与测试水平在组件层是扎实的（10 表+FTS+purge、巩固事务、两段取消、6 道闸门均有高保真证据）；
 问题集中在「接线层」：MVP 未把已验证的组件拼进运行的插件主链路。建议下卡顺序：H1（接线巩固→压缩→发布）
 → M1（轮次去重）→ M2（预算兜底）→ L1–L6。修复后重跑本报告第二节全部七项核验 + 新增 e2e 假绿扫描即可复检。
+
+## 七、round-2 复审（t24，reviewed t23 = commit 34dedcb）
+
+- **复审范围**：commit 34dedcb（t23 修复卡，父提交 09bc140）：src/index.js 重接线（+1042）、
+  consolidate.js 分页去重、adapter.js +unarchive/cwd/llm(complete/listProviders/listModels)、
+  commands.js/tools.js 注入 clock/cwd、apply 幂等 + dispose；新增 test/e2e/apply-turn.test.js（3 用例）。
+- **测试复跑（写入报告）**：`cd dsh-companion && node --test` → **260 tests / 15 suites / 260 pass /
+  0 fail / 0 skipped，duration_ms 1186.042**（Node v24.9.0，real≈1.3s），exit 0。
+- **独立探针（系统临时目录 rev-r2-probe.mjs，非仓库文件）15/15 PASS**：
+  p1a–p1i apply 生产路径全链路（巩固水位=1→facts 写库→turn1 只 staged 不发布→turn1 step1 经 assemble
+  注入 `[相关记忆]`→同 turn step2 不重复注入→turn2 头 compactRegion(1..1) 一次→publishBoard 发布→
+  巩固行 status=compacted→turn2 step2 不重复压缩）；p2a–p2c 二次 apply 返回同句柄、dispose 幂等、
+  30s tick 被清；p3 备份轮转 9→7；p4 既有 300 条事实仍触发巩固且同 key 去重（facts=0，总数不增）。
+- **round-1 findings 复验（逐条）**：
+  - H1 巩固→压缩→发布主链路：**修复** —— src/index.js:372-376（turn 头 maybeCompact→maybeConsolidate）、
+    :428-501 maybeConsolidate（watermark 判定→consolidate→登记 pendingCompact）、:508-541 maybeCompact
+    （open turn 内 compactRegion→markConsolidated→publishBoard('compact')）、:129-136 restart/unarchive 发布；
+    探针 p1a–p1i。V6/V15-复检：turn1 只 staged（探针 p1c）、压缩成功才发布并发（探针 p1f–p1h）。
+  - M1 轮次去重：**修复** —— index.js:352-357（turnKeyOf:1100-1112 按 payload.turn 置位）、:551-558
+    injectRecall 同 turn turnSeen 一次；工具尾 isToolTail:1160-1168 跳过；探针 p1d/p1e。
+  - M2 注入走 assemble 预算：**修复** —— index.js:562-605（retrieve budgetTokens=2050 + assemble
+    limits 2050/32K + overBudget 计数 :597-599）。
+  - L1 去重 500：**修复** —— consolidate.js:380-391 分页 200 全量去重；探针 p4a/p4b。
+  - L2 备份 7 份：**修复** —— index.js:971-1027 `db.YYYY-MM-DD.bak` readdir+slice(-7)、
+    失败写 scheduler_jobs:992-1000；探针 p3。
+  - L3 Date.now/process.cwd：**修复** —— tools.js:36 注入 clock 全工具 nowMs()、thread_run cwd 由
+    接线注入（缺失返回 cwd-unavailable，index.js:325；无 capability 拒答不再静默）。
+  - L4 memory_forget：**修复** —— tools.js:129-141 改 store.forgetFact（S1 tombstone+purge_payload）。
+  - L5 unarchive 静默：**修复** —— tools.js:275-283 缺 unarchiveSession 返回 {ok:false,
+    reason:'unarchive-unavailable'}；prompt 缺失同样拒答 :295-302。
+  - L6 metrics 无写点：**修复** —— index.js:363-370 tokenMeter 每轮度量、:406-421 recordTokenEvent
+    写 tokens 审计事件（/状态 展示本轮 token）。
+  - deep-sleep 空壳：**修复** —— index.js:730-776 runDeepSleep（deepConsolidate:783-814 →
+    decayFacts:846-873 分页降级 → gcFtsOrphans:821-838 → staged 状态板 → consolidations kind=deep +
+    memory_events 审计）；apply-turn.test.js 第 3 用例覆盖。
+- **t12 专项遗留（review-t12.md M1 apply 幂等/无 shutdown）**：**修复** —— index.js:97 INSTALLS WeakMap
+  幂等（:111-115 同句柄短路）、:161-190 handle.dispose（逆序 disposer→scheduler.stop→store.close→
+  INSTALLS.delete）、装载异常回滚 :145-159。探针 p2a–p2c。
+- **round-2 新增 L 级备查（不阻塞 verdict）**：
+  1. turnKeyOf（index.js:1100-1112）在宿主 payload 无 `turn` 字段时返回 null → isNewTurn 恒 false，
+     巩固不触发、召回退化为按 step 注入。当前平台契约（docs/platform-api.md:17）payload 已含 turn，
+     属防御性退化，非缺陷。
+  2. deep-sleep 情景→语义抽取为规则子步（MVP 口径，CHANGELOG 已声明），归为后续版本事项。
+  3. p3 探针复现轮转算法（readdir+slice(-7)）而非直接调 backupDatabase；方案与 L2 实现一致（逐文件行核验），判定通过。
+- **round-2 verdict：pass**（H=0；上述 3 条为 L 级备查，不要求修复）。
+
+## 附录B：round-1 探针（r1–r6，系统临时目录 rev-probe.mjs）round-2 有效性核对
+
+t23 的 git show 34dedcb 文件清单不含 store.js / retrieve.js / assemble.js / worker.js / registry.js /
+scheduler.js / proactive.js / bigram.js，round-1 对这些模块的 file:line 结论继续成立；
+工具/命令/巩固/入口的 round-1 结论已在 §七逐条更新。
