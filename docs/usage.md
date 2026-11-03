@@ -84,6 +84,18 @@
 已取消置顶：12
 ```
 
+### `/记忆 导出 [md|json]`
+
+把活跃事实、情景、提醒、线程与状态板导出到 `.data/export/memory-YYYY-MM-DD-HHmm.<fmt>`（缺省 `json`，文件名为 UTC 时间戳），并在回复里给出各表条数与路径：
+
+```text
+/记忆 导出 md
+已导出记忆（md）：facts=96 · episodes=120 · reminders=4 · threads=3
+文件：.data/export/memory-2026-11-04-0912.md
+```
+
+默认**不导出** `secret` / `sensitive`、墓碑（tombstone）、`superseded` 条目；状态板里引用了未导出事实原文的行会被剔除。格式非 `md` / `json` 时返回用法提示。恢复与加密见 [导出、恢复与加密](#导出恢复与加密)。
+
 ### `/成本`
 
 汇总 `memory_events` 中记录的 token 用量：
@@ -114,12 +126,12 @@ health | archived | 体检 | 2026-10-20
 
 ```text
 /状态
-状态：entities 8 / episodes 120 / facts 96 / reminders 4 / state_board 2 / state_board_rev 9 / threads 3 / consolidations 21 / memory_events 310 / fts facts 96/episodes 120 / tokens 本轮 入 8000 出 1200（超预算 0 次）
+状态：entities 8 / episodes 120 / facts 96 / reminders 4 / state_board 2 / state_board_rev 9 / threads 3 / consolidations 21 / memory_events 310 / fts facts 96/episodes 120 / tokens 本轮 入 8000 出 1200（超预算 0 次）｜今日 0/3000000｜RSS ok 128MB｜向量：关
 水位 main：120
 最近 job：s2-purge ok upto_seq=0（2026-11-03 03:30）
 ```
 
-最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。
+最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·最近命中 N」。
 
 `/状态` 末尾还会给出自愈观测（无事件时显示「无」）：
 
@@ -352,9 +364,62 @@ health | archived | 体检 | 2026-10-20
 }
 ```
 
+## 导出、恢复与加密
+
+导出覆盖 facts / episodes / reminders / threads / 状态板；文件里的 `version` 恒为 1，`scope` 记录导出所用作用域。
+
+### 导出
+
+```text
+/记忆 导出 json
+/记忆 导出 md
+```
+
+也可以直接调 API（脚本或测试）：
+
+```js
+import { exportAll } from './src/memory/export.js';
+const result = exportAll({ store, scope: 'main', format: 'json' });
+// → { path, format, exported_at, scope, counts, bytes }
+```
+
+文件名形如 `memory-2026-11-04-0912.json`（UTC 时间戳），默认目录 `<cwd>/.data/export`，可用 `dir` / `now` 覆盖。默认**不导出** `sensitive` / `secret`、墓碑与 `superseded`；状态板按「未导出事实的 statement」行级剔除，避免板面泄漏。
+
+### 恢复
+
+```js
+import { importAll } from './src/memory/export.js';
+importAll({ store, file: '.data/export/memory-2026-11-04-0912.json', mode: 'fresh' });
+```
+
+- `fresh`：目标库五张表必须为空（`Store.open` 建出的空状态板占位行不算），适合新机器或重建。
+- `merge`：按主键跳过已存在的行（facts.id / threads.key / reminders.id 等），不覆盖本地已有内容。
+- 整个导入在单事务内，任一行失败整体回滚；导出集中缺失的引用（`consolidation_id` / `source_episode_id` / `superseded_by`）置 null；恢复后逐行重建 facts / episodes FTS。
+
+### 加密（单条事实）
+
+```bash
+node scripts/export-encrypted.mjs .data/companion.db 12 --out secret.enc
+node scripts/decrypt-encrypted.mjs secret.enc --out fact.json
+```
+
+- 口令只从 stdin 读取（TTY 下关闭回显）；空口令、缺 `--out`、事实不存在都以退出码 1 失败。
+- 解密先校验再写文件，错误口令或损坏文件不会留下明文半文件。
+- 格式：AES-256-GCM + scrypt（N=2^14、r=8、p=1），随机 salt(16B) / iv(12B)，magic `DSH-COMPANION-EXPORT-1` + JSON header 保存 KDF 参数与 tag。
+
+### 向量召回（可选）
+
+默认 `vector.enabled=false`：检索与 v0.2.0 逐字节一致，不读 `fact_vectors`。开启后 `hybridSearch` 用 RRF（`1/(60+rank)`）融合 FTS 与向量，同一 fact 去重；向量路只召回 active、normal、未删除、非 `sensitive`/`secret` 且 R ≥ 0.05 的事实。`hash` 是字符 bigram 哈希投影（非生产质量），离线对比可跑：
+
+```bash
+node scripts/bench-vector.mjs --dim 256 --json
+```
+
+旧库升级到 schema v5 不会自动补向量：旧事实在下一次写入 / 编辑 / 强化时重建投影，期间开启向量只是召回不到它们，不会报错。
+
 ## 配置示例
 
-默认配置即可启动。下面是三个常见调整。
+默认配置即可启动。下面是几个常见调整。
 
 安静时段改为 22:30–07:30，并把每日主动消息上限降到 1 条：
 
@@ -374,6 +439,15 @@ proactiveDailyCap: 0
 
 ```yaml
 dbPath: "D:/dsh-data/companion.db"
+```
+
+开启可选向量召回（默认关闭；`hash` 为非生产质量的字符哈希投影）：
+
+```yaml
+vector:
+  enabled: true
+  dim: 256
+  embedder: hash
 ```
 
 完整配置项与默认值见 [README](../README.md#配置)。
@@ -399,6 +473,8 @@ dbPath: "D:/dsh-data/companion.db"
 - 无 main 会话或 `prompt` 不可用：主动消息发送失败会留在队列等待下个 tick；`thread_run` 返回 `prompt-unavailable`。召回只影响注入，不影响原始对话。
 - 无模型（`ctx.companion.consolidationLlm` 与 `ctx.llm` 都不可用）：巩固跳过并记 debug 日志，不阻塞对话，已有记忆照常检索。
 - 无 `unarchiveSession`：复用归档线程返回 `unarchive-unavailable`。
+- 无 `sessionController`：`task_run` 返回 `session-unavailable`；`/记忆 导出` 仍可用（只读库）。
+- `vector.embedder: none` 或 `enabled: false`：检索退化为 bigram FTS，与旧版一致；`/状态` 显示「向量：关」。
 
 ### 工具错误
 
@@ -416,6 +492,8 @@ dbPath: "D:/dsh-data/companion.db"
 ### 数据库与文件
 
 - 备份失败：写 `USED/scheduler_jobs/backup_failed` 审计并抛给调度器记 `job_error`，次日重试；成功时按日期滚动保留最近 7 份。
+- 导出失败（如目录不可写）：命令层抛出错误并在回复里显示原因，不会写半截文件；`fresh` 恢复在目标库非空时直接拒绝，不写入任何行。
+- 导出文件默认落在 `<cwd>/.data/export/`，文件名精确到分钟（同一分钟重复导出会覆盖同名文件）。
 - 遗忘到期清理失败：任务错误记账，下次 03:30 继续；冷静期内的行不会被提前删除。
 
 ## 常见问题
@@ -432,7 +510,17 @@ dbPath: "D:/dsh-data/companion.db"
 
 ### 如何导出单条明文？
 
-没有单独的导出命令。用 `memory_search` 找到 id 后，返回的 `text` 就是原文（`/记忆` 只给汇总，不列原文）；需要文件时，可从 `dbPath` 指向的 SQLite 数据库 `facts` 表读取 `statement` 字段，或直接复制整库文件。复制前建议停止插件，避免漏掉 WAL 中的数据。
+整库视图用 `/记忆 导出 md|json`（默认剔除 `sensitive`/`secret`、墓碑与被取代项，状态板按行 scrub）；单条事实的加密导出用 `node scripts/export-encrypted.mjs <db> <fact-id> --out <file>`，口令从 stdin 读、不落盘。只想看明文时，`memory_search` 返回的 `text` 就是原文。
+
+### 如何迁移到新机器？
+
+1. 旧机器：`/记忆 导出 json`（或 `md` 仅作阅读），把 `.data/export/memory-*.json` 拷走；
+2. 新机器：`importAll({ store, file, mode: 'fresh' })` 导入空库（已有数据时用 `merge`，按主键跳过已存在行）；
+3. 导入是单事务，失败零落库；恢复后 FTS 自动重建。旧事实不会自动补向量：开启 `vector.enabled` 后，它们在下一次写入 / 编辑 / 强化时才有投影。
+
+### 向量召回为什么没效果？
+
+先确认 `vector.enabled: true`（默认关闭）且 `/状态` 显示「向量：开·dim X·最近命中 N」。当前只有 `hash` 实现——字符 bigram 哈希投影，不是真实 embedding，中文同义改写召回有限；旧库升级到 schema v5 后旧事实没有向量，需要一次写入或编辑触发重建。真实 embedding 接入留待 P3。
 
 ### 主动消息为什么没来？
 
@@ -455,6 +543,7 @@ dbPath: "D:/dsh-data/companion.db"
 插件随后按新 surface 重写水位（`retargetConsolidation`），因此水位只在「当前可见 surface」内自洽，
 历史行只作审计。升级到 v0.1.1 时旧库会迁移到 `schema_version=4`：清空 `consolidations`
 （开发期约定，旧值语义不可比）、把 `episodes.consolidation_id` 置空；facts/episodes 不受影响。
+v0.3.0 起 `schema_version=5`：只新增 `fact_vectors`（向量投影）表，既有数据不动。
 
 ### 数据存在哪里？
 
