@@ -267,7 +267,7 @@ describe('apply（插件入口）', () => {
     assert.equal(calls.length, 0);
   });
 
-  test('不做任何平台注册（无副作用）', () => {
+  test('只经平台服务注册，不调用旧式 registerCommand/registerTool 钩子', () => {
     const touched = [];
     const ctx = {
       logger: { info: (...args) => touched.push(['logger.info', ...args]) },
@@ -276,8 +276,10 @@ describe('apply（插件入口）', () => {
       on: (...args) => touched.push(['on', ...args]),
       emit: (...args) => touched.push(['emit', ...args]),
     };
-    apply(ctx, {});
-    assert.equal(touched.length, 1);
+    apply(ctx, { dbPath: ':memory:' });
     assert.equal(touched[0][0], 'logger.info');
+    assert.ok(touched.some(([kind, event]) => kind === 'on' && event === 'agent/pre-step'));
+    assert.equal(touched.filter(([kind]) => kind === 'registerCommand').length, 0);
+    assert.equal(touched.filter(([kind]) => kind === 'registerTool').length, 0);
   });
 });

@@ -19,53 +19,19 @@ import assert from 'node:assert/strict';
 import { Store } from '../../src/memory/store.js';
 import { consolidate } from '../../src/memory/consolidate.js';
 import { publishBoard, stageBoard } from '../../src/memory/state-board.js';
-
-const DAY = 86_400;
-const BASE = 1_700_000_000;
-const SEQ_FROM = 31;
-const SEQ_TO = 42;
+import {
+  WRITE_FAIL_BASE as BASE,
+  WRITE_FAIL_DAY as DAY,
+  WRITE_FAIL_SEQ_FROM as SEQ_FROM,
+  WRITE_FAIL_SEQ_TO as SEQ_TO,
+  makeWriteFailDraft as makeDraft,
+} from '../helpers/scenarios.js';
 
 /** 每个测试独立内存库，t.after 关闭。 */
 function openStore(t) {
   const store = Store.open(':memory:');
   t.after(() => store.close());
   return store;
-}
-
-/** 合法草稿：1 episode + 2 facts + 1 reminder。 */
-function makeDraft() {
-  return {
-    episode: {
-      title: 'V15 事务演练',
-      summary: '用户确认了咖啡偏好，并讨论把记忆落到 SQLite。',
-      topics: ['测试', '事务'],
-      started_at: BASE,
-    },
-    facts: [
-      {
-        kind: 'preference',
-        subject_text: '用户',
-        predicate: '偏好',
-        object_text: '黑咖啡',
-        statement: '用户偏好黑咖啡',
-      },
-      {
-        kind: 'project',
-        subject_text: 'dsh-companion',
-        predicate: '使用',
-        object_text: 'SQLite',
-        statement: 'dsh-companion 使用 SQLite 存储',
-      },
-    ],
-    reminders: [
-      {
-        kind: 'todo',
-        title: '复盘 V15 事务回滚',
-        due_at: BASE + DAY,
-        due_granularity: 'day',
-      },
-    ],
-  };
 }
 
 /** 假 llm：记录调用参数，固定返回合法草稿。 */

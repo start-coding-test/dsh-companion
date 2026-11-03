@@ -323,6 +323,8 @@ test('capabilities 反映宿主能力', () => {
     archive: true,
     tokenMeter: true,
     logger: true,
+    commands: false,
+    tools: false,
   });
 
   const partial = createAdapter(new FakeCtx({ missing: ['compaction', 'tokenMeter'] }));

@@ -17,37 +17,12 @@ import {
 } from '../../src/memory/assemble.js';
 import { buildSections } from '../../src/persona/sections.js';
 import { DEFAULT_CARD } from '../../src/persona/card.js';
-
-/** 固定时钟：装配只应依赖输入，不应读取真实时间。 */
-const NOW = Object.freeze({
-  epoch: Date.parse('2026-11-03T20:00:00.000+08:00'),
-  iso: '2026-11-03T20:00:00.000+08:00',
-});
-const DAY_MS = 86_400_000;
-const dayOf = (offset) => new Date(NOW.epoch + offset * DAY_MS).toISOString().slice(0, 10);
-
-/** 每条历史 100 字 = 50 token。 */
-const HISTORY_CHARS = 100;
-const HISTORY_TOKENS = estimateTokens('历'.repeat(HISTORY_CHARS));
-
-function makeHistory(count, chars = HISTORY_CHARS, prefix = '第') {
-  return Array.from({ length: count }, (_, index) => ({
-    role: index % 2 === 0 ? 'user' : 'assistant',
-    content: `${prefix}${index}条`.padEnd(chars, '历').slice(0, chars),
-  }));
-}
-
-function makeRecallItem({ id, score, chars = 400, retention = 0 }) {
-  return {
-    id,
-    kind: 'fact',
-    date: dayOf(-Number(id.replace(/\D/gu, '') || 0)),
-    score,
-    // 模拟记忆强度 R：assemble 不读它，弱项不得因此挤掉强项。
-    retention,
-    text: `${id}：${'记'.repeat(Math.max(0, chars - id.length - 1))}`,
-  };
-}
+import {
+  BUDGET_HISTORY_CHARS as HISTORY_CHARS,
+  BUDGET_HISTORY_TOKENS as HISTORY_TOKENS,
+  makeBudgetHistory as makeHistory,
+  makeBudgetRecallItem as makeRecallItem,
+} from '../helpers/scenarios.js';
 
 function layerSum(result) {
   return Object.values(result.layers).reduce((sum, value) => sum + value, 0);

@@ -124,6 +124,12 @@ export function createAdapter(ctx, opts = {}) {
     get logger() {
       return typeof ctx.logger?.info === 'function';
     },
+    get commands() {
+      return typeof ctx.commands?.register === 'function';
+    },
+    get tools() {
+      return typeof ctx.tools?.register === 'function';
+    },
   });
 
   /**
@@ -294,6 +300,41 @@ export function createAdapter(ctx, opts = {}) {
     return ctx.tokenMeter.measure(session, requestHeader);
   }
 
+  /**
+   * 注册一条人类命令。定义形状与平台一致：
+   * `{ definitionId, name, description, input?, handler }`。
+   * 命令名必须是平台可解析的小写 ASCII（`/^[a-z][a-z0-9_-]*$/`）。
+   * @param {{definitionId?: string, name: string, description: string, handler: Function}} definition
+   * @returns {Function} 平台 disposer
+   */
+  function registerCommand(definition) {
+    if (!capabilities.commands) {
+      throw unavailable('no-commands', 'ctx.commands.register()');
+    }
+    if (definition === null || typeof definition !== 'object') {
+      throw new TypeError('registerCommand(definition): definition must be an object');
+    }
+    return ctx.commands.register(definition);
+  }
+
+  /**
+   * 注册一个模型工具。定义形状采用平台裸注册契约：
+   * `{ name, description, parameters, output: { schema, render }, execute }`。
+   * `parameters` / `output.schema` 均为 JSON Schema；本插件不依赖 `defineTool`。
+   * @param {{name: string, description: string, parameters: object,
+   *   output: {schema: object, render: Function}, execute: Function}} definition
+   * @returns {Function} 平台 disposer
+   */
+  function registerTool(definition) {
+    if (!capabilities.tools) {
+      throw unavailable('no-tools', 'ctx.tools.register()');
+    }
+    if (definition === null || typeof definition !== 'object') {
+      throw new TypeError('registerTool(definition): definition must be an object');
+    }
+    return ctx.tools.register(definition);
+  }
+
   return {
     now,
     log,
@@ -307,6 +348,8 @@ export function createAdapter(ctx, opts = {}) {
     whenIdle,
     archiveSession,
     measure,
+    registerCommand,
+    registerTool,
     capabilities,
   };
 }
