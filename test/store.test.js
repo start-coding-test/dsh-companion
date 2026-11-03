@@ -59,7 +59,7 @@ test('Store.open 建出 10 张业务/辅助表与 2 张 FTS 虚表', () => {
   const version = store.db
     .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
     .get();
-  assert.equal(version.value, '3');
+  assert.equal(version.value, '4');
 
   // 状态板占位行
   const board = store.getBoardState('main');
@@ -658,4 +658,49 @@ test('forget 后满 7 天 purge：物理删除、其它 scope 不受影响、审
   const purged = store.listEvents({ action: 'PURGED', limit: 500 });
   assert.ok(purged.some((event) => event.row_id === fact.id));
   assert.ok(purged.some((event) => event.row_id === episode.id));
+});
+
+test('v3 库迁移到 v4：加 compaction_start_seq、清空 consolidations、episode 关联置空', () => {
+  const file = join(dir, 'legacy-v3.db');
+  const legacy = Store.open(file);
+  const consolidation = legacy.insertConsolidation({
+    scope: 'main',
+    session_id: 'legacy',
+    kind: 'nap',
+    trigger: 'idle',
+    upto_seq: 10,
+    turn_from: 10,
+    turn_to: 10,
+    status: 'written',
+    started_at: 1_700_000_000,
+  });
+  const episode = legacy.insertEpisode({
+    scope: 'main',
+    session_id: 'legacy',
+    consolidation_id: consolidation.id,
+    title: '旧情景',
+    salience: 'normal',
+  });
+  // 退化成 v3 形状：没有 compaction_start_seq，版本号 '3'。
+  legacy.db.exec('ALTER TABLE consolidations DROP COLUMN compaction_start_seq');
+  legacy.db.exec("UPDATE schema_meta SET value = '3' WHERE key = 'schema_version'");
+  legacy.close();
+
+  const migrated = Store.open(file);
+  try {
+    const version = migrated.db
+      .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
+      .get();
+    assert.equal(version.value, '4');
+    const columns = migrated.db
+      .prepare("PRAGMA table_info('consolidations')")
+      .all()
+      .map((column) => column.name);
+    assert.ok(columns.includes('compaction_start_seq'), '迁移后应补出新列');
+    assert.equal(migrated.stats().consolidations, 0, '旧 turn 口径的巩固行被清空');
+    assert.equal(migrated.getEpisode(episode.id).consolidation_id, null, 'episode 关联被解除');
+    assert.equal(migrated.getWatermark('main'), 0);
+  } finally {
+    migrated.close();
+  }
 });

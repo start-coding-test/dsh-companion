@@ -34,8 +34,8 @@ import { toBigrams, toMatchQuery } from './bigram.js';
 import { DEFAULT_ALPHA, decayOf, reinforce } from './reinforce.js';
 import { boardFragments, renderBoard, scrubBoardText } from './state-board.js';
 
-/** schema 版本（06 v3.3 §8.2 初始值）。 */
-const SCHEMA_VERSION = '3';
+/** schema 版本（v4：consolidations 改 surface seq 口径，见 docs/h1-h3-probe.md）。 */
+const SCHEMA_VERSION = '4';
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
 
@@ -104,7 +104,8 @@ CREATE TABLE IF NOT EXISTS consolidations (
   status        TEXT NOT NULL CHECK (status IN ('running','written','compacted','failed')),
   error         TEXT,
   started_at    INTEGER NOT NULL,
-  finished_at   INTEGER
+  finished_at   INTEGER,
+  compaction_start_seq INTEGER
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_consolidations_scope_upto ON consolidations(scope, upto_seq, kind);
 CREATE INDEX IF NOT EXISTS ix_consolidations_scope ON consolidations(scope, upto_seq);
@@ -487,12 +488,48 @@ export class Store {
     const row = this.#db
       .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
       .get();
-    if (!row || row.value !== SCHEMA_VERSION) {
+    const from = row ? String(row.value) : 'missing';
+    if (from !== SCHEMA_VERSION) this.#migrateFrom(from);
+    this.#ensureScopeRow('main');
+  }
+
+  /**
+   * 升级旧库；只支持 v3 → v4。
+   *
+   * v3 的 `consolidations.upto_seq` 是插件自增 turn 计数，与平台 surface seq
+   * 不可比（H1）。开发期尚无用户数据，直接清空巩固行（facts/episodes 保留），
+   * 并把 episodes.consolidation_id 置空以免外键阻断删除。
+   * @param {string} from 旧版本号
+   */
+  #migrateFrom(from) {
+    if (from !== '3') {
       throw new StoreError(
-        `[store] unsupported schema_version: ${row ? row.value : 'missing'} (expected ${SCHEMA_VERSION})`,
+        `[store] unsupported schema_version: ${from} (expected ${SCHEMA_VERSION})`,
       );
     }
-    this.#ensureScopeRow('main');
+    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const columns = this.#db
+        .prepare("PRAGMA table_info('consolidations')")
+        .all()
+        .map((column) => column.name);
+      if (!columns.includes('compaction_start_seq')) {
+        this.#db.exec('ALTER TABLE consolidations ADD COLUMN compaction_start_seq INTEGER');
+      }
+      this.#db.exec('UPDATE episodes SET consolidation_id = NULL WHERE consolidation_id IS NOT NULL');
+      this.#db.exec('DELETE FROM consolidations');
+      this.#db
+        .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
+        .run(SCHEMA_VERSION);
+      this.#db.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.#db.exec('ROLLBACK');
+      } catch {
+        // 回滚失败时保留原始错误
+      }
+      throw error;
+    }
   }
 
   close() {
@@ -1493,8 +1530,9 @@ export class Store {
       .prepare(
         `INSERT INTO consolidations (
            id, scope, session_id, kind, trigger, upto_seq, turn_from, turn_to,
-           tokens_in, tokens_out, status, error, started_at, finished_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           tokens_in, tokens_out, status, error, started_at, finished_at,
+           compaction_start_seq
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -1511,6 +1549,7 @@ export class Store {
         input.error ?? null,
         epochOr(input.started_at, nowSeconds()),
         epochOr(input.finished_at, null),
+        input.compaction_start_seq ?? input.turn_from ?? null,
       );
     return this.getConsolidation(id);
   }
@@ -1524,7 +1563,11 @@ export class Store {
   }
 
   /**
-   * 巩固水位线：MAX(upto_seq) WHERE scope=? AND status IN ('written','compacted')。
+   * 巩固水位：最近一次成功巩固的 **surface seq**。
+   *
+   * 取「最新一条」而不是 MAX(upto_seq)：压缩会把区间替换成一个追加在日志末尾的
+   * 节点，可见 seq 可能非单调（catalog:627-632），MAX 会跳过刚写入的较低水位。
+   * forget_flush 是定向巩固，不代表整段推进，不参与水位。
    * @param {string} scope
    * @returns {number} 无水印时 0
    */
@@ -1532,11 +1575,29 @@ export class Store {
     requireString(scope, 'getWatermark(scope)');
     const row = this.#db
       .prepare(
-        `SELECT MAX(upto_seq) AS watermark FROM consolidations
-          WHERE scope = ? AND status IN ('written','compacted')`,
+        `SELECT upto_seq AS watermark FROM consolidations
+          WHERE scope = ? AND status IN ('written','compacted') AND kind <> 'forget_flush'
+          ORDER BY started_at DESC, rowid DESC LIMIT 1`,
       )
       .get(scope);
     return row && row.watermark !== null ? Number(row.watermark) : 0;
+  }
+
+  /**
+   * 压缩后用新 seq 空间重写水位（H1：替换节点 seq 最大，旧的数值水位已失效）。
+   * @param {string} id 巩固行 id
+   * @param {{uptoSeq: number}} [options]
+   * @returns {object|null}
+   */
+  retargetConsolidation(id, options = {}) {
+    const seq = Number(options.uptoSeq);
+    if (!Number.isSafeInteger(seq) || seq < 0) {
+      throw new TypeError('[store] retargetConsolidation(uptoSeq) must be a non-negative integer');
+    }
+    const current = this.getConsolidation(id);
+    if (!current) return null;
+    this.#db.prepare('UPDATE consolidations SET upto_seq = ? WHERE id = ?').run(seq, id);
+    return this.getConsolidation(id);
   }
 
   /**

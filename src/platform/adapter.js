@@ -130,6 +130,15 @@ export function createAdapter(ctx, opts = {}) {
     get tokenMeter() {
       return typeof ctx.tokenMeter?.measure === 'function';
     },
+    get tokenEstimator() {
+      return typeof ctx.tokenMeter?.estimateMessage === 'function';
+    },
+    get sessionEvent() {
+      return typeof ctx.on === 'function';
+    },
+    get sessionQuery() {
+      return typeof ctx.sessionQuery?.readSurface === 'function';
+    },
     get logger() {
       return typeof ctx.logger?.info === 'function';
     },
@@ -316,6 +325,54 @@ export function createAdapter(ctx, opts = {}) {
   }
 
   /**
+   * 估算一条消息的 token（文本 + 角色框架，平台固定启发式）。
+   * 只用于 surface 索引里给单条消息标价，不参与预算判定。
+   * @param {object} message
+   * @returns {number}
+   */
+  function estimateMessage(message) {
+    if (typeof ctx.tokenMeter?.estimateMessage !== 'function') {
+      throw unavailable('no-token-estimator', 'ctx.tokenMeter.estimateMessage()');
+    }
+    return ctx.tokenMeter.estimateMessage(message);
+  }
+
+  /**
+   * 订阅 `session/event`（post-commit 逐条 append feed）。
+   * 回调参数是 (session, event)；返回 disposer。
+   * @param {(session: object, event: object) => void} handler
+   * @returns {Function}
+   */
+  function onSessionEvent(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('onSessionEvent(handler): handler must be a function');
+    }
+    if (typeof ctx.on !== 'function') {
+      throw unavailable('no-session-event', 'ctx.on("session/event")');
+    }
+    return ctx.on('session/event', (session, event) => {
+      try {
+        handler(session, event);
+      } catch {
+        // 索引是加速层：任何异常都不能打断会话事件流。
+      }
+    });
+  }
+
+  /**
+   * 读一个会话当前的完整 surface 快照（events 与 surface.nodes 逐位 1:1）。
+   * 每次 O(整段 log)：只用于冷启动/漏事件回填，不要放进热路径。
+   * @param {string} sessionId
+   * @returns {Promise<object>}
+   */
+  function readSurface(sessionId) {
+    if (typeof ctx.sessionQuery?.readSurface !== 'function') {
+      throw unavailable('no-session-query', 'ctx.sessionQuery.readSurface()');
+    }
+    return ctx.sessionQuery.readSurface(sessionId);
+  }
+
+  /**
    * 注册一条人类命令。定义形状与平台一致：
    * `{ definitionId, name, description, input?, handler }`。
    * 命令名必须是平台可解析的小写 ASCII（`/^[a-z][a-z0-9_-]*$/`）。
@@ -463,6 +520,9 @@ export function createAdapter(ctx, opts = {}) {
     whenIdle,
     archiveSession,
     measure,
+    estimateMessage,
+    onSessionEvent,
+    readSurface,
     registerCommand,
     registerTool,
     unarchiveSession,

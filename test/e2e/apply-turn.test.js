@@ -43,10 +43,12 @@ const DRAFT = {
 
 /**
  * FakeCtx + commands/tools/llm 三个平台服务；tokenMeter 返回值可由测试改写。
- * @returns {{ctx: FakeCtx, streams: object[]}}
+ * 会话带 surface（H1：巩固窗口按 surface seq 选区），user 消息在 dispatch 前先 commit。
+ * @returns {{ctx: FakeCtx, streams: object[], session: object}}
  */
 function makeApplyCtx({ now = TEST_NOW } = {}) {
   const ctx = new FakeCtx({ now });
+  const session = ctx.addSession({ id: 'session-1' });
   ctx.commands = {
     registrations: [],
     register(definition) {
@@ -80,19 +82,27 @@ function makeApplyCtx({ now = TEST_NOW } = {}) {
     surfaceTokens: 41_000,
     nodes: [],
   };
-  return { ctx, streams };
+  return { ctx, streams, session };
 }
 
 /**
  * 一轮 pre-step 的标准 payload（role 消息形态）。
+ * 平台语义：user 消息在 pre-step 之前已经 commit 进 session surface，
+ * 因此这里先 emit `user/message`，再返回带 `agent.session` 的 payload。
+ * @param {FakeCtx} ctx
+ * @param {object} session
  * @param {number} turn
  * @param {string} text
  * @param {number} [step]
  * @returns {object}
  */
-function turnPayload(turn, text, step = 1) {
+function turnPayload(ctx, session, turn, text, step = 1) {
+  ctx.emitSessionEvent(session.id, {
+    type: 'user/message',
+    data: { role: 'user', content: [{ type: 'text', text }] },
+  });
   return {
-    agent: { id: 'agent-1', session: { id: 'session-1' } },
+    agent: { id: session.id, session },
     messages: [{ role: 'user', content: [{ type: 'text', text }] }],
     turn,
     step,
@@ -114,15 +124,16 @@ function decisionText(decision) {
 
 test('apply 生产路径：巩固 → 下一轮 turn 头压缩 → 发布状态板 → 召回新事实', async () => {
   const temp = makeTempStore();
-  const { ctx, streams } = makeApplyCtx();
-  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14 });
+  const { ctx, streams, session } = makeApplyCtx();
+  // retainTokens 同时是巩固窗口的尾部保留区（H1）；测试用 8 让短消息也能落到窗口内。
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4 });
   try {
     assert.equal(typeof handle?.dispose, 'function');
     // FakeCtx 的 FakeCtx 默认 now 是手动时钟；apply 的 restart 发布在空 staged 上返回 null。
     assert.equal(temp.store.getBoard('main'), '');
 
     // ---------------- turn 1：pre-step 触发巩固 ----------------
-    const first = await ctx.dispatch('agent/pre-step', turnPayload(1, '我下周要把预算调到 8000。'), {
+    const first = await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 1, '我下周要把预算调到 8000。'), {
       kind: 'enter',
       messages: [],
     });
@@ -136,7 +147,7 @@ test('apply 生产路径：巩固 → 下一轮 turn 头压缩 → 发布状态�
     assert.ok(temp.store.getBoardState('main').staged_revision >= 1);
 
     // turn 1 的第二步：不再重复巩固/注入。
-    const second = await ctx.dispatch('agent/pre-step', turnPayload(1, '补充一句，下周一执行。', 2), {
+    const second = await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 1, '补充一句，下周一执行。', 2), {
       kind: 'enter',
       messages: [],
     });
@@ -155,7 +166,7 @@ test('apply 生产路径：巩固 → 下一轮 turn 头压缩 → 发布状态�
     const compactCalls = ctx.callsOf('compaction.compactRegion');
     assert.equal(compactCalls.length, 0);
 
-    const third = await ctx.dispatch('agent/pre-step', turnPayload(2, '现在预算额度是多少？'), {
+    const third = await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 2, '现在预算额度是多少？'), {
       kind: 'enter',
       messages: [],
     });
@@ -166,15 +177,20 @@ test('apply 生产路径：巩固 → 下一轮 turn 头压缩 → 发布状态�
     const state = temp.store.getBoardState('main');
     assert.ok(state.revision >= 1, '压缩成功后应发布状态板');
     assert.match(temp.store.getBoard('main'), /8000/u);
+    // H1：压缩后旧 seq 被替换节点顶替（本 fake 追加 seq=4），水位在新 seq 空间内自洽。
+    assert.deepEqual(session.surface.nodes, [2, 3, 4]);
+    assert.equal(temp.store.getWatermark('main'), 4, '水位应改写为压缩后的新 seq');
     const status = temp.store.db
-      .prepare("SELECT status FROM consolidations WHERE scope = 'main' AND upto_seq = 1 AND kind = 'nap'")
+      .prepare("SELECT status, upto_seq, compaction_start_seq FROM consolidations WHERE scope = 'main' AND kind = 'nap'")
       .get();
     assert.equal(status.status, 'compacted', '压缩成功后巩固行应标记 compacted');
+    assert.equal(status.upto_seq, 4, '巩固行的 upto_seq 应随水位重定目标');
+    assert.equal(status.compaction_start_seq, 1, '巩固行应记录压缩区间起点 seq');
     assert.match(decisionText(third), /\[相关记忆\]/u, '下一轮应召回新事实');
     assert.match(decisionText(third), /8000/u);
 
     // 第二轮之后的 step 不再注入。
-    const fourth = await ctx.dispatch('agent/pre-step', turnPayload(2, '谢谢。', 2), {
+    const fourth = await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 2, '谢谢。', 2), {
       kind: 'enter',
       messages: [],
     });
@@ -226,7 +242,8 @@ test('apply 生产路径：deep-sleep 每日补跑执行降级/FTS GC 并写 con
   temp.store.db.prepare('INSERT INTO fts_facts (rowid, txt) VALUES (?, ?)').run(999_999, '孤儿记忆');
 
   const { ctx } = makeApplyCtx({ now: deepNow });
-  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14 });
+  // retainTokens 同时是巩固窗口的尾部保留区（H1）；测试用 8 让短消息也能落到窗口内。
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4 });
   try {
     await new Promise((resolve) => setTimeout(resolve, 80));
 
@@ -268,7 +285,7 @@ test('apply 生产路径：deep-sleep 每日补跑执行降级/FTS GC 并写 con
  */
 async function countConsolidations(overrides) {
   const temp = makeTempStore();
-  const { ctx, streams } = makeApplyCtx();
+  const { ctx, streams, session } = makeApplyCtx();
   // 13K：高于覆盖值 12000，低于默认 24000；idle 不会触发（时钟不前进）。
   ctx.returns['tokenMeter.measure'] = {
     logRevision: 1,
@@ -278,10 +295,10 @@ async function countConsolidations(overrides) {
     surfaceTokens: 13_000,
     nodes: [],
   };
-  const handle = apply(ctx, { dbPath: temp.dbPath, ...overrides });
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4, ...overrides });
   try {
-    await ctx.dispatch('agent/pre-step', turnPayload(1, '记录一下这个决定。'), { kind: 'enter', messages: [] });
-    await ctx.dispatch('agent/pre-step', turnPayload(2, '继续。'), { kind: 'enter', messages: [] });
+    await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 1, '记录一下这个决定。'), { kind: 'enter', messages: [] });
+    await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 2, '继续。'), { kind: 'enter', messages: [] });
     const row = temp.store.db
       .prepare("SELECT COUNT(*) AS n FROM consolidations WHERE scope = 'main' AND kind = 'nap'")
       .get();

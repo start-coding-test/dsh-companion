@@ -29,6 +29,9 @@
 | 15 | `workspaceRegistry.unarchiveSession` | `ctx.workspaceRegistry.unarchiveSession(sessionId)` | 线程重新激活（当前适配层未封装，见 §3） | `dsh-workspace/lib/index.js:553` |
 | 16 | `tokenMeter.measure` | `ctx.tokenMeter.measure(session, requestHeader) → { totalTokens, surfaceTokens, nodes, ... }` | 读取会话 token 用量（阈值判断） | `dsh-token-meter/lib/index.js:692,722` |
 | 17 | `ctx.logger` | `ctx.logger.info/warn/error/debug(message, meta?)`；也可 `ctx.logger()` 取命名 logger | 插件观测 | `cordis/lib/index.js:579-582`；用法 `dsh-agent/lib/index.js:258` |
+| 18 | `session/event` | `ctx.on('session/event', (session, event) => void)`（post-commit，emit）；`event.seq` 为该事件的 session seq，`event.type ∈ {system,developer,user,assistant}/message`、`tool/result` | H1 surface 索引的增量正文来源 | api-catalog `dsh-tool-cordis/lib/types/api-catalog.js:4379-4384` |
+| 19 | `sessionQuery.readSurface` | `ctx.sessionQuery.readSurface(sessionId) → { session, inheritedEventCount, capturedThroughSeq, events }`；`events` 与 `session.surface.nodes` 逐位 1:1，含正文；每次 O(整段 log) | 索引冷启动/压缩后全量回填（每会话至多一次） | api-catalog `:2383-2386`；实现 `dsh-session-query/lib/index.js:1167-1175` |
+| 20 | `tokenMeter.estimateMessage` | `ctx.tokenMeter.estimateMessage(message) → number`；单条消息的启发式 token 估算 | surface 索引里实时事件的 token 计价 | api-catalog `:3297-3320`；内部 `dsh-token-meter/lib/index.js:531-551` |
 
 ### 1.1 pre-step 的两个关键细节
 
@@ -85,6 +88,9 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 | `whenIdle(agentOrCreated)` | `agent.whenIdle()` | 接受 agent 句柄或 `createSession` 返回值 `{ agent }` |
 | `archiveSession(sessionId, options?)` | `ctx.workspaceRegistry.archiveSession(...)` | 归档线程；冻结场景应传 `{ stopActivity: true }` |
 | `measure(session, requestHeader?)` | `ctx.tokenMeter.measure(...)` | 返回平台计量对象 |
+| `estimateMessage(message)` | `ctx.tokenMeter.estimateMessage(...)` | 单条消息的启发式 token（surface 索引计价） |
+| `onSessionEvent(handler)` | `ctx.on('session/event', (session, event) => …)` | 返回 disposer；handler 异常被吞掉，不打断事件流 |
+| `readSurface(sessionId)` | `ctx.sessionQuery.readSurface(...)` | O(整段 log)：仅冷启动/漏事件回填用 |
 
 ### 2.1 `onPreStep` 补丁
 
@@ -106,7 +112,7 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 
 适配器对象上有只读的 `capabilities`（getter，随宿主服务装载实时变化）：
 `systemPrompt`、`preStep`、`timer`、`compaction`、`sessionController`、`archive`、
-`tokenMeter`、`logger`。调用缺失能力时抛 `PlatformError`：
+`tokenMeter`、`tokenEstimator`、`sessionEvent`、`sessionQuery`、`logger`。调用缺失能力时抛 `PlatformError`：
 
 | code | 触发方法 |
 | --- | --- |
@@ -117,6 +123,9 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 | `no-session` | `createSession` / `prompt` / `cancel` |
 | `no-archive` | `archiveSession` |
 | `no-token-meter` | `measure` |
+| `no-token-estimator` | `estimateMessage` |
+| `no-session-event` | `onSessionEvent` |
+| `no-session-query` | `readSurface` |
 | `no-when-idle` | `whenIdle`（传入对象没有 `whenIdle()`） |
 
 `PlatformError` 定义在 `src/platform/errors.js`：`new PlatformError(code, message?)`，
@@ -135,10 +144,11 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 
 ## 4. FakeCtx（`test/fakes/ctx.js`）
 
-`FakeCtx` 覆盖适配层用到的 11 个平台面：
+`FakeCtx` 覆盖适配层用到的平台面：
 `now`、`logger`、`systemPrompt.section`、`on`、`interval`、`compaction.compactRegion`、
 `sessionController.createSession`、`sessionController.prompt`、`sessionController.cancel`、
-`workspaceRegistry.archiveSession`、`tokenMeter.measure`。
+`workspaceRegistry.archiveSession`、`tokenMeter.measure`、`tokenMeter.estimateMessage`、
+`sessionQuery.readSurface`，以及用真实 session 形态模拟的 `session/event` 源。
 
 ```js
 import { FakeCtx } from './test/fakes/ctx.js';
@@ -154,6 +164,11 @@ ctx.advance(60_000);              // 推进手动时钟
 await ctx.fireTimers(2);          // 触发 every 注册的回调（已 dispose 的跳过）
 await ctx.dispatch('agent/pre-step', payload, fallback); // 模拟 waterfall
 ctx.callsOf('sessionController.prompt'); // 调用记录 { method, args, at }
+
+// 带 surface 的会话（H1：seq 来自 surface.nodes，不是 log 下标）
+const session = ctx.addSession({ id: 'session-1', events: [userEvent('...', 7)] });
+ctx.emitSessionEvent(session.id, userEvent('新消息', 8)); // 触发 session/event
+ctx.compactSession(session.id, 7, 8, { remap: [100] });    // 模拟压缩后的 seq 重映射
 ```
 
 - `calls` 记录 `{ method, args, at }`，断言转发参数用 `callsOf(method)`。

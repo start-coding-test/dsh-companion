@@ -43,6 +43,12 @@ import { createMetrics } from './runtime/metrics.js';
 import { createProactive } from './runtime/proactive.js';
 import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
 import { createTools } from './runtime/tools.js';
+import {
+  createSurfaceIndex,
+  planRegion,
+  surfaceSeqs,
+  watermarkAfterCompact,
+} from './session/surface.js';
 import * as threadRegistry from './thread/registry.js';
 import { zonedDayKey } from './time.js';
 
@@ -135,8 +141,17 @@ export function apply(ctx, rawConfig) {
       platform.log('info', '[dsh-companion] state board published on restart', { revision: restarted });
     }
     state.pendingCompact = recoverPendingCompact(store, SCOPE);
-    state.lastCompactedSeq = lastCompactedSeq(store, SCOPE);
-    state.turnSeq = Math.max(state.turnSeq, Number(store.getWatermark(SCOPE)) || 0);
+    state.watermarkSeq = Number(store.getWatermark(SCOPE)) || 0;
+    // H1：surface 索引。优先用 session/event 增量维护；宿主没有该事件时靠
+    // readSurface 冷启动回填（每次 O(整段 log)，只在缺失时触发）。
+    state.surface = createSurfaceIndex({ platform, tailTokens: state.config.retainTokens });
+    if (platform.capabilities.sessionEvent) {
+      track(platform.onSessionEvent((session, event) => {
+        state.surface.record(session, event);
+      }));
+    } else {
+      platform.log('debug', '[dsh-companion] session/event unavailable; surface index rebuilds on demand');
+    }
     publishOnThreadUnarchive(platform, store);
 
     registerSections(platform, store, track);
@@ -208,8 +223,12 @@ function createWiringState({ host, platform, store, config, metrics }) {
     proactive: null,
     /** 上一轮 turn 标识（platform payload.turn）。 */
     lastTurn: null,
-    /** 插件自增 seq；以巩固水位为起点，保证 consolidate 不会立刻 skipped。 */
-    turnSeq: 0,
+    /** H1：surface seq 索引（session/event 增量 + readSurface 冷启动回填）。 */
+    surface: null,
+    /** 最近一次 pre-step 的 surface 快照（timer/审计复用）。 */
+    surfaceSnapshot: null,
+    /** 巩固水位：最近一次成功巩固的 surface seq；0 = 尚未巩固任何节点。 */
+    watermarkSeq: 0,
     /** 已注入召回的 turn 集合（同一 turn 只注入一次）。 */
     turnSeen: new Set(),
     /** 本轮注入的 fact id（H5：下一轮判断是否被用上）。 */
@@ -223,7 +242,6 @@ function createWiringState({ host, platform, store, config, metrics }) {
     tokens: 0,
     overCount: 0,
     pendingCompact: null,
-    lastCompactedSeq: 0,
     llmResolved: false,
     llm: null,
     llmRoute: null,
@@ -364,10 +382,7 @@ async function runPreStep(state, payload) {
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const turnKey = turnKeyOf(payload);
   const isNewTurn = turnKey !== null && turnKey !== state.lastTurn;
-  if (isNewTurn) {
-    state.lastTurn = turnKey;
-    state.turnSeq += 1;
-  }
+  if (isNewTurn) state.lastTurn = turnKey;
 
   captureTranscript(state, messages);
   // H5：先根据「上一轮 assistant 是否复述了上轮注入的 fact」做强化，
@@ -385,6 +400,9 @@ async function runPreStep(state, payload) {
     if (isNewTurn) recordTokenEvent(state, usage);
   }
 
+  // H1：每步刷新 surface 快照（seq 列表 + 对齐的 token/文本索引）。
+  await refreshSurface(state, payload, usage?.nodes ?? null);
+
   if (isNewTurn) {
     // 先补上一轮写库后未完成的两段式压缩（平台只允许 turn 内压缩）。
     await maybeCompact(state, payload);
@@ -392,6 +410,32 @@ async function runPreStep(state, payload) {
   }
 
   return injectRecall(state, payload, messages, turnKey);
+}
+
+/**
+ * 刷新当前会话的 surface 快照（无 session 时为 null，插件继续工作）。
+ * @param {object} state
+ * @param {object} payload
+ * @param {object[]|null} [measuredNodes] 已从 tokenMeter 拿到的节点，免二次测量
+ * @param {{forceRebuild?: boolean}} [options]
+ * @returns {Promise<object|null>}
+ */
+async function refreshSurface(state, payload, measuredNodes = null, options = {}) {
+  const session = payload?.agent?.session ?? null;
+  if (session === null || typeof session !== 'object' || state.surface === null) return null;
+  try {
+    const snapshot = await state.surface.snapshot(session, {
+      measured: measuredNodes,
+      forceRebuild: options.forceRebuild === true,
+    });
+    state.surfaceSnapshot = snapshot;
+    return snapshot;
+  } catch (error) {
+    state.platform.log('debug', '[dsh-companion] surface snapshot failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
 }
 
 /**
@@ -467,7 +511,7 @@ function reinforceOnUse(state, messages, isNewTurn) {
   }
 }
 
-/** @param {object} state @param {object} payload @returns {number|null} */
+/** @param {object} state @param {object} payload @returns {object|null} */
 function measureTokens(state, payload) {
   const { platform } = state;
   if (!platform.capabilities.tokenMeter) return null;
@@ -478,6 +522,8 @@ function measureTokens(state, payload) {
     return {
       tokensIn: Number(measured?.totalTokens) || 0,
       tokensOut: Number(measured?.surfaceDeltaTokens) || 0,
+      nodes: Array.isArray(measured?.nodes) ? measured.nodes : null,
+      session,
     };
   } catch (error) {
     platform.log('debug', '[dsh-companion] tokenMeter.measure failed', {
@@ -526,10 +572,30 @@ async function maybeConsolidate(state, payload) {
     idleMs: config.idleMs,
   });
   if (!plan.trigger) return;
-
-  const watermark = Number(store.getWatermark(SCOPE)) || 0;
-  if (state.turnSeq <= watermark) return;
   if (state.transcript.length === 0) return;
+
+  // H1：窗口按 surface seq 算 —— 水位之后的节点，减去尾部 6,144 tokens 保留区。
+  const snapshot = await refreshSurface(state, payload);
+  if (snapshot === null) return;
+  const { region, reason } = planRegion(snapshot, {
+    afterSeq: state.watermarkSeq,
+    budgetTokens: state.config.retainTokens,
+  });
+  if (region === null) {
+    platform.log('debug', '[dsh-companion] consolidation window empty', {
+      reason,
+      watermark: state.watermarkSeq,
+      nodes: snapshot.seqs.length,
+    });
+    return;
+  }
+  if (region.missing > 0) {
+    platform.log('debug', '[dsh-companion] consolidation skipped: surface text incomplete', {
+      missing: region.missing,
+      count: region.count,
+    });
+    return;
+  }
 
   const llm = await resolveConsolidationLlm(state);
   if (typeof llm !== 'function') {
@@ -545,20 +611,24 @@ async function maybeConsolidate(state, payload) {
     const result = await consolidate({
       store,
       scope: SCOPE,
-      seqFrom: watermark + 1,
-      seqTo: state.turnSeq,
+      seqFrom: region.startSeq,
+      seqTo: region.endSeq,
       llm,
       now: at,
       trigger: plan.trigger,
       sessionId: sessionIdOf(payload) ?? SCOPE,
+      // 窗口已在 surface 层选好；水位推进允许跨过旧值。
+      guardWatermark: false,
     });
     if (result?.skipped) return;
 
     const consolidation = findConsolidation(store, SCOPE, Number(result.upto_seq));
     state.pendingCompact = {
       id: consolidation?.id ?? null,
-      uptoSeq: Number(result.upto_seq),
+      startSeq: region.startSeq,
+      endSeq: region.endSeq,
     };
+    state.watermarkSeq = region.endSeq;
     metrics.inc('consolidations');
     platform.log('info', '[dsh-companion] consolidation written', {
       upto_seq: result.upto_seq,
@@ -601,22 +671,50 @@ async function maybeCompact(state, payload) {
     platform.log('debug', '[dsh-companion] compaction unavailable; keeping pending_compact');
     return;
   }
-  const start = Math.max(1, state.lastCompactedSeq + 1);
-  const end = Math.min(state.pendingCompact.uptoSeq, state.turnSeq);
-  if (end < start) return;
 
+  const pending = state.pendingCompact;
+  const snapshot = await refreshSurface(state, payload);
+  if (snapshot === null) return;
+  const seqs = snapshot.seqs;
+  const startIdx = seqs.indexOf(pending.startSeq);
+  const endIdx = seqs.indexOf(pending.endSeq);
+  if (startIdx < 0 || endIdx < 0 || endIdx < startIdx) {
+    // 区间已不在当前 surface（被别的压缩替换 / 会话切换）：丢弃，不重试旧 seq。
+    platform.log('warn', '[dsh-companion] pending compaction region expired; dropping', {
+      startSeq: pending.startSeq,
+      endSeq: pending.endSeq,
+      nodes: seqs.length,
+    });
+    state.pendingCompact = null;
+    state.metrics.inc('compactionDrops');
+    return;
+  }
+
+  const start = seqs[startIdx];
+  const end = seqs[endIdx];
   try {
     await platform.compactRegion(start, end, payload?.agent);
-    if (state.pendingCompact.id) {
-      store.markConsolidated(state.pendingCompact.id, { status: 'compacted' });
+    if (pending.id) {
+      store.markConsolidated(pending.id, { status: 'compacted' });
     }
-    state.lastCompactedSeq = end;
-    state.pendingCompact = null;
     state.metrics.inc('compactions');
+
+    // 压缩把区间替换成追加在日志末尾的节点（seq 最大），旧水位在新空间失效：
+    // 重读 surface，水位记为「替换节点 / 位置水位」并在库内重写，保证自洽。
+    const next = await refreshSurface(state, payload, null, { forceRebuild: true });
+    const watermark = watermarkAfterCompact({
+      newSeqs: next?.seqs ?? surfaceSeqs(payload?.agent?.session),
+      oldSeqs: seqs,
+      startIdx,
+    });
+    state.watermarkSeq = watermark;
+    if (pending.id) store.retargetConsolidation(pending.id, { uptoSeq: watermark });
+    state.pendingCompact = null;
     const revision = publishBoard(store, SCOPE, 'compact');
     platform.log('info', '[dsh-companion] compacted and published state board', {
       start,
       end,
+      watermark,
       revision,
     });
   } catch (error) {
@@ -899,26 +997,36 @@ async function runDeepSleep(state) {
  */
 async function deepConsolidate(state) {
   const { store, platform } = state;
-  const watermark = Number(store.getWatermark(SCOPE)) || 0;
-  if (state.transcript.length === 0 || state.turnSeq <= watermark) {
-    return { written: false, reason: 'nothing-to-consolidate' };
+  if (state.transcript.length === 0) return { written: false, reason: 'nothing-to-consolidate' };
+  // 定时器没有 payload：用最近一次 pre-step 的快照（无快照说明本轮没跑过 agent）。
+  const snapshot = state.surfaceSnapshot;
+  if (snapshot === null || snapshot.seqs.length === 0) {
+    return { written: false, reason: 'no-surface' };
   }
+  const { region, reason } = planRegion(snapshot, {
+    afterSeq: state.watermarkSeq,
+    budgetTokens: state.config.retainTokens,
+  });
+  if (region === null) return { written: false, reason };
+  if (region.missing > 0) return { written: false, reason: 'text-incomplete' };
   const llm = await resolveConsolidationLlm(state);
   if (typeof llm !== 'function') return { written: false, reason: 'no-llm' };
   try {
     const result = await consolidate({
       store,
       scope: SCOPE,
-      seqFrom: watermark + 1,
-      seqTo: state.turnSeq,
+      seqFrom: region.startSeq,
+      seqTo: region.endSeq,
       llm,
       now: Math.floor(platform.now() / 1000),
       trigger: 'deep-sleep',
       sessionId: SCOPE,
+      guardWatermark: false,
     });
     if (result?.skipped) return { written: false, reason: 'skipped' };
     const row = findConsolidation(store, SCOPE, Number(result.upto_seq));
-    state.pendingCompact = { id: row?.id ?? null, uptoSeq: Number(result.upto_seq) };
+    state.pendingCompact = { id: row?.id ?? null, startSeq: region.startSeq, endSeq: region.endSeq };
+    state.watermarkSeq = region.endSeq;
     state.metrics.inc('consolidations');
     return { written: true, upto_seq: result.upto_seq, facts: result.facts ?? 0 };
   } catch (error) {
@@ -1170,30 +1278,21 @@ async function freezeThreads(store, platform, config) {
 // ---------------------------------------------------------------- 小工具
 
 /**
+ * 重启后恢复未完成的两段式压缩（只认 nap：deep 行的 upto_seq 是审计水位）。
  * @param {Store} store
  * @param {string} scope
- * @returns {{id: string, uptoSeq: number}|null}
+ * @returns {{id: string, startSeq: number, endSeq: number}|null}
  */
 function recoverPendingCompact(store, scope) {
   const row = store.db.prepare(
-    `SELECT id, upto_seq FROM consolidations
-      WHERE scope = ? AND status = 'written'
-      ORDER BY upto_seq DESC LIMIT 1`,
+    `SELECT id, upto_seq, turn_from, compaction_start_seq FROM consolidations
+      WHERE scope = ? AND status = 'written' AND kind = 'nap'
+      ORDER BY started_at DESC, rowid DESC LIMIT 1`,
   ).get(scope);
-  return row ? { id: row.id, uptoSeq: Number(row.upto_seq) } : null;
-}
-
-/**
- * @param {Store} store
- * @param {string} scope
- * @returns {number}
- */
-function lastCompactedSeq(store, scope) {
-  const row = store.db.prepare(
-    `SELECT MAX(upto_seq) AS seq FROM consolidations
-      WHERE scope = ? AND status = 'compacted'`,
-  ).get(scope);
-  return row && row.seq !== null ? Number(row.seq) : 0;
+  if (!row) return null;
+  const endSeq = Number(row.upto_seq);
+  const startSeq = Number(row.compaction_start_seq ?? row.turn_from ?? endSeq);
+  return { id: row.id, startSeq, endSeq };
 }
 
 /**

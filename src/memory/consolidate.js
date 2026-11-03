@@ -367,6 +367,8 @@ function factKey(fact) {
  * @param {string} [input.kind='nap'] 巩固类型（nap/deep/forget_flush）
  * @param {string[]} [input.excludeFactIds] 定向巩固排除的事实 id：其 statement
  *   相同/包含/被包含的草稿事实一律不写回（遗忘闭环用）
+ * @param {boolean} [input.guardWatermark=true] 是否做「段已巩固过」守卫；
+ *   index.js 已在 surface 层面选好窗口，传 false 以允许水位从射线外推进
  * @returns {Promise<{skipped: boolean, upto_seq: number, episodeId?: string,
  *                    facts?: number, kind?: string, excluded?: number}>}
  */
@@ -376,9 +378,8 @@ export async function consolidate(input = {}) {
   const scope = requireScope(input.scope ?? 'main');
   const from = requireSeq(seqFrom, 'seqFrom');
   const to = requireSeq(seqTo, 'seqTo');
-  if (to < from) {
-    throw new RangeError('[consolidate] seqTo must be greater than or equal to seqFrom');
-  }
+  // 不校验 seqFrom <= seqTo：surface 位置不等于数值顺序，压缩后的可见 seq
+  // 可能非单调（catalog:627-632）。
 
   const kind = nonEmptyString(input.kind) ?? 'nap';
   if (!CONSOLIDATION_KINDS.has(kind)) {
@@ -388,8 +389,9 @@ export async function consolidate(input = {}) {
   // 1) 水位线：这段是否已经巩固过。skipped 路径绝不调用模型、绝不写库。
   // forget_flush 例外：遗忘后的定向重巩固本来就是「同一区间再蒸馏一次」，
   // 新事实会排除被遗忘目标；水位取 MAX，不会被这次重跑推回去。
+  const guardWatermark = input.guardWatermark !== false;
   const watermark = Number(store.getWatermark(scope)) || 0;
-  if (to <= watermark && kind !== 'forget_flush') {
+  if (guardWatermark && to <= watermark && kind !== 'forget_flush') {
     return { skipped: true, upto_seq: watermark };
   }
 
@@ -427,6 +429,7 @@ export async function consolidate(input = {}) {
       upto_seq: to,
       turn_from: from,
       turn_to: to,
+      compaction_start_seq: from,
       status: 'written',
       started_at: at,
       finished_at: at,

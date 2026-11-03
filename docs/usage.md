@@ -322,6 +322,14 @@ dbPath: "D:/dsh-data/companion.db"
 
 同时活跃的线程最多 6 个（`threadMaxActive`），超过后新建会被拒绝；`key=new` 时必须提供 `name`。线程空闲超过 14 天（`threadIdleDays`）会被归档冻结，再次使用同一 key 时会自动重新激活。
 
+### 巩固和压缩用的是哪个 seq？（v0.1.1 起）
+
+`consolidations.upto_seq` / `compaction_start_seq` 记的是**会话 surface 节点的 seq**（`session.surface.nodes`），
+不再是插件自增的轮次计数。压缩会把区间替换成追加在日志末尾的新节点（seq 变大），
+插件随后按新 surface 重写水位（`retargetConsolidation`），因此水位只在「当前可见 surface」内自洽，
+历史行只作审计。升级到 v0.1.1 时旧库会迁移到 `schema_version=4`：清空 `consolidations`
+（开发期约定，旧值语义不可比）、把 `episodes.consolidation_id` 置空；facts/episodes 不受影响。
+
 ### 数据存在哪里？
 
 默认在插件工作目录的 `.data/companion.db`（可通过 `dbPath` 修改），包含 `-wal`、`-shm` 附属文件。平台自己的会话 JSONL 由 DSH 管理，不在本插件数据库内。
