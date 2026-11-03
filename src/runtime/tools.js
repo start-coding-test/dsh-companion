@@ -2,7 +2,9 @@
  * 模型工具面（05 §7.5、t11 卡）：8 个工具的描述符 + 执行层。
  *
  * 约束：
- * - `createTools` 只接收依赖（store/retrieve/registry/platform），execute 不读全局单例；
+ * - `createTools` 只接收依赖（store/retrieve/registry/platform/clock/cwd），execute 不读全局单例；
+ *   clock 与 cwd 由接线层注入，模块内不再直接调 Date.now() / process.cwd()；
+ * - 能力缺失时返回 `{ok:false,reuse?...,reason}`，不静默跳过；
  * - 每个工具都带合法 JSON Schema（type=object + properties + required）；
  * - 必填参数缺失时同步抛 TypeError，便于模型侧拿到明确错误；
  * - thread_run 遵循 05 §2.8.1：先用 registry 做复用/新建/拒绝判定，
@@ -28,12 +30,19 @@ const LIMIT_SCHEMA = Object.freeze({
  * @param {Function} deps.retrieve 四档检索函数（src/memory/retrieve.js）
  * @param {object} [deps.registry] src/thread/registry.js 的命名空间
  * @param {object} [deps.platform] src/platform/adapter.js 返回的适配器
+ * @param {() => number} [deps.clock] 可注入时钟（毫秒），默认 Date.now
+ * @param {string} [deps.cwd] thread_run 新建会话的默认工作目录
  * @returns {Array<{name:string, description:string, parameters:object, execute:Function}>}
  */
-export function createTools({ store, retrieve, registry, platform } = {}) {
+export function createTools({ store, retrieve, registry, platform, clock = Date.now, cwd } = {}) {
   if (store === null || store === undefined) {
     throw new TypeError('createTools: store is required');
   }
+  if (typeof clock !== 'function') {
+    throw new TypeError('createTools: clock must be a function');
+  }
+  const nowMs = () => Number(clock());
+  const defaultCwd = typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined;
 
   return [
     {
@@ -52,7 +61,7 @@ export function createTools({ store, retrieve, registry, platform } = {}) {
       async execute(args = {}) {
         assertArgs(args, 'memory_search');
         if (typeof retrieve !== 'function') {
-          throw new TypeError('createTools: retrieve is required for memory_search');
+          return { ok: false, reason: 'retrieve-unavailable' };
         }
         const query = requireString(args.query, 'memory_search', 'query');
         const scope = optionalString(args.scope, 'memory_search', 'scope') ?? 'main';
@@ -120,8 +129,17 @@ export function createTools({ store, retrieve, registry, platform } = {}) {
         const row = store.getFact(id);
         if (!row) return { ok: false, id, reason: 'not-found' };
         if (row.deleted_at) return { ok: true, id, alreadyDeleted: true, deletedAt: row.deleted_at };
-        const deleted = store.deleteFact(id);
-        return { ok: true, id, alreadyDeleted: false, deletedAt: deleted?.deleted_at ?? null };
+        const forgotten = store.forgetFact(id, {
+          at: Math.floor(nowMs() / 1000),
+          payload: { statement: row.statement, kind: row.kind, scope: row.scope },
+        });
+        return {
+          ok: forgotten,
+          id,
+          alreadyDeleted: false,
+          tombstoned: forgotten,
+          reason: forgotten ? undefined : 'not-active',
+        };
       },
     },
 
@@ -180,7 +198,7 @@ export function createTools({ store, retrieve, registry, platform } = {}) {
         if (row.status === 'done') return { ok: true, id, alreadyDone: true, reminder: row };
         if (row.status === 'cancelled') return { ok: false, id, reason: 'cancelled', reminder: row };
 
-        const nowSec = Math.floor(Date.now() / 1000);
+        const nowSec = Math.floor(nowMs() / 1000);
         const info = store.db
           .prepare(
             `UPDATE reminders
@@ -249,7 +267,7 @@ export function createTools({ store, retrieve, registry, platform } = {}) {
           return { ok: false, action: 'reject', key: plan.key ?? key, reason: plan.reason };
         }
 
-        const nowSec = Math.floor(Date.now() / 1000);
+        const nowSec = Math.floor(nowMs() / 1000);
         if (plan.action === 'reuse') {
           let thread = store.getThread(plan.key);
           if (!thread) {
@@ -257,9 +275,15 @@ export function createTools({ store, retrieve, registry, platform } = {}) {
           }
           let reactivated = false;
           if (thread.status !== 'active') {
-            if (typeof platform?.unarchiveSession === 'function') {
-              await platform.unarchiveSession(thread.session_id);
+            if (typeof platform?.unarchiveSession !== 'function') {
+              return {
+                ok: false,
+                action: 'reuse',
+                key: plan.key,
+                reason: 'unarchive-unavailable',
+              };
             }
+            await platform.unarchiveSession(thread.session_id);
             thread = store.upsertThread({
               ...thread,
               status: 'active',
@@ -271,7 +295,12 @@ export function createTools({ store, retrieve, registry, platform } = {}) {
           let prompted = false;
           if (goal !== undefined) {
             if (typeof platform?.prompt !== 'function') {
-              throw new TypeError('createTools: platform.prompt is required to send a thread goal');
+              return {
+                ok: false,
+                action: 'reuse',
+                key: plan.key,
+                reason: 'prompt-unavailable',
+              };
             }
             await platform.prompt({
               sessionId: thread.session_id,
@@ -291,10 +320,15 @@ export function createTools({ store, retrieve, registry, platform } = {}) {
         }
 
         if (typeof platform?.createSession !== 'function') {
-          throw new TypeError('createTools: platform.createSession is required to create a thread');
+          return { ok: false, action: 'create', key: plan.key, reason: 'session-unavailable' };
+        }
+        const targetCwd = optionalString(args.cwd, 'thread_run', 'cwd') ?? defaultCwd;
+        if (targetCwd === undefined) {
+          // cwd 必须由接线层从宿主注入；不读 process.cwd()（L3）。
+          return { ok: false, action: 'create', key: plan.key, reason: 'cwd-unavailable' };
         }
         const created = await platform.createSession({
-          cwd: optionalString(args.cwd, 'thread_run', 'cwd') ?? process.cwd(),
+          cwd: targetCwd,
           agentPreset: 'companion-thread',
         });
         const sessionId = sessionIdOf(created);
@@ -342,7 +376,7 @@ export function createTools({ store, retrieve, registry, platform } = {}) {
       },
       execute(args = {}) {
         assertArgs(args, 'cost_report');
-        return summarizeCost(store, Date.now());
+        return summarizeCost(store, nowMs());
       },
     },
   ];

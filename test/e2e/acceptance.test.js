@@ -4,6 +4,9 @@
  * 复用 test/e2e/helpers.js 与 test/helpers/scenarios.js 的场景数据，
  * 不重复定义遗忘/预算/写失败的场景。只跑假宿主与临时库：
  * 不启动真实 DSH、不联网、不读真实时钟。
+ *
+ * 口径：本文件是组件级 self-wired（逐模块调用 consolidate / scheduler /
+ * proactive），不是 apply() 的生产路径；生产接线由 apply-turn.test.js 覆盖。
  */
 
 import { test } from 'node:test';

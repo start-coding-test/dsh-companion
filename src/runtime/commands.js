@@ -18,11 +18,12 @@ const MAX_FORGET = 5;
  * @param {object} options
  * @param {string} options.text 原始输入
  * @param {import('../memory/store.js').Store} options.store
- * @param {number|Date} [options.now=Date.now] 毫秒时间戳或 Date
+ * @param {number|Date} options.now 毫秒时间戳或 Date（由接线层注入）
  * @param {string} [options.scope='main'] 作用域
+ * @param {object} [options.metrics] createMetrics() 句柄；/状态 用它显示本轮 token
  * @returns {{handled: boolean, reply: string}}
  */
-export function handleCommand({ text, store, now = Date.now(), scope = 'main' } = {}) {
+export function handleCommand({ text, store, now, scope = 'main', metrics } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
   if (!raw.startsWith('/')) return { handled: false, reply: '' };
@@ -47,7 +48,7 @@ export function handleCommand({ text, store, now = Date.now(), scope = 'main' } 
   if (command === '线程') {
     return { handled: true, reply: formatThreads(store.listThreads({ limit: 100 })) };
   }
-  return { handled: true, reply: formatStatus(store, scope) };
+  return { handled: true, reply: formatStatus(store, scope, metrics) };
 }
 
 /**
@@ -58,11 +59,11 @@ export function handleCommand({ text, store, now = Date.now(), scope = 'main' } 
  * 事件不计入。返回结构固定为 {today, month}，各自 {tokensIn, tokensOut, total}。
  *
  * @param {object} store
- * @param {number|Date} [now=Date.now]
+ * @param {number|Date} now 毫秒时间戳或 Date（由接线层注入）
  * @returns {{today: {tokensIn:number,tokensOut:number,total:number},
  *            month: {tokensIn:number,tokensOut:number,total:number}}}
  */
-export function summarizeCost(store, now = Date.now()) {
+export function summarizeCost(store, now) {
   const at = toMillis(now);
   const dayStart = startOfDay(at);
   const monthStart = startOfMonth(at);
@@ -312,7 +313,7 @@ function formatThreads(rows) {
 }
 
 /** @param {object} store @param {string} scope */
-function formatStatus(store, scope) {
+function formatStatus(store, scope, metrics) {
   const stats = store.stats();
   const tables = [
     'entities', 'episodes', 'facts', 'reminders', 'state_board', 'state_board_rev',
@@ -325,7 +326,26 @@ function formatStatus(store, scope) {
     ? `${job.kind} ${job.status} upto_seq=${job.upto_seq}（${formatDateTime(job.started_at)}）`
     : '无';
   const fts = `fts ${stats.fts_facts ?? 0}/${stats.fts_episodes ?? 0}`;
-  return `状态：${counts} / ${fts}\n水位 ${scope}：${watermark}\n最近 job：${jobText}`;
+  const tokenText = formatTokenSnapshot(metrics);
+  return `状态：${counts} / ${fts}${tokenText}\n水位 ${scope}：${watermark}\n最近 job：${jobText}`;
+}
+
+/**
+ * 本轮 token 快照（L6）：metrics 缺失时显示 0，绝不 throw。
+ * @param {object} [metrics]
+ * @returns {string}
+ */
+function formatTokenSnapshot(metrics) {
+  if (!metrics || typeof metrics.snapshot !== 'function') return ' / tokens 本轮 0';
+  try {
+    const snapshot = metrics.snapshot();
+    const tokensIn = Number(snapshot.tokensIn) || 0;
+    const tokensOut = Number(snapshot.tokensOut) || 0;
+    const overBudget = Number(snapshot.overBudget) || 0;
+    return ` / tokens 本轮 入 ${tokensIn} 出 ${tokensOut}（超预算 ${overBudget} 次）`;
+  } catch {
+    return ' / tokens 本轮 0';
+  }
 }
 
 /** @param {object} store @param {string} scope */
@@ -351,7 +371,8 @@ function hasDb(store) {
 function toMillis(value) {
   if (value instanceof Date) return value.getTime();
   const n = Number(value);
-  if (!Number.isFinite(n)) return Date.now();
+  // 非法时间戳不读全局时钟：交给调用方注入的 now 语义保持一致，记为 0。
+  if (!Number.isFinite(n)) return 0;
   return n < 1e11 ? n * 1000 : n;
 }
 

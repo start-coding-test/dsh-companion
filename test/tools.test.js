@@ -49,7 +49,14 @@ function makeHarness() {
       return { ok: true };
     },
   };
-  const tools = createTools({ store, retrieve, registry, platform });
+  const tools = createTools({
+    store,
+    retrieve,
+    registry,
+    platform,
+    clock: () => NOW_MS,
+    cwd: '/tmp/dsh-companion-thread',
+  });
   const byName = Object.fromEntries(tools.map((tool) => [tool.name, tool]));
   return { store, retrieve, searchCalls, platform, tools, byName };
 }

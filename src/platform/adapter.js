@@ -97,6 +97,15 @@ export function createAdapter(ctx, opts = {}) {
       ? () => ctx.now()
       : () => Date.now();
 
+  /**
+   * 宿主工作目录投影；工具层需要它而不是直接读 process.cwd()。
+   * @returns {string|undefined}
+   */
+  const cwd = () => {
+    const value = ctx.cwd ?? ctx.workspace?.cwd;
+    return typeof value === 'string' && value !== '' ? value : undefined;
+  };
+
   const capabilities = Object.freeze({
     get systemPrompt() {
       return typeof ctx.systemPrompt?.section === 'function';
@@ -129,6 +138,12 @@ export function createAdapter(ctx, opts = {}) {
     },
     get tools() {
       return typeof ctx.tools?.register === 'function';
+    },
+    get unarchive() {
+      return typeof ctx.workspaceRegistry?.unarchiveSession === 'function';
+    },
+    get llm() {
+      return typeof ctx.llm?.stream === 'function';
     },
   });
 
@@ -335,8 +350,108 @@ export function createAdapter(ctx, opts = {}) {
     return ctx.tools.register(definition);
   }
 
+  /**
+   * 解除归档（线程重新激活）。与 archiveSession 对称，可选能力。
+   * @param {string} sessionId
+   * @returns {Promise<unknown>}
+   */
+  function unarchiveSession(sessionId) {
+    if (!capabilities.unarchive) {
+      throw unavailable('no-unarchive', 'ctx.workspaceRegistry.unarchiveSession()');
+    }
+    if (typeof sessionId !== 'string' || sessionId.length === 0) {
+      throw new TypeError('unarchiveSession(sessionId): sessionId must be a non-empty string');
+    }
+    return ctx.workspaceRegistry.unarchiveSession(sessionId);
+  }
+
+  /**
+   * 列出平台已注册的模型路由（`ctx.llm.listProviders()` 的只读投影）。
+   * @returns {Array<{id: string, name: string}>}
+   */
+  function listProviders() {
+    if (!capabilities.llm) {
+      throw unavailable('no-llm', 'ctx.llm.listProviders()');
+    }
+    const rows = ctx.llm.listProviders?.() ?? [];
+    return Array.isArray(rows)
+      ? rows.map((row) => ({ id: row?.id, name: row?.name }))
+      : [];
+  }
+
+  /**
+   * @param {string} provider 路由 id
+   * @returns {Promise<Array<{id: string, name: string}>>}
+   */
+  async function listModels(provider) {
+    if (!capabilities.llm) {
+      throw unavailable('no-llm', 'ctx.llm.listModels()');
+    }
+    if (typeof provider !== 'string' || provider.length === 0) {
+      throw new TypeError('listModels(provider): provider must be a non-empty string');
+    }
+    if (typeof ctx.llm.listModels !== 'function') return [];
+    const rows = await ctx.llm.listModels(provider);
+    return Array.isArray(rows)
+      ? rows.map((row) => ({ id: row?.id, name: row?.name }))
+      : [];
+  }
+
+  /**
+   * 走平台唯一模型调用路径（`ctx.llm.stream`），把文本增量拼成完整字符串。
+   * 只用于巩固草稿这类一次性文本生成；失败时抛错，由调用方降级。
+   *
+   * @param {{provider: string, model: string, messages: unknown[],
+   *          signal?: AbortSignal}} request
+   * @returns {Promise<string>}
+   */
+  async function complete(request) {
+    if (!capabilities.llm) {
+      throw unavailable('no-llm', 'ctx.llm.stream()');
+    }
+    if (request === null || typeof request !== 'object') {
+      throw new TypeError('complete(request): request must be an object');
+    }
+    if (typeof request.provider !== 'string' || request.provider.length === 0) {
+      throw new TypeError('complete(request): provider must be a non-empty string');
+    }
+    if (typeof request.model !== 'string' || request.model.length === 0) {
+      throw new TypeError('complete(request): model must be a non-empty string');
+    }
+    if (!Array.isArray(request.messages)) {
+      throw new TypeError('complete(request): messages must be an array');
+    }
+
+    let text = '';
+    let failure = null;
+    for await (const chunk of ctx.llm.stream({
+      provider: request.provider,
+      model: request.model,
+      messages: request.messages,
+      ...(request.signal === undefined ? {} : { signal: request.signal }),
+    })) {
+      if (chunk === null || typeof chunk !== 'object') continue;
+      if (chunk.type === 'text-delta') {
+        const delta = chunk.text ?? chunk.delta ?? '';
+        if (typeof delta === 'string') text += delta;
+      } else if (chunk.type === 'finish') {
+        if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') {
+          failure = chunk.reason?.failure?.message ?? chunk.reason?.kind;
+        }
+      }
+    }
+    if (failure !== null) {
+      throw new Error(`model call failed: ${failure}`);
+    }
+    if (text.trim() === '') {
+      throw new Error('model call returned no text');
+    }
+    return text;
+  }
+
   return {
     now,
+    cwd,
     log,
     section,
     onPreStep,
@@ -350,6 +465,10 @@ export function createAdapter(ctx, opts = {}) {
     measure,
     registerCommand,
     registerTool,
+    unarchiveSession,
+    listProviders,
+    listModels,
+    complete,
     capabilities,
   };
 }

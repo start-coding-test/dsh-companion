@@ -14,6 +14,7 @@ const invokedAsDirectory = /[\\/]test[\\/]e2e$/u.test(entry);
 
 if (invokedAsDirectory) {
   await import('./acceptance.test.js');
+  await import('./apply-turn.test.js');
   await import('./assemble-budget.test.js');
   await import('./forget.test.js');
   await import('./interrupt.test.js');

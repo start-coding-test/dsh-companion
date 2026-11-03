@@ -1,18 +1,39 @@
 /**
  * 插件入口：装配人格段、记忆管线、命令、工具与调度器。
  *
- * 设计约束（t12 / 07 §4）：
+ * 设计约束（t12 / t23 / 07 §4）：
  * - 只做接线，不实现业务逻辑；所有能力来自已完成的模块与平台适配层；
  * - 不直接 import 任何 @deepseek-ai/* 包，平台调用统一经 createAdapter(ctx)；
  * - 宿主缺少某项服务时安静跳过（日志用 debug），不让插件装载失败；
- * - 配置非法时 fail-fast，抛 ConfigError 且不产生任何注册。
+ * - 配置非法时 fail-fast，抛 ConfigError 且不产生任何注册；
+ * - 同一 ctx 二次 apply 是幂等的：返回同一个 { dispose } 句柄，不重复注册；
+ * - dispose 关闭 Store、清掉 interval 与所有注册。
+ *
+ * 主链路（t23 H1）：
+ *   每轮 agent/pre-step
+ *     → 记录 token 度量（tokenMeter.measure）与转录快照
+ *     → turn 头：planConsolidation 判定（hard > idle > threshold）
+ *     → consolidate 先写库（成功才登记 pending_compact）
+ *     → 同一 turn 头（若有上轮 pending）compactRegion(区间终点 ≤ 水位) → 成功后
+ *       publishBoard('compact')
+ *     → 召回经 assemble 预算裁切，同一 turn 只注入一次
+ *   deep-sleep 03:00 不再空转：遗忘降级 + 状态板重渲染（staged）+ 审计。
  */
-
-import { copyFileSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 import { normalizeConfig } from './config.js';
 import { Store } from './memory/store.js';
 import { retrieve } from './memory/retrieve.js';
+import { assemble } from './memory/assemble.js';
+import {
+  DEFAULT_AT_TOKENS,
+  DEFAULT_HARD_TOKENS,
+  DEFAULT_IDLE_MS,
+  consolidate,
+  planConsolidation,
+} from './memory/consolidate.js';
+import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections } from './persona/sections.js';
 import { DEFAULT_CARD } from './persona/card.js';
 import { createAdapter } from './platform/adapter.js';
@@ -27,6 +48,19 @@ export const name = 'dsh-companion';
 
 /** 默认作用域。 */
 const SCOPE = 'main';
+
+/** 召回预算（R-SES-07：注入 ≤2050 tokens，总量 ≤32K）。 */
+const RECALL_BUDGET_TOKENS = 2050;
+const WORKING_BUDGET_TOKENS = 32_000;
+
+/** 转录快照：只保留最近 N 条 / N 字符，供巩固模型使用。 */
+const TRANSCRIPT_MAX_MESSAGES = 40;
+const TRANSCRIPT_MAX_CHARS = 6000;
+
+/** 备份保留份数（t23 L2：按日期滚动）。 */
+const BACKUP_KEEP = 7;
+
+const DAY_MS = 86_400_000;
 
 /**
  * 平台命令名必须是小写 ASCII（`/^[a-z][a-z0-9_-]*$/`），
@@ -59,103 +93,217 @@ const COMMAND_ALIASES = Object.freeze([
   }),
 ]);
 
+/** 每个 ctx 一份安装记录：二次 apply 短路，dispose 释放。 */
+const INSTALLS = new WeakMap();
+
 /**
  * 插件入口。
  * @param {object} ctx 平台上下文
  * @param {Record<string, unknown>} [rawConfig] 用户原始配置
- * @returns {void}
+ * @returns {{dispose: () => void}|undefined}
  */
 export function apply(ctx, rawConfig) {
   const config = normalizeConfig(rawConfig);
   const host = ctx !== null && typeof ctx === 'object' ? ctx : null;
   host?.logger?.info?.('[dsh-companion] config ok', { warnings: config.warnings });
-  if (host === null) return;
+  if (host === null) return undefined;
+
+  const installed = INSTALLS.get(host);
+  if (installed) {
+    host.logger?.debug?.('[dsh-companion] already installed on this context; reusing handle');
+    return installed.handle;
+  }
 
   const platform = createAdapter(host, { now: () => host.now?.() ?? Date.now() });
   const store = Store.open(config.dbPath);
   const metrics = createMetrics({ clock: platform.now });
+  const state = createWiringState({ host, platform, store, config, metrics });
 
-  registerSections(platform, store);
-  registerMemoryPipeline(platform, store, metrics);
-  registerCommands(platform, store);
-  registerTools(platform, store);
-  startScheduler(platform, store, config, metrics);
+  const disposers = [];
+  const track = (disposer) => {
+    if (typeof disposer === 'function') disposers.push(disposer);
+  };
+
+  try {
+    // 重启/重载发布时机（四时机之一）。
+    const restarted = publishBoard(store, SCOPE, 'restart');
+    if (restarted !== null) {
+      platform.log('info', '[dsh-companion] state board published on restart', { revision: restarted });
+    }
+    state.pendingCompact = recoverPendingCompact(store, SCOPE);
+    state.lastCompactedSeq = lastCompactedSeq(store, SCOPE);
+    state.turnSeq = Math.max(state.turnSeq, Number(store.getWatermark(SCOPE)) || 0);
+    publishOnThreadUnarchive(platform, store);
+
+    registerSections(platform, store, track);
+    if (platform.capabilities.preStep) {
+      track(platform.onPreStep((payload) => runPreStep(state, payload)));
+    }
+    registerCommands(platform, store, metrics, track);
+    registerTools(platform, store, track);
+    track(startScheduler(state));
+  } catch (error) {
+    for (const disposer of disposers.splice(0).reverse()) {
+      try {
+        disposer();
+      } catch {
+        // 卸载失败不应遮蔽原始装载错误。
+      }
+    }
+    try {
+      store.close();
+    } catch {
+      // Store 可能尚未成功打开。
+    }
+    throw error;
+  }
+
+  let disposed = false;
+  const handle = Object.freeze({
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      for (const disposer of disposers.splice(0).reverse()) {
+        try {
+          disposer();
+        } catch {
+          // 单个 disposer 失败不影响其余资源释放。
+        }
+      }
+      try {
+        state.scheduler?.stop?.();
+      } catch {
+        // scheduler 可能尚未启动。
+      }
+      try {
+        store.close();
+      } catch {
+        // 已关闭时幂等。
+      }
+      INSTALLS.delete(host);
+      host.logger?.info?.('[dsh-companion] disposed');
+    },
+  });
+
+  INSTALLS.set(host, { handle, store });
+  return handle;
 }
+
+/**
+ * @param {object} input
+ * @returns {object}
+ */
+function createWiringState({ host, platform, store, config, metrics }) {
+  return {
+    host,
+    platform,
+    store,
+    config,
+    metrics,
+    scheduler: null,
+    proactive: null,
+    /** 上一轮 turn 标识（platform payload.turn）。 */
+    lastTurn: null,
+    /** 插件自增 seq；以巩固水位为起点，保证 consolidate 不会立刻 skipped。 */
+    turnSeq: 0,
+    /** 已注入召回的 turn 集合（同一 turn 只注入一次）。 */
+    turnSeen: new Set(),
+    /** 最近一段转录（用于巩固模型草稿）。 */
+    transcript: [],
+    lastHumanAt: null,
+    tokens: 0,
+    overCount: 0,
+    pendingCompact: null,
+    lastCompactedSeq: 0,
+    llmResolved: false,
+    llm: null,
+    llmRoute: null,
+    warnedNoLlm: false,
+  };
+}
+
+// ----------------------------------------------------------- 人格段 / 命令
 
 /**
  * 注册人格三段与状态板段。
  * @param {object} platform
  * @param {Store} store
+ * @param {(disposer: Function) => void} track
  */
-function registerSections(platform, store) {
+function registerSections(platform, store, track) {
   if (!platform.capabilities.systemPrompt) return;
   for (const section of buildSections(DEFAULT_CARD)) {
-    platform.section(section);
+    track(platform.section(section));
   }
-  platform.section({
+  track(platform.section({
     name: 'persona:state_board',
     order: 160,
     text: () => {
       const published = store.getBoard(SCOPE);
       return published === null || published === undefined ? '' : boardSection(published).text;
     },
-  });
+  }));
 }
 
 /**
- * 注册检索注入：每轮把与本轮用户输入相关的记忆拼成一条文本块，追加到本批
- * 进入消息末尾（agent/pre-step 的 inject 语义）。
+ * 第三个状态板发布时机：线程恢复（unarchive）。
+ * 工具层只会调用 platform.unarchiveSession，因此在这里包一层，成功后发布。
  * @param {object} platform
  * @param {Store} store
- * @param {{inc: Function}} metrics
  */
-function registerMemoryPipeline(platform, store, metrics) {
-  if (!platform.capabilities.preStep) return;
-  platform.onPreStep(async (payload) => {
-    const query = lastTextBlock(payload?.messages);
-    if (query === '' || query.startsWith('[相关记忆]')) return null;
-    let result;
+function publishOnThreadUnarchive(platform, store) {
+  const original = platform.unarchiveSession;
+  if (typeof original !== 'function') return;
+  platform.unarchiveSession = async (sessionId, ...rest) => {
+    const result = await original(sessionId, ...rest);
     try {
-      result = await retrieve({ store, query: query.slice(0, 200), scope: SCOPE, now: platform.now() });
+      publishBoard(store, SCOPE, 'thread-unarchive');
     } catch (error) {
-      platform.log('warn', '[dsh-companion] recall injection failed', {
+      platform.log('warn', '[dsh-companion] publish on thread unarchive failed', {
         message: error instanceof Error ? error.message : String(error),
       });
-      return null;
     }
-    if (!Array.isArray(result?.items) || result.items.length === 0) return null;
-    metrics.inc('recalls', result.items.length);
-    const lines = result.items.map((item) => `- (${item.kind} #${item.id}) ${item.text}`);
-    return { inject: [{ type: 'text', text: `[相关记忆]\n${lines.join('\n')}` }] };
-  });
+    return result;
+  };
 }
 
 /**
  * 注册 4 个 ASCII 命令；handler 统一转给 handleCommand。
  * @param {object} platform
  * @param {Store} store
+ * @param {object} metrics
+ * @param {(disposer: Function) => void} track
  */
-function registerCommands(platform, store) {
+function registerCommands(platform, store, metrics, track) {
   if (!platform.capabilities.commands) return;
   for (const alias of COMMAND_ALIASES) {
-    platform.registerCommand({
+    track(platform.registerCommand({
       definitionId: alias.definitionId,
       name: alias.name,
       description: alias.description,
       handler: (invocation) => {
         const rawInput = typeof invocation?.rawInput === 'string' ? invocation.rawInput : '';
-        const result = handleCommand({
-          text: `${alias.prefix}${rawInput}`,
-          store,
-          now: platform.now(),
-          scope: SCOPE,
-        });
+        let result;
+        try {
+          result = handleCommand({
+            text: `${alias.prefix}${rawInput}`,
+            store,
+            now: platform.now(),
+            scope: SCOPE,
+            metrics,
+          });
+        } catch (error) {
+          return {
+            kind: 'error',
+            text: `命令失败：${error instanceof Error ? error.message : String(error)}`,
+          };
+        }
         if (!result.handled) {
           return { kind: 'error', text: `未识别的命令参数；用法：${alias.prefix} [参数]` };
         }
         return { kind: 'success', text: result.reply };
       },
-    });
+    }));
   }
 }
 
@@ -164,17 +312,20 @@ function registerCommands(platform, store) {
  * 契约补齐 output（宽 schema + 文本 render），不做 defineTool 依赖。
  * @param {object} platform
  * @param {Store} store
+ * @param {(disposer: Function) => void} track
  */
-function registerTools(platform, store) {
+function registerTools(platform, store, track) {
   if (!platform.capabilities.tools) return;
   const tools = createTools({
     store,
     retrieve,
     registry: threadRegistry,
     platform,
+    clock: platform.now,
+    cwd: typeof platform.cwd === 'function' ? platform.cwd() : undefined,
   });
   for (const tool of tools) {
-    platform.registerTool({
+    track(platform.registerTool({
       name: tool.name,
       description: tool.description,
       parameters: tool.parameters,
@@ -183,19 +334,555 @@ function registerTools(platform, store) {
         render: (_args, value) => [{ type: 'text', text: renderToolValue(value) }],
       },
       execute: (args) => tool.execute(args ?? {}),
+    }));
+  }
+}
+
+// -------------------------------------------------------------- 主管线
+
+/**
+ * agent/pre-step 主处理：度量 → 巩固/压缩 → 召回注入（每 turn 一次）。
+ * @param {object} state
+ * @param {object} payload {agent, messages, turn, step, signal}
+ * @returns {Promise<object|null>}
+ */
+async function runPreStep(state, payload) {
+  const { platform } = state;
+  const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+  const turnKey = turnKeyOf(payload);
+  const isNewTurn = turnKey !== null && turnKey !== state.lastTurn;
+  if (isNewTurn) {
+    state.lastTurn = turnKey;
+    state.turnSeq += 1;
+  }
+
+  captureTranscript(state, messages);
+  const human = lastUserText(messages);
+  if (human !== '') state.lastHumanAt = platform.now();
+
+  const usage = measureTokens(state, payload);
+  if (usage !== null) {
+    state.tokens = usage.tokensIn;
+    state.overCount = usage.tokensIn >= DEFAULT_AT_TOKENS ? state.overCount + 1 : 0;
+    state.metrics.observe('tokensIn', usage.tokensIn);
+    state.metrics.observe('tokensOut', usage.tokensOut);
+    if (isNewTurn) recordTokenEvent(state, usage);
+  }
+
+  if (isNewTurn) {
+    // 先补上一轮写库后未完成的两段式压缩（平台只允许 turn 内压缩）。
+    await maybeCompact(state, payload);
+    await maybeConsolidate(state, payload);
+  }
+
+  return injectRecall(state, payload, messages, turnKey);
+}
+
+/** @param {object} state @param {object} payload @returns {number|null} */
+function measureTokens(state, payload) {
+  const { platform } = state;
+  if (!platform.capabilities.tokenMeter) return null;
+  const session = payload?.agent?.session ?? payload?.agent;
+  if (session === null || typeof session !== 'object') return null;
+  try {
+    const measured = platform.measure(session);
+    return {
+      tokensIn: Number(measured?.totalTokens) || 0,
+      tokensOut: Number(measured?.surfaceDeltaTokens) || 0,
+    };
+  } catch (error) {
+    platform.log('debug', '[dsh-companion] tokenMeter.measure failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+/**
+ * 每轮写一条 token 审计事件，供 /成本 与 /状态 统计（L6）。
+ * @param {object} state
+ * @param {{tokensIn: number, tokensOut: number}} usage
+ */
+function recordTokenEvent(state, usage) {
+  try {
+    state.store.appendEvent({
+      at: Math.floor(state.platform.now() / 1000),
+      action: 'USED',
+      table_name: 'tokens',
+      actor: 'consolidator',
+      reason: 'turn_metrics',
+      detail_json: { tokensIn: usage.tokensIn, tokensOut: usage.tokensOut },
+    });
+  } catch (error) {
+    state.platform.log('debug', '[dsh-companion] token event failed', {
+      message: error instanceof Error ? error.message : String(error),
     });
   }
 }
 
 /**
- * 注册并启动 6 个定时任务；任务体只调用已完成模块。
- * @param {object} platform
- * @param {Store} store
- * @param {object} config
- * @param {object} metrics
+ * 巩固阶段：水位判断 → 模型草稿 → 单事务写库，成功才登记 pending_compact。
+ * @param {object} state
+ * @param {object} payload
  */
-function startScheduler(platform, store, config, metrics) {
-  if (!platform.capabilities.timer) return;
+async function maybeConsolidate(state, payload) {
+  const { store, platform, metrics } = state;
+  const plan = planConsolidation({
+    tokens: state.tokens,
+    lastHumanAt: state.lastHumanAt,
+    now: platform.now(),
+    overCount: state.overCount,
+    hardTokens: DEFAULT_HARD_TOKENS,
+    atTokens: DEFAULT_AT_TOKENS,
+    idleMs: DEFAULT_IDLE_MS,
+  });
+  if (!plan.trigger) return;
+
+  const watermark = Number(store.getWatermark(SCOPE)) || 0;
+  if (state.turnSeq <= watermark) return;
+  if (state.transcript.length === 0) return;
+
+  const llm = await resolveConsolidationLlm(state);
+  if (typeof llm !== 'function') {
+    if (!state.warnedNoLlm) {
+      state.warnedNoLlm = true;
+      platform.log('debug', '[dsh-companion] consolidation model unavailable; skipping consolidation');
+    }
+    return;
+  }
+
+  const at = Math.floor(platform.now() / 1000);
+  try {
+    const result = await consolidate({
+      store,
+      scope: SCOPE,
+      seqFrom: watermark + 1,
+      seqTo: state.turnSeq,
+      llm,
+      now: at,
+      trigger: plan.trigger,
+      sessionId: sessionIdOf(payload) ?? SCOPE,
+    });
+    if (result?.skipped) return;
+
+    const consolidation = findConsolidation(store, SCOPE, Number(result.upto_seq));
+    state.pendingCompact = {
+      id: consolidation?.id ?? null,
+      uptoSeq: Number(result.upto_seq),
+    };
+    metrics.inc('consolidations');
+    platform.log('info', '[dsh-companion] consolidation written', {
+      upto_seq: result.upto_seq,
+      facts: result.facts ?? 0,
+      trigger: plan.trigger,
+    });
+  } catch (error) {
+    metrics.inc('consolidationFailures');
+    platform.log('warn', '[dsh-companion] consolidation failed', {
+      trigger: plan.trigger,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    try {
+      store.appendEvent({
+        at,
+        action: 'UPDATE',
+        table_name: 'consolidations',
+        actor: 'consolidator',
+        reason: 'consolidation_failed',
+        detail_json: {
+          trigger: plan.trigger,
+          message: error instanceof Error ? error.message : String(error),
+        },
+      });
+    } catch {
+      // 审计失败不覆盖原始错误。
+    }
+  }
+}
+
+/**
+ * 两段式压缩：只在 open turn 内调用；终点 ≤ 巩固水位，成功后发布状态板。
+ * @param {object} state
+ * @param {object} payload
+ */
+async function maybeCompact(state, payload) {
+  const { platform, store } = state;
+  if (state.pendingCompact === null) return;
+  if (!platform.capabilities.compaction) {
+    platform.log('debug', '[dsh-companion] compaction unavailable; keeping pending_compact');
+    return;
+  }
+  const start = Math.max(1, state.lastCompactedSeq + 1);
+  const end = Math.min(state.pendingCompact.uptoSeq, state.turnSeq);
+  if (end < start) return;
+
+  try {
+    await platform.compactRegion(start, end, payload?.agent);
+    if (state.pendingCompact.id) {
+      store.markConsolidated(state.pendingCompact.id, { status: 'compacted' });
+    }
+    state.lastCompactedSeq = end;
+    state.pendingCompact = null;
+    state.metrics.inc('compactions');
+    const revision = publishBoard(store, SCOPE, 'compact');
+    platform.log('info', '[dsh-companion] compacted and published state board', {
+      start,
+      end,
+      revision,
+    });
+  } catch (error) {
+    state.metrics.inc('compactionFailures');
+    platform.log('warn', '[dsh-companion] compactRegion failed; keeping pending_compact', {
+      start,
+      end,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * 召回注入：经 assemble 做预算裁切，同一 turn 只注入一次；末条是工具结果时跳过。
+ * @param {object} state
+ * @param {object} payload
+ * @param {unknown[]} messages
+ * @param {string|null} turnKey
+ * @returns {Promise<object|null>}
+ */
+async function injectRecall(state, payload, messages, turnKey) {
+  const { store, platform, metrics, config } = state;
+  const key = turnKey ?? `step:${String(payload?.step ?? 'unknown')}`;
+  if (state.turnSeen.has(key)) return null;
+  if (isToolTail(messages)) {
+    state.turnSeen.add(key);
+    return null;
+  }
+  const query = lastUserText(messages).slice(0, 200);
+  if (query === '') return null;
+
+  let recalled;
+  try {
+    recalled = await retrieve({
+      store,
+      query,
+      scope: SCOPE,
+      now: platform.now(),
+      budgetTokens: RECALL_BUDGET_TOKENS,
+    });
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] recall injection failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    state.turnSeen.add(key);
+    return null;
+  }
+  if (!Array.isArray(recalled?.items) || recalled.items.length === 0) {
+    state.turnSeen.add(key);
+    return null;
+  }
+
+  const assembled = assemble({
+    sections: [],
+    boardText: '',
+    recallItems: recalled.items,
+    history: [],
+    userInput: query,
+    limits: {
+      workingMemoryTokens: WORKING_BUDGET_TOKENS,
+      retainTokens: config.retainTokens,
+      boardTokens: 0,
+      recallTokens: RECALL_BUDGET_TOKENS,
+      summaryTokens: 0,
+    },
+  });
+  if (assembled?.dropped?.recall > 0 || (assembled?.tokens?.recall ?? 0) > RECALL_BUDGET_TOKENS) {
+    metrics.inc('overBudget');
+  }
+  metrics.inc('recalls', recalled.items.length);
+  state.turnSeen.add(key);
+
+  const injection = extractRecallBlock(assembled?.messages);
+  return injection === '' ? null : { inject: [{ type: 'text', text: injection }] };
+}
+
+/**
+ * 提取 assemble 渲染出的 `[相关记忆]` 块（含标题）。
+ * @param {unknown[]} messages
+ * @returns {string}
+ */
+function extractRecallBlock(messages) {
+  if (!Array.isArray(messages)) return '';
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message === null || typeof message !== 'object') continue;
+    const blocks = Array.isArray(message.content) ? message.content : [];
+    for (const block of blocks) {
+      if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+      const marker = block.text.indexOf('[相关记忆]');
+      if (marker >= 0) return block.text.slice(marker).trim();
+    }
+  }
+  return '';
+}
+
+// ---------------------------------------------------------- 巩固模型接入
+
+/**
+ * 解析巩固模型：优先宿主注入（`ctx.companion.consolidationLlm`），
+ * 其次走平台唯一模型路径 `ctx.llm.stream`（自动选第一条 provider/model）。
+ * @param {object} state
+ * @returns {Promise<Function|null>}
+ */
+async function resolveConsolidationLlm(state) {
+  if (state.llmResolved) return state.llm;
+  state.llmResolved = true;
+
+  const hook = state.host?.companion?.consolidationLlm;
+  if (typeof hook === 'function') {
+    state.llm = async ({ scope, seqFrom, seqTo }) => hook({
+      scope,
+      seqFrom,
+      seqTo,
+      transcript: state.transcript,
+    });
+    return state.llm;
+  }
+
+  if (!state.platform.capabilities.llm) return null;
+  try {
+    const providers = state.platform.listProviders();
+    const provider = Array.isArray(providers) ? providers.find((row) => row?.id) : null;
+    if (!provider) return null;
+    const models = await state.platform.listModels(provider.id);
+    const model = Array.isArray(models) ? models.find((row) => row?.id) : null;
+    if (!model) return null;
+    state.llmRoute = { provider: provider.id, model: model.id };
+  } catch (error) {
+    state.platform.log('debug', '[dsh-companion] llm route resolution failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+
+  state.llm = async ({ scope, seqFrom, seqTo }) => {
+    const prompt = buildConsolidationPrompt(state, { scope, seqFrom, seqTo });
+    const text = await state.platform.complete({
+      provider: state.llmRoute.provider,
+      model: state.llmRoute.model,
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+    });
+    return parseDraftJson(text);
+  };
+  return state.llm;
+}
+
+/**
+ * 巩固提示词：把转录转成草稿 JSON。只保留文本，不含工具参数。
+ * @param {object} state
+ * @param {{scope: string, seqFrom: number, seqTo: number}} segment
+ * @returns {string}
+ */
+function buildConsolidationPrompt(state, segment) {
+  const lines = state.transcript.map((row) => `${row.role}: ${row.text}`);
+  return [
+    '你是私人管家的记忆巩固器。把下面这段对话压缩成一条情景记忆与若干长期事实。',
+    '只输出一个 JSON 对象，不要解释，不要 Markdown 代码块。格式：',
+    '{"episode":{"title":"...","summary":"..."},',
+    ' "facts":[{"kind":"identity|relation|preference|project|knowledge|other",',
+    '           "subject_text":"...","predicate":"...","object_text":"...","statement":"..."}],',
+    ' "reminders":[{"kind":"todo","title":"..."}]}',
+    `scope=${segment.scope} seq=${segment.seqFrom}-${segment.seqTo}`,
+    '对话：',
+    lines.join('\n'),
+  ].join('\n');
+}
+
+/**
+ * 解析模型返回的草稿 JSON；容忍 ```json 代码块包裹。
+ * @param {string} text
+ * @returns {object}
+ */
+function parseDraftJson(text) {
+  const trimmed = String(text ?? '').trim();
+  const fenced = /^```(?:json)?\s*([\s\S]*?)```$/u.exec(trimmed);
+  const body = fenced ? fenced[1].trim() : trimmed;
+  const start = body.indexOf('{');
+  const end = body.lastIndexOf('}');
+  if (start < 0 || end <= start) {
+    throw new Error('consolidation draft is not a JSON object');
+  }
+  return JSON.parse(body.slice(start, end + 1));
+}
+
+// -------------------------------------------------------------- 深睡任务
+
+/**
+ * deep-sleep（03:00）MVP 子步（06 §4.3 的最小实现，已在代码与 CHANGELOG 注明）：
+ * 1) 巩固：睡眠窗口内若还有未巩固的转录且模型可用，按 deep-sleep 触发写库；
+ *    成功则登记 pending_compact，交给下一次 open turn 压缩；
+ * 2) 遗忘降级：active 且非 pinned 的事实，超过 strength_days 未强化 → dormant；
+ * 3) GC：清理 FTS 孤儿行（仅崩溃残留，正常 purge 会成对删除）；
+ * 4) 状态板重渲染：把结果写进 staged（发布仍只在四个时机）；
+ * 5) 审计：写一条 kind=deep 的 consolidations 与 memory_events（不改水位）。
+ * 情景→语义的模型抽取需要更强的巩固模型，留给后续版本（MVP 只做规则子步）。
+ * @param {object} state
+ * @returns {Promise<{consolidated: object, dormant: number, gc: number}>}
+ */
+async function runDeepSleep(state) {
+  const { store, platform } = state;
+  const now = platform.now();
+  const consolidated = await deepConsolidate(state);
+  const dormant = decayFacts(state, now);
+  const gc = gcFtsOrphans(state);
+  const board = renderBoard({
+    recent: store.listEpisodes({ scope: SCOPE, limit: 6 }),
+    facts: store.listFacts({ scope: SCOPE, status: 'active', limit: 10 }),
+    threads: store.listThreads({ status: 'active', limit: 10 }),
+    reminders: store.listReminders({ scope: SCOPE, limit: 12 }),
+  });
+  stageBoard(store, SCOPE, board);
+
+  const at = Math.floor(now / 1000);
+  const day = new Date(now).toISOString().slice(0, 10);
+  try {
+    store.insertConsolidation({
+      scope: SCOPE,
+      session_id: `deep:${day}`,
+      // consolidations.kind 的 CHECK 只允许 nap/deep/forget_flush；
+      // 日粒度记在 session_id 与审计 detail 里。
+      kind: 'deep',
+      trigger: 'deep-sleep',
+      upto_seq: Number(store.getWatermark(SCOPE)) || 0,
+      status: 'written',
+      started_at: at,
+      finished_at: at,
+    });
+  } catch (error) {
+    if (!/UNIQUE/iu.test(String(error?.message ?? error))) {
+      platform.log('warn', '[dsh-companion] deep-sleep consolidation row failed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  store.appendEvent({
+    at,
+    action: 'UPDATE',
+    table_name: 'facts',
+    actor: 'consolidator',
+    reason: 'deep-sleep',
+    detail_json: { day, dormant, gc, consolidated, board: 'staged' },
+  });
+  platform.log('info', '[dsh-companion] deep-sleep done', { dormant, gc, consolidated });
+  return { consolidated, dormant, gc };
+}
+
+/**
+ * 睡眠期巩固：只处理已产生但未巩固的转录；无模型时安静跳过。
+ * @param {object} state
+ * @returns {Promise<object>}
+ */
+async function deepConsolidate(state) {
+  const { store, platform } = state;
+  const watermark = Number(store.getWatermark(SCOPE)) || 0;
+  if (state.transcript.length === 0 || state.turnSeq <= watermark) {
+    return { written: false, reason: 'nothing-to-consolidate' };
+  }
+  const llm = await resolveConsolidationLlm(state);
+  if (typeof llm !== 'function') return { written: false, reason: 'no-llm' };
+  try {
+    const result = await consolidate({
+      store,
+      scope: SCOPE,
+      seqFrom: watermark + 1,
+      seqTo: state.turnSeq,
+      llm,
+      now: Math.floor(platform.now() / 1000),
+      trigger: 'deep-sleep',
+      sessionId: SCOPE,
+    });
+    if (result?.skipped) return { written: false, reason: 'skipped' };
+    const row = findConsolidation(store, SCOPE, Number(result.upto_seq));
+    state.pendingCompact = { id: row?.id ?? null, uptoSeq: Number(result.upto_seq) };
+    state.metrics.inc('consolidations');
+    return { written: true, upto_seq: result.upto_seq, facts: result.facts ?? 0 };
+  } catch (error) {
+    state.metrics.inc('consolidationFailures');
+    platform.log('warn', '[dsh-companion] deep-sleep consolidation failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return { written: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/**
+ * FTS 孤儿清理：删除主表已不存在、但索引行仍残留的行（崩溃残留）。
+ * @param {object} state
+ * @returns {number} 清理行数
+ */
+function gcFtsOrphans(state) {
+  const { store, platform } = state;
+  let removed = 0;
+  for (const [fts, main] of [['fts_facts', 'facts'], ['fts_episodes', 'episodes']]) {
+    try {
+      const info = store.db
+        .prepare(`DELETE FROM ${fts} WHERE rowid NOT IN (SELECT rowid FROM ${main})`)
+        .run();
+      removed += Number(info.changes) || 0;
+    } catch (error) {
+      platform.log('debug', '[dsh-companion] fts gc skipped', {
+        table: fts,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return removed;
+}
+
+/**
+ * 遗忘降级：分页扫描，避免 listFacts 单页截断遗漏。
+ * @param {object} state
+ * @param {number} nowMs
+ * @returns {number} 降级条数
+ */
+function decayFacts(state, nowMs) {
+  const { store, platform } = state;
+  const pageSize = 200;
+  let dormant = 0;
+  for (let offset = 0; ; offset += pageSize) {
+    const page = store.listFacts({ scope: SCOPE, status: 'active', limit: pageSize, offset });
+    for (const fact of page) {
+      if (fact.salience === 'pinned') continue;
+      const strengthDays = Number(fact.strength_days);
+      if (!Number.isFinite(strengthDays) || strengthDays <= 0) continue;
+      const last = toMillis(fact.last_reinforced_at);
+      if (last === null) continue;
+      if ((nowMs - last) / DAY_MS >= strengthDays) {
+        try {
+          store.updateFact(fact.id, { status: 'dormant' });
+          dormant += 1;
+        } catch (error) {
+          platform.log('warn', '[dsh-companion] fact decay failed', {
+            id: fact.id,
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+    if (page.length < pageSize) break;
+  }
+  return dormant;
+}
+
+// ------------------------------------------------------------ 调度与备份
+
+/**
+ * 注册并启动 6 个定时任务；任务体只调用已完成模块。
+ * @param {object} state
+ * @returns {Function} disposer：停止 scheduler
+ */
+function startScheduler(state) {
+  const { platform, store, config, metrics } = state;
+  if (!platform.capabilities.timer) return () => {};
+
   const proactive = createProactive({
     store,
     platform: {
@@ -207,24 +894,25 @@ function startScheduler(platform, store, config, metrics) {
     config,
     clock: platform.now,
   });
+  state.proactive = proactive;
 
   const jobs = {
     'idle-probe': async () => {
       await proactive.flush();
     },
     reminders: async () => {
-      fireDueReminders(store, platform, proactive);
+      fireDueReminders(state);
       await proactive.flush();
     },
-    'deep-sleep': () => {
-      platform.log('debug', '[dsh-companion] deep-sleep tick', metrics.snapshot());
+    'deep-sleep': async () => {
+      await runDeepSleep(state);
     },
     's2-purge': () => {
       const result = store.purge({ now: platform.now(), cutoffDays: config.purgeAfterDays });
       platform.log('info', '[dsh-companion] s2-purge done', result);
     },
     backup: () => {
-      backupDatabase(store, platform);
+      backupDatabase(state);
     },
     'thread-freeze': async () => {
       await freezeThreads(store, platform, config);
@@ -240,18 +928,19 @@ function startScheduler(platform, store, config, metrics) {
       if (typeof handle === 'function') handle();
     },
   });
+  state.scheduler = scheduler;
   scheduler.start(platform.now());
-  platform.log('info', '[dsh-companion] scheduler started', { jobs: JOB_IDS.length });
+  platform.log('info', '[dsh-companion] scheduler started', { jobs: JOB_IDS.length, metrics: metrics.snapshot() });
+  return () => scheduler.stop();
 }
 
 /**
  * 把到点的提醒转成主动消息，并标记为 fired。
- * @param {Store} store
- * @param {object} platform
- * @param {{enqueue: Function}} proactive
+ * @param {object} state
  * @returns {number} 本次处理条数
  */
-function fireDueReminders(store, platform, proactive) {
+function fireDueReminders(state) {
+  const { store, platform, proactive } = state;
   const now = platform.now();
   const seconds = Math.floor(now / 1000);
   const due = store.dueReminders({ now: seconds, limit: 50 });
@@ -263,7 +952,7 @@ function fireDueReminders(store, platform, proactive) {
   );
   for (const row of due) {
     mark.run(String(seconds), row.id);
-    proactive.enqueue({
+    proactive?.enqueue({
       kind: 'reminder',
       text: `提醒：${row.title}`,
       dedupeKey: `reminder:${row.id}:${seconds}`,
@@ -274,19 +963,67 @@ function fireDueReminders(store, platform, proactive) {
 }
 
 /**
- * 备份 SQLite 主库：先 checkpoint 把 WAL 落盘，再复制为 `<dbPath>.bak`。
- * @param {Store} store
- * @param {object} platform
+ * 备份 SQLite 主库：checkpoint → 复制为 `<db>.<YYYY-MM-DD>.bak`，
+ * 只保留最近 7 份；失败写 scheduler_jobs 审计事件（L2）。
+ * @param {object} state
+ * @returns {string|null} 备份路径
  */
-function backupDatabase(store, platform) {
-  if (store.dbPath === ':memory:') return;
+function backupDatabase(state) {
+  const { store, platform } = state;
+  if (store.dbPath === ':memory:') return null;
+  const now = platform.now();
+  const stamp = new Date(now).toISOString().slice(0, 10);
+  const dir = dirname(store.dbPath);
+  const base = basename(store.dbPath);
+  const target = join(dir, `${base}.${stamp}.bak`);
+
   try {
-    store.db.exec('PRAGMA wal_checkpoint(FULL)');
-  } catch {
-    // checkpoint 失败不阻断复制；主库仍可能包含大部分已提交数据。
+    mkdirSync(dir, { recursive: true });
+    try {
+      store.db.exec('PRAGMA wal_checkpoint(FULL)');
+    } catch {
+      // checkpoint 失败不阻断复制；主库仍可能包含大部分已提交数据。
+    }
+    copyFileSync(store.dbPath, target);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    platform.log('error', '[dsh-companion] backup failed', { path: target, message });
+    try {
+      store.appendEvent({
+        at: Math.floor(now / 1000),
+        action: 'USED',
+        table_name: 'scheduler_jobs',
+        row_id: 'backup',
+        actor: 'scheduler',
+        reason: 'backup_failed',
+        detail_json: { message, path: target },
+      });
+    } catch {
+      // 审计失败不影响任务继续。
+    }
+    return null;
   }
-  copyFileSync(store.dbPath, `${store.dbPath}.bak`);
-  platform.log('info', '[dsh-companion] backup done', { path: `${store.dbPath}.bak` });
+
+  try {
+    const prefix = `${base}.`;
+    const backups = readdirSync(dir)
+      .filter((file) => file.startsWith(prefix) && file.endsWith('.bak'))
+      .sort();
+    for (const file of backups.slice(0, Math.max(0, backups.length - BACKUP_KEEP))) {
+      try {
+        unlinkSync(join(dir, file));
+      } catch {
+        // 单个旧备份删除失败不阻断本次备份。
+      }
+    }
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] backup rotation failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  platform.log('info', '[dsh-companion] backup done', { path: target });
+  return target;
 }
 
 /**
@@ -312,21 +1049,166 @@ async function freezeThreads(store, platform, config) {
   }
 }
 
+// ---------------------------------------------------------------- 小工具
+
 /**
- * 取本批进入消息里最后一条非空文本块；没有则返回空串。
- * @param {unknown} messages
+ * @param {Store} store
+ * @param {string} scope
+ * @returns {{id: string, uptoSeq: number}|null}
+ */
+function recoverPendingCompact(store, scope) {
+  const row = store.db.prepare(
+    `SELECT id, upto_seq FROM consolidations
+      WHERE scope = ? AND status = 'written'
+      ORDER BY upto_seq DESC LIMIT 1`,
+  ).get(scope);
+  return row ? { id: row.id, uptoSeq: Number(row.upto_seq) } : null;
+}
+
+/**
+ * @param {Store} store
+ * @param {string} scope
+ * @returns {number}
+ */
+function lastCompactedSeq(store, scope) {
+  const row = store.db.prepare(
+    `SELECT MAX(upto_seq) AS seq FROM consolidations
+      WHERE scope = ? AND status = 'compacted'`,
+  ).get(scope);
+  return row && row.seq !== null ? Number(row.seq) : 0;
+}
+
+/**
+ * @param {Store} store
+ * @param {string} scope
+ * @param {number} uptoSeq
+ * @returns {object|null}
+ */
+function findConsolidation(store, scope, uptoSeq) {
+  return store.db.prepare(
+    `SELECT * FROM consolidations
+      WHERE scope = ? AND upto_seq = ? AND kind = 'nap'
+      ORDER BY started_at DESC LIMIT 1`,
+  ).get(scope, uptoSeq) ?? null;
+}
+
+/**
+ * turn 标识：优先 payload.turn；对象取 id，否则 JSON 化。
+ * @param {object} payload
+ * @returns {string|null}
+ */
+function turnKeyOf(payload) {
+  const turn = payload?.turn;
+  if (turn === undefined || turn === null) return null;
+  if (typeof turn === 'object') {
+    if (turn.id !== undefined && turn.id !== null) return `turn:${String(turn.id)}`;
+    try {
+      return `turn:${JSON.stringify(turn)}`;
+    } catch {
+      return null;
+    }
+  }
+  return `turn:${String(turn)}`;
+}
+
+/**
+ * 把平台 payload.messages 的两种形态（role 消息数组 / 裸内容块数组）统一成文本行。
+ * @param {unknown[]} messages
+ * @returns {{role: string, text: string}[]}
+ */
+function textRows(messages) {
+  if (!Array.isArray(messages)) return [];
+  const rows = [];
+  for (const message of messages) {
+    if (message === null || typeof message !== 'object') continue;
+    if (Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block?.type !== 'text' || typeof block.text !== 'string') continue;
+        rows.push({ role: typeof message.role === 'string' ? message.role : 'user', text: block.text });
+      }
+      continue;
+    }
+    if (message.type === 'text' && typeof message.text === 'string') {
+      rows.push({ role: typeof message.role === 'string' ? message.role : 'user', text: message.text });
+    }
+  }
+  return rows;
+}
+
+/**
+ * 取本批最后一条 user 文本（跳过注入块）。
+ * @param {unknown[]} messages
  * @returns {string}
  */
-function lastTextBlock(messages) {
-  if (!Array.isArray(messages)) return '';
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const block = messages[index];
-    if (block === null || typeof block !== 'object') continue;
-    if (block.type !== 'text' || typeof block.text !== 'string') continue;
-    const text = block.text.trim();
-    if (text !== '') return text;
+function lastUserText(messages) {
+  const rows = textRows(messages);
+  for (let index = rows.length - 1; index >= 0; index -= 1) {
+    const row = rows[index];
+    if (row.role !== 'user') continue;
+    const text = row.text.trim();
+    if (text === '' || text.startsWith('[相关记忆]')) continue;
+    return text;
   }
   return '';
+}
+
+/**
+ * 末条消息是否工具结果（工具调用后不再注入召回）。
+ * @param {unknown[]} messages
+ * @returns {boolean}
+ */
+function isToolTail(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const last = messages[messages.length - 1];
+  if (last === null || typeof last !== 'object') return false;
+  if (last.role === 'tool') return true;
+  if (last.type === 'tool-result' || last.type === 'tool-call') return true;
+  const blocks = Array.isArray(last.content) ? last.content : [];
+  return blocks.some((block) => block?.type === 'tool-result' || block?.type === 'tool-call');
+}
+
+/**
+ * 转录快照：最近 N 条文本消息，截断到 N 字符。
+ * @param {object} state
+ * @param {unknown[]} messages
+ */
+function captureTranscript(state, messages) {
+  const rows = [];
+  for (const row of textRows(messages)) {
+    if (row.role !== 'user' && row.role !== 'assistant') continue;
+    const text = row.text.trim();
+    if (text === '' || text.startsWith('[相关记忆]')) continue;
+    rows.push({ role: row.role, text });
+  }
+  const tail = rows.slice(-TRANSCRIPT_MAX_MESSAGES);
+  const joined = [];
+  let budget = TRANSCRIPT_MAX_CHARS;
+  for (let index = tail.length - 1; index >= 0 && budget > 0; index -= 1) {
+    const row = tail[index];
+    const text = row.text.length > budget ? row.text.slice(row.text.length - budget) : row.text;
+    joined.unshift({ role: row.role, text });
+    budget -= text.length;
+  }
+  state.transcript = joined;
+}
+
+/** @param {object} payload @returns {string|null} */
+function sessionIdOf(payload) {
+  const id = payload?.agent?.session?.id ?? payload?.agent?.id;
+  return typeof id === 'string' && id.length > 0 ? id : null;
+}
+
+/**
+ * 秒/毫秒统一成毫秒。
+ * @param {number|Date|null|undefined} value
+ * @returns {number|null}
+ */
+function toMillis(value) {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value.getTime();
+  const num = Number(value);
+  if (!Number.isFinite(num)) return null;
+  return Math.abs(num) < 1e11 ? Math.round(num * 1000) : Math.round(num);
 }
 
 /**

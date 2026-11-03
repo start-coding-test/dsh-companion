@@ -235,7 +235,7 @@ describe('apply（插件入口）', () => {
   test('合法配置不抛，且只记录一条 config ok 日志', () => {
     const calls = [];
     const ctx = { logger: { info: (...args) => calls.push(args) } };
-    assert.doesNotThrow(() => apply(ctx, { threadIdleDays: 21 }));
+    assert.doesNotThrow(() => apply(ctx, { threadIdleDays: 21, dbPath: ':memory:' }));
     assert.equal(calls.length, 1);
     assert.equal(calls[0][0], '[dsh-companion] config ok');
     assert.deepEqual(calls[0][1], { warnings: [] });
@@ -244,16 +244,16 @@ describe('apply（插件入口）', () => {
   test('未知字段通过日志 warnings 暴露', () => {
     const calls = [];
     const ctx = { logger: { info: (...args) => calls.push(args) } };
-    apply(ctx, { nope: 1 });
+    apply(ctx, { nope: 1, dbPath: ':memory:' });
     assert.equal(calls.length, 1);
     assert.equal(calls[0][1].warnings.length, 1);
     assert.match(calls[0][1].warnings[0], /nope/);
   });
 
   test('无 logger / 空 ctx 时不抛错', () => {
-    assert.doesNotThrow(() => apply({}, {}));
+    assert.doesNotThrow(() => apply({}, { dbPath: ':memory:' }));
     assert.doesNotThrow(() => apply(undefined, undefined));
-    assert.doesNotThrow(() => apply({ logger: {} }, {}));
+    assert.doesNotThrow(() => apply({ logger: {} }, { dbPath: ':memory:' }));
   });
 
   test('非法配置 fail-fast 抛 ConfigError 且不写日志', () => {

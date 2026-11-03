@@ -4,6 +4,9 @@
  *   → open turn 压缩成功后才 publish → 下一轮召回看到新事实。
  *
  * 原则：只依赖 FakeCtx + 临时库；不启动真实 DSH、不联网、不读真实时钟。
+ *
+ * 口径：本文件是组件级 self-wired（测试自己串 consolidate / compactRegion /
+ * publishBoard），不是 apply() 的生产路径；生产接线由 apply-turn.test.js 覆盖。
  */
 
 import { test } from 'node:test';

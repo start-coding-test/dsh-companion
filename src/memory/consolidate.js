@@ -25,6 +25,9 @@ export const DEFAULT_AT_TOKENS = 24_000;
 /** 空闲阈值：距最后一条人类消息 30 分钟。 */
 export const DEFAULT_IDLE_MS = 30 * 60 * 1000;
 
+/** 去重扫描的事实分页大小（Store 单页上限远大于此值）。 */
+const FACT_PAGE_SIZE = 200;
+
 const FACT_KINDS = new Set([
   'identity', 'relation', 'preference', 'project', 'knowledge', 'other',
 ]);
@@ -377,11 +380,15 @@ export async function consolidate(input = {}) {
     });
 
     // facts：key+value 完全相同的跳过（MVP 的「cos 去重」简化）。
-    const seen = new Set(
-      store.listFacts({ scope, limit: 500 }).map((row) =>
-        factKey({ subject_text: row.subject_text, predicate: row.predicate, object_text: row.object_text }),
-      ),
-    );
+    // 分页读取全量事实，避免 limit=500 截断后重复写入（L1）。
+    const seen = new Set();
+    for (let offset = 0; ; offset += FACT_PAGE_SIZE) {
+      const page = store.listFacts({ scope, limit: FACT_PAGE_SIZE, offset });
+      for (const row of page) {
+        seen.add(factKey({ subject_text: row.subject_text, predicate: row.predicate, object_text: row.object_text }));
+      }
+      if (page.length < FACT_PAGE_SIZE) break;
+    }
     let insertedFacts = 0;
     for (const fact of facts) {
       const key = factKey(fact);
