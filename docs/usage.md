@@ -50,8 +50,10 @@
 
 ```text
 /成本
-成本：今日 12345 tokens（入 8000 / 出 4345）｜本月 98765 tokens（入 60000 / 出 38765）
+成本：今日 12345 tokens（入 8000 / 出 4345）｜本月 98765 tokens（入 60000 / 出 38765）｜今日配额 12345 / 3000000
 ```
+
+达到每日 3M token 后追加「（已熔断）」，并在本地日界翻篇时自动复位。
 
 ### `/线程`
 
@@ -262,6 +264,8 @@ health | archived | 体检 | 2026-10-20
 - **硬超时 900s**：两段式回收——先 `cancel({sessionId, keepInbox:true})` 只中止
   当前轮，再 `cleanInbox(sessionId)` 清空排队；终态 `timeout`，回执写「超时」。
 - 宿主没有 `sessionController` 时返回 `{ "ok": false, "reason": "session-unavailable" }`。
+- 每日 token 达到 3M 时返回 `{ "ok": false, "reason": "daily_budget_exceeded" }`；
+  RSS 达到降级线时返回 `{ "ok": false, "reason": "memory_pressure" }`（入队前拒绝）。
 
 审计：收尾写两条 `memory_events`（append-only）：`USED` + `kind:"task_receipt"`
 （回执正文）与 `USED` + `kind:"task_run"`（任务生命周期）。`action` 词表里没有

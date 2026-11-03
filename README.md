@@ -69,6 +69,10 @@ token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryToke
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
+**每日 token 熔断**：按 `timezone` 的本地日界累计每日 token 用量，达到 `3,000,000` 后进入熔断：拒绝新的 `task_run`、暂停主动消息，`/成本` 与 `/状态` 会显示「已熔断」；本地日界翻篇自动复位。该上限固定为 3M，v0.1.1 不提供配置键。
+
+**RSS 三档降级**：每 60 秒检查一次进程 RSS，`≥2.95GiB` 记 warn 指标（不降级）、`≥3.0GiB` 停 `task_run` 与主动消息、`≥3.15GiB` 再停线程创建；恢复后自动解除。阈值固定，v0.1.1 不提供配置键。
+
 ## 首次安装自检
 
 默认配置是 32K 工作记忆；机器内存或模型上下文不同，建议先跑一次自检：
@@ -115,7 +119,8 @@ node scripts/calibrate/run.mjs
 - **无跨设备备份**：数据库只在本机；backup 任务只在本机按日期滚动保留 7 份。
 - 平台管理的会话 JSONL 不在插件控制范围内，插件无法删除。
 - **单人模型**：主会话与线程按 `scope` 隔离（线程为 `thread:<key>`），但仍是单人使用，不是多人协作。
-- **task_run 串行**：worker 全局单槽、忙时排队至多 2 个；软超时 600s 只告警，硬超时 900s 两段式取消（先中止当前轮、再清空排队）。
+- **task_run 串行**：worker 全局单槽、忙时排队至多 2 个；软超时 600s 只告警，硬超时 900s 两段式取消（先中止当前轮、再清空排队）。熔断或 RSS 降级时 `task_run` 会在入队前被拒绝（`daily_budget_exceeded` / `memory_pressure`）。
+- **预算/内存保护固定阈值**：每日 3M token 与 RSS 2.95/3.0/3.15GiB 三档不可配置；RSS warn 只记 metric，stop_dispatch 起才停派发；保护读数读取失败时按 `ok` 放行，不会因此中断会话。
 - **subagent 仍见全局人格段**：平台的 system prompt 段没有 per-session 文本；插件只能让 subagent 跳过召回、巩固与写库，无法移除人格 / 记忆提示段。
 - deep-sleep 的「情景→语义」模型抽取尚未实现，MVP 只做规则子步。
 

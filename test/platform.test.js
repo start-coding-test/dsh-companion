@@ -317,6 +317,7 @@ test('capabilities 反映宿主能力', () => {
   assert.deepEqual({ ...full.capabilities }, {
     systemPrompt: true,
     preStep: true,
+    turnStopping: true,
     timer: true,
     compaction: true,
     sessionController: true,

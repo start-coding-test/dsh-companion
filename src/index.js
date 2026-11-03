@@ -39,6 +39,15 @@ import { boardSection, buildSections } from './persona/sections.js';
 import { DEFAULT_CARD } from './persona/card.js';
 import { createAdapter } from './platform/adapter.js';
 import { MAIN_SCOPE, classifySession, threadScope } from './session/identity.js';
+import {
+  BUDGET_REASONS,
+  DAILY_TOKEN_LIMIT,
+  checkMemory,
+  createBudgetState,
+  levelAtLeast,
+  overDailyBudget,
+  recordTurnUsage,
+} from './runtime/budget.js';
 import { handleCommand } from './runtime/commands.js';
 import { createMetrics } from './runtime/metrics.js';
 import { createProactive } from './runtime/proactive.js';
@@ -87,7 +96,7 @@ const COMMAND_ALIASES = Object.freeze([
   Object.freeze({
     name: 'cost',
     definitionId: 'dsh-companion/command-cost',
-    description: '查看今日/本月 token 成本（对应 /成本）',
+    description: '查看今日/本月 token 成本与每日 3M 熔断状态（对应 /成本）',
     prefix: '/成本',
   }),
   Object.freeze({
@@ -160,8 +169,15 @@ export function apply(ctx, rawConfig) {
     if (platform.capabilities.preStep) {
       track(platform.onPreStep((payload) => runPreStep(state, payload)));
     }
-    registerCommands(platform, store, config, metrics, track, () => state.currentScope);
-    registerTools(platform, store, config, track, () => state.currentScope);
+    // M4：turn 结束时结算本轮 token；没有该事件时由下一次 pre-step 的差值兜底。
+    if (platform.capabilities.turnStopping && typeof platform.onTurnStopping === 'function') {
+      track(platform.onTurnStopping((payload) => {
+        const usage = measureTokens(state, payload);
+        if (usage !== null) recordUsage(state, usage, sessionIdOf(payload));
+      }));
+    }
+    registerCommands(platform, store, config, metrics, track, () => state.currentScope, () => budgetInfo(state));
+    registerTools(platform, store, config, track, () => state.currentScope, () => toolBudgetGate(state));
     track(startScheduler(state));
   } catch (error) {
     for (const disposer of disposers.splice(0).reverse()) {
@@ -224,6 +240,16 @@ function createWiringState({ host, platform, store, config, metrics }) {
     metrics,
     scheduler: null,
     proactive: null,
+    /** M4：每日 token 累计（按配置时区的日键复位）。 */
+    budget: createBudgetState(),
+    /** M4：每个会话上次测得的 totalTokens；差值即一轮新增用量。 */
+    tokenBaselines: new Map(),
+    /** M4：当日是否已到 3M 熔断线。 */
+    budgetTripped: false,
+    /** M4：最近一次 RSS 检查结果；scheduler 启动前为 ok。 */
+    rss: { level: 'ok', code: 0, rssBytes: 0, rssMB: 0, totalmemBytes: 0, checkedAt: null },
+    /** M4：测试可经宿主注入内存读数；缺省走 process.memoryUsage()。 */
+    rssReader: typeof host?.rssReader === 'function' ? host.rssReader : null,
     /** 上一轮 turn 标识（platform payload.turn）；按 scope 分开，避免线程共用 turn 号。 */
     lastTurn: null,
     /** H3：每个 scope 的上一轮 turn 标识。 */
@@ -332,8 +358,9 @@ function publishOnThreadUnarchive(platform, store) {
  * @param {object} metrics
  * @param {(disposer: Function) => void} track
  * @param {() => (string|null)} [currentScope]
+ * @param {() => object|undefined} [budgetInfo] 命令展示用的预算/RSS 快照
  */
-function registerCommands(platform, store, config, metrics, track, currentScope) {
+function registerCommands(platform, store, config, metrics, track, currentScope, budgetInfo) {
   if (!platform.capabilities.commands) return;
   for (const alias of COMMAND_ALIASES) {
     track(platform.registerCommand({
@@ -351,6 +378,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope)
             scope: currentScope?.() ?? SCOPE,
             metrics,
             timeZone: config.timezone,
+            budget: typeof budgetInfo === 'function' ? budgetInfo() : undefined,
           });
         } catch (error) {
           return {
@@ -375,8 +403,9 @@ function registerCommands(platform, store, config, metrics, track, currentScope)
  * @param {Readonly<Record<string, unknown>>} config
  * @param {(disposer: Function) => void} track
  * @param {() => (string|null)} [currentScope]
+ * @param {() => object|undefined} [budgetGate] M4：task_run/thread_run 的预算/内存闸门
  */
-function registerTools(platform, store, config, track, currentScope) {
+function registerTools(platform, store, config, track, currentScope, budgetGate) {
   if (!platform.capabilities.tools) return;
   const tools = createTools({
     store,
@@ -387,6 +416,7 @@ function registerTools(platform, store, config, track, currentScope) {
     cwd: typeof platform.cwd === 'function' ? platform.cwd() : undefined,
     timeZone: config.timezone,
     currentScope,
+    budgetGate,
   });
   for (const tool of tools) {
     track(platform.registerTool({
@@ -511,6 +541,11 @@ async function runPreStep(state, payload) {
     state.metrics.observe('tokensIn', usage.tokensIn);
     state.metrics.observe('tokensOut', usage.tokensOut);
     if (isNewTurn) recordTokenEvent(state, usage);
+  }
+  if (usage !== null) {
+    // M4：turn-stopping 可用时这里通常 delta=0（已在 turn 末结算）；
+    // 不可用/未触发时，本次差值就是上一轮新增用量。
+    recordUsage(state, usage, sessionIdOf(payload) ?? scope);
   }
 
   // H1：每步刷新 surface 快照（seq 列表 + 对齐的 token/文本索引）。
@@ -684,6 +719,154 @@ function recordTokenEvent(state, usage) {
       message: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+/**
+ * M4：按 tokenMeter 的 totalTokens 差值累计当日用量。
+ *
+ * 首次见到某会话只建基线（不把插件装载前的历史算进今天）；之后每次测量
+ * 记增量。turn-stopping 与 pre-step 共用基线，因此不会双计。
+ * @param {object} state
+ * @param {{tokensIn: number}} usage measureTokens 的返回值
+ * @param {string|null} sessionId
+ * @returns {number} 本次记入的增量
+ */
+function recordUsage(state, usage, sessionId) {
+  if (usage === null || typeof usage !== 'object') return 0;
+  const id = typeof sessionId === 'string' && sessionId !== '' ? sessionId : 'unknown';
+  const total = Math.max(0, Number(usage.tokensIn) || 0);
+  const baselines = state.tokenBaselines;
+  let delta = 0;
+  if (baselines.has(id)) {
+    const previous = baselines.get(id);
+    delta = total > previous ? total - previous : 0;
+  }
+  baselines.set(id, total);
+  if (delta > 0) {
+    recordTurnUsage(state.budget, delta, {
+      at: state.platform.now(),
+      timezone: state.config.timezone,
+    });
+    state.platform.log('debug', '[dsh-companion] daily token usage', {
+      sessionId: id,
+      delta,
+      dailyTokens: state.budget.dailyTokens,
+    });
+  }
+  refreshBudget(state);
+  return delta;
+}
+
+/**
+ * M4：刷新当日熔断状态与 metrics；跨日自动复位并解除熔断。
+ * @param {object} state
+ * @param {number} [at]
+ * @returns {boolean} 是否处于熔断
+ */
+function refreshBudget(state, at = state.platform.now()) {
+  const was = state.budgetTripped === true;
+  const tripped = overDailyBudget(state.budget, DAILY_TOKEN_LIMIT, {
+    at,
+    timezone: state.config.timezone,
+  });
+  state.budgetTripped = tripped;
+  state.metrics.observe('dailyTokens', state.budget.dailyTokens);
+  state.metrics.observe('budgetTripped', tripped ? 1 : 0);
+  if (tripped && !was) {
+    state.platform.log('warn', '[dsh-companion] daily token budget tripped', {
+      dailyTokens: state.budget.dailyTokens,
+      limit: DAILY_TOKEN_LIMIT,
+    });
+  } else if (!tripped && was) {
+    state.platform.log('info', '[dsh-companion] daily token budget reset', {
+      dailyTokens: state.budget.dailyTokens,
+      dayKey: state.budget.dailyDayKey,
+    });
+  }
+  return tripped;
+}
+
+/**
+ * 命令层预算快照（/成本、/状态用）。
+ * @param {object} state
+ * @returns {object}
+ */
+function budgetInfo(state) {
+  refreshBudget(state);
+  return {
+    dailyTokens: state.budget.dailyTokens,
+    dailyLimit: DAILY_TOKEN_LIMIT,
+    tripped: state.budgetTripped,
+    rssLevel: state.rss.level,
+    rssLevelCode: state.rss.code,
+    rssMB: state.rss.rssMB,
+  };
+}
+
+/**
+ * M4：工具层闸门。stop_dispatch 停 task_run；main_only 额外停线程创建。
+ * @param {object} state
+ * @returns {{allowTask: boolean, allowThread: boolean, taskReason?: string, threadReason?: string}}
+ */
+function toolBudgetGate(state) {
+  refreshBudget(state);
+  const memoryBlocked = levelAtLeast(state.rss.level, 'stop_dispatch');
+  const mainOnly = levelAtLeast(state.rss.level, 'main_only');
+  return {
+    allowTask: !state.budgetTripped && !memoryBlocked,
+    allowThread: !mainOnly,
+    taskReason: state.budgetTripped ? BUDGET_REASONS.daily : BUDGET_REASONS.memory,
+    threadReason: BUDGET_REASONS.mainOnly,
+  };
+}
+
+/**
+ * M4：读一次 RSS 并更新档位/metrics。异常安全，绝不让内存保护中断调度。
+ * @param {object} state
+ * @returns {{level: string, code: number, rssBytes: number, rssMB: number}}
+ */
+function runRssCheck(state) {
+  const previous = state.rss?.level ?? 'ok';
+  let result;
+  try {
+    result = checkMemory(state.rssReader === null ? {} : { rssReader: state.rssReader });
+  } catch (error) {
+    state.platform.log('debug', '[dsh-companion] rss check failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return state.rss;
+  }
+  state.rss = {
+    level: result.level,
+    code: result.code,
+    rssBytes: result.rssBytes,
+    rssMB: result.rssMB,
+    totalmemBytes: result.totalmemBytes,
+    checkedAt: state.platform.now(),
+  };
+  state.metrics.observe('rssLevel', result.code);
+  state.metrics.observe('rssUsedMB', result.rssMB);
+  if (result.level !== previous) {
+    if (levelAtLeast(result.level, 'stop_dispatch')) {
+      state.platform.log('warn', '[dsh-companion] rss pressure degraded', {
+        level: result.level,
+        rssMB: result.rssMB,
+      });
+    } else if (result.level === 'ok') {
+      state.platform.log('info', '[dsh-companion] rss pressure recovered', { rssMB: result.rssMB });
+    }
+  }
+  return state.rss;
+}
+
+/**
+ * 主动消息是否应暂停：熔断或 RSS ≥ stop_dispatch 时不再 flush/投递提醒。
+ * @param {object} state
+ * @returns {boolean}
+ */
+function proactiveBlocked(state) {
+  refreshBudget(state);
+  return state.budgetTripped === true || levelAtLeast(state.rss.level, 'stop_dispatch');
 }
 
 /**
@@ -1361,9 +1544,14 @@ function startScheduler(state) {
 
   const jobs = {
     'idle-probe': async () => {
+      // M4：每 60s 读一次 RSS；warn 只记 metric，stop_dispatch/main_only 降级。
+      runRssCheck(state);
+      if (proactiveBlocked(state)) return;
       await proactive.flush();
     },
     reminders: async () => {
+      // 降级/熔断期间不把提醒标记 fired，恢复后仍可补投。
+      if (proactiveBlocked(state)) return;
       fireDueReminders(state);
       await proactive.flush();
     },

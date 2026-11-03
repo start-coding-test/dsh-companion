@@ -113,6 +113,10 @@ export function createAdapter(ctx, opts = {}) {
     get preStep() {
       return typeof ctx.on === 'function';
     },
+    get turnStopping() {
+      // 事件存在性无法静态探测；宿主有 on() 即允许注册，真实触发由会话决定。
+      return typeof ctx.on === 'function';
+    },
     get timer() {
       return typeof ctx.interval === 'function';
     },
@@ -211,6 +215,31 @@ export function createAdapter(ctx, opts = {}) {
       return mergeDecision(decision, patch);
     };
     return ctx.on('agent/pre-step', listener);
+  }
+
+  /**
+   * 注册 agent/turn-stopping 监听器（serial 事件，无 next）。
+   * handle 在 turn 关闭前执行；这里吞掉处理异常，避免保护逻辑阻断会话。
+   * @param {(payload: object) => void|Promise<void>} handler
+   * @returns {Function}
+   */
+  function onTurnStopping(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('onTurnStopping(handler): handler must be a function');
+    }
+    if (typeof ctx.on !== 'function') {
+      throw unavailable('no-turn-stopping', 'ctx.on("agent/turn-stopping")');
+    }
+    const listener = async (payload) => {
+      try {
+        await handler(payload);
+      } catch (error) {
+        log('warn', '[dsh-companion] turn-stopping handler failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    };
+    return ctx.on('agent/turn-stopping', listener);
   }
 
   /**
@@ -566,6 +595,7 @@ export function createAdapter(ctx, opts = {}) {
     log,
     section,
     onPreStep,
+    onTurnStopping,
     every,
     compactRegion,
     createSession,

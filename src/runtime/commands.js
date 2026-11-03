@@ -11,6 +11,7 @@
  */
 
 import { forgetMemory } from '../memory/forget.js';
+import { DAILY_TOKEN_LIMIT } from './budget.js';
 import {
   DEFAULT_TIMEZONE,
   isValidTimeZone,
@@ -22,6 +23,7 @@ import {
 
 const MEMORY_COMMANDS = new Set(['记忆', '成本', '线程', '状态']);
 const MAX_FORGET = 5;
+const RSS_LEVEL_NAMES = Object.freeze(['ok', 'warn', 'stop_dispatch', 'main_only']);
 
 /**
  * 解析并执行一条用户命令。
@@ -33,6 +35,8 @@ const MAX_FORGET = 5;
  * @param {string} [options.scope='main'] 作用域
  * @param {object} [options.metrics] createMetrics() 句柄；/状态 用它显示本轮 token
  * @param {string} [options.timeZone=DEFAULT_TIMEZONE] 日期/日界线所用 IANA 时区
+ * @param {{dailyTokens?: number, dailyLimit?: number, tripped?: boolean,
+ *   rssLevel?: string, rssMB?: number}} [options.budget] M4 预算/RSS 快照
  * @returns {{handled: boolean, reply: string}}
  */
 export function handleCommand({
@@ -42,6 +46,7 @@ export function handleCommand({
   scope = 'main',
   metrics,
   timeZone = DEFAULT_TIMEZONE,
+  budget,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -65,12 +70,12 @@ export function handleCommand({
   }
   if (command === '成本') {
     const summary = summarizeCost(store, now, timeZone);
-    return { handled: true, reply: formatCost(summary) };
+    return { handled: true, reply: formatCost(summary, budget) };
   }
   if (command === '线程') {
     return { handled: true, reply: formatThreads(store.listThreads({ limit: 100 }), timeZone) };
   }
-  return { handled: true, reply: formatStatus(store, scope, metrics, timeZone) };
+  return { handled: true, reply: formatStatus(store, scope, metrics, timeZone, budget) };
 }
 
 /**
@@ -368,10 +373,21 @@ function listTokenEvents(store, sinceSec) {
     .filter((row) => toMillis(row.at) / 1000 >= sinceSec);
 }
 
-/** @param {{today:object, month:object}} summary */
-function formatCost(summary) {
-  return `成本：今日 ${summary.today.total} tokens（入 ${summary.today.tokensIn} / 出 ${summary.today.tokensOut}）`
+/**
+ * 成本文案；budget 存在时追加今日配额/熔断状态（M4）。
+ * @param {{today:object, month:object}} summary
+ * @param {{dailyTokens?: number, dailyLimit?: number, tripped?: boolean}} [budget]
+ */
+function formatCost(summary, budget) {
+  let text = `成本：今日 ${summary.today.total} tokens（入 ${summary.today.tokensIn} / 出 ${summary.today.tokensOut}）`
     + `｜本月 ${summary.month.total} tokens（入 ${summary.month.tokensIn} / 出 ${summary.month.tokensOut}）`;
+  if (budget !== null && typeof budget === 'object') {
+    const daily = Number(budget.dailyTokens) || 0;
+    const limit = Number(budget.dailyLimit) || DAILY_TOKEN_LIMIT;
+    text += `｜今日配额 ${daily} / ${limit}`;
+    if (budget.tripped === true) text += '（已熔断）';
+  }
+  return text;
 }
 
 // ------------------------------------------------------------- 线程/状态
@@ -386,8 +402,8 @@ function formatThreads(rows, timeZone) {
   return lines.join('\n');
 }
 
-/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone */
-function formatStatus(store, scope, metrics, timeZone) {
+/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] */
+function formatStatus(store, scope, metrics, timeZone, budget) {
   const stats = store.stats();
   const tables = [
     'entities', 'episodes', 'facts', 'reminders', 'state_board', 'state_board_rev',
@@ -400,23 +416,33 @@ function formatStatus(store, scope, metrics, timeZone) {
     ? `${job.kind} ${job.status} upto_seq=${job.upto_seq}（${formatDateTime(job.started_at, timeZone)}）`
     : '无';
   const fts = `fts ${stats.fts_facts ?? 0}/${stats.fts_episodes ?? 0}`;
-  const tokenText = formatTokenSnapshot(metrics);
+  const tokenText = formatTokenSnapshot(metrics, budget);
   return `状态：${counts} / ${fts}${tokenText}\n水位 ${scope}：${watermark}\n最近 job：${jobText}`;
 }
 
 /**
- * 本轮 token 快照（L6）：metrics 缺失时显示 0，绝不 throw。
+ * 本轮 token / 每日配额 / RSS 快照（L6、M4）：metrics 缺失时显示 0，绝不 throw。
+ * RSS 的 MB 优先用接线层传入的 state.rss（metrics 的 rssMB 是进程实时读数，
+ * 与可注入的 rssReader 不是同一口径）。
  * @param {object} [metrics]
+ * @param {object} [budget]
  * @returns {string}
  */
-function formatTokenSnapshot(metrics) {
+function formatTokenSnapshot(metrics, budget) {
   if (!metrics || typeof metrics.snapshot !== 'function') return ' / tokens 本轮 0';
   try {
     const snapshot = metrics.snapshot();
     const tokensIn = Number(snapshot.tokensIn) || 0;
     const tokensOut = Number(snapshot.tokensOut) || 0;
     const overBudget = Number(snapshot.overBudget) || 0;
-    return ` / tokens 本轮 入 ${tokensIn} 出 ${tokensOut}（超预算 ${overBudget} 次）`;
+    const daily = Number(budget?.dailyTokens ?? snapshot.dailyTokens) || 0;
+    const tripped = budget?.tripped === true || Number(snapshot.budgetTripped) >= 1;
+    const rssCode = Number(budget?.rssLevelCode ?? snapshot.rssLevel) || 0;
+    const rssName = RSS_LEVEL_NAMES[rssCode] ?? 'ok';
+    const rssMB = Number(budget?.rssMB ?? snapshot.rssMB) || 0;
+    return ` / tokens 本轮 入 ${tokensIn} 出 ${tokensOut}（超预算 ${overBudget} 次）`
+      + `｜今日 ${daily}/${DAILY_TOKEN_LIMIT}${tripped ? '（已熔断）' : ''}`
+      + `｜RSS ${rssName} ${rssMB}MB`;
   } catch {
     return ' / tokens 本轮 0';
   }

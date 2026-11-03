@@ -41,6 +41,8 @@ const LIMIT_SCHEMA = Object.freeze({
  * @param {string} [deps.timeZone=DEFAULT_TIMEZONE] cost_report 日界线所用 IANA 时区
  * @param {() => (string|null|undefined)} [deps.currentScope] 当前会话 scope
  *   （pre-step 记录）；undefined=尚未路由（按 main），null=subagent（拒绝记忆工具）。
+ * @param {() => {allowTask?: boolean, allowThread?: boolean, taskReason?: string,
+ *   threadReason?: string}} [deps.budgetGate] M4 执行前闸门（每日熔断/RSS 降级）。
  * @returns {Array<{name:string, description:string, parameters:object, execute:Function}>}
  */
 export function createTools({
@@ -52,6 +54,7 @@ export function createTools({
   cwd,
   timeZone = DEFAULT_TIMEZONE,
   currentScope,
+  budgetGate,
 } = {}) {
   if (store === null || store === undefined) {
     throw new TypeError('createTools: store is required');
@@ -71,6 +74,21 @@ export function createTools({
    * @returns {string|null|undefined}
    */
   const scopeNow = () => (typeof currentScope === 'function' ? currentScope() : undefined);
+
+  /**
+   * M4 闸门快照；闸门本身异常时放行（不能因为保护层故障阻断工具）。
+   * @returns {{allowTask?: boolean, allowThread?: boolean, taskReason?: string,
+   *   threadReason?: string}|null}
+   */
+  const gateNow = () => {
+    if (typeof budgetGate !== 'function') return null;
+    try {
+      const gate = budgetGate();
+      return gate !== null && typeof gate === 'object' ? gate : null;
+    } catch {
+      return null;
+    }
+  };
 
   /**
    * 解析并校验请求 scope：默认当前 session scope；显式 scope 必须与之相同。
@@ -322,6 +340,10 @@ export function createTools({
         const name = optionalString(args.name, 'thread_run', 'name');
         const goal = optionalString(args.goal, 'thread_run', 'goal');
         if (exceedsGoalLimit(goal)) return { ok: false, reason: 'goal_too_long' };
+        const gate = gateNow();
+        if (gate !== null && gate.allowThread === false) {
+          return { ok: false, reason: gate.threadReason ?? 'memory_main_only' };
+        }
         const plan = planThreadRun(registry, { store, key, name });
         if (plan.action === 'reject') {
           return { ok: false, action: 'reject', key: plan.key ?? key, reason: plan.reason };
@@ -453,6 +475,10 @@ export function createTools({
         assertArgs(args, 'task_run');
         const goal = requireString(args.goal, 'task_run', 'goal');
         const title = optionalString(args.title, 'task_run', 'title');
+        const gate = gateNow();
+        if (gate !== null && gate.allowTask === false) {
+          return { ok: false, reason: gate.taskReason ?? 'daily_budget_exceeded' };
+        }
         if (typeof platform?.createSession !== 'function'
           || typeof platform?.prompt !== 'function'
           || typeof platform?.whenIdle !== 'function') {
