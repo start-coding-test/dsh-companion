@@ -251,17 +251,15 @@ export function seedMemory(store, options = {}) {
 }
 
 /**
- * V2 S1（显式遗忘的第一步）的测试侧实现。
+ * V2 S1（显式遗忘的第一步）的测试侧封装。
  *
- * 06 v3.3 §7.8 的要求：立即停读、冷静期只软删不物删。当前 Store 的公开面
- * 只有 deleteFact（仅置 deleted_at）与 deleteEpisode（仅置 deleted_at），没有
- * updateEpisode / updateReminder；因此这里在一个事务内：
- *   - fact   → updateFact({status:'tombstoned', deleted_at})（公开 API）；
- *   - episode→ 直接 UPDATE 补 status='tombstoned'（目标态，缺失公开方法）；
- *   - reminder→ 06 未给提醒冷静期，S1 直接硬删；
- *   - 状态板 → replaceBoardLines(scope, []) 同步删行，并清 state_board_rev
- *             快照（无公开删除方法，S1 图中要求状态板同步）。
- * 生产命令层落地后应改为调用真实 API；此处的直达 SQL 只出现在 e2e 辅助中。
+ * 06 v3.3 §7.8：S1 立即停读、7 天冷静期内只软删不物删。这里在一个事务内
+ * 调用 Store 的显式遗忘 API（与生产命令层同一入口）：
+ *   - fact     → store.forgetFact（status='tombstoned'、deleted_at、purge_payload）；
+ *   - episode  → store.forgetEpisode（同上，行与 FTS 保留到 purge）；
+ *   - reminder → store.forgetReminder（提醒无冷静期，直接删行）；
+ *   - 状态板   → replaceBoardLines(scope, []) 同步删行；state_board_rev 无公开
+ *                删除 API，仍需直达 SQL 清空快照（S1 要求状态板同步）。
  *
  * @param {Store} store
  * @param {{scope?: string, factId?: string|null, episodeId?: string|null,
@@ -286,26 +284,14 @@ export function forgetMemory(store, options = {}) {
   const at = toEpochSeconds(now);
 
   return store.transaction(() => {
-    if (factId) {
-      const row = store.updateFact(factId, { status: 'tombstoned', deleted_at: at });
-      if (!row) throw new Error(`forgetMemory: fact not found: ${factId}`);
+    if (factId && !store.forgetFact(factId, { at })) {
+      throw new Error(`forgetMemory: fact not found or already forgotten: ${factId}`);
     }
-    if (episodeId) {
-      const info = store.db
-        .prepare(
-          `UPDATE episodes SET status = 'tombstoned', deleted_at = ?
-            WHERE id = ? AND deleted_at IS NULL`,
-        )
-        .run(at, episodeId);
-      if (Number(info.changes) === 0) {
-        throw new Error(`forgetMemory: episode not found or already deleted: ${episodeId}`);
-      }
+    if (episodeId && !store.forgetEpisode(episodeId, { at })) {
+      throw new Error(`forgetMemory: episode not found or already forgotten: ${episodeId}`);
     }
-    if (reminderId) {
-      const info = store.db.prepare('DELETE FROM reminders WHERE id = ?').run(reminderId);
-      if (Number(info.changes) === 0) {
-        throw new Error(`forgetMemory: reminder not found: ${reminderId}`);
-      }
+    if (reminderId && !store.forgetReminder(reminderId, { at })) {
+      throw new Error(`forgetMemory: reminder not found: ${reminderId}`);
     }
 
     store.replaceBoardLines(scope, [], { now: at });

@@ -483,3 +483,179 @@ test('stats 返回各表与 FTS 计数', () => {
   assert.equal(counts.fts_facts, counts.facts);
   assert.equal(counts.fts_episodes, counts.episodes);
 });
+
+test('forgetFact：active→tombstoned、正文快照进 purge_payload、立即停读且幂等', () => {
+  const now = 2_200_000_000;
+  const fact = store.insertFact(
+    makeFact({
+      scope: 'forget-fact',
+      subject_text: '青柠计划',
+      statement: '青柠计划的代号是蓝鲸',
+    }),
+  );
+  assert.ok(store.searchBigram('青柠计划', { scope: 'forget-fact' }).length > 0);
+
+  assert.equal(
+    store.forgetFact(fact.id, { at: now, payload: { reason: 'user', excerpt: '青柠计划' } }),
+    true,
+  );
+  const row = store.getFact(fact.id);
+  assert.equal(row.status, 'tombstoned');
+  assert.equal(row.deleted_at, now);
+  assert.deepEqual(JSON.parse(row.purge_payload), { reason: 'user', excerpt: '青柠计划' });
+  // S1 立即停读：FTS 行还在，但检索已过滤 deleted_at
+  assert.equal(store.searchBigram('青柠计划', { scope: 'forget-fact' }).length, 0);
+
+  // 幂等与缺行
+  assert.equal(store.forgetFact(fact.id, { at: now + 10 }), false);
+  assert.equal(store.getFact(fact.id).deleted_at, now);
+  assert.equal(store.forgetFact('fact-does-not-exist'), false);
+});
+
+test('forgetFact：dormant 不转 tombstoned，且不影响其它 scope', () => {
+  const dormant = store.insertFact(
+    makeFact({ scope: 'forget-fact-dormant', statement: '休眠事实', status: 'dormant' }),
+  );
+  assert.equal(store.forgetFact(dormant.id, { at: 2_200_000_100 }), false);
+  assert.equal(store.getFact(dormant.id).status, 'dormant');
+
+  const target = store.insertFact(makeFact({ scope: 'forget-fact-b', statement: '本 scope 事实' }));
+  const other = store.insertFact(makeFact({ scope: 'forget-fact-c', statement: '别的 scope 事实' }));
+  assert.equal(store.forgetFact(target.id, { at: 2_200_000_100 }), true);
+  assert.equal(store.getFact(other.id).status, 'active');
+  // 默认 payload 为 {}
+  assert.deepEqual(JSON.parse(store.getFact(target.id).purge_payload), {});
+});
+
+test('forgetEpisode：active→tombstoned 并保留行/FTS 到冷静期结束', () => {
+  const now = 2_200_000_200;
+  const episode = store.insertEpisode({
+    scope: 'forget-episode',
+    session_id: 's',
+    title: '找房 青柠计划',
+    summary: '确认租房攻略',
+    salience: 'normal',
+  });
+  assert.ok(store.searchBigram('租房攻略', { scope: 'forget-episode' }).length > 0);
+
+  assert.equal(
+    store.forgetEpisode(episode.id, { at: now, payload: { kept: 'minimal' } }),
+    true,
+  );
+  const row = store.getEpisode(episode.id);
+  assert.equal(row.status, 'tombstoned');
+  assert.equal(row.deleted_at, now);
+  assert.deepEqual(JSON.parse(row.purge_payload), { kept: 'minimal' });
+  assert.equal(store.searchBigram('租房攻略', { scope: 'forget-episode' }).length, 0);
+  assert.ok(store.getEpisode(episode.id), '冷静期内行仍在');
+
+  assert.equal(store.forgetEpisode(episode.id, { at: now }), false);
+  assert.equal(store.forgetEpisode('episode-does-not-exist'), false);
+
+  const dormant = store.insertEpisode({
+    scope: 'forget-episode',
+    session_id: 's',
+    title: '已沉睡情景',
+    status: 'dormant',
+  });
+  assert.equal(store.forgetEpisode(dormant.id, { at: now }), false);
+  assert.equal(store.getEpisode(dormant.id).status, 'dormant');
+});
+
+test('forgetReminder：提醒无冷静期，S1 直接删行且幂等', () => {
+  const reminder = store.insertReminder({
+    scope: 'forget-reminder',
+    kind: 'todo',
+    title: '跟进青柠计划预算',
+    next_fire_at: 1_700_000_000,
+  });
+  assert.equal(store.forgetReminder(reminder.id), true);
+  assert.equal(store.getReminder(reminder.id), null);
+  assert.deepEqual(store.listReminders({ scope: 'forget-reminder', includeDeleted: true }), []);
+  assert.equal(store.forgetReminder(reminder.id), false);
+  assert.equal(store.forgetReminder('reminder-does-not-exist'), false);
+});
+
+test('updateEpisode：白名单字段与 FTS 刷新；未知字段抛 TypeError；缺行返回 null', () => {
+  const episode = store.insertEpisode({
+    scope: 'episode-update',
+    session_id: 's',
+    title: '旧标题 找房',
+    summary: '旧摘要',
+    topics_json: ['旧话题'],
+    salience: 'normal',
+  });
+
+  const updated = store.updateEpisode(episode.id, {
+    title: '新标题 租房',
+    summary: '新摘要 预算',
+    evidence: '用户原话',
+    topics_json: ['租房', '预算'],
+    entities_json: ['房东'],
+    mood: 'neutral',
+    fidelity: 'gist',
+    purge_payload: '{"x":1}',
+  });
+  assert.equal(updated.title, '新标题 租房');
+  assert.equal(updated.summary, '新摘要 预算');
+  assert.equal(updated.evidence, '用户原话');
+  assert.deepEqual(JSON.parse(updated.topics_json), ['租房', '预算']);
+  assert.deepEqual(JSON.parse(updated.entities_json), ['房东']);
+  assert.equal(updated.mood, 'neutral');
+  assert.equal(updated.fidelity, 'gist');
+  assert.equal(updated.purge_payload, '{"x":1}');
+  // FTS 投影随 title/summary/topics 重写
+  assert.ok(store.searchBigram('租房', { scope: 'episode-update' }).length > 0);
+  assert.equal(store.searchBigram('旧标题', { scope: 'episode-update' }).length, 0);
+
+  assert.throws(() => store.updateEpisode(episode.id, { titel: 'x' }), /unknown field/);
+  assert.throws(() => store.updateEpisode(episode.id, { mood: 'angry' }), /invalid episode mood/);
+  assert.throws(
+    () => store.updateEpisode(episode.id, { status: 'superseded' }),
+    /invalid episode status/,
+  );
+  assert.equal(store.updateEpisode('episode-does-not-exist', { title: 'x' }), null);
+
+  const sleeping = store.updateEpisode(episode.id, { status: 'dormant', deleted_at: 123 });
+  assert.equal(sleeping.status, 'dormant');
+  assert.equal(sleeping.deleted_at, 123);
+});
+
+test('forget 后满 7 天 purge：物理删除、其它 scope 不受影响、审计与水位不动', () => {
+  const now = 2_300_000_000;
+  const fact = store.insertFact(
+    makeFact({ scope: 'forget-purge', statement: '待清理 青柠计划 细节' }),
+  );
+  const episode = store.insertEpisode({
+    scope: 'forget-purge',
+    session_id: 's',
+    title: '待清理情景',
+    summary: '青柠计划 细节',
+    salience: 'normal',
+  });
+  const keep = store.insertFact(
+    makeFact({ scope: 'forget-purge-keep', statement: '另一 scope 事实' }),
+  );
+  const eventsBefore = store.stats().memory_events;
+  const watermarkBefore = store.getWatermark('forget-purge');
+
+  assert.equal(store.forgetFact(fact.id, { at: now, payload: { salience: 'normal' } }), true);
+  assert.equal(store.forgetEpisode(episode.id, { at: now, payload: { salience: 'normal' } }), true);
+  // S1 不写审计、不动巩固水位
+  assert.equal(store.stats().memory_events, eventsBefore);
+  assert.equal(store.getWatermark('forget-purge'), watermarkBefore);
+
+  const result = store.purge({ now: now + 8 * 86_400, cutoffDays: 7 });
+  assert.ok(result.facts >= 1);
+  assert.ok(result.episodes >= 1);
+  assert.equal(store.getFact(fact.id), null);
+  assert.equal(store.getEpisode(episode.id), null);
+  assert.equal(store.listFacts({ scope: 'forget-purge', includeDeleted: true }).length, 0);
+  assert.equal(store.listEpisodes({ scope: 'forget-purge', includeDeleted: true }).length, 0);
+  assert.ok(store.getFact(keep.id), '其它 scope 的行不被误删');
+  assert.equal(store.getWatermark('forget-purge'), watermarkBefore);
+
+  const purged = store.listEvents({ action: 'PURGED', limit: 500 });
+  assert.ok(purged.some((event) => event.row_id === fact.id));
+  assert.ok(purged.some((event) => event.row_id === episode.id));
+});

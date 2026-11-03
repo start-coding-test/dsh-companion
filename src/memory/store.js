@@ -56,6 +56,9 @@ const EVENT_ACTIONS = new Set([
 const EVENT_ACTORS = new Set(['consolidator', 'user', 'scheduler', 'migrator']);
 const CONSOLIDATION_STATUSES = new Set(['running', 'written', 'compacted', 'failed']);
 const THREAD_STATUSES = new Set(['active', 'archived', 'retired']);
+const EPISODE_STATUSES = new Set(['active', 'dormant', 'tombstoned']);
+const MOOD_VALUES = new Set(['positive', 'neutral', 'tired', 'anxious', 'low', 'excited']);
+const FIDELITY_VALUES = new Set(['full', 'gist', 'index']);
 const BOARD_SECTIONS = new Set(['in_progress', 'decided', 'open_question', 'upcoming', 'threads']);
 
 /**
@@ -657,6 +660,92 @@ export class Store {
     return info.changes > 0 ? this.getEpisode(id) : null;
   }
 
+  /**
+   * 更新一条情景（白名单字段，06 v3.3 §8.2）。
+   *
+   * 未知字段抛 TypeError（避免拼错列名被静默忽略）；topics_json /
+   * entities_json 接受数组或 JSON 文本；deleted_at 接受 Unix 秒或 Date。
+   * 改 title/summary/topics_json 后同步重写 FTS 投影。
+   *
+   * @param {string} id
+   * @param {object} [patch]
+   * @returns {object|null} 更新后的行；行不存在返回 null
+   */
+  updateEpisode(id, patch = {}) {
+    if (!patch || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new TypeError('[store] updateEpisode(id, patch) requires a patch object');
+    }
+    const current = this.getEpisode(id);
+    if (!current) return null;
+
+    const textColumns = new Set([
+      'title', 'summary', 'evidence', 'mood', 'fidelity', 'status', 'purge_payload',
+    ]);
+    const jsonColumns = new Set(['topics_json', 'entities_json']);
+    /** @type {Map<string, unknown>} */
+    const fields = new Map();
+
+    for (const [key, value] of Object.entries(patch)) {
+      if (key === 'deleted_at') {
+        fields.set(key, epochOr(value, null));
+      } else if (jsonColumns.has(key)) {
+        fields.set(key, toJsonArray(value));
+      } else if (key === 'title') {
+        fields.set(key, requireString(value, 'episodes.title'));
+      } else if (key === 'status') {
+        if (!EPISODE_STATUSES.has(value)) {
+          throw new TypeError(`[store] invalid episode status: ${String(value)}`);
+        }
+        fields.set(key, value);
+      } else if (key === 'mood') {
+        if (value !== null && value !== undefined && !MOOD_VALUES.has(value)) {
+          throw new TypeError(`[store] invalid episode mood: ${String(value)}`);
+        }
+        fields.set(key, value ?? null);
+      } else if (key === 'fidelity') {
+        if (value !== null && value !== undefined && !FIDELITY_VALUES.has(value)) {
+          throw new TypeError(`[store] invalid episode fidelity: ${String(value)}`);
+        }
+        fields.set(key, value ?? null);
+      } else if (textColumns.has(key)) {
+        fields.set(key, value ?? null);
+      } else {
+        throw new TypeError(`[store] updateEpisode: unknown field "${key}"`);
+      }
+    }
+
+    if (fields.size === 0) return current;
+
+    const assignments = [...fields.keys()].map((key) => `${key} = ?`);
+    this.#db
+      .prepare(`UPDATE episodes SET ${assignments.join(', ')} WHERE id = ?`)
+      .run(...fields.values(), id);
+    this.#refreshEpisodesFts(id);
+    return this.getEpisode(id);
+  }
+
+  /**
+   * S1 显式遗忘情景：仅 active 可转 tombstoned，正文快照写 purge_payload，
+   * 行与 FTS 保留到 S2 purge（06 v3.3 §7.8「立即停读 → 7 天冷静期」）。
+   * 已 tombstoned 或行不存在（含 dormant）返回 false，保持幂等。
+   *
+   * @param {string} id
+   * @param {{at?: number|Date, payload?: unknown}} [options]
+   * @returns {boolean} 是否发生状态迁移
+   */
+  forgetEpisode(id, options = {}) {
+    const at = epochOr(options.at, nowSeconds());
+    const payload = JSON.stringify(options.payload ?? {});
+    const info = this.#db
+      .prepare(
+        `UPDATE episodes
+            SET status = 'tombstoned', deleted_at = ?, purge_payload = ?
+          WHERE id = ? AND status = 'active'`,
+      )
+      .run(at, payload, id);
+    return Number(info.changes) > 0;
+  }
+
   // --------------------------------------------------------------- facts
 
   /**
@@ -782,6 +871,28 @@ export class Store {
       .prepare('UPDATE facts SET deleted_at = ?, updated_at = unixepoch() WHERE id = ? AND deleted_at IS NULL')
       .run(at, id);
     return info.changes > 0 ? this.getFact(id) : null;
+  }
+
+  /**
+   * S1 显式遗忘事实：仅 active 可转 tombstoned，正文快照写 purge_payload，
+   * 行与 FTS 保留到 S2 purge（06 v3.3 §7.8「立即停读 → 7 天冷静期」）。
+   * 已 tombstoned 或行不存在返回 false，保持幂等。
+   *
+   * @param {string} id
+   * @param {{at?: number|Date, payload?: unknown}} [options]
+   * @returns {boolean} 是否发生状态迁移
+   */
+  forgetFact(id, options = {}) {
+    const at = epochOr(options.at, nowSeconds());
+    const payload = JSON.stringify(options.payload ?? {});
+    const info = this.#db
+      .prepare(
+        `UPDATE facts
+            SET status = 'tombstoned', deleted_at = ?, purge_payload = ?, updated_at = unixepoch()
+          WHERE id = ? AND status = 'active'`,
+      )
+      .run(at, payload, id);
+    return Number(info.changes) > 0;
   }
 
   /**
@@ -912,6 +1023,24 @@ export class Store {
           LIMIT ? OFFSET ?`,
       )
       .all(...args, limit, offset);
+  }
+
+  /**
+   * S1 显式遗忘提醒。
+   *
+   * reminders 表没有 `tombstoned` 状态，也没有 `purge_payload` 列（06 v3.3 §7.7
+   * 提醒不参与自然遗忘，无需冷静期正文快照）；purge() 也只扫 facts/episodes。
+   * 因此显式遗忘按「立即停读」直接物理删除该行，重复调用或行不存在返回 false。
+   *
+   * @param {string} id
+   * @param {object} [options] 预留（提醒无冷静期，at/payload 无落点）
+   * @returns {boolean} 是否删除了行
+   */
+  forgetReminder(id, options = {}) {
+    // 提醒无冷静期（06 §7.7）：options.at/payload 无落点，保留签名以免调用方分叉。
+    void options;
+    const info = this.#db.prepare('DELETE FROM reminders WHERE id = ?').run(id);
+    return Number(info.changes) > 0;
   }
 
   // ---------------------------------------------------------- state board
