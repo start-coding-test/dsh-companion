@@ -3,10 +3,17 @@ import assert from 'node:assert/strict';
 
 import { ConfigError, DEFAULTS, isQuietAt, normalizeConfig, parseClock } from '../src/config.js';
 import { apply, name as pluginName } from '../src/index.js';
+import { zonedMinutesOfDay } from '../src/time.js';
 
-/** 构造本地时间（避免 UTC 偏移影响 isQuietAt 的分钟比较）。 */
+/**
+ * 构造 Asia/Shanghai 墙上时间（与配置默认 timezone 一致）。
+ * 显式写 +08:00，结果不随进程 TZ 漂移；安静时段断言才有确定含义。
+ */
 function at(hours, minutes, day = 15) {
-  return new Date(2026, 0, day, hours, minutes, 0, 0);
+  const hh = String(hours).padStart(2, '0');
+  const mm = String(minutes).padStart(2, '0');
+  const dd = String(day).padStart(2, '0');
+  return new Date(Date.parse(`2026-01-${dd}T${hh}:${mm}:00+08:00`));
 }
 
 function expectConfigError(raw, expectedField) {
@@ -33,6 +40,8 @@ describe('DEFAULTS', () => {
     assert.equal(DEFAULTS.proactiveDailyCap, 3);
     assert.equal(DEFAULTS.quietStart, '23:00');
     assert.equal(DEFAULTS.quietEnd, '08:00');
+    assert.equal(DEFAULTS.timezone, 'Asia/Shanghai');
+    assert.equal(DEFAULTS.idleMs, 30 * 60 * 1000);
     assert.equal(DEFAULTS.purgeAfterDays, 7);
     assert.equal(DEFAULTS.dbPath, './.data/companion.db');
   });
@@ -121,6 +130,10 @@ describe('normalizeConfig 非法输入', () => {
     ['quietStart 超范围', 'quietStart', { quietStart: '25:00' }],
     ['quietEnd 格式错误', 'quietEnd', { quietEnd: '8:00' }],
     ['quietStart 非字符串', 'quietStart', { quietStart: 2300 }],
+    ['timezone 非 IANA 名', 'timezone', { timezone: 'Mars/Olympus' }],
+    ['timezone 空串', 'timezone', { timezone: '   ' }],
+    ['timezone 非字符串', 'timezone', { timezone: 8 }],
+    ['idleMs 为 0', 'idleMs', { idleMs: 0 }],
     ['dbPath 为空串', 'dbPath', { dbPath: '   ' }],
     ['retainTokens 不小于 compactAtTokens', 'retainTokens', { retainTokens: 24000 }],
     ['compactAtTokens 不小于 workingMemoryTokens', 'compactAtTokens', { compactAtTokens: 32000 }],
@@ -224,6 +237,46 @@ describe('isQuietAt（默认 23:00-08:00，跨午夜）', () => {
       return true;
     });
     assert.throws(() => isQuietAt('23:30', DEFAULTS), ConfigError);
+  });
+});
+
+describe('timezone（M1：墙上时间不依赖进程 TZ）', () => {
+  test('默认时区为 Asia/Shanghai，且可覆盖为其他 IANA 时区', () => {
+    assert.equal(normalizeConfig().timezone, 'Asia/Shanghai');
+    assert.equal(normalizeConfig({ timezone: 'America/New_York' }).timezone, 'America/New_York');
+  });
+
+  test('安静时段按 Asia/Shanghai 分区分钟判定边界 22:59 / 23:00 / 07:59 / 08:00', () => {
+    // 先证明测试用的 epoch 确实是上海墙上时间，而不是进程本地时间。
+    assert.equal(zonedMinutesOfDay(at(22, 59).getTime(), 'Asia/Shanghai'), 22 * 60 + 59);
+    assert.equal(zonedMinutesOfDay(at(23, 0).getTime(), 'Asia/Shanghai'), 23 * 60);
+    assert.equal(zonedMinutesOfDay(at(7, 59).getTime(), 'Asia/Shanghai'), 7 * 60 + 59);
+    assert.equal(zonedMinutesOfDay(at(8, 0).getTime(), 'Asia/Shanghai'), 8 * 60);
+
+    assert.equal(isQuietAt(at(22, 59), DEFAULTS), false);
+    assert.equal(isQuietAt(at(23, 0), DEFAULTS), true);
+    assert.equal(isQuietAt(at(7, 59), DEFAULTS), true);
+    assert.equal(isQuietAt(at(8, 0), DEFAULTS), false);
+  });
+
+  test('覆盖 timezone 后安静时段按该分区判定（America/New_York）', () => {
+    const cfg = normalizeConfig({ timezone: 'America/New_York' });
+    // 2026-01-16 12:00 +08:00 = 2026-01-15 23:00 EST（EST = UTC-5）。
+    const ny2300 = new Date(Date.parse('2026-01-16T12:00:00+08:00'));
+    const ny2259 = new Date(Date.parse('2026-01-16T11:59:00+08:00'));
+    const ny0800 = new Date(Date.parse('2026-01-16T21:00:00+08:00'));
+    assert.equal(isQuietAt(ny2259, cfg), false);
+    assert.equal(isQuietAt(ny2300, cfg), true);
+    assert.equal(isQuietAt(ny0800, cfg), false);
+  });
+
+  test('isQuietAt 对非法 timezone 抛 ConfigError(timezone)', () => {
+    const cfg = { quietStart: '23:00', quietEnd: '08:00', timezone: 'Not/AZone' };
+    assert.throws(() => isQuietAt(at(23, 30), cfg), (err) => {
+      assert.ok(err instanceof ConfigError);
+      assert.equal(err.field, 'timezone');
+      return true;
+    });
   });
 });
 

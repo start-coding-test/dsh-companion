@@ -54,16 +54,20 @@ dsh-companion/
 | `workingMemoryTokens` | `32000` | 工作记忆装配上限（token） | 正整数 |
 | `compactAtTokens` | `24000` | 连续两轮超过后触发巩固 | 正整数 |
 | `compactHardTokens` | `40000` | 安全阀阈值 | 正整数 |
+| `idleMs` | `1800000` | 距最后一条人类消息多久后允许「空闲巩固」（毫秒） | 正整数 |
 | `retainTokens` | `6144` | 压缩时保留的最近对话尾部 | 正整数 |
 | `threadIdleDays` | `14` | 线程空闲多少天后冻结 | `>= 1` |
 | `threadMaxActive` | `6` | 同时活跃的线程上限 | `>= 1` |
 | `proactiveDailyCap` | `3` | 每日主动消息上限 | `>= 0`，`0` 关闭主动 |
 | `quietStart` | `"23:00"` | 安静时段开始 | `HH:MM` |
 | `quietEnd` | `"08:00"` | 安静时段结束 | `HH:MM` |
+| `timezone` | `"Asia/Shanghai"` | 墙上时间所用 IANA 时区（安静时段、每日任务、日界线、备份文件名） | 合法 IANA 时区名 |
 | `purgeAfterDays` | `7` | 遗忘冷静期，到期物理删除 | `1`–`30` |
 | `dbPath` | `"./.data/companion.db"` | SQLite 数据库路径 | 非空字符串 |
 
 token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`。未知配置键只记警告，不阻断启动。
+
+所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
 ## 命令与工具
 

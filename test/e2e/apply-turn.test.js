@@ -12,6 +12,8 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync } from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 
 import { FakeCtx } from '../fakes/ctx.js';
 import { apply } from '../../src/index.js';
@@ -204,9 +206,9 @@ test('同一 ctx 二次 apply 幂等，dispose 关闭 Store 并清掉 interval',
 });
 
 test('apply 生产路径：deep-sleep 每日补跑执行降级/FTS GC 并写 consolidations 与审计', async () => {
-  // 本地 2026-11-04 04:30（构造器按本地时区解释）：deep-sleep 计划时刻 03:00
+  // Asia/Shanghai 2026-11-04 04:30（默认 config.timezone）：deep-sleep 计划时刻 03:00
   // 落在 6h 补扫窗口内，且窗口判断与运行环境时区无关。
-  const deepNow = new Date(2026, 10, 4, 4, 30, 0, 0).getTime();
+  const deepNow = Date.parse('2026-11-04T04:30:00+08:00');
   const nowSec = Math.floor(deepNow / 1000);
   const temp = makeTempStore();
   const stale = temp.store.insertFact({
@@ -251,6 +253,81 @@ test('apply 生产路径：deep-sleep 每日补跑执行降级/FTS GC 并写 con
     assert.ok(detail.dormant >= 1);
     assert.ok(detail.gc >= 1);
     assert.ok(temp.store.getBoardState('main').staged_revision >= 1, '深睡后应 stage 状态板');
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});
+
+// ------------------------------------------------ M2：配置项立即生效（生产路径）
+
+/**
+ * 用同一套 turn 序列量一次「是否巩固」，便于对比不同 compactAtTokens。
+ * @param {Record<string, unknown>} overrides
+ * @returns {Promise<{consolidations: number, streams: number}>}
+ */
+async function countConsolidations(overrides) {
+  const temp = makeTempStore();
+  const { ctx, streams } = makeApplyCtx();
+  // 13K：高于覆盖值 12000，低于默认 24000；idle 不会触发（时钟不前进）。
+  ctx.returns['tokenMeter.measure'] = {
+    logRevision: 1,
+    baseline: null,
+    surfaceDeltaTokens: 5,
+    totalTokens: 13_000,
+    surfaceTokens: 13_000,
+    nodes: [],
+  };
+  const handle = apply(ctx, { dbPath: temp.dbPath, ...overrides });
+  try {
+    await ctx.dispatch('agent/pre-step', turnPayload(1, '记录一下这个决定。'), { kind: 'enter', messages: [] });
+    await ctx.dispatch('agent/pre-step', turnPayload(2, '继续。'), { kind: 'enter', messages: [] });
+    const row = temp.store.db
+      .prepare("SELECT COUNT(*) AS n FROM consolidations WHERE scope = 'main' AND kind = 'nap'")
+      .get();
+    return { consolidations: Number(row.n), streams: streams.length };
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+}
+
+test('apply 生产路径：override compactAtTokens=12000 后行为改变', async () => {
+  const overridden = await countConsolidations({ compactAtTokens: 12_000 });
+  assert.equal(overridden.consolidations, 1, '覆盖阈值 12000 后，13K token 应触发巩固');
+  assert.equal(overridden.streams, 1, '巩固模型应被调用一次');
+
+  const defaults = await countConsolidations({});
+  assert.equal(defaults.consolidations, 0, '默认阈值 24000 时，13K token 不应触发巩固');
+  assert.equal(defaults.streams, 0);
+});
+
+test('apply 生产路径：备份文件名用 config.timezone 的本地日期（跨 UTC 日界）', async () => {
+  // 上海 2026-11-04 04:30 = UTC 2026-11-03 20:30：本地日期与 UTC 日期不同。
+  const now = Date.parse('2026-11-04T04:30:00+08:00');
+  const temp = makeTempStore();
+  const { ctx } = makeApplyCtx({ now });
+  const handle = apply(ctx, { dbPath: temp.dbPath });
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const dir = dirname(temp.dbPath);
+    const base = basename(temp.dbPath);
+    assert.equal(
+      existsSync(join(dir, `${base}.2026-11-04.bak`)),
+      true,
+      '备份文件名应使用配置时区的本地日期 2026-11-04',
+    );
+    assert.equal(
+      existsSync(join(dir, `${base}.2026-11-03.bak`)),
+      false,
+      '不应使用 UTC 日期 2026-11-03',
+    );
+
+    const run = temp.store.db
+      .prepare("SELECT session_id FROM consolidations WHERE trigger = 'deep-sleep' ORDER BY id DESC LIMIT 1")
+      .get();
+    assert.equal(run.session_id, 'deep:2026-11-04', 'deep-sleep 的 session_id 也用本地日期');
   } finally {
     handle.dispose();
     temp.cleanup();

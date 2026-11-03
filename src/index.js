@@ -26,13 +26,7 @@ import { normalizeConfig } from './config.js';
 import { Store } from './memory/store.js';
 import { retrieve } from './memory/retrieve.js';
 import { assemble } from './memory/assemble.js';
-import {
-  DEFAULT_AT_TOKENS,
-  DEFAULT_HARD_TOKENS,
-  DEFAULT_IDLE_MS,
-  consolidate,
-  planConsolidation,
-} from './memory/consolidate.js';
+import { consolidate, planConsolidation } from './memory/consolidate.js';
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections } from './persona/sections.js';
 import { DEFAULT_CARD } from './persona/card.js';
@@ -43,15 +37,15 @@ import { createProactive } from './runtime/proactive.js';
 import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
 import { createTools } from './runtime/tools.js';
 import * as threadRegistry from './thread/registry.js';
+import { zonedDayKey } from './time.js';
 
 export const name = 'dsh-companion';
 
 /** 默认作用域。 */
 const SCOPE = 'main';
 
-/** 召回预算（R-SES-07：注入 ≤2050 tokens，总量 ≤32K）。 */
+/** 召回预算（R-SES-07：注入 ≤2050 tokens；总量由 config.workingMemoryTokens 控制）。 */
 const RECALL_BUDGET_TOKENS = 2050;
-const WORKING_BUDGET_TOKENS = 32_000;
 
 /** 转录快照：只保留最近 N 条 / N 字符，供巩固模型使用。 */
 const TRANSCRIPT_MAX_MESSAGES = 40;
@@ -139,8 +133,8 @@ export function apply(ctx, rawConfig) {
     if (platform.capabilities.preStep) {
       track(platform.onPreStep((payload) => runPreStep(state, payload)));
     }
-    registerCommands(platform, store, metrics, track);
-    registerTools(platform, store, track);
+    registerCommands(platform, store, config, metrics, track);
+    registerTools(platform, store, config, track);
     track(startScheduler(state));
   } catch (error) {
     for (const disposer of disposers.splice(0).reverse()) {
@@ -271,10 +265,11 @@ function publishOnThreadUnarchive(platform, store) {
  * 注册 4 个 ASCII 命令；handler 统一转给 handleCommand。
  * @param {object} platform
  * @param {Store} store
+ * @param {Readonly<Record<string, unknown>>} config
  * @param {object} metrics
  * @param {(disposer: Function) => void} track
  */
-function registerCommands(platform, store, metrics, track) {
+function registerCommands(platform, store, config, metrics, track) {
   if (!platform.capabilities.commands) return;
   for (const alias of COMMAND_ALIASES) {
     track(platform.registerCommand({
@@ -291,6 +286,7 @@ function registerCommands(platform, store, metrics, track) {
             now: platform.now(),
             scope: SCOPE,
             metrics,
+            timeZone: config.timezone,
           });
         } catch (error) {
           return {
@@ -312,9 +308,10 @@ function registerCommands(platform, store, metrics, track) {
  * 契约补齐 output（宽 schema + 文本 render），不做 defineTool 依赖。
  * @param {object} platform
  * @param {Store} store
+ * @param {Readonly<Record<string, unknown>>} config
  * @param {(disposer: Function) => void} track
  */
-function registerTools(platform, store, track) {
+function registerTools(platform, store, config, track) {
   if (!platform.capabilities.tools) return;
   const tools = createTools({
     store,
@@ -323,6 +320,7 @@ function registerTools(platform, store, track) {
     platform,
     clock: platform.now,
     cwd: typeof platform.cwd === 'function' ? platform.cwd() : undefined,
+    timeZone: config.timezone,
   });
   for (const tool of tools) {
     track(platform.registerTool({
@@ -347,7 +345,7 @@ function registerTools(platform, store, track) {
  * @returns {Promise<object|null>}
  */
 async function runPreStep(state, payload) {
-  const { platform } = state;
+  const { platform, config } = state;
   const messages = Array.isArray(payload?.messages) ? payload.messages : [];
   const turnKey = turnKeyOf(payload);
   const isNewTurn = turnKey !== null && turnKey !== state.lastTurn;
@@ -363,7 +361,7 @@ async function runPreStep(state, payload) {
   const usage = measureTokens(state, payload);
   if (usage !== null) {
     state.tokens = usage.tokensIn;
-    state.overCount = usage.tokensIn >= DEFAULT_AT_TOKENS ? state.overCount + 1 : 0;
+    state.overCount = usage.tokensIn >= config.compactAtTokens ? state.overCount + 1 : 0;
     state.metrics.observe('tokensIn', usage.tokensIn);
     state.metrics.observe('tokensOut', usage.tokensOut);
     if (isNewTurn) recordTokenEvent(state, usage);
@@ -426,15 +424,15 @@ function recordTokenEvent(state, usage) {
  * @param {object} payload
  */
 async function maybeConsolidate(state, payload) {
-  const { store, platform, metrics } = state;
+  const { store, platform, metrics, config } = state;
   const plan = planConsolidation({
     tokens: state.tokens,
     lastHumanAt: state.lastHumanAt,
     now: platform.now(),
     overCount: state.overCount,
-    hardTokens: DEFAULT_HARD_TOKENS,
-    atTokens: DEFAULT_AT_TOKENS,
-    idleMs: DEFAULT_IDLE_MS,
+    hardTokens: config.compactHardTokens,
+    atTokens: config.compactAtTokens,
+    idleMs: config.idleMs,
   });
   if (!plan.trigger) return;
 
@@ -587,7 +585,7 @@ async function injectRecall(state, payload, messages, turnKey) {
     history: [],
     userInput: query,
     limits: {
-      workingMemoryTokens: WORKING_BUDGET_TOKENS,
+      workingMemoryTokens: config.workingMemoryTokens,
       retainTokens: config.retainTokens,
       boardTokens: 0,
       recallTokens: RECALL_BUDGET_TOKENS,
@@ -728,7 +726,7 @@ function parseDraftJson(text) {
  * @returns {Promise<{consolidated: object, dormant: number, gc: number}>}
  */
 async function runDeepSleep(state) {
-  const { store, platform } = state;
+  const { store, platform, config } = state;
   const now = platform.now();
   const consolidated = await deepConsolidate(state);
   const dormant = decayFacts(state, now);
@@ -742,7 +740,7 @@ async function runDeepSleep(state) {
   stageBoard(store, SCOPE, board);
 
   const at = Math.floor(now / 1000);
-  const day = new Date(now).toISOString().slice(0, 10);
+  const day = zonedDayKey(now, config.timezone);
   try {
     store.insertConsolidation({
       scope: SCOPE,
@@ -923,6 +921,7 @@ function startScheduler(state) {
     clock: platform.now,
     store,
     jobs,
+    timeZone: config.timezone,
     timer: (callback, delay) => platform.every(delay, callback),
     clearTimer: (handle) => {
       if (typeof handle === 'function') handle();
@@ -972,7 +971,7 @@ function backupDatabase(state) {
   const { store, platform } = state;
   if (store.dbPath === ':memory:') return null;
   const now = platform.now();
-  const stamp = new Date(now).toISOString().slice(0, 10);
+  const stamp = zonedDayKey(now, state.config.timezone);
   const dir = dirname(store.dbPath);
   const base = basename(store.dbPath);
   const target = join(dir, `${base}.${stamp}.bak`);

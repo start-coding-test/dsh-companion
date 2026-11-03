@@ -4,7 +4,8 @@
  * 设计口径（06 v3.3 §9、05 v3.0 §2.1）：
  * - 间隔任务：idle-probe 每 60s、reminders 每 30s；
  * - 每日任务：deep-sleep 03:00、s2-purge 03:30、backup 04:00、
- *   thread-freeze 03:00（全部按本地时区 Date 计算，不写死 UTC 偏移）；
+ *   thread-freeze 03:00（全部按配置时区 config.timezone 的分区墙上时间计算，
+ *   不读 process.env.TZ、不写死 UTC 偏移）；
  * - 每次触发把 lastRunAt 以 memory_events 事件（detail.kind='job_run'）落库，
  *   重启后从事件恢复；启动时若每日任务在 catchUpWindowMs（默认 6h）内漏跑，
  *   补跑一次；超出补扫窗口的当日任务直接放弃，避免拖到白天突然补跑；
@@ -13,6 +14,16 @@
  * 本模块只负责「何时触发」；任务体由调用方通过 jobs 注入（job id → 函数），
  * 未注入的 job 只记录触发事件，不执行任何业务。仅使用 Node 内置能力。
  */
+
+import {
+  DEFAULT_TIMEZONE,
+  addDaysToDayKey,
+  dayKeyToParts,
+  isValidTimeZone,
+  zonedDayKey,
+  zonedParts,
+  zonedTimeToInstant,
+} from '../time.js';
 
 /**
  * 内置任务表。`at` 仅用于展示/测试，真正计算用 `atMinutes`（本地分钟）。
@@ -45,32 +56,44 @@ function normalizeNow(value) {
   throw new TypeError(`[scheduler] invalid time: ${String(value)}`);
 }
 
-/** @param {number} ms @returns {string} 本地日期键，用于「当日只跑一次」 */
-function localDayKey(ms) {
-  const date = new Date(ms);
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${date.getFullYear()}-${month}-${day}`;
+/** @param {number} ms @param {string} timeZone @returns {string} 分区日期键，用于「当日只跑一次」 */
+function localDayKey(ms, timeZone) {
+  return zonedDayKey(ms, timeZone);
 }
 
 /**
- * 本地时区里「当天 HH:MM」的毫秒时间戳。
- * 用 setHours 而不是 UTC 偏移，DST 切换交给 Date 归一化。
+ * 配置时区里「当天 HH:MM」的毫秒时间戳：先取分区墙上日期，再反解瞬时，
+ * 跨夏令时由 Intl 归一化。
  * @param {number} ms
  * @param {number} minutes 0..1439
+ * @param {string} timeZone
  * @returns {number}
  */
-function scheduleToday(ms, minutes) {
-  const date = new Date(ms);
-  date.setHours(Math.floor(minutes / 60), minutes % 60, 0, 0);
-  return date.getTime();
+function scheduleToday(ms, minutes, timeZone) {
+  const parts = zonedParts(ms, timeZone);
+  return zonedTimeToInstant({
+    year: parts.year,
+    month: parts.month,
+    day: parts.day,
+    hour: Math.floor(minutes / 60),
+    minute: minutes % 60,
+    second: 0,
+  }, timeZone);
 }
 
-/** @param {number} ms @param {number} days @returns {number} */
-function addLocalDays(ms, days) {
-  const date = new Date(ms);
-  date.setDate(date.getDate() + days);
-  return date.getTime();
+/**
+ * 同一分区墙上时间加 N 天（保留时分秒）。
+ * @param {number} ms @param {number} days @param {string} timeZone @returns {number}
+ */
+function addLocalDays(ms, days, timeZone) {
+  const parts = zonedParts(ms, timeZone);
+  const shifted = dayKeyToParts(addDaysToDayKey(zonedDayKey(ms, timeZone), days));
+  return zonedTimeToInstant({
+    ...shifted,
+    hour: parts.hour,
+    minute: parts.minute,
+    second: parts.second,
+  }, timeZone);
 }
 
 /** @param {unknown} detail @returns {object|null} */
@@ -96,6 +119,7 @@ function parseDetail(detail) {
  *   也可以是 (now, context) => ... 的统一 handler
  * @param {number} [options.tickMs] 定时器 tick，默认 30s
  * @param {number} [options.catchUpWindowMs] 启动补扫窗口，默认 6h
+ * @param {string} [options.timeZone=DEFAULT_TIMEZONE] 墙上时间所用 IANA 时区
  * @param {Function} [options.timer] setInterval 替身
  * @param {Function} [options.clearTimer] clearInterval 替身
  * @returns {{start: Function, stop: Function, runDue: Function, listJobs: Function}}
@@ -106,6 +130,7 @@ export function createScheduler({
   jobs = {},
   tickMs = 30_000,
   catchUpWindowMs = 6 * 3600 * 1000,
+  timeZone = DEFAULT_TIMEZONE,
   timer = setInterval,
   clearTimer = clearInterval,
 } = {}) {
@@ -129,6 +154,9 @@ export function createScheduler({
   }
   if (jobs !== null && typeof jobs !== 'object' && typeof jobs !== 'function') {
     throw new TypeError('createScheduler(jobs): must be a map or a function');
+  }
+  if (!isValidTimeZone(timeZone)) {
+    throw new TypeError(`createScheduler(timeZone): unknown IANA time zone "${String(timeZone)}"`);
   }
 
   /** @type {Map<string, number>} 上次触发时间（ms） */
@@ -273,13 +301,13 @@ export function createScheduler({
       const last = lastRunAt.get(spec.id);
       return last === undefined || last === null || at - last >= spec.intervalMs;
     }
-    const scheduled = scheduleToday(at, spec.atMinutes);
+    const scheduled = scheduleToday(at, spec.atMinutes, timeZone);
     if (at < scheduled) return false;
     if (at - scheduled > catchUpWindowMs) {
-      suppressed.add(`${spec.id}:${localDayKey(at)}`);
+      suppressed.add(`${spec.id}:${localDayKey(at, timeZone)}`);
       return false;
     }
-    if (suppressed.has(`${spec.id}:${localDayKey(at)}`)) return false;
+    if (suppressed.has(`${spec.id}:${localDayKey(at, timeZone)}`)) return false;
     const last = lastRunAt.get(spec.id);
     return last === undefined || last === null || last < scheduled;
   }
@@ -320,13 +348,13 @@ export function createScheduler({
     const catchUp = [];
     for (const spec of JOB_SPECS) {
       if (spec.kind !== 'daily' || running.has(spec.id)) continue;
-      const scheduled = scheduleToday(at, spec.atMinutes);
+      const scheduled = scheduleToday(at, spec.atMinutes, timeZone);
       if (at < scheduled) continue;
       const last = lastRunAt.get(spec.id);
       if (last !== undefined && last !== null && last >= scheduled) continue;
-      if (suppressed.has(`${spec.id}:${localDayKey(at)}`)) continue;
+      if (suppressed.has(`${spec.id}:${localDayKey(at, timeZone)}`)) continue;
       if (at - scheduled > catchUpWindowMs) {
-        suppressed.add(`${spec.id}:${localDayKey(at)}`);
+        suppressed.add(`${spec.id}:${localDayKey(at, timeZone)}`);
         continue;
       }
       invoke(spec, at, 'catch-up');
@@ -380,13 +408,13 @@ export function createScheduler({
           nextRunAt: (last ?? at) + spec.intervalMs,
         };
       }
-      const scheduled = scheduleToday(at, spec.atMinutes);
-      const suppressedToday = suppressed.has(`${spec.id}:${localDayKey(at)}`);
+      const scheduled = scheduleToday(at, spec.atMinutes, timeZone);
+      const suppressedToday = suppressed.has(`${spec.id}:${localDayKey(at, timeZone)}`);
       let nextRunAt;
       if (at < scheduled) {
         nextRunAt = scheduled;
       } else if (suppressedToday || (last !== null && last >= scheduled)) {
-        nextRunAt = addLocalDays(scheduled, 1);
+        nextRunAt = addLocalDays(scheduled, 1, timeZone);
       } else {
         nextRunAt = scheduled;
       }
@@ -409,11 +437,11 @@ export function createScheduler({
   }
   for (const spec of JOB_SPECS) {
     if (spec.kind !== 'daily') continue;
-    const scheduled = scheduleToday(initAt, spec.atMinutes);
+    const scheduled = scheduleToday(initAt, spec.atMinutes, timeZone);
     const last = lastRunAt.get(spec.id);
     if (initAt >= scheduled && (last === undefined || last === null || last < scheduled)
       && initAt - scheduled > catchUpWindowMs) {
-      suppressed.add(`${spec.id}:${localDayKey(initAt)}`);
+      suppressed.add(`${spec.id}:${localDayKey(initAt, timeZone)}`);
     }
   }
 

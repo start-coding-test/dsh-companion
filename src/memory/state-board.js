@@ -19,6 +19,8 @@
  * 线程 scope 的四组输入都只含该线程自己的行。
  */
 
+import { DEFAULT_TIMEZONE, zonedParts } from '../time.js';
+
 /** 状态板总预算（token，按 Math.ceil(len / 2) 估算）。 */
 export const BOARD_TOKEN_LIMIT = 800;
 
@@ -72,12 +74,13 @@ function toSeconds(value) {
   return null;
 }
 
-/** @param {number|null} seconds @returns {string} 形如 11-03（本地时区） */
+/** @param {number|null} seconds @returns {string} 形如 11-03（产品默认时区，不随进程 TZ 漂移） */
 function formatDay(seconds) {
   if (seconds === null) return '';
-  const date = new Date(seconds * 1000);
-  if (Number.isNaN(date.getTime())) return '';
-  return `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+  const ms = seconds * 1000;
+  if (!Number.isFinite(ms)) return '';
+  const parts = zonedParts(ms, DEFAULT_TIMEZONE);
+  return `${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
 }
 
 /** 压成单行并截断到 max 个字符（含省略号）。 */

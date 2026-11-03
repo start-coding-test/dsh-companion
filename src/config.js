@@ -3,6 +3,8 @@
  * 仅使用 Node 内置能力，零第三方依赖。
  */
 
+import { DEFAULT_TIMEZONE, isValidTimeZone, zonedMinutesOfDay } from './time.js';
+
 export class ConfigError extends Error {
   /**
    * @param {string} field 出错的配置字段（或参数）名
@@ -19,12 +21,14 @@ export const DEFAULTS = {
   workingMemoryTokens: 32000,
   compactAtTokens: 24000,
   compactHardTokens: 40000,
+  idleMs: 30 * 60 * 1000,
   retainTokens: 6144,
   threadIdleDays: 14,
   threadMaxActive: 6,
   proactiveDailyCap: 3,
   quietStart: '23:00',
   quietEnd: '08:00',
+  timezone: DEFAULT_TIMEZONE,
   purgeAfterDays: 7,
   dbPath: './.data/companion.db',
 };
@@ -107,6 +111,7 @@ export function normalizeConfig(raw = {}) {
   requireInteger(cfg, 'workingMemoryTokens', 1, MAX);
   requireInteger(cfg, 'compactAtTokens', 1, MAX);
   requireInteger(cfg, 'compactHardTokens', 1, MAX);
+  requireInteger(cfg, 'idleMs', 1, MAX);
   requireInteger(cfg, 'retainTokens', 1, MAX);
   requireInteger(cfg, 'threadIdleDays', 1, MAX);
   requireInteger(cfg, 'threadMaxActive', 1, MAX);
@@ -126,6 +131,13 @@ export function normalizeConfig(raw = {}) {
   parseClockField(cfg.quietStart, 'quietStart');
   parseClockField(cfg.quietEnd, 'quietEnd');
 
+  if (typeof cfg.timezone !== 'string' || cfg.timezone.trim() === '') {
+    throw new ConfigError('timezone', `must be a non-empty IANA time zone, got ${JSON.stringify(cfg.timezone)}`);
+  }
+  if (!isValidTimeZone(cfg.timezone)) {
+    throw new ConfigError('timezone', `unknown IANA time zone "${cfg.timezone}"`);
+  }
+
   if (typeof cfg.dbPath !== 'string' || cfg.dbPath.trim() === '') {
     throw new ConfigError('dbPath', 'must be a non-empty string');
   }
@@ -134,9 +146,10 @@ export function normalizeConfig(raw = {}) {
 }
 
 /**
- * 判断给定时刻是否处于安静时段（分钟比较，支持跨午夜；start == end 视为全天安静）。
+ * 判断给定时刻是否处于安静时段（按 config.timezone 取分区分钟比较，支持跨午夜；
+ * start == end 视为全天安静）。不依赖进程本地时区。
  * @param {Date} date
- * @param {{quietStart?: string, quietEnd?: string}} [cfg]
+ * @param {{quietStart?: string, quietEnd?: string, timezone?: string}} [cfg]
  * @returns {boolean}
  */
 export function isQuietAt(date, cfg = DEFAULTS) {
@@ -146,7 +159,11 @@ export function isQuietAt(date, cfg = DEFAULTS) {
   const source = cfg ?? DEFAULTS;
   const start = parseClockField(source.quietStart ?? DEFAULTS.quietStart, 'quietStart');
   const end = parseClockField(source.quietEnd ?? DEFAULTS.quietEnd, 'quietEnd');
-  const now = date.getHours() * 60 + date.getMinutes();
+  const timeZone = source.timezone ?? DEFAULTS.timezone;
+  if (!isValidTimeZone(timeZone)) {
+    throw new ConfigError('timezone', `unknown IANA time zone "${String(timeZone)}"`);
+  }
+  const now = zonedMinutesOfDay(date.getTime(), timeZone);
 
   if (start === end) return true;
   if (start < end) return now >= start && now < end;

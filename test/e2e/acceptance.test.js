@@ -37,7 +37,7 @@ import {
   makeWriteFailDraft,
 } from '../helpers/scenarios.js';
 
-/** 本地时刻 → epoch ms（测试环境为 UTC+8）。 */
+/** Asia/Shanghai 墙上时刻 → epoch ms（等于默认 config.timezone，与进程 TZ 无关）。 */
 const at = (iso) => Date.parse(`${iso}+08:00`);
 
 const results = [];

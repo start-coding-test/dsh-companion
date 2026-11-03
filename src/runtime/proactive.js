@@ -16,6 +16,7 @@
  */
 
 import { DEFAULTS, isQuietAt } from '../config.js';
+import { DEFAULT_TIMEZONE, isValidTimeZone, zonedDayKey } from '../time.js';
 
 /** 单类每日上限（PR-03）。 */
 export const KIND_CAPS = Object.freeze({ task_report: 1, reminder: 2, chat: 1 });
@@ -45,12 +46,9 @@ function normalizeNow(value) {
   throw new TypeError(`[proactive] invalid time: ${String(value)}`);
 }
 
-/** @param {number} ms @returns {string} 本地日期键 */
-function dayKey(ms) {
-  const date = new Date(ms);
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  return `${date.getFullYear()}-${month}-${day}`;
+/** @param {number} ms @param {string} timeZone @returns {string} 分区日期键 */
+function dayKey(ms, timeZone) {
+  return zonedDayKey(ms, timeZone);
 }
 
 /** @param {unknown} detail @returns {object|null} */
@@ -64,11 +62,6 @@ function parseDetail(detail) {
   } catch {
     return null;
   }
-}
-
-/** @param {number} at @param {number} ms */
-function sameDay(at, ms) {
-  return dayKey(at) === dayKey(ms);
 }
 
 /**
@@ -100,9 +93,14 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
   if (!Number.isInteger(dailyCap) || dailyCap < 0) {
     throw new TypeError(`createProactive(config): proactiveDailyCap must be a non-negative integer, got ${dailyCap}`);
   }
+  const timeZone = settings.timezone ?? DEFAULTS.timezone ?? DEFAULT_TIMEZONE;
+  if (!isValidTimeZone(timeZone)) {
+    throw new TypeError(`createProactive(config): unknown IANA time zone "${String(timeZone)}"`);
+  }
   const quietConfig = {
     quietStart: settings.quietStart ?? DEFAULTS.quietStart,
     quietEnd: settings.quietEnd ?? DEFAULTS.quietEnd,
+    timezone: timeZone,
   };
 
   const nowMs = () => normalizeNow(clock());
@@ -113,7 +111,7 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
   const dedupe = new Map();
 
   const state = {
-    dayKey: dayKey(nowMs()),
+    dayKey: dayKey(nowMs(), timeZone),
     sentToday: 0,
     byKind: { task_report: 0, reminder: 0, chat: 0 },
   };
@@ -138,7 +136,7 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
       const seconds = Number(row?.at);
       if (!Number.isFinite(seconds)) continue;
       const sentAt = seconds * 1000;
-      if (KINDS.includes(detail.msgKind) && sameDay(sentAt, state.dayKey)) {
+      if (KINDS.includes(detail.msgKind) && dayKey(sentAt, timeZone) === state.dayKey) {
         state.sentToday += 1;
         state.byKind[detail.msgKind] += 1;
       }
@@ -154,7 +152,7 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
 
   /** 跨天后重置当日预算。 */
   function ensureDay(at) {
-    const key = dayKey(at);
+    const key = dayKey(at, timeZone);
     if (key === state.dayKey) return;
     state.dayKey = key;
     state.sentToday = 0;

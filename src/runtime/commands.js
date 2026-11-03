@@ -9,6 +9,15 @@
  * - 命令回复是给人看的短文本，不塞 JSON。
  */
 
+import {
+  DEFAULT_TIMEZONE,
+  isValidTimeZone,
+  zonedDayKey,
+  zonedParts,
+  zonedStartOfDay,
+  zonedStartOfMonth,
+} from '../time.js';
+
 const MEMORY_COMMANDS = new Set(['记忆', '成本', '线程', '状态']);
 const MAX_FORGET = 5;
 
@@ -21,9 +30,17 @@ const MAX_FORGET = 5;
  * @param {number|Date} options.now 毫秒时间戳或 Date（由接线层注入）
  * @param {string} [options.scope='main'] 作用域
  * @param {object} [options.metrics] createMetrics() 句柄；/状态 用它显示本轮 token
+ * @param {string} [options.timeZone=DEFAULT_TIMEZONE] 日期/日界线所用 IANA 时区
  * @returns {{handled: boolean, reply: string}}
  */
-export function handleCommand({ text, store, now, scope = 'main', metrics } = {}) {
+export function handleCommand({
+  text,
+  store,
+  now,
+  scope = 'main',
+  metrics,
+  timeZone = DEFAULT_TIMEZONE,
+} = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
   if (!raw.startsWith('/')) return { handled: false, reply: '' };
@@ -37,18 +54,21 @@ export function handleCommand({ text, store, now, scope = 'main', metrics } = {}
   if (store === null || store === undefined) {
     throw new TypeError('[commands] store is required');
   }
+  if (!isValidTimeZone(timeZone)) {
+    throw new TypeError(`[commands] unknown IANA time zone "${String(timeZone)}"`);
+  }
 
   if (command === '记忆') {
     return handleMemoryCommand(parts.slice(1), { store, now, scope });
   }
   if (command === '成本') {
-    const summary = summarizeCost(store, now);
+    const summary = summarizeCost(store, now, timeZone);
     return { handled: true, reply: formatCost(summary) };
   }
   if (command === '线程') {
-    return { handled: true, reply: formatThreads(store.listThreads({ limit: 100 })) };
+    return { handled: true, reply: formatThreads(store.listThreads({ limit: 100 }), timeZone) };
   }
-  return { handled: true, reply: formatStatus(store, scope, metrics) };
+  return { handled: true, reply: formatStatus(store, scope, metrics, timeZone) };
 }
 
 /**
@@ -60,13 +80,17 @@ export function handleCommand({ text, store, now, scope = 'main', metrics } = {}
  *
  * @param {object} store
  * @param {number|Date} now 毫秒时间戳或 Date（由接线层注入）
+ * @param {string} [timeZone=DEFAULT_TIMEZONE] 日界线所用 IANA 时区
  * @returns {{today: {tokensIn:number,tokensOut:number,total:number},
  *            month: {tokensIn:number,tokensOut:number,total:number}}}
  */
-export function summarizeCost(store, now) {
+export function summarizeCost(store, now, timeZone = DEFAULT_TIMEZONE) {
+  if (!isValidTimeZone(timeZone)) {
+    throw new TypeError(`[commands] unknown IANA time zone "${String(timeZone)}"`);
+  }
   const at = toMillis(now);
-  const dayStart = startOfDay(at);
-  const monthStart = startOfMonth(at);
+  const dayStart = zonedStartOfDay(at, timeZone);
+  const monthStart = zonedStartOfMonth(at, timeZone);
   const rows = listTokenEvents(store, Math.floor(monthStart / 1000));
 
   const today = emptyCost();
@@ -302,18 +326,18 @@ function formatCost(summary) {
 
 // ------------------------------------------------------------- 线程/状态
 
-/** @param {object[]} rows */
-function formatThreads(rows) {
+/** @param {object[]} rows @param {string} timeZone */
+function formatThreads(rows, timeZone) {
   if (rows.length === 0) return '线程目录：暂无。';
   const lines = ['线程目录（' + rows.length + '）：', 'key | 状态 | 名称 | 最后活跃'];
   for (const row of rows) {
-    lines.push(`${row.key} | ${row.status} | ${row.name} | ${formatDate(row.last_active_at)}`);
+    lines.push(`${row.key} | ${row.status} | ${row.name} | ${formatDate(row.last_active_at, timeZone)}`);
   }
   return lines.join('\n');
 }
 
-/** @param {object} store @param {string} scope */
-function formatStatus(store, scope, metrics) {
+/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone */
+function formatStatus(store, scope, metrics, timeZone) {
   const stats = store.stats();
   const tables = [
     'entities', 'episodes', 'facts', 'reminders', 'state_board', 'state_board_rev',
@@ -323,7 +347,7 @@ function formatStatus(store, scope, metrics) {
   const watermark = store.getWatermark(scope);
   const job = latestConsolidation(store, scope);
   const jobText = job
-    ? `${job.kind} ${job.status} upto_seq=${job.upto_seq}（${formatDateTime(job.started_at)}）`
+    ? `${job.kind} ${job.status} upto_seq=${job.upto_seq}（${formatDateTime(job.started_at, timeZone)}）`
     : '无';
   const fts = `fts ${stats.fts_facts ?? 0}/${stats.fts_episodes ?? 0}`;
   const tokenText = formatTokenSnapshot(metrics);
@@ -376,29 +400,18 @@ function toMillis(value) {
   return n < 1e11 ? n * 1000 : n;
 }
 
-/** @param {number} ms */
-function startOfDay(ms) {
-  const date = new Date(ms);
-  date.setHours(0, 0, 0, 0);
-  return date.getTime();
-}
-
-/** @param {number} ms */
-function startOfMonth(ms) {
-  const date = new Date(ms);
-  date.setDate(1);
-  date.setHours(0, 0, 0, 0);
-  return date.getTime();
-}
-
-/** @param {number|null|undefined} sec */
-function formatDate(sec) {
+/** @param {number|null|undefined} sec @param {string} timeZone */
+function formatDate(sec, timeZone) {
   if (!Number.isFinite(Number(sec)) || Number(sec) <= 0) return '—';
-  return new Date(Number(sec) * 1000).toISOString().slice(0, 10);
+  return zonedDayKey(Number(sec) * 1000, timeZone);
 }
 
-/** @param {number|null|undefined} sec */
-function formatDateTime(sec) {
+/** @param {number|null|undefined} sec @param {string} timeZone */
+function formatDateTime(sec, timeZone) {
   if (!Number.isFinite(Number(sec)) || Number(sec) <= 0) return '—';
-  return new Date(Number(sec) * 1000).toISOString().slice(0, 16).replace('T', ' ');
+  const ms = Number(sec) * 1000;
+  const parts = zonedParts(ms, timeZone);
+  const hh = String(parts.hour).padStart(2, '0');
+  const mm = String(parts.minute).padStart(2, '0');
+  return `${zonedDayKey(ms, timeZone)} ${hh}:${mm}`;
 }

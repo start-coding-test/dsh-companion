@@ -12,6 +12,7 @@
  */
 
 import { summarizeCost } from './commands.js';
+import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
 
 const FACT_KINDS = new Set(['identity', 'relation', 'preference', 'project', 'knowledge', 'other']);
 const SALIENCE = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
@@ -32,14 +33,26 @@ const LIMIT_SCHEMA = Object.freeze({
  * @param {object} [deps.platform] src/platform/adapter.js 返回的适配器
  * @param {() => number} [deps.clock] 可注入时钟（毫秒），默认 Date.now
  * @param {string} [deps.cwd] thread_run 新建会话的默认工作目录
+ * @param {string} [deps.timeZone=DEFAULT_TIMEZONE] cost_report 日界线所用 IANA 时区
  * @returns {Array<{name:string, description:string, parameters:object, execute:Function}>}
  */
-export function createTools({ store, retrieve, registry, platform, clock = Date.now, cwd } = {}) {
+export function createTools({
+  store,
+  retrieve,
+  registry,
+  platform,
+  clock = Date.now,
+  cwd,
+  timeZone = DEFAULT_TIMEZONE,
+} = {}) {
   if (store === null || store === undefined) {
     throw new TypeError('createTools: store is required');
   }
   if (typeof clock !== 'function') {
     throw new TypeError('createTools: clock must be a function');
+  }
+  if (!isValidTimeZone(timeZone)) {
+    throw new TypeError(`createTools: unknown IANA time zone "${String(timeZone)}"`);
   }
   const nowMs = () => Number(clock());
   const defaultCwd = typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined;
@@ -376,7 +389,7 @@ export function createTools({ store, retrieve, registry, platform, clock = Date.
       },
       execute(args = {}) {
         assertArgs(args, 'cost_report');
-        return summarizeCost(store, nowMs());
+        return summarizeCost(store, nowMs(), timeZone);
       },
     },
   ];

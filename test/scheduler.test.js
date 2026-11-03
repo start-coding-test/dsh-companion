@@ -1,7 +1,8 @@
 /**
  * T9 调度器与主动消息闸门测试。
  *
- * 时钟一律用本地时区构造（new Date(y, m, d, h, min)），避免写死 UTC 偏移；
+ * 时钟一律用 Asia/Shanghai 墙上时间构造（等价于默认 config.timezone），
+ * 显式写 +08:00，因此结果与进程 TZ 无关；
  * 每个用例独立内存库 + 假 platform，不依赖真实定时器/网络。
  */
 import { test } from 'node:test';
@@ -21,9 +22,12 @@ import {
   PROACTIVE_EVENT_TABLE,
 } from '../src/runtime/proactive.js';
 
-/** 本地时间（毫秒）。2026-01-15 是周四。 */
+/** Asia/Shanghai 墙上时间（毫秒）。2026-01-15 是周四。 */
 function local(day, hour, minute = 0) {
-  return new Date(2026, 0, day, hour, minute, 0, 0).getTime();
+  const dd = String(day).padStart(2, '0');
+  const hh = String(hour).padStart(2, '0');
+  const mm = String(minute).padStart(2, '0');
+  return Date.parse(`2026-01-${dd}T${hh}:${mm}:00+08:00`);
 }
 
 function memoryStore(t) {
@@ -501,4 +505,59 @@ test('发送记录写 store（memory_events），重启后恢复当日计数与 
   const duplicate = await second.flush(local(15, 10, 5));
   assert.equal(duplicate.sent, 0);
   assert.equal(duplicate.suppressed, 1);
+});
+
+// --------------------------------------------------- M1：显式时区（不读 TZ）
+
+test('timeZone 覆盖：每日 03:00 按配置分区判定（America/New_York）', (t) => {
+  const store = memoryStore(t);
+  const { jobs, calls } = makeJobs();
+  const timers = fakeTimers();
+  let now = Date.parse('2026-01-15T02:59:00-05:00');
+  const scheduler = createScheduler({
+    store,
+    clock: () => now,
+    jobs,
+    timeZone: 'America/New_York',
+    timer: timers.timer,
+    clearTimer: timers.clearTimer,
+  });
+
+  assert.deepEqual(scheduler.runDue(now).ran, [], '纽约 02:59 未到每日 03:00');
+
+  now = Date.parse('2026-01-15T03:00:00-05:00');
+  const report = scheduler.runDue(now);
+  assert.ok(report.ran.includes('deep-sleep'), '纽约 03:00 应触发 deep-sleep');
+  assert.ok(report.ran.includes('thread-freeze'), '纽约 03:00 应触发 thread-freeze');
+});
+
+test('timeZone 覆盖：主动闸门安静时段按配置分区（America/New_York）', async (t) => {
+  const store = memoryStore(t);
+  const sent = [];
+  const ny2300 = Date.parse('2026-01-16T12:00:00+08:00'); // 纽约 2026-01-15 23:00（EST）
+  const ny0800 = Date.parse('2026-01-16T21:00:00+08:00'); // 纽约 2026-01-16 08:00（EST）
+  const gate = createProactive({
+    store,
+    platform: { prompt: async (_sessionId, text) => { sent.push(text); } },
+    config: normalizeConfig({ timezone: 'America/New_York' }),
+    clock: () => ny2300,
+  });
+
+  gate.enqueue({ kind: 'chat', text: '纽约深夜消息', at: ny2300 });
+  const quiet = await gate.flush(ny2300);
+  assert.equal(quiet.quiet, true, '纽约 23:00 应判定为安静时段');
+  assert.equal(quiet.sent, 0);
+  assert.equal(gate.stats(ny2300).quiet, true);
+
+  const morning = await gate.flush(ny0800);
+  assert.equal(morning.quiet, false, '纽约 08:00 应解除安静时段');
+  assert.equal(morning.sent, 1);
+  assert.deepEqual(sent, ['纽约深夜消息']);
+});
+
+test('createScheduler 参数校验：非法 timeZone 抛 TypeError', () => {
+  assert.throws(
+    () => createScheduler({ store: { appendEvent() {} }, timeZone: 'Not/AZone' }),
+    (err) => err instanceof TypeError && /timeZone/u.test(err.message),
+  );
 });
