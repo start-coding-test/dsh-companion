@@ -8,8 +8,8 @@
  * 强化按「是否真的被回复用上」触发（见 index.js 的接线）：
  *   - 上一轮注入过的 fact，若下一轮 assistant 文本复述了它（二元组重合 ≥0.6）
  *     → α=2.0；
- *   - 若本轮 user 文本还带确认词（对/是的/没错/记住了/确实/就是）
- *     → α=4.0。
+ *   - 若本轮 user 文本是短确认语（对/是的/没错/记住了/确实/就是，
+ *     整句或独立小句，见 isConfirmation）→ α=4.0。
  *
  * 本模块保持纯函数 + 窄依赖：只依赖 Store 的 reinforceFact 能力，
  * 不做日志、不读时钟（now/at 全部由调用方传入），便于单测与复用。
@@ -23,6 +23,79 @@ export const CONFIRM_ALPHA = 4.0;
 export const MAX_STRENGTH_DAYS = 3650;
 /** 「用上」判定阈值：fact 二元组被 assistant 文本覆盖的比例。 */
 export const USE_OVERLAP_THRESHOLD = 0.6;
+
+/**
+ * N-L1：确认词。只有「短确认语」才算确认（整句/独立小句/带语气短尾），
+ * 不能用 `text.includes(word)`——否则「对比一下」「对话」「不对」都会误触发 α=4。
+ */
+export const CONFIRMATION_WORDS = Object.freeze(['对', '是的', '没错', '记住了', '确实', '就是']);
+
+/** 确认词后允许的语气短尾：「对呀」「没错吧」「记住了啊」。 */
+const CONFIRM_TAIL_PARTICLES = new Set(['啊', '呀', '呢', '吧', '哦', '嘛', '哈', '嗯', '啦', '的']);
+
+/**
+ * 否定/犹疑标记：命中片段附近出现即不算确认。
+ * 判定时先剔除确认词本身，避免把「没错」里的「没」「错」当成否定。
+ */
+const CONFIRM_NEGATION = /不|没|别|错|未必/;
+
+/**
+ * 句子边界：空白、标点、符号（含中英文标点）。
+ * @param {string|undefined} ch
+ * @returns {boolean}
+ */
+function isBoundaryChar(ch) {
+  return ch === undefined || /[\s\p{P}\p{S}]/u.test(ch);
+}
+
+/**
+ * N-L1：判断一段 user 文本是不是「短确认语」。
+ *
+ * 判定步骤：
+ * 1. trim 并去掉句末标点/空白；
+ * 2. 确认词必须出现在合法位置，三选一：
+ *    a. 整句就是确认词（「对」「记住了。」）；
+ *    b. 确认词独立成小句：前后都是边界（「嗯，对，就这样」）；
+ *    c. 以确认词开头且紧接边界或 ≤2 个语气短尾（「对，就是这样」「没错吧？」）。
+ * 3. 命中片段附近出现 不/没/别/错/未必 → 不算确认（「好像不太对」「对，但是不对」）。
+ *
+ * 纯函数：不改状态、不读时钟，便于单测与复用。
+ *
+ * @param {unknown} text
+ * @returns {boolean}
+ */
+export function isConfirmation(text) {
+  const raw = typeof text === 'string' ? text : String(text ?? '');
+  const trimmed = raw.trim();
+  if (trimmed === '') return false;
+  // 去掉句末标点/符号/空白（保留句中标点作为小句边界）。
+  const stripped = trimmed.replace(/[\p{P}\p{S}\s]+$/u, '');
+  if (stripped === '') return false;
+  const chars = [...stripped];
+  if (chars.length === 0) return false;
+
+  for (const word of CONFIRMATION_WORDS) {
+    const wordChars = [...word];
+    for (let index = 0; index + wordChars.length <= chars.length; index += 1) {
+      if (!wordChars.every((ch, offset) => chars[index + offset] === ch)) continue;
+      const end = index + wordChars.length;
+      // 条件 b：确认词前必须是边界（句首也算）。
+      if (index > 0 && !isBoundaryChar(chars[index - 1])) continue;
+      // 条件 a/b：后边界；条件 c：句首 + 语气短尾。
+      let afterOk = end === chars.length || isBoundaryChar(chars[end]);
+      if (!afterOk && index === 0) {
+        const tail = chars.slice(end);
+        afterOk = tail.length <= 2 && tail.every((ch) => CONFIRM_TAIL_PARTICLES.has(ch));
+      }
+      if (!afterOk) continue;
+      // 否定守卫：只看命中片段之外的部分，避免「没错」被自身字符误伤。
+      const around = chars.slice(0, index).join('') + chars.slice(end).join('');
+      if (CONFIRM_NEGATION.test(around)) continue;
+      return true;
+    }
+  }
+  return false;
+}
 
 const DAY_MS = 86_400_000;
 /** 秒/毫秒判别阈值（与 retrieve.js 的 toMillis 一致）。 */

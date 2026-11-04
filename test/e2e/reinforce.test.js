@@ -226,3 +226,43 @@ test('apply：assistant 未复述（回复无关）→ 强度与 recall_count �
   assert.equal(after.recall_count, 0);
   assert.equal(reinforcementEvents(temp.store, seeded.factId).length, 0);
 });
+
+test('apply：含「对」的子串（对比一下）不算确认语 → α=2（N-L1）', async (t) => {
+  const temp = makeTempStore();
+  const seeded = seedMemory(temp.store, { now: TEST_NOW, statement: FACT_STATEMENT });
+  const ctx = makeApplyCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14 });
+  t.after(() => {
+    handle.dispose();
+    temp.cleanup();
+  });
+
+  await ctx.dispatch(
+    'agent/pre-step',
+    turnPayload(1, messages(['user', '我是不是说过青柠计划的代号？'])),
+    { kind: 'enter', messages: [] },
+  );
+  ctx.advance(DAY_MS);
+  await ctx.dispatch(
+    'agent/pre-step',
+    turnPayload(
+      2,
+      messages(
+        ['user', '我是不是说过青柠计划的代号？'],
+        ['assistant', '是的，青柠计划的代号是蓝鲸。'],
+        ['user', '对比一下，蓝鲸和虎鲸哪个更大？'],
+      ),
+    ),
+    { kind: 'enter', messages: [] },
+  );
+
+  const after = temp.store.getFact(seeded.factId);
+  const R = Math.exp(-1 / 14);
+  const expected = 14 * (1 + 2 * (1 - R)) + 1;
+  assert.equal(after.recall_count, 1);
+  assert.ok(Math.abs(after.strength_days - expected) < 1e-6, '「对比一下」不得使用 α=4');
+  const events = reinforcementEvents(temp.store, seeded.factId);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].detail.alpha, 2);
+});
+

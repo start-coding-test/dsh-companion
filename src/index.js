@@ -31,6 +31,7 @@ import {
   DEFAULT_ALPHA,
   USE_OVERLAP_THRESHOLD,
   applyReinforcement,
+  isConfirmation,
   overlapRatio,
 } from './memory/reinforce.js';
 import { buildConsolidationPrompt, consolidate, planConsolidation } from './memory/consolidate.js';
@@ -110,9 +111,6 @@ const TRANSCRIPT_MAX_CHARS = 6000;
 
 /** 备份保留份数（t23 L2：按日期滚动）。 */
 const BACKUP_KEEP = 7;
-
-/** H5 确认词：本轮 user 文本带这些词且上一轮 assistant 复述过 fact → α=4。 */
-const CONFIRMATION_WORDS = Object.freeze(['对', '是的', '没错', '记住了', '确实', '就是']);
 
 const DAY_MS = 86_400_000;
 
@@ -612,22 +610,32 @@ function routeSession(state, payload) {
 const WATERMARK_ANCHOR_PREFIX = 'watermark_anchor:';
 
 /**
- * 读持久化的水位锚点（N-H1）。
+ * 读持久化的水位锚点（N-H1/R-L2）。
+ *
+ * 约定：正数 = 重锚到的 surface seq；-1 = 已重锚到起点（内存水位 0）。
+ * 0 同时被 sleep 写路径用作「清空」（Store 没有 deleteMeta），所以「有效锚点 0」
+ * 必须用哨兵 -1 落库，否则重启后会回退到旧 upto_seq，再次 stale、再次归零。
+ *
  * @param {{getMeta: Function}} store
  * @param {string} scope
- * @returns {number|null}
+ * @returns {number|null} 正数 seq、-1，或 null（无锚点）
  */
 function readWatermarkAnchor(store, scope) {
   try {
     const raw = Number(store.getMeta(`${WATERMARK_ANCHOR_PREFIX}${scope}`));
-    return Number.isSafeInteger(raw) && raw > 0 ? raw : null;
+    return Number.isSafeInteger(raw) && (raw > 0 || raw === -1) ? raw : null;
   } catch {
     return null;
   }
 }
 
 /**
- * 写/清水位锚点。写 0 表示清空（Store 没有 deleteMeta）。
+ * 写/清水位锚点。
+ *
+ * - 正数：重锚到的 surface seq；
+ * - -1：已重锚到起点（内存水位 0），重启时按 0 恢复；
+ * - 0/null：清空，回到「最新一条巩固行的 upto_seq」口径。
+ *
  * @param {{setMeta: Function}} store
  * @param {string} scope
  * @param {number|null} seq
@@ -647,12 +655,17 @@ function clearWatermarkAnchor(store, scope) {
 
 /**
  * 初始化水位：优先用外部压缩后的重锚值，否则用最新巩固行的 upto_seq。
+ *
+ * R-L2：锚点 -1 表示「已重锚到起点」，这里还原成内存水位 0（有效锚点），
+ * 不能再回退旧 upto_seq；其他值仍按无锚点处理。导出供单测与重启恢复断言。
+ *
  * @param {{getWatermark: Function, getMeta: Function}} store
  * @param {string} scope
  * @returns {number}
  */
-function initialWatermark(store, scope) {
+export function initialWatermark(store, scope) {
   const anchor = readWatermarkAnchor(store, scope);
+  if (anchor === -1) return 0;
   if (anchor !== null) return anchor;
   return Number(store.getWatermark(scope)) || 0;
 }
@@ -727,7 +740,8 @@ function ensureWatermark(state, scope, snapshot) {
   const { anchor, mode, lost } = resolveReanchor(previous, seqs, current);
 
   setWatermark(state, scope, anchor);
-  writeWatermarkAnchor(state.store, scope, anchor);
+  // R-L2：anchor 为 0 时落库写 -1（哨兵），否则重启后会被旧 upto_seq 覆盖。
+  writeWatermarkAnchor(state.store, scope, anchor > 0 ? anchor : -1);
   state.metrics.inc('watermarkReanchors');
   if (lost > 0) state.metrics.inc('compactionLostUnconsolidated', lost);
   state.platform.log(
@@ -896,8 +910,8 @@ async function refreshSurface(state, payload, measuredNodes = null, options = {}
  * - 只认「注入之后出现的新 assistant」：注入时记录最近 assistant 文本/条数，
  *   同一 turn 的后续 step 若还没有新回复，则保留 pending 到下一次 pre-step；
  *   进入新 turn 仍无新回复（历史缺失）则放弃，避免陈旧注入误强化。
- * - 本轮 user 文本含确认词（对/是的/没错/记住了/确实/就是）且复述成立 → α=4，
- *   否则 α=2。
+ * - 本轮 user 文本是短确认语（整句/独立小句，见 isConfirmation）且复述成立 → α=4，
+ *   否则 α=2。不能用子串匹配：`对比一下`、`对话` 都包含「对」。
  * - 每条 fact 每批注入只强化一次；pinned/已删/非 active 跳过；失败只 warn。
  *
  * @param {object} state
@@ -934,7 +948,7 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
 
   state.lastRecalledIds = [];
   const userText = lastUserText(messages);
-  const confirmed = CONFIRMATION_WORDS.some((word) => userText.includes(word));
+  const confirmed = isConfirmation(userText);
   const alpha = confirmed ? CONFIRM_ALPHA : DEFAULT_ALPHA;
   const at = Math.floor(state.platform.now() / 1000);
 
