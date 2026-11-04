@@ -105,6 +105,26 @@ import { zonedDayKey, zonedParts } from './time.js';
 
 export const name = 'dsh-companion';
 
+/**
+ * cordis inject 声明（C-H1）。
+ *
+ * 只列目标宿主真实存在、且插件缺了就跑不起来的 service；名单以
+ * `scripts/probe/probe-plugin.js` 产出的 `.data/probe.json`
+ * `capabilities.services.*.present` 为准（2026-11-03 探针：四项均为 true）。
+ *
+ * - `ctx.interval` 是 timer 混入的访问器，内部读 `timer` service，所以声明
+ *   `timer` 而不是 `interval`；`ctx.on` 来自 Context 自带的 events，不需要声明。
+ * - cordis 4 没有 optional inject：一旦声明，宿主缺该 service 时整个 entry 会停在
+ *   待激活状态、插件永远不 apply。因此其余能力（compaction / sessionController /
+ *   workspaceRegistry / tokenMeter / sessionQuery / agents / llm / logger …）全部
+ *   走 `ctx.get(name)` 探测 + adapter 的 unavailable 降级，不写进 inject。
+ *
+ * 历史：v0.4.2 之前没有本声明，真实宿主上 apply 的第一个属性读
+ * （`ctx.rssReader`）就抛 `cannot get property "rssReader" without inject`，
+ * 插件从未激活；测试用普通对象 mock，属性读不抛，所以 667 个用例没覆盖到。
+ */
+export const inject = ['systemPrompt', 'timer', 'commands', 'tools'];
+
 /** 默认/主会话作用域。 */
 const SCOPE = MAIN_SCOPE;
 
@@ -182,12 +202,84 @@ const COMMAND_ALIASES = Object.freeze([
 const INSTALLS = new WeakMap();
 
 /**
+ * 读一个宿主席位：先看 `apply()` 第三参 hooks（测试/嵌入方显式注入），
+ * 再经 `ctx.get(name)` 读宿主 service。
+ *
+ * 绝不直接读 Context 代理属性：cordis 4 对 inject 未声明的 service 属性读会抛
+ * `cannot get property "x" without inject`（C-H1 根因）。`ctx.get()` 是唯一
+ * 不抛的属性读法，缺失时返回 undefined。
+ *
+ * @param {object} ctx 平台上下文
+ * @param {Record<string, unknown>} hooks 显式注入的席位
+ * @param {string} name 席位名
+ * @returns {unknown}
+ */
+function hostValue(ctx, hooks, name) {
+  if (hooks !== null && typeof hooks === 'object'
+    && Object.prototype.hasOwnProperty.call(hooks, name)
+    && hooks[name] !== undefined) {
+    return hooks[name];
+  }
+  if (typeof ctx?.get !== 'function') return undefined;
+  try {
+    return ctx.get(name);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 组装测试席位：now / cwd / rssReader / companion。
+ *
+ * 宿主（或 hooks）不提供时回落进程能力，保证插件在裸 ctx（单测、headless 探针）
+ * 上仍能启动：`Date.now()`、`process.cwd()`、`process.memoryUsage().rss`。
+ *
+ * @param {object} ctx 平台上下文
+ * @param {Record<string, unknown>} hooks
+ * @returns {{now: () => number, cwd: () => string, rssReader: () => number, companion: object|null}}
+ */
+function createSeats(ctx, hooks) {
+  const nowSeat = hostValue(ctx, hooks, 'now');
+  let now;
+  if (typeof nowSeat === 'function') {
+    now = () => Number(nowSeat());
+  } else if (typeof nowSeat === 'number' && Number.isFinite(nowSeat)) {
+    now = () => nowSeat;
+  } else {
+    now = () => Date.now();
+  }
+
+  const workspaceSeat = hostValue(ctx, hooks, 'workspace');
+  const cwdSeat = hostValue(ctx, hooks, 'cwd');
+  const cwd = () => {
+    let value;
+    if (typeof cwdSeat === 'function') value = cwdSeat();
+    else if (cwdSeat !== undefined) value = cwdSeat;
+    else value = workspaceSeat?.cwd;
+    return typeof value === 'string' && value !== '' ? value : process.cwd();
+  };
+
+  const rssSeat = hostValue(ctx, hooks, 'rssReader');
+  const rssReader = typeof rssSeat === 'function'
+    ? () => Number(rssSeat())
+    : () => process.memoryUsage().rss;
+
+  const companionSeat = hostValue(ctx, hooks, 'companion');
+  const companion = companionSeat !== null && typeof companionSeat === 'object'
+    ? companionSeat
+    : null;
+
+  return { now, cwd, rssReader, companion };
+}
+
+/**
  * 插件入口。
  * @param {object} ctx 平台上下文
  * @param {Record<string, unknown>} [rawConfig] 用户原始配置
+ * @param {Record<string, unknown>} [hooks] 显式注入的测试席位（now/cwd/rssReader/companion）
  * @returns {{dispose: () => void}|undefined}
  */
-export function apply(ctx, rawConfig) {
+export function apply(ctx, rawConfig, hooks = {}) {
   const config = normalizeConfig(rawConfig);
   const host = ctx !== null && typeof ctx === 'object' ? ctx : null;
   host?.logger?.info?.('[dsh-companion] config ok', { warnings: config.warnings });
@@ -199,7 +291,8 @@ export function apply(ctx, rawConfig) {
     return installed.handle;
   }
 
-  const platform = createAdapter(host, { now: () => host.now?.() ?? Date.now() });
+  const seats = createSeats(host, hooks);
+  const platform = createAdapter(host, { now: seats.now, cwd: seats.cwd });
   const store = Store.open(config.dbPath);
   // W4：向量关闭时保持 v0.3.2 的 hash 投影路径；开启时按 embedder 配置 id/dim。
   // local/remote 没有同步向量函数，写入路径先不投影，由 idle-probe 回填。
@@ -210,7 +303,7 @@ export function apply(ctx, rawConfig) {
     store.configureVectors({ id: embedder.id, dim: embedder.dim || 0, embed: null });
   }
   const metrics = createMetrics({ clock: platform.now });
-  const state = createWiringState({ host, platform, store, config, metrics, embedder });
+  const state = createWiringState({ platform, store, config, metrics, embedder, seats });
   if (embedder !== null && embedder.kind === 'remote') {
     // W4：remote 会把原文发到第三方，启动时必须显式告警（隐私例外见 docs/embedding.md）。
     platform.log('warn', '[dsh-companion] vector.embedder=remote enabled; memory text will be sent to a third party', {
@@ -324,9 +417,8 @@ export function apply(ctx, rawConfig) {
  * @param {object} input
  * @returns {object}
  */
-function createWiringState({ host, platform, store, config, metrics, embedder = null }) {
+function createWiringState({ platform, store, config, metrics, embedder = null, seats }) {
   return {
-    host,
     platform,
     store,
     config,
@@ -347,8 +439,10 @@ function createWiringState({ host, platform, store, config, metrics, embedder = 
     budgetTripped: false,
     /** M4：最近一次 RSS 检查结果；scheduler 启动前为 ok。 */
     rss: { level: 'ok', code: 0, rssBytes: 0, rssMB: 0, totalmemBytes: 0, checkedAt: null },
-    /** M4：测试可经宿主注入内存读数；缺省走 process.memoryUsage()。 */
-    rssReader: typeof host?.rssReader === 'function' ? host.rssReader : null,
+    /** M4：测试/宿主可注入内存读数；缺省走 process.memoryUsage()（经 seats 回落）。 */
+    rssReader: seats.rssReader,
+    /** P1-b：测试/宿主可注入模型钩子；缺省 null（走 adapter 的 llm 能力）。 */
+    companion: seats.companion,
     /** 上一轮 turn 标识（platform payload.turn）；按 scope 分开，避免线程共用 turn 号。 */
     lastTurn: null,
     /** H3：每个 scope 的上一轮 turn 标识。 */
@@ -2174,7 +2268,7 @@ async function resolveConsolidationLlm(state) {
   if (state.llmResolved) return state.llm;
   state.llmResolved = true;
 
-  const hook = state.host?.companion?.consolidationLlm;
+  const hook = state.companion?.consolidationLlm;
   if (typeof hook === 'function') {
     state.llm = async ({ scope, seqFrom, seqTo, regionText, textSource, transcript }) => hook({
       scope,
@@ -2870,7 +2964,7 @@ function recordChatDelivery(state, report) {
 async function resolveChatLlm(state) {
   if (state.chatLlmResolved) return state.chatLlm;
   state.chatLlmResolved = true;
-  const hook = state.host?.companion?.chatLlm;
+  const hook = state.companion?.chatLlm;
   if (typeof hook === 'function') {
     state.chatLlm = async (input) => hook(input);
     state.chatLlmRoute = { kind: 'hook' };

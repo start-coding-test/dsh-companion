@@ -3,6 +3,12 @@
  * Gate 0 headless 采集器：用临时 DSH_HOME + 独立 profile 跑一次 headless 会话，
  * 把探针写出的 probe.json 拷回仓库 `.data/probe.json`。
  *
+ * `--plugin` 是发布门（C-H1）：不再挂 Gate 0 探针，而是用 `--patch` 把本仓库的
+ * 真插件 `src/index.js` 插进 headless profile，跑一次并断言
+ *   `[dsh-companion] scheduler started`
+ * 出现、且输出里没有 `did not activate`。没有 DSH 的机器上该模式退出码 2，
+ * 可在 CI 里用 `--plugin` 的退出码区分「跳过」（2）与「失败」（1）。
+ *
  * 特点：
  * - 不读、不写用户 `~/.dsh`：DSH_HOME 指向仓库内 `.data/probe-home`；
  * - 不安装依赖、不修改 profile；profile 由 shipped 模板按需生成；
@@ -13,8 +19,9 @@
  * 用法：
  *   node scripts/probe/run-headless.mjs [--help]
  *   node scripts/probe/run-headless.mjs [--task "..." ] [--dsh <path>] [--timeout <ms>]
+ *   node scripts/probe/run-headless.mjs --plugin [--dsh <path>] [--keep-home]
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -26,16 +33,28 @@ const PROBE_OUT = join(REPO_ROOT, '.data', 'probe.json');
 const PROBE_RUN1 = join(REPO_ROOT, '.data', 'probe-run1.json');
 const PROBE_HOME = join(REPO_ROOT, '.data', 'probe-home');
 
+/** C-H1 发布门：真插件入口与它专用的 overlay/临时 home。 */
+const PLUGIN_ENTRY = join(REPO_ROOT, 'src', 'index.js');
+const PLUGIN_PATCH = join(REPO_ROOT, '.data', 'plugin-gate.patch.yml');
+const PLUGIN_HOME = join(REPO_ROOT, '.data', 'plugin-gate-home');
+const PLUGIN_DB = join(REPO_ROOT, '.data', 'plugin-gate', 'companion.db');
+const PLUGIN_MARKER = '[dsh-companion] scheduler started';
+const PLUGIN_FAILURE_MARKER = 'did not activate';
+
 const HELP = `Gate 0 headless 探针采集器
 
 用法:
   node scripts/probe/run-headless.mjs [options]
+  node scripts/probe/run-headless.mjs --plugin [options]
 
 选项:
   --task <text>      发给 headless 会话的任务文本（默认: "Reply with exactly: ok"）
   --task2 <text>     --two-turn 时第二轮的任务文本（默认: "Second turn: reply with exactly: ok"）
   --two-turn         首轮之后用 --session-id 续跑同一会话，采集第 2 个 turn 的
                      pre-step/surface（模型凭据缺失时也能拿到第 2 个 pre-step）
+  --plugin           C-H1 发布门：用 --patch 把本仓库真插件（src/index.js）挂到
+                     headless，跑一次并断言出现 "[dsh-companion] scheduler started"、
+                     且没有 "did not activate"。退出码 0=通过，1=未通过，2=找不到 DSH
   --dsh <path>       DSH CLI 路径（默认依次尝试 DSH_CLI 环境变量、PATH、常见安装目录）
   --timeout <ms>     子进程超时，默认 120000
   --keep-home        保留临时 DSH_HOME（默认也会保留，便于查看日志；目录在 .data/ 下）
@@ -47,10 +66,11 @@ const HELP = `Gate 0 headless 探针采集器
   DSH_PROBE_TIMEOUT  超时毫秒数（可被 --timeout 覆盖）
 
 说明:
-  - 临时 DSH_HOME 固定为 ${PROBE_HOME}
+  - 临时 DSH_HOME 固定为 ${PROBE_HOME}（--plugin 用 ${PLUGIN_HOME}）
   - 探针输出先写入临时 DSH_HOME，再拷贝到 ${PROBE_OUT}
   - 加 --two-turn 时，第一轮报告另存为 .data/probe-run1.json，第二轮报告写入
     .data/probe.json（第二轮 surface 已非空，可回答 compactRegion 的 seq 语义）
+  - --plugin 每次重建 .data/plugin-gate/companion.db，避免旧库掩盖激活失败
   - 该脚本不会读取或修改用户 ~/.dsh；若模型凭据缺失，会话可能失败，
     但 agent/pre-step 已在请求前触发，probe.json 仍可用于 Gate 0 判定。
 `;
@@ -68,6 +88,7 @@ function parseArgs(argv) {
     timeoutMs: Number(process.env.DSH_PROBE_TIMEOUT ?? 120_000),
     keepHome: false,
     twoTurn: false,
+    plugin: false,
     help: false,
   };
   for (let index = 0; index < argv.length; index += 1) {
@@ -80,6 +101,8 @@ function parseArgs(argv) {
       options.task2 = argv[++index] ?? '';
     } else if (arg === '--two-turn') {
       options.twoTurn = true;
+    } else if (arg === '--plugin') {
+      options.plugin = true;
     } else if (arg === '--dsh') {
       options.dsh = argv[++index];
     } else if (arg === '--timeout') {
@@ -259,13 +282,20 @@ function printSummary(summary) {
  */
 function runHeadless(launch, env, args, timeoutMs) {
   return new Promise((resolvePromise) => {
-    const child = spawn(launch.command, args, {
-      cwd: REPO_ROOT,
-      env,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: true,
-      shell: launch.shell,
-    });
+    let child;
+    try {
+      child = spawn(launch.command, args, {
+        cwd: REPO_ROOT,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+        shell: launch.shell,
+      });
+    } catch (error) {
+      // 某些沙箱里 spawn 直接抛（EPERM），按一次失败运行上报，交调用方判定。
+      resolvePromise({ exitCode: null, timedOut: false, stdout: '', stderr: `spawn error: ${error.message}` });
+      return;
+    }
     let stdout = '';
     let stderr = '';
     let timedOut = false;
@@ -319,11 +349,115 @@ function printFailureTail(label, run) {
   }
 }
 
+/**
+ * 生成干净的子进程环境：清掉当前 DSH 会话的 profile/session 变量，避免串到临时 home。
+ * @param {object} launch
+ * @param {string} home 临时 DSH_HOME
+ * @param {object} [extra] 额外环境变量（DSH_PROBE_OUT 等）
+ * @returns {object}
+ */
+function childEnvFor(launch, home, extra = {}) {
+  const env = { ...process.env };
+  for (const key of ['DSH_PROFILE', 'DSH_PROFILE_DIR', 'DSH_SESSION_ID', 'DSH_WEB_URL', 'DSH_SHELL']) {
+    delete env[key];
+  }
+  return Object.assign(env, { DSH_HOME: home, ...extra }, launch.env);
+}
+
+/**
+ * 写 --plugin 模式的 overlay patch。
+ * `name` 相对 patch 文件目录解析（与 probe.patch.yml 的 ./probe-plugin.js 同一语义）。
+ * @returns {string} patch 文件路径
+ */
+function writePluginPatch() {
+  const dbPath = PLUGIN_DB.split('\\').join('/');
+  const lines = [
+    '# 自动生成：run-headless.mjs --plugin（C-H1 发布门），请勿手改。',
+    '- insert:',
+    '    - id: dsh-companion-plugin-gate',
+    '      name: ../src/index.js',
+    '      config:',
+    `        dbPath: ${JSON.stringify(dbPath)}`,
+    '',
+  ];
+  writeFileSync(PLUGIN_PATCH, lines.join('\n'), 'utf8');
+  return PLUGIN_PATCH;
+}
+
+/**
+ * C-H1 发布门：把真插件挂到 headless 宿主上跑一次，断言它真的激活。
+ *
+ * 判定只看启动日志（scheduler started 在 apply 内、构建会话之前打印），
+ * 因此模型凭据缺失、会话请求失败都不影响本门判定。
+ *
+ * @param {object} options parseArgs 结果
+ * @returns {Promise<number>} 0 通过；1 未通过；2 环境缺失（找不到 DSH / 插件入口）
+ */
+async function runPluginGate(options) {
+  if (!existsSync(PLUGIN_ENTRY)) {
+    process.stderr.write(`plugin-gate: missing plugin entry ${PLUGIN_ENTRY}\n`);
+    return 2;
+  }
+  const located = locateDsh(options.dsh);
+  if (!located) {
+    process.stderr.write(
+      'plugin-gate: DSH CLI not found. Pass --dsh <path>, set DSH_CLI, or set DSH_INSTALL_DIR to the DeepSeek Harness install root.\n',
+    );
+    return 2;
+  }
+
+  const launch = resolveLaunch(located.path);
+  if (!options.keepHome && existsSync(PLUGIN_HOME)) {
+    rmSync(PLUGIN_HOME, { recursive: true, force: true });
+  }
+  mkdirSync(PLUGIN_HOME, { recursive: true });
+  mkdirSync(dirname(PLUGIN_DB), { recursive: true });
+  // 每次从空库开始：旧库存在会让人误以为插件已激活（正是 C-H1 的现场）。
+  for (const suffix of ['', '-wal', '-shm']) {
+    const file = `${PLUGIN_DB}${suffix}`;
+    if (existsSync(file)) rmSync(file, { force: true });
+  }
+  const patch = writePluginPatch();
+  const args = [...launch.prefixArgs, '--profile', 'headless', '--patch', patch, options.task];
+  const env = childEnvFor(launch, PLUGIN_HOME);
+
+  process.stdout.write(`plugin-gate: DSH CLI ${located.path} (${located.source})\n`);
+  process.stdout.write(`plugin-gate: plugin ${PLUGIN_ENTRY}\n`);
+  process.stdout.write(`plugin-gate: overlay ${patch}\n`);
+  process.stdout.write(`plugin-gate: temp DSH_HOME ${PLUGIN_HOME}\n`);
+
+  const run = await runHeadless(launch, env, args, options.timeoutMs);
+  const combined = `${run.stdout}\n${run.stderr}`;
+  const started = combined.includes(PLUGIN_MARKER);
+  const inactive = combined.includes(PLUGIN_FAILURE_MARKER);
+  process.stdout.write(
+    `plugin-gate: exit=${run.exitCode}${run.timedOut ? ' (timeout)' : ''} schedulerStarted=${started} didNotActivate=${inactive}\n`,
+  );
+
+  if (started && !inactive) {
+    process.stdout.write(`plugin-gate: PASS (${PLUGIN_MARKER})\n`);
+    return 0;
+  }
+
+  process.stderr.write(
+    `plugin-gate: FAIL (${started ? 'plugin logged did not activate' : 'missing scheduler started marker'})\n`,
+  );
+  for (const [label, text] of [['stdout', run.stdout], ['stderr', run.stderr]]) {
+    const tail = redact(text.trim()).split(/\r?\n/).slice(-20).join('\n');
+    if (tail) process.stderr.write(`plugin-gate: ${label} (tail):\n${tail}\n`);
+  }
+  return 1;
+}
+
 async function main() {
   const options = parseArgs(process.argv.slice(2));
   if (options.help) {
     process.stdout.write(HELP);
     return 0;
+  }
+
+  if (options.plugin) {
+    return await runPluginGate(options);
   }
 
   if (!existsSync(PATCH_FILE)) {
@@ -355,15 +489,7 @@ async function main() {
   process.stdout.write(`probe: overlay ${PATCH_FILE}\n`);
 
   // 子进程只继承普通环境：清掉当前 DSH 会话的 profile/session 变量，避免串到临时 home。
-  const childEnv = { ...process.env };
-  for (const key of ['DSH_PROFILE', 'DSH_PROFILE_DIR', 'DSH_SESSION_ID', 'DSH_WEB_URL', 'DSH_SHELL']) {
-    delete childEnv[key];
-  }
-  Object.assign(childEnv, {
-    DSH_HOME: PROBE_HOME,
-    DSH_PROBE_OUT: probeInHome,
-    ...launch.env,
-  });
+  const childEnv = childEnvFor(launch, PROBE_HOME, { DSH_PROBE_OUT: probeInHome });
 
   const first = await runHeadless(launch, childEnv, [...baseArgs, options.task], options.timeoutMs);
   if (!existsSync(probeInHome)) {

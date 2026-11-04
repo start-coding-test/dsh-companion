@@ -82,8 +82,15 @@ function promptSource(request, source) {
  * 创建本插件唯一的平台入口。所有平台调用都经传入的 ctx（或调用方传入的
  * agent 句柄）完成，适配层本身不 import 平台内部包。
  *
+ * C-H1：cordis 4 对**未声明 inject** 的 service 属性读会直接抛
+ * `cannot get property "x" without inject`，所以这里一律用 `ctx.get(name)`
+ * 读 service（永不抛，缺失返回 undefined），再由 capabilities 走
+ * `unavailable()` 降级；`ctx.logger`/`ctx.on` 是 Context 自有属性/mixin，
+ * 不在 inject 约束内。测试席位 now/cwd 由调用方经 opts 传入。
+ *
  * @param {object} ctx DSH/Cordis 平台上下文
- * @param {{ now?: () => number }} [opts] 可注入时钟（测试与回放用）
+ * @param {{ now?: () => number, cwd?: string|(() => string|undefined) }} [opts]
+ *   可注入时钟与工作目录（测试与回放用）
  * @returns {object} 适配器；capabilities 暴露当前宿主实际具备的能力
  */
 export function createAdapter(ctx, opts = {}) {
@@ -91,24 +98,55 @@ export function createAdapter(ctx, opts = {}) {
     throw new TypeError('createAdapter(ctx): ctx must be an object');
   }
 
-  const now = typeof opts.now === 'function'
-    ? opts.now
-    : typeof ctx.now === 'function'
-      ? () => ctx.now()
-      : () => Date.now();
+  /**
+   * 按 service 名读平台能力。`ctx.get()` 是 cordis 4 唯一不抛的属性读法：
+   * 未注册/未激活时返回 undefined，不会因为缺 inject 而打断 apply。
+   * @param {string} name
+   * @returns {any}
+   */
+  const service = (name) => {
+    if (typeof ctx.get !== 'function') return undefined;
+    try {
+      return ctx.get(name);
+    } catch {
+      return undefined;
+    }
+  };
+
+  /** Context 自有属性（不在 inject 约束内）；cordis 根上下文一定持有 logger。 */
+  const logger = ctx.logger;
+
+  /**
+   * 时钟：优先 opts.now（apply 传入的席位），其次宿主 `ctx.get('now')`，
+   * 最后回落 Date.now()。绝不直接读 `ctx.now`：cordis 4 里它是未声明 service，
+   * 属性读会抛 `cannot get property "now" without inject`。
+   */
+  const nowSeat = typeof opts.now === 'function' ? opts.now : service('now');
+  const now = typeof nowSeat === 'function'
+    ? () => Number(nowSeat())
+    : (typeof nowSeat === 'number' && Number.isFinite(nowSeat) ? () => nowSeat : () => Date.now());
 
   /**
    * 宿主工作目录投影；工具层需要它而不是直接读 process.cwd()。
+   * 读取顺序：opts.cwd → `ctx.get('cwd')` → `ctx.get('workspace').cwd`，
+   * 都没有时返回 undefined，由 apply 的席位兜底 process.cwd()。
    * @returns {string|undefined}
    */
   const cwd = () => {
-    const value = ctx.cwd ?? ctx.workspace?.cwd;
+    let value;
+    if (typeof opts.cwd === 'function') value = opts.cwd();
+    else if (opts.cwd !== undefined) value = opts.cwd;
+    if (value === undefined) {
+      const seat = service('cwd');
+      value = typeof seat === 'function' ? seat() : seat;
+    }
+    if (value === undefined) value = service('workspace')?.cwd;
     return typeof value === 'string' && value !== '' ? value : undefined;
   };
 
   const capabilities = Object.freeze({
     get systemPrompt() {
-      return typeof ctx.systemPrompt?.section === 'function';
+      return typeof service('systemPrompt')?.section === 'function';
     },
     get preStep() {
       return typeof ctx.on === 'function';
@@ -118,49 +156,51 @@ export function createAdapter(ctx, opts = {}) {
       return typeof ctx.on === 'function';
     },
     get timer() {
-      return typeof ctx.interval === 'function';
+      return typeof service('timer')?.interval === 'function';
     },
     get compaction() {
-      return typeof ctx.compaction?.compactRegion === 'function';
+      return typeof service('compaction')?.compactRegion === 'function';
     },
     get sessionController() {
-      return typeof ctx.sessionController?.createSession === 'function'
-        && typeof ctx.sessionController?.prompt === 'function'
-        && typeof ctx.sessionController?.cancel === 'function';
+      const controller = service('sessionController');
+      return typeof controller?.createSession === 'function'
+        && typeof controller?.prompt === 'function'
+        && typeof controller?.cancel === 'function';
     },
     get archive() {
-      return typeof ctx.workspaceRegistry?.archiveSession === 'function';
+      return typeof service('workspaceRegistry')?.archiveSession === 'function';
     },
     get tokenMeter() {
-      return typeof ctx.tokenMeter?.measure === 'function';
+      return typeof service('tokenMeter')?.measure === 'function';
     },
     get tokenEstimator() {
-      return typeof ctx.tokenMeter?.estimateMessage === 'function';
+      return typeof service('tokenMeter')?.estimateMessage === 'function';
     },
     get sessionEvent() {
       return typeof ctx.on === 'function';
     },
     get sessionQuery() {
-      return typeof ctx.sessionQuery?.readSurface === 'function';
+      return typeof service('sessionQuery')?.readSurface === 'function';
     },
     get inbox() {
       // 清空排队输入需要拿到 agent 句柄（ctx.agents.get）再走 agent.inbox。
-      return typeof ctx.agents?.get === 'function' || Array.isArray(ctx.agents);
+      const agents = service('agents');
+      return typeof agents?.get === 'function' || Array.isArray(agents);
     },
     get logger() {
-      return typeof ctx.logger?.info === 'function';
+      return logger !== undefined && logger !== null && typeof logger.info === 'function';
     },
     get commands() {
-      return typeof ctx.commands?.register === 'function';
+      return typeof service('commands')?.register === 'function';
     },
     get tools() {
-      return typeof ctx.tools?.register === 'function';
+      return typeof service('tools')?.register === 'function';
     },
     get unarchive() {
-      return typeof ctx.workspaceRegistry?.unarchiveSession === 'function';
+      return typeof service('workspaceRegistry')?.unarchiveSession === 'function';
     },
     get llm() {
-      return typeof ctx.llm?.stream === 'function';
+      return typeof service('llm')?.stream === 'function';
     },
   });
 
@@ -175,7 +215,6 @@ export function createAdapter(ctx, opts = {}) {
     if (!LOG_LEVELS.has(level)) {
       throw new TypeError(`log(level): unsupported level "${String(level)}"`);
     }
-    const logger = ctx.logger;
     const sink = logger?.[level];
     if (typeof sink !== 'function') return false;
     if (meta === undefined) sink.call(logger, message);
@@ -189,10 +228,11 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Function}
    */
   function section(section) {
-    if (!capabilities.systemPrompt) {
+    const impl = service('systemPrompt');
+    if (typeof impl?.section !== 'function') {
       throw unavailable('no-system-prompt', 'ctx.systemPrompt.section()');
     }
-    return ctx.systemPrompt.section(section);
+    return impl.section(section);
   }
 
   /**
@@ -249,7 +289,8 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Function}
    */
   function every(ms, callback) {
-    if (typeof ctx.interval !== 'function') {
+    const timer = service('timer');
+    if (typeof timer?.interval !== 'function') {
       throw unavailable('no-timer', 'ctx.interval()');
     }
     if (typeof callback !== 'function') {
@@ -258,7 +299,7 @@ export function createAdapter(ctx, opts = {}) {
     if (!Number.isFinite(ms) || ms <= 0) {
       throw new TypeError('every(ms, callback): ms must be a positive finite number');
     }
-    return ctx.interval(callback, ms);
+    return timer.interval(callback, ms);
   }
 
   /**
@@ -272,10 +313,11 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Promise<object>}
    */
   function compactRegion(start, end, agent, signal) {
-    if (!capabilities.compaction) {
+    const impl = service('compaction');
+    if (typeof impl?.compactRegion !== 'function') {
       throw unavailable('no-compaction', 'ctx.compaction.compactRegion()');
     }
-    return ctx.compaction.compactRegion(start, end, agent, signal);
+    return impl.compactRegion(start, end, agent, signal);
   }
 
   /**
@@ -283,10 +325,11 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Promise<{agent: object, agentPreset: unknown}>}
    */
   function createSession(request) {
-    if (typeof ctx.sessionController?.createSession !== 'function') {
+    const impl = service('sessionController');
+    if (typeof impl?.createSession !== 'function') {
       throw unavailable('no-session', 'ctx.sessionController.createSession()');
     }
-    return ctx.sessionController.createSession(request);
+    return impl.createSession(request);
   }
 
   /**
@@ -296,10 +339,11 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Promise<unknown>}
    */
   function prompt(request, source) {
-    if (typeof ctx.sessionController?.prompt !== 'function') {
+    const impl = service('sessionController');
+    if (typeof impl?.prompt !== 'function') {
       throw unavailable('no-session', 'ctx.sessionController.prompt()');
     }
-    return ctx.sessionController.prompt(request, promptSource(request, source));
+    return impl.prompt(request, promptSource(request, source));
   }
 
   /**
@@ -308,14 +352,15 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {unknown}
    */
   function cancel(target) {
-    if (typeof ctx.sessionController?.cancel !== 'function') {
+    const impl = service('sessionController');
+    if (typeof impl?.cancel !== 'function') {
       throw unavailable('no-session', 'ctx.sessionController.cancel()');
     }
-    if (typeof target === 'string') return ctx.sessionController.cancel({ sessionId: target });
+    if (typeof target === 'string') return impl.cancel({ sessionId: target });
     if (target === null || typeof target !== 'object') {
       throw new TypeError('cancel(target): expected a sessionId string or a request object');
     }
-    return ctx.sessionController.cancel(target);
+    return impl.cancel(target);
   }
 
   /**
@@ -326,10 +371,11 @@ export function createAdapter(ctx, opts = {}) {
   function resolveAgent(target) {
     let candidate = target;
     if (typeof candidate === 'string') {
-      if (typeof ctx.agents?.get === 'function') {
-        candidate = ctx.agents.get(candidate);
-      } else if (Array.isArray(ctx.agents)) {
-        candidate = ctx.agents.find(
+      const agents = service('agents');
+      if (typeof agents?.get === 'function') {
+        candidate = agents.get(candidate);
+      } else if (Array.isArray(agents)) {
+        candidate = agents.find(
           (agent) => agent?.id === target || agent?.session?.id === target,
         );
       } else {
@@ -388,10 +434,11 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Promise<unknown>}
    */
   function archiveSession(sessionId, options = {}) {
-    if (typeof ctx.workspaceRegistry?.archiveSession !== 'function') {
+    const impl = service('workspaceRegistry');
+    if (typeof impl?.archiveSession !== 'function') {
       throw unavailable('no-archive', 'ctx.workspaceRegistry.archiveSession()');
     }
-    return ctx.workspaceRegistry.archiveSession(sessionId, options);
+    return impl.archiveSession(sessionId, options);
   }
 
   /**
@@ -401,10 +448,11 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {object}
    */
   function measure(session, requestHeader) {
-    if (typeof ctx.tokenMeter?.measure !== 'function') {
+    const impl = service('tokenMeter');
+    if (typeof impl?.measure !== 'function') {
       throw unavailable('no-token-meter', 'ctx.tokenMeter.measure()');
     }
-    return ctx.tokenMeter.measure(session, requestHeader);
+    return impl.measure(session, requestHeader);
   }
 
   /**
@@ -414,10 +462,11 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {number}
    */
   function estimateMessage(message) {
-    if (typeof ctx.tokenMeter?.estimateMessage !== 'function') {
+    const impl = service('tokenMeter');
+    if (typeof impl?.estimateMessage !== 'function') {
       throw unavailable('no-token-estimator', 'ctx.tokenMeter.estimateMessage()');
     }
-    return ctx.tokenMeter.estimateMessage(message);
+    return impl.estimateMessage(message);
   }
 
   /**
@@ -449,10 +498,11 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Promise<object>}
    */
   function readSurface(sessionId) {
-    if (typeof ctx.sessionQuery?.readSurface !== 'function') {
+    const impl = service('sessionQuery');
+    if (typeof impl?.readSurface !== 'function') {
       throw unavailable('no-session-query', 'ctx.sessionQuery.readSurface()');
     }
-    return ctx.sessionQuery.readSurface(sessionId);
+    return impl.readSurface(sessionId);
   }
 
   /**
@@ -463,13 +513,14 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Function} 平台 disposer
    */
   function registerCommand(definition) {
-    if (!capabilities.commands) {
+    const impl = service('commands');
+    if (typeof impl?.register !== 'function') {
       throw unavailable('no-commands', 'ctx.commands.register()');
     }
     if (definition === null || typeof definition !== 'object') {
       throw new TypeError('registerCommand(definition): definition must be an object');
     }
-    return ctx.commands.register(definition);
+    return impl.register(definition);
   }
 
   /**
@@ -481,13 +532,14 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Function} 平台 disposer
    */
   function registerTool(definition) {
-    if (!capabilities.tools) {
+    const impl = service('tools');
+    if (typeof impl?.register !== 'function') {
       throw unavailable('no-tools', 'ctx.tools.register()');
     }
     if (definition === null || typeof definition !== 'object') {
       throw new TypeError('registerTool(definition): definition must be an object');
     }
-    return ctx.tools.register(definition);
+    return impl.register(definition);
   }
 
   /**
@@ -496,13 +548,14 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Promise<unknown>}
    */
   function unarchiveSession(sessionId) {
-    if (!capabilities.unarchive) {
+    const impl = service('workspaceRegistry');
+    if (typeof impl?.unarchiveSession !== 'function') {
       throw unavailable('no-unarchive', 'ctx.workspaceRegistry.unarchiveSession()');
     }
     if (typeof sessionId !== 'string' || sessionId.length === 0) {
       throw new TypeError('unarchiveSession(sessionId): sessionId must be a non-empty string');
     }
-    return ctx.workspaceRegistry.unarchiveSession(sessionId);
+    return impl.unarchiveSession(sessionId);
   }
 
   /**
@@ -510,10 +563,11 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Array<{id: string, name: string}>}
    */
   function listProviders() {
-    if (!capabilities.llm) {
+    const impl = service('llm');
+    if (typeof impl?.stream !== 'function') {
       throw unavailable('no-llm', 'ctx.llm.listProviders()');
     }
-    const rows = ctx.llm.listProviders?.() ?? [];
+    const rows = impl.listProviders?.() ?? [];
     return Array.isArray(rows)
       ? rows.map((row) => ({ id: row?.id, name: row?.name }))
       : [];
@@ -524,14 +578,15 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Promise<Array<{id: string, name: string}>>}
    */
   async function listModels(provider) {
-    if (!capabilities.llm) {
+    const impl = service('llm');
+    if (typeof impl?.stream !== 'function') {
       throw unavailable('no-llm', 'ctx.llm.listModels()');
     }
     if (typeof provider !== 'string' || provider.length === 0) {
       throw new TypeError('listModels(provider): provider must be a non-empty string');
     }
-    if (typeof ctx.llm.listModels !== 'function') return [];
-    const rows = await ctx.llm.listModels(provider);
+    if (typeof impl.listModels !== 'function') return [];
+    const rows = await impl.listModels(provider);
     return Array.isArray(rows)
       ? rows.map((row) => ({ id: row?.id, name: row?.name }))
       : [];
@@ -546,7 +601,8 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Promise<string>}
    */
   async function complete(request) {
-    if (!capabilities.llm) {
+    const impl = service('llm');
+    if (typeof impl?.stream !== 'function') {
       throw unavailable('no-llm', 'ctx.llm.stream()');
     }
     if (request === null || typeof request !== 'object') {
@@ -564,7 +620,7 @@ export function createAdapter(ctx, opts = {}) {
 
     let text = '';
     let failure = null;
-    for await (const chunk of ctx.llm.stream({
+    for await (const chunk of impl.stream({
       provider: request.provider,
       model: request.model,
       messages: request.messages,

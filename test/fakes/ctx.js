@@ -228,6 +228,35 @@ export class FakeCtx {
   }
 
   /**
+   * cordis 4 的 `ctx.get(name)`：唯一不抛的属性读法。
+   *
+   * 适配层（src/platform/adapter.js）与 `apply()` 的席位读取都只走这里；
+   * FakeCtx 仍按测试需要把 service 直接挂在自身上（旧断言不受影响），
+   * 但被测代码不再直接读 Context 代理属性（C-H1）。
+   *
+   * @param {string} name service 名或席位名（now/cwd/workspace/rssReader/companion）
+   * @returns {unknown}
+   */
+  get(name) {
+    if (typeof name !== 'string' || name.length === 0) return undefined;
+    if (name === 'now') return () => this.now();
+    if (name === 'cwd') {
+      return typeof this.cwd === 'string' && this.cwd !== '' ? this.cwd : undefined;
+    }
+    if (name === 'workspace') return this.workspace;
+    if (name === 'rssReader') {
+      return typeof this.rssReader === 'function' ? this.rssReader : undefined;
+    }
+    if (name === 'companion') return this.companion;
+    if (name === 'timer') {
+      if (this.missing.has('timer') || typeof this.interval !== 'function') return undefined;
+      return { interval: (callback, delay) => this.interval(callback, delay) };
+    }
+    if (this.missing.has(name)) return undefined;
+    return this[name];
+  }
+
+  /**
    * 当前手动时钟（毫秒）。
    * @returns {number}
    */

@@ -16,8 +16,13 @@ import { existsSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 import { FakeCtx } from '../fakes/ctx.js';
-import { apply } from '../../src/index.js';
+import { apply as applyCordis } from '../../src/index.js';
+import { strictCtx } from '../helpers/strict-ctx.js';
+
 import { TEST_NOW, makeTempStore, settle, waitFor } from './helpers.js';
+
+// C-H1：apply 一律经严格 ctx 代理，未声明 inject 的属性读会像真实 cordis 一样抛错。
+const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
 /** 巩固模型返回的草稿（预算事实，便于召回断言）。 */
 const DRAFT = {

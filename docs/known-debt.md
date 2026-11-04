@@ -8,6 +8,9 @@
 
 本表是 `memory/docs/07-风险与里程碑.md` §7.5 的**运行清单，不新增判据**。每行给出一句判据摘要，完整表述以 07 为准。
 
+> **C-H1 激活口径（2026-11-04）**：v0.4.2 及以前，本插件在真实 cordis 宿主上**从未激活过**——缺少 `export const inject`，`apply()` 的第一个属性读（`ctx.rssReader`）就抛 `cannot get property "rssReader" without inject`，下表所有「代码侧已实现」都只代表 mock 环境通过（旧 mock 是普通对象，读属性不抛，667 个用例因此没覆盖宿主约束）。
+> C-H1 已补 inject 声明、去掉 Context 属性直读、加严格 mock，并给 `run-headless.mjs` 增加 `--plugin` 发布门；**C-H1 修复并通过手册 §6.2（真机跑通 `node scripts/probe/run-headless.mjs --plugin`，看到 `[dsh-companion] scheduler started` 且无 `did not activate`）之后，本表才算进入真机确认**。
+
 | Gate | 判据（一句） | 状态 | 证据来源 | 真机命令或观察点 |
 | --- | --- | --- | --- | --- |
 | G0-1 人格默认值 | 名字/称呼/语气已拍板；不通过只用中性默认 | 代码侧已实现，待真机确认 | `test/persona.test.js`；07 §7.5 | 全新 profile 首条消息看称呼与语气；检查 system prompt 段 |

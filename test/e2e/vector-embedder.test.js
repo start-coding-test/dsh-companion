@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { FakeCtx } from '../fakes/ctx.js';
-import { apply } from '../../src/index.js';
+import { apply as applyCordis } from '../../src/index.js';
+import { strictCtx } from '../helpers/strict-ctx.js';
+
+// C-H1：apply 一律经严格 ctx 代理，未声明 inject 的属性读会像真实 cordis 一样抛错。
+const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
 function openCtx(config) {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-vector-e2e-'));
@@ -93,5 +97,4 @@ test('/状态：remote 显式开启时显示目标域名，并记录隐私 warn'
     },
   );
 });
-
 

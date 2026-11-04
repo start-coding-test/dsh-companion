@@ -10,7 +10,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { FakeCtx } from '../fakes/ctx.js';
-import { apply, name as pluginName } from '../../src/index.js';
+import { apply as applyCordis, name as pluginName } from '../../src/index.js';
+import { strictCtx } from '../helpers/strict-ctx.js';
+
+// C-H1：apply 一律经严格 ctx 代理，未声明 inject 的属性读会像真实 cordis 一样抛错。
+const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
 const EXPECTED_COMMANDS = ['chat-off', 'chat-on', 'cost', 'memory', 'status', 'threads'];
 const EXPECTED_TOOLS = [
@@ -128,4 +132,38 @@ test('注册的命令与工具真的连到 Store', async () => {
   assert.ok(decision.messages.some(
     (block) => block.type === 'text' && block.text.includes('[相关记忆]'),
   ));
+});
+
+test('严格 ctx：未声明属性像 cordis 一样抛错，声明面读法不改', () => {
+  const ctx = makePluginCtx();
+  const strict = strictCtx(ctx);
+  assert.equal(strictCtx(ctx), strict, '同一 fake/inject 复用同一个代理');
+
+  // Context 自有属性与 mixin：cordis 不把它们算进 inject 约束。
+  assert.equal(strict.logger, ctx.logger);
+  assert.equal(typeof strict.get, 'function');
+  assert.equal(typeof strict.on, 'function');
+  // inject 声明过的 service：允许继续读。
+  assert.equal(strict.systemPrompt, ctx.systemPrompt);
+  assert.equal(typeof strict.get('timer').interval, 'function');
+
+  // 席位和未声明 service：必须抛 cordis 同文案（旧普通对象 mock 的盲区）。
+  for (const prop of ['now', 'cwd', 'workspace', 'rssReader', 'companion', 'llm', 'sessionController']) {
+    assert.throws(
+      () => strict[prop],
+      (error) => error instanceof Error
+        && error.message === `cannot get property "${prop}" without inject`,
+    );
+  }
+});
+
+test('apply 在严格代理下完成安装（C-H1 回归）', () => {
+  const ctx = makePluginCtx();
+  const handle = applyCordis(strictCtx(ctx), { dbPath: ':memory:' });
+
+  assert.equal(typeof handle.dispose, 'function');
+  assert.equal(ctx.listeners.get('agent/pre-step')?.length, 1);
+  assert.ok(ctx.logs.some((entry) => entry.message === '[dsh-companion] scheduler started'));
+
+  handle.dispose();
 });

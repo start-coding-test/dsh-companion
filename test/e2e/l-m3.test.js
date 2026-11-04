@@ -18,9 +18,14 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { FakeCtx } from '../fakes/ctx.js';
-import { apply } from '../../src/index.js';
+import { apply as applyCordis } from '../../src/index.js';
+import { strictCtx } from '../helpers/strict-ctx.js';
+
 import { normalizeThreadName, THREAD_NAME_MAX } from '../../src/thread/registry.js';
 import { TEST_NOW, makeTempStore, seedMemory, settle, waitFor } from './helpers.js';
+
+// C-H1：apply 一律经严格 ctx 代理，未声明 inject 的属性读会像真实 cordis 一样抛错。
+const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 

@@ -8,8 +8,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { FakeCtx } from '../fakes/ctx.js';
-import { apply } from '../../src/index.js';
+import { apply as applyCordis } from '../../src/index.js';
+import { strictCtx } from '../helpers/strict-ctx.js';
+
 import { TEST_NOW, makeTempStore, settle, waitFor } from './helpers.js';
+
+// C-H1：apply 一律经严格 ctx 代理，未声明 inject 的属性读会像真实 cordis 一样抛错。
+const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
 const DRAFT = {
   episode: {

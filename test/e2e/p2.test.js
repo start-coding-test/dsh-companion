@@ -23,7 +23,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { FakeCtx } from '../fakes/ctx.js';
-import { apply } from '../../src/index.js';
+import { apply as applyCordis } from '../../src/index.js';
+import { strictCtx } from '../helpers/strict-ctx.js';
+
 import { Store } from '../../src/memory/store.js';
 import {
   ENCRYPTED_MAGIC,
@@ -36,6 +38,9 @@ import {
 import { cosine, hashEmbed, hybridSearch, searchVector } from '../../src/memory/vector.js';
 import { retrieve } from '../../src/memory/retrieve.js';
 import { makeTempStore, TEST_NOW } from './helpers.js';
+
+// C-H1：apply 一律经严格 ctx 代理，未声明 inject 的属性读会像真实 cordis 一样抛错。
+const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
 const AT = Math.floor(TEST_NOW / 1000);
 const VECTOR_ON = Object.freeze({ enabled: true, dim: 256, embedder: 'hash' });
