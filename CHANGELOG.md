@@ -2,6 +2,22 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.1] - 2026-11-04
+
+v0.4.0 评审的 E-M1 / S-M1 / L-2 修复。schema 升至 v8（旧库自动升级）；仍为零第三方运行时依赖；remote embedding 默认关闭。复审见 `docs/review-v6.md`（pass，H=0 / M=0）。
+
+### Fixed
+
+- **E-M1 local embedding 阻塞首个 turn**：`local` 的加载等待与推理都受 `vector.embedTimeoutMs`（默认 300）约束，超时抛 `EmbeddingTimeout`（`kind=transient`），后台加载继续（`loadTimeoutMs` 硬上限 180s）；启动与 idle-probe 异步预热，不 await 在 turn 路径上；加载期间召回本轮回退纯 FTS、不向用户抛错，加载完成后下一轮走向量。缺依赖（`ERR_MODULE_NOT_FOUND` / `Cannot find module`）→ fatal 停用 local 只记日志；网络/超时/初始化失败 → transient 指数退避（1/2/4/8s，第 5 次后 60s 冷却，不永久停用）。新增指标 `vectorEmbedLoadFailures` / `vectorEmbedFatal`。
+- **S-M1 W5 把「被注入」当「被需要」**：`reneed_kind` 增加 `used`，只有下一轮复述重叠 ≥0.6 才把首次样本从 `recall` 升级为 `used`（保留首次时间/档位）；S0 主口径只统计 `used` / `dedupe` / `correction`。新增 `same_context` 列，写入间隔 <6h 或来源 episode 仍在当前 surface 的即时召回标 1，统计默认排除，避免压低 S0 有效样本。
+- **L-2 确认词长度上限**：去掉标点/空白后超过 10 字不再算确认（`CONFIRM_MAX_CHARS`），「对，我明天要去北京开会，顺便……」不再触发 α=4；「对」「没错」「嗯，对。」仍算确认。
+
+### Changed
+
+- **schema v7→v8**：`facts` 增加 `same_context` 列；`reneed_kind` 合法值（含 `used`）改用幂等触发器校验，不重建表；旧库整体单事务升级，重复打开幂等，旧 v7 样本 `same_context=0`。
+- **测试**：639 → 646 个用例 / 16 个套件（新增 E-M1/S-M1/L-2 集成与回归）；默认、`TZ=UTC`、`TZ=America/New_York` 全绿。
+- **文档**：README 增补 local 超时/预热/FTS 回退并更新 schema v8 埋点；`docs/embedding.md` 补 local 超时与预热、错误分类与退避、schema v8；`docs/s0-calibration.md` 改为「用上为主、注入仅对照」两层口径并更新 SQL；`docs/known-debt.md` 登记 E-M1/S-M1 已关闭与新增债务；新增 `docs/review-v6.md`。
+
 ## [0.4.0] - 2026-11-04
 
 v0.3.2 评审的 R-M1 / R-L1 / R-M2 / R-L2 / N-L1 / N-M3 修复，并入 W4 embedding 可插拔与 W5 S0 首次再需要埋点。schema 升至 v7；仍为零第三方运行时依赖；remote embedding 默认关闭。复审见 `docs/review-v5.md`（pass，H=0 / M=0 / L=2）。

@@ -4,17 +4,14 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.0 已发布**（2026-11-04），`node --test` 全绿：626 个用例 / 16 个套件，git tag `v0.4.0`。
+当前状态：**v0.4.1 已发布**（2026-11-04），`node --test` 全绿：646 个用例 / 16 个套件，git tag `v0.4.1`。
 
-## v0.4.0 变更摘要
+## v0.4.1 变更摘要
 
-- **外部压缩重锚**：按 surface 位置取替换节点；压缩吞掉未巩固内容时把锚点前挪到平台摘要之前，让摘要进入下一次巩固，并用 `compactionLostUnconsolidated` 记丢失量。锚到起点时写哨兵 `-1`，重启后不会回退旧水位（R-M1/R-L1/R-L2）。
-- **执行槽日志**：`thread_run` 带 `goal` 持有执行槽到线程空闲；create 分支直接传会话句柄，reuse 反查失败与 900s 兜底都会写 `warn`，并记 `threadSlotFallback` / `threadSlotTimeout`（R-M2）。
-- **RSS 三档可配置**：`rssWarnGiB` / `rssStopGiB` / `rssMainOnlyGiB`，4G 云端可按预算降到 `2.2` / `2.4` / `2.6`（N-M3；公式见 [docs/calibration.md](docs/calibration.md)）。
-- **确认词边界**：只有整句或独立小句的「对 / 是 / 记住了」等才触发强化，避免「对比一下」这类子串误判（N-L1）。
-- **Embedding 可插拔**：`vector.embedder` 支持 `hash` / `local` / `remote` / `none`；向量按 `embedder_id` 隔离，换模型后由 idle-probe 分批回填（W4，见 [docs/embedding.md](docs/embedding.md)）。
-- **S0 评测埋点**：`facts.first_reneed_at` / `first_reneed_tier` / `reneed_kind` 记录首次再需要，schema v7（W5，流程见 [docs/s0-calibration.md](docs/s0-calibration.md)）。
-- **本轮未做项与真机联调清单**：见 [docs/known-debt.md](docs/known-debt.md)。
+- **local embedding 限时与异步预热（E-M1）**：加载等待与推理都受 `vector.embedTimeoutMs`（默认 300）约束，超时本轮回退纯 FTS、不向用户抛错；启动与 idle-probe 异步预热，不阻塞首个 turn；缺依赖（`Cannot find module`）fatal 停用 local，网络/超时/初始化失败 transient 指数退避（见 [docs/embedding.md](docs/embedding.md)）。
+- **S0 只统计「用上」（S-M1）**：`reneed_kind` 增加 `used`（下一轮复述重叠 ≥0.6 才从 `recall` 升级），`same_context=1` 的同会话即时召回默认排除，避免把「被注入」当「被需要」；schema 升至 v8，旧库自动升级（见 [docs/s0-calibration.md](docs/s0-calibration.md)）。
+- **确认词长度上限（L-2）**：去掉标点/空白后超过 10 字不再算确认，「对，我明天要去北京开会，顺便……」不再触发 α=4 强化。
+- **复审**：v0.4.1 发布前复审 pass，见 [docs/review-v6.md](docs/review-v6.md)；v0.4.0 及更早变更见 [CHANGELOG](CHANGELOG.md)，本轮未做项与真机联调清单见 [docs/known-debt.md](docs/known-debt.md)。
 
 ## 目录结构
 
@@ -229,4 +226,5 @@ node --test test/e2e   # 只跑端到端
 - [P1 批复审（v0.2.0）](docs/review-v3.md)
 - [P2 批复审（v0.3.0）](docs/review-v4.md)
 - [v0.4.0 发布前复审（v0.3.2 修复核验）](docs/review-v5.md)
+- [v0.4.1 发布前复审（E-M1 / S-M1+L-2 修复核验）](docs/review-v6.md)
 - [变更记录](CHANGELOG.md)

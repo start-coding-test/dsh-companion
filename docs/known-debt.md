@@ -121,7 +121,7 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 
 ## 6. 关联文档
 
-- [README](../README.md)：配置表、v0.4.0 变更摘要、已知限制
+- [README](../README.md)：配置表、v0.4.1 变更摘要、已知限制
 - [使用手册](usage.md)：执行槽、向量召回、外部压缩与水位重锚、FAQ
 - [Embedding 可插拔](embedding.md)：三实现、隐私例外、回填
 - [S0 标定流程](s0-calibration.md)：`first_reneed_*` 埋点与两周评测
