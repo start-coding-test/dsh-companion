@@ -118,6 +118,13 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **建议排期**：P1 前由 07 明确单位与默认值口径；真机复测（D-5）按明确后的数值执行。
 - **验收方式**：07 补一句单位（GB 或 GiB）并给出 4G 机器的推荐默认；代码/文档/自检表三处数值一致；D-5 的复测记录引用该口径。
 
+### D-9 V3-H2 提醒投递的 store 故障属 best-effort（接受现状）
+
+- **现状**：队列钩子 `onAttempt` / `onSent` / `onFailed` 里的异常只记入该次投递的 `report.error`，不会中断投递本身。若 `claimReminderDelivery` 因 store 故障抛错，投递仍会进行、行保持 `pending`，重启后可能再发一次（同一 fireKey 的成功标记也未能落库）。
+- **影响**：仅在 SQLite 写失败等极端情况下出现一次重复提醒；正常路径两阶段投递与 `fired` 幂等已由 `test/e2e/reminder-delivery.test.js` 覆盖。
+- **建议排期**：本版不修；后续强化提醒状态机时，把 store 写失败视为投递失败并走 `onFailed`（同时累计 `delivery_attempts`）。
+- **验收方式**：构造 store 写失败（注入抛错的 `claimReminderDelivery`），断言提醒不重复发送或明确置 `expired`。
+
 ## 5. 已关闭（本轮修复）
 
 - **S2-M1 `used` 升级锁死首次注入时间/档位/same_context**：v0.4.2 修复，commit `890f028`。新增 `first_used_at` / `first_used_tier` / `used_same_context`（schema v9），用上那一刻写入并按 `observed_at` 重新判定 same_context；「首次」指首次非 same_context 用上，same_context 的 used 可被后续非 same_context used 覆盖一次，reverse 不覆盖；`first_reneed_*` 保留为 recall 对照样本。SQL 与口径见 [s0-calibration.md](s0-calibration.md)。

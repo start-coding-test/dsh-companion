@@ -128,13 +128,14 @@ health | archived | 体检 | 2026-10-20
 /状态
 状态：entities 8 / episodes 120 / facts 96 / reminders 4 / state_board 2 / state_board_rev 9 / threads 3 / consolidations 21 / memory_events 310 / fts facts 96/episodes 120 / tokens 本轮 入 8000 出 1200（超预算 0 次）｜今日 0/3000000｜RSS ok 128MB｜向量：关
 RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
+主会话：main-3f2a（绑定 latest-user）
 水位重锚：2 次
 未巩固被压缩：1 个节点
 水位 main：120
 最近 job：s2-purge ok upto_seq=0（2026-11-03 03:30）
 ```
 
-最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。
+最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。「主会话：<id>（绑定 <mode>）」是当前提醒投递目标与绑定策略（`latest-user` 会跟随最新真实用户会话，`first` 保持首个，见[主会话绑定](#主会话绑定v044)）；宿主没有 `sessionController` 时多一行「线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）」。
 
 `/状态` 末尾还会给出自愈观测（无事件时显示「无」）：
 
@@ -454,6 +455,21 @@ schema v9 对向量表本身没有新改动：v0.3.0（schema 5）新建 `fact_v
 
 **边界（R-L3）**：被压缩区间里尚未巩固的原始对话已经从 surface 消失，只能以平台摘要的形式进入记忆库；摘要没有保留的细节无法恢复。不要把「之后再巩固」当成丢失内容的兜底，重要信息应在压缩前写入记忆，或不要依赖外部压缩来保存。
 
+### 主会话绑定（v0.4.4）
+
+提醒要投到「当前主会话」，而桌面端可能先后开过多个会话。默认 `session.mainBinding: 'latest-user'`：
+
+- 只有**线程外**会话出现真实用户输入时，才把 `main_session_id` 重绑到该会话，并记一条 info 日志（旧/新 id）；
+- runtime-context、召回注入与中文命令提示都不算用户输入，不会触发重绑；
+- `'first'` 保持首个主会话不变（多开但想固定投递目标时用）；
+- `/状态` 显示「主会话：<id>（绑定 <mode>）」，提醒投递到该会话；取不到主会话 id 时按投递失败处理，留在 backlog 等下个 tick。
+
+```yaml
+session:
+  # latest-user（默认）：跟随最新真实用户会话；first：保持首个主会话。
+  mainBinding: latest-user
+```
+
 ## 配置示例
 
 默认配置即可启动。下面是几个常见调整。
@@ -561,7 +577,7 @@ rssMainOnlyGiB: 2.6
 - 无 main 会话或 `prompt` 不可用：主动消息发送失败会留在队列等待下个 tick；`thread_run` 返回 `prompt-unavailable`。召回只影响注入，不影响原始对话。
 - 无模型（`ctx.companion.consolidationLlm` 与 `ctx.llm` 都不可用）：巩固跳过并记 debug 日志，不阻塞对话，已有记忆照常检索。
 - 无 `unarchiveSession`：复用归档线程返回 `unarchive-unavailable`。
-- 无 `sessionController`：`task_run` 返回 `session-unavailable`；`/记忆 导出` 仍可用（只读库）。
+- 无 `sessionController`：`thread_list` / `thread_run` / `task_run` **不注册**（其余 7 个工具不受影响），`/状态` 显示「线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）」；若被旧调用触发，`task_run` 返回 `session-unavailable`；`/记忆 导出` 仍可用（只读库）。headless / one-shot / SDK profile 属于正常降级；desktop profile 组合 web-app，能力齐全。
 - `vector.embedder: none`、`enabled: false` 或 remote 未显式 `remote.enabled: true`：检索退化为 bigram FTS，与旧版一致；`/状态` 显示「向量：关」。
 
 ### 工具错误
@@ -632,7 +648,7 @@ rssMainOnlyGiB: 2.6
 历史行只作审计。升级到 v0.1.1 时旧库会迁移到 `schema_version=4`：清空 `consolidations`
 （开发期约定，旧值语义不可比）、把 `episodes.consolidation_id` 置空；facts/episodes 不受影响。
 v0.3.0 起 `schema_version=5`：只新增 `fact_vectors`（向量投影）表，既有数据不动。
-v0.4.0 起 `schema_version=7`：v5→v6 先给 `fact_vectors` 增加 `embedder_id`，旧向量行回填为 `hash:<dim>`；v6→v7 再给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind` 三列（旧行 NULL）和 `(scope, first_reneed_at)` 索引，用于 S0 首次再需要标定（见 [s0-calibration.md](s0-calibration.md)）。v0.4.1 起 `schema_version=8`：增加 `same_context` 与 `used` 升级口径，排除同会话即时召回。v0.4.2 起 `schema_version=9`：增加 `first_used_at` / `first_used_tier` / `used_same_context` 与 `(scope, first_used_at)` 索引，用上那一刻单独记录，recall 样本保留对照（旧行新列为 NULL）。旧库按列检测逐级推进，无需手工改版本。
+v0.4.0 起 `schema_version=7`：v5→v6 先给 `fact_vectors` 增加 `embedder_id`，旧向量行回填为 `hash:<dim>`；v6→v7 再给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind` 三列（旧行 NULL）和 `(scope, first_reneed_at)` 索引，用于 S0 首次再需要标定（见 [s0-calibration.md](s0-calibration.md)）。v0.4.1 起 `schema_version=8`：增加 `same_context` 与 `used` 升级口径，排除同会话即时召回。v0.4.2 起 `schema_version=9`：增加 `first_used_at` / `first_used_tier` / `used_same_context` 与 `(scope, first_used_at)` 索引，用上那一刻单独记录，recall 样本保留对照（旧行新列为 NULL）。旧库按列检测逐级推进，无需手工改版本。v0.4.4 起 `schema_version=10`：`reminders` 的 `status` CHECK 增加 `delivering`，新增 `delivery_attempts` 列（旧行 `0`），幂等重建表并重建两个索引，兼容 v3..v9。
 
 ### 数据存在哪里？
 

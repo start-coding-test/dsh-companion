@@ -4,18 +4,33 @@
 
 ## [0.4.4] - 2026-11-04
 
-V3-H1 修复：召回注入改为完整平台消息。仍为零第三方运行时依赖，无 schema 变更。
+v0.4.3 云端真机回报与代码评审的必修项修复：召回注入契约、提醒两阶段投递与 fired 语义、线程能力门控、服务访问与回收、主会话重绑、召回相关性门、编辑重抽、日志级别与中文命令提示。仍为零第三方运行时依赖；schema 升至 v10（旧库自动升级）。
 
 ### Fixed
 
-- **V3-H1 召回注入让真机回合崩溃**：v0.4.3 的 `injectRecall` 返回裸内容块 `{ type: 'text', text }`，平台在 `dsh-agent-loop/lib/index.js:1067` 读取 `message.source.kind` 时抛 `Cannot read properties of undefined (reading 'kind')`。现在注入完整平台消息（`id` / `role: 'user'` / `content` / `source.kind = 'companion-recall'`），与 `dsh-time-context/lib/index.js:215-246` 的 `createUserMessage` 形状一致；`mergeDecision` 对每个 inject 元素做形状校验（`role` 非空字符串、`content` 数组或字符串），不合法直接 `TypeError`。
+- **V3-H1 召回注入让真机回合崩溃**：v0.4.3 的 `injectRecall` 返回裸内容块 `{ type: 'text', text }`，平台在 `dsh-agent-loop/lib/index.js:1067` 读取 `message.source.kind` 时抛 `Cannot read properties of undefined (reading 'kind')`。现在注入完整平台消息（`id` / `role: 'user'` / `content` / `source.kind = 'companion-recall'`），与 `dsh-time-context/lib/index.js:215-246` 的 `createUserMessage` 形状一致；`mergeDecision` 对每个 inject 元素做形状校验（`role` 非空字符串、`content` 数组或字符串），不合法直接 `TypeError`。热读（同回合）与冷读（重开会话、读 JSONL）都按同一消息形状复验。
 - **召回块不再被当用户发言巩固**：巩固窗口与转录按 `source.kind = 'companion-recall'` 排除召回消息（surface 记录正文置空），避免「注入 → 巩固」自我强化；token / surface 计量口径不变（注入消息按普通 `user/message` 计价，召回内容预算仍由 `RECALL_BUDGET_TOKENS` 约束）。
+- **V3-H2 提醒投递状态与 fired 语义**：主动消息不再向字面量 `'main'` 投递，改由 identity 解析当前主会话 id（解析不到与投递失败同路径，保留 backlog）。提醒改为两阶段：claim 置 `delivering` 并写 `last_fire_key` / `delivery_attempts`，投递成功才置 `fired`（同一提醒同一 fireKey 只发一次）；失败回 `pending` 并保留 `last_fire_key`，同一 fireKey 尝试 ≥3 次置 `expired`；队列条目的合并、溢出丢弃与失败都会回调 `onAttempt/onSent/onFailed`，不会留下卡在 `delivering` 的行。启动时 `recoverReminderDeliveries` 把崩溃遗留的 `delivering` 回收为 `pending`（超限置 `expired`）。
+- **V3-H3② 宿主无 `sessionController` 时不再注册线程/任务工具**：`thread_list` / `thread_run` / `task_run` 仅在 `capabilities.threadTools` 为真时注册（其余 7 个工具不变），`/状态` 显示「线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）」；能力探测只读（`createSession`/`prompt`/`cancel` 齐全才为真），绝不 createSession。headless / one-shot / SDK profile 属正常降级；desktop profile 组合 web-app，`sessionController` 来源与挂载点见 `docs/platform-api.md` §1.3。
+- **V3-M1 服务访问与回收**：声明的 `systemPrompt` / `timer` / `commands` / `tools` 改走属性访问（`ctx[name]`），未声明的 `compaction` / `workspaceRegistry` / `tokenMeter` 等仍走 `ctx.get()`；`apply()` 通过 `ctx.on('dispose')` 挂回收，dispose 后再 apply 不会重复注册工具、命令、system prompt 段与 pre-step。
+- **V3-M2 `main_session_id` 重绑**：新增 `session.mainBinding`（`latest-user` 默认 / `first`）。默认只在「线程外会话出现真实用户输入」时把主会话重绑到最新会话并记 info 日志（旧/新 id），runtime-context、召回注入与中文命令提示都不算用户输入；`/状态` 显示「主会话：<id>（绑定 <mode>）」，提醒投递到该会话。
+- **V3-M3 召回相关性门槛**：召回改为先过滤后打分——查询门跳过长度 <4、纯算术/符号与常见问候，候选需有 FTS/bigram 词法命中或向量余弦 ≥ `recall.minVectorScore`（默认 0.35），非空查询不再用 recency 硬凑。新增非枚举 `recall.*` 配置（`skipSmallTalk` 默认 true），非法值 fail-fast。
+- **V3-M4 记忆改后重抽 `object_text` 并重建索引**：`/记忆 改 <id> <新内容>` 用新旧 statement 的「主体+关系」边界重抽 `object_text`（抽不出则置 `NULL`），插入新行并在同一事务刷新 FTS 与向量，旧行标 `superseded`；编辑审计 detail 增 `edited` / `reextracted`，抽不出时 `reextracted=false` 留痕。
+- **V3-L1 日志镜像级别**：headless 函数型 logger 默认只镜像 `info` / `warn` / `error`，`DSH_COMPANION_MIRROR_DEBUG=1` 才带 `debug`，避免刷屏。
+- **V3-L3 中文命令提示**：宿主只注册 ASCII 命令名（`/memory`、`/status`、`/cost`、`/threads` 等）；误输入中文命令时 pre-step 注入一条「请用 /memory、/status、/cost、/threads」提示（完整平台消息，`source.kind = 'companion-command-hint'`，同回合仅一次，巩固与转录排除）。
 
 ### Changed
 
 - **召回块的可见期**：召回块随会话保留到下一次压缩，压缩后旧块才被替换。`/记忆 忘掉` 只影响之后的召回；压缩前模型仍可能看到旧块，回执不要承诺「立刻不可见」。
-- **测试**：新增 `test/e2e/recall-injection.test.js`（fake loop 按 `dsh-agent-loop:1067` 逐条消费、JSONL 冷读复验 id/role/source/content、巩固层排除）；`test/platform.test.js` 增加 inject 形状校验；`test/e2e/plugin-smoke.test.js` 改为按 `source.kind` 识别召回消息。
+- **schema v10**：`reminders` 的 `status` CHECK 增加 `delivering`，新增 `delivery_attempts` 列；`#ensureRemindersDeliveryColumns` 幂等重建表并重建两个索引，兼容 v3..v9 旧库（旧行 `delivery_attempts=0`）。`src/memory/export.js` 的 schema 兜底同步到 10。
+- **文档**：`docs/platform-api.md` 增 §2.1.1 完整平台消息契约与 §1.3 `sessionController` 来源/挂载点；`docs/usage.md` 增召回门槛配置、主会话绑定与 schema v10；`docs/known-debt.md` D-5 的 RSS 2.2/2.4/2.6 改为按自检值下调（例如 3.64GiB 对应 1.96/2.14/2.32）。
+- **测试**：743 个用例 / 16 个套件（三时区全绿）。新增 `test/e2e/recall-injection.test.js`（fake loop 按 `dsh-agent-loop:1067` 逐条消费、JSONL 冷读、巩固层排除）、`test/e2e/reminder-delivery.test.js`（两阶段投递/重启补发/回收）、`test/retrieve-relevance.test.js`、`test/v044-m1-adapter.test.js`、`test/v044-m4-edit-reextract.test.js`、`test/v044-hardening.test.js` 与 `test/v044-regression.test.js`（v0.4.4 全项集成回归）；`test/platform.test.js` 增加 inject 形状校验；`test/e2e/plugin-smoke.test.js` 改为按 `source.kind` 识别召回消息。
+- **提交归属交错说明**：V3-H3②/L1/L3 的 `307b08c` 与 V3-H2/M2 的 `2b5668f` 都改了 `src/runtime/commands.js`（H3② 先加「线程：宿主不支持」文案，M2 随后加主会话行），共享工作树按序合并，最终文件以两者组合结果为准。
 - **发布门**：`scripts/probe/run-headless.mjs --plugin` 增加 round B —— 预置 1 条 fact 后发命中消息，断言无 `reading 'kind'` 崩溃且该 fact 的 `facts.first_reneed_at` 非空（召回真的注入过）；无模型凭据时明确标注 SKIP 并保留日志。
+
+### Verified
+
+- 三时区 `node --test`（默认 / `TZ=UTC` / `TZ=America/Los_Angeles`）743/743 pass、0 fail；发布前独立复审 `docs/review-v9.md`（pass，H=0 / M=0）。
 
 ## [0.4.3] - 2026-11-04
 

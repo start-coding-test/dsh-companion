@@ -4,7 +4,19 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.2 已发布**（2026-11-04）。`node --test` 全绿：667 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/Los_Angeles` 三时区）。
+当前状态：**v0.4.4 已发布**（2026-11-04）。`node --test` 全绿：743 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/Los_Angeles` 三时区）。
+
+## v0.4.4 变更摘要
+
+- **召回注入改为完整平台消息（V3-H1）**：带 `id` / `role: 'user'` / `content` / `source.kind='companion-recall'`，修复真机 `reading 'kind'` 崩溃；`mergeDecision` 校验形状，巩固与转录排除召回块。召回块随会话保留到下一次压缩，忘掉后压缩前仍可能可见（见 [docs/platform-api.md](docs/platform-api.md) §2.1.1）。
+- **提醒两阶段投递（V3-H2）**：claim → `delivering`，成功才 `fired` 且同一 fireKey 只发一次；失败回 `pending` 保留 `last_fire_key`，≥3 次 `expired`；启动回收 `delivering`。schema 升至 v10（旧库自动升级）。
+- **主会话重绑（V3-M2）**：新增 `session.mainBinding`（默认 `latest-user`）；只有线程外会话出现真实用户输入才重绑，runtime-context / 召回 / 命令提示不算输入；`/状态` 显示「主会话：<id>（绑定 <mode>）」，提醒投递到该会话。
+- **线程能力门控（V3-H3②）**：宿主没有 `sessionController`（headless / one-shot / SDK）时不注册 `thread_list` / `thread_run` / `task_run`，`/状态` 显示「线程：宿主不支持」；desktop profile 组合 web-app，能力齐全。
+- **服务访问与回收（V3-M1）**：声明服务改走属性访问，未声明服务仍 `ctx.get()`；dispose 后再 apply 不会重复注册。
+- **召回相关性门槛（V3-M3）**：短查询/小聊跳过，候选需 FTS/bigram 命中或向量 ≥ `recall.minVectorScore`（默认 0.35）；新增非枚举 `recall.*` 配置（见 [docs/usage.md](docs/usage.md)）。
+- **编辑重抽（V3-M4）**：`/记忆 改` 重抽 `object_text` 并在同一事务重建 FTS/向量，旧行 `superseded`。
+- **日志与中文命令提示（V3-L1/L3）**：headless 镜像默认只到 `info/warn/error`（`DSH_COMPANION_MIRROR_DEBUG=1` 带 debug）；宿主只注册 ASCII 命令名，误输入中文命令时回一句 ASCII 提示。RSS 文档档位改为按自检值下调（V3-L2）。
+- **复审**：发布前独立复审 pass（H=0 / M=0），见 [docs/review-v9.md](docs/review-v9.md)。完整条目见 [CHANGELOG](CHANGELOG.md)。
 
 ## v0.4.2 变更摘要
 
@@ -110,8 +122,13 @@ DSH 会把 `name` 转成 `file://` URL 再动态 import：绝对路径按 `pathT
 | `vector.remote.apiKeyEnv` | `""` | 读取 API key 的环境变量名 | 非空字符串或空串 |
 | `vector.remote.timeoutMs` | `300` | remote 超时；缺省继承 `embedTimeoutMs` | 整数 `1`–`60000` |
 | `vector.backfillBatchSize` | `8` | idle-probe 每批回填条数 | 整数 `1`–`50` |
+| `recall.minVectorScore` | `0.35` | 向量候选的相关性下限；低于且无 FTS/bigram 命中即丢弃 | 数字 `0`–`1` |
+| `recall.skipSmallTalk` | `true` | 长度 <4、纯算术/符号与常见问候跳过召回 | 布尔 |
+| `session.mainBinding` | `"latest-user"` | 主会话绑定策略：`latest-user` 跟随最新真实用户会话，`first` 保持首个主会话 | `latest-user` / `first` |
 
-token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置，v0.4.2 新增 `vector.backfillTimeoutMs` 并把 `backfillBatchSize` 默认降到 8；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
+token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置，v0.4.2 新增 `vector.backfillTimeoutMs` 并把 `backfillBatchSize` 默认降到 8；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。v0.4.4 起新增非枚举的 `recall.*` 与 `session.mainBinding`，同样不参与 16 键安装自检。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
+
+**主会话绑定（v0.4.4）**：默认 `session.mainBinding: 'latest-user'`——只有当**线程外**会话出现真实用户输入时才把 `main_session_id` 重绑到该会话，并记一条 info 日志（旧/新 id）；runtime-context、召回注入与中文命令提示都不算用户输入，不会触发重绑。`'first'` 保持原主会话不变。提醒投递到当前主会话，`/状态` 会显示「主会话：<id>（绑定 <mode>）」。
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
