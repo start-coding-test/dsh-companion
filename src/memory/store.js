@@ -842,18 +842,22 @@ export class Store {
    * 可重复执行。
    */
   #ensureReneedKindTriggers() {
+    // kind 字面量从 reneed.js 的 RENEED_KINDS 生成，避免这里与校验集合两处
+    // 漂移。注意 CREATE TRIGGER IF NOT EXISTS 不会更新已存在的触发器：若将来
+    // 增删 kind，需要在迁移里显式 DROP 再重建（当前 kind 集未变，不需要）。
+    const kinds = RENEED_KINDS.map((kind) => `'${kind}'`).join(', ');
     this.#db.exec(`
       CREATE TRIGGER IF NOT EXISTS trg_facts_reneed_kind_ins
       BEFORE INSERT ON facts
       WHEN NEW.reneed_kind IS NOT NULL
-       AND NEW.reneed_kind NOT IN ('recall','dedupe','correction','used')
+       AND NEW.reneed_kind NOT IN (${kinds})
       BEGIN
         SELECT RAISE(ABORT, 'invalid facts.reneed_kind');
       END;
       CREATE TRIGGER IF NOT EXISTS trg_facts_reneed_kind_upd
       BEFORE UPDATE OF reneed_kind ON facts
       WHEN NEW.reneed_kind IS NOT NULL
-       AND NEW.reneed_kind NOT IN ('recall','dedupe','correction','used')
+       AND NEW.reneed_kind NOT IN (${kinds})
       BEGIN
         SELECT RAISE(ABORT, 'invalid facts.reneed_kind');
       END;
@@ -1283,17 +1287,21 @@ export class Store {
   // --------------------------------------------------------------- facts
 
   /**
-   * 记录一条事实的「首次再需要」（W5 S0 标定）。幂等：只有
+   * 记录一条事实的「首次再需要」（W5 S0 标定，recall/漏样本对照）。幂等：只有
    * first_reneed_at 为 NULL 时才写，后到的 recall/correction 不覆盖首次样本。
    *
    * v8：`sameContext=true` 标记同会话即时召回（写入后 <6h 或来源 episode 仍在
    * 当前 surface），统计时排除；kind 允许 `used`。
    *
+   * v9/M-1：`reneed_kind='used'` 的行整体跳过——used 主样本可能先于 recall
+   * 样本出现（index 档注入不写 first_reneed_at），后续 full/gist 注入不得把
+   * kind 降级回 recall，也不得补写晚于 first_used_at 的 first_reneed_at。
+   *
    * @param {string} id
    * @param {{at?: number|Date, tier: 'clear'|'ambiguous'|'miss',
    *          kind: 'recall'|'dedupe'|'correction'|'used',
    *          sameContext?: boolean}} options
-   * @returns {boolean} 是否本次写入（false = 已有首次样本或行不存在）
+   * @returns {boolean} 是否本次写入（false = 已有首次样本/已是 used 或行不存在）
    */
   markFirstReneed(id, options = {}) {
     const factId = requireString(id, 'first_reneed.id');
@@ -1312,7 +1320,8 @@ export class Store {
         `UPDATE facts
             SET first_reneed_at = ?, first_reneed_tier = ?, reneed_kind = ?,
                 same_context = ?, updated_at = unixepoch()
-          WHERE id = ? AND first_reneed_at IS NULL`,
+          WHERE id = ? AND first_reneed_at IS NULL
+            AND (reneed_kind IS NULL OR reneed_kind <> 'used')`,
       )
       .run(at, tier, kind, sameContext, factId);
     return Number(info.changes) > 0;

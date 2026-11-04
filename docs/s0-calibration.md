@@ -75,11 +75,12 @@
 | `first_reneed_tier` | TEXT | 对应事件的 `clear` / `ambiguous` / `miss` |
 | `reneed_kind` | TEXT | `recall`（仅注入，对照）/ `used`（用上，主样本）/ `dedupe` / `correction` |
 | `same_context` | INTEGER | `1` = 首次再需要事件发生在同会话即时上下文（Δt<6h 或来源 episode 仍在 surface）；只约束 recall/dedupe/correction 对照 |
-| `first_used_at` | INTEGER | 首次**非 same_context 用上**的 Unix 秒；same_context 的 `used` 先写入，后续非 same_context 用上可覆盖一次 |
+| `first_used_at` | INTEGER | 首次「用上」的 Unix 秒：same_context 的 `used` 先记录，之后首次非 same_context 用上覆盖一次；已有非 same_context 不再覆盖 |
 | `first_used_tier` | TEXT | 用上时的档位 `clear` / `ambiguous` |
 | `used_same_context` | INTEGER | `1` = 该次用上仍是同会话即时上下文；`0` = 主样本 |
 
-- **写入口径**：`recall` / `dedupe` / `correction` 关注首次再需要，走 `store.markFirstReneed(id, {at, tier, kind, sameContext})`，`first_reneed_at` 只写一次；`used` 走 `store.markReneedUsed(id, {at, tier, sameContext})`，写 `first_used_at = 当前用上时刻`、`first_used_tier = 当前档位`、`used_same_context = 当场重新判定的 same_context`，并只把 `reneed_kind` 升级为 `used`，不改 `first_reneed_*`。`used_same_context` 的覆盖条件是 `NULL` 或「已有 `1`、本次 `0`」；已有 `0` 不再覆盖；`dedupe` / `correction` 不会被 `used` 改写。
+- **写入口径**：`recall` / `dedupe` / `correction` 关注首次再需要，走 `store.markFirstReneed(id, {at, tier, kind, sameContext})`，`first_reneed_at` 只写一次；`used` 走 `store.markReneedUsed(id, {at, tier, sameContext})`，写 `first_used_at = 当前用上时刻`、`first_used_tier = 本轮实际注入档位`（index 档记为 `miss`，不用库内 `fidelity` 反猜）、`used_same_context = 当场重新判定的 same_context`，并只把 `reneed_kind` 升级为 `used`，不改 `first_reneed_*`。`used_same_context` 的覆盖条件是 `NULL` 或「已有 `1`、本次 `0`」；已有 `0` 不再覆盖；`dedupe` / `correction` 不会被 `used` 改写。
+- **`used` 行允许没有 recall 样本**：index 档注入不写 `first_reneed_at`（只进本轮注入记录），若下一轮就被复述用上，`used` 行的 `first_reneed_at` 保持 `NULL` 是合法状态。此后即使 full/gist 档再次注入，`markFirstReneed` 也会因 `reneed_kind='used'` 整体跳过：不得补写晚于 `first_used_at` 的对照时间，也不得把 `reneed_kind` 降级回 `recall`。因此 `first_reneed_*` 始终只是「recall 对照样本」，主样本（`used`）只依赖 `first_used_*` / `used_same_context`。
 - **Δt 与 same_context 用 `observed_at`（L2-1）**：用上时间 `first_used_at` 记录的是真实用上时刻，Δt 从**原话时间** `facts.observed_at` 起算，而不是巩固时刻 `created_at`；same_context 的 6h 判定同样以 `observed_at` 为起点。取不到 `observed_at` 时，`index.js` 的 `factOriginTime` / `resolveObservedAt` 依次退回来源 episode 的 `observed_at`、`started_at`、`created_at`，最后才用 `fact.created_at`；该回退顺序写在代码注释里。SQL 侧以 `observed_at` 为准，并把 `observed_at = 0` 的历史异常行排除。
 - schema 演进：v7 增加 `first_reneed_*`；v8 增加 `same_context` 并把 `reneed_kind` 合法值扩为含 `used`（幂等触发器校验，不重建表）；v9 增加 `first_used_*` / `used_same_context`，v8→v9 只推进版本、列由打开时检测补齐；重复打开幂等。
 - 索引 `(scope, first_reneed_at)` 与 `(scope, first_used_at)`（`ix_facts_used`）。

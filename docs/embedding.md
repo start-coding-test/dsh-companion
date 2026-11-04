@@ -110,7 +110,7 @@ remote 不实现 local 的加载/推理单飞：每次查询或回填都是一�
 
 ## 失败降级与指标
 
-- 召回/回填时 embedding 超时、transient 失败或 HTTP 错误：`vectorEmbedFailures` +1，本轮退回 FTS；同一 turn 不重试。回填超时另记 `vectorBackfillTimeouts`；查询或回填遇到已有推理在跑记 `vectorEmbedBusy`，查询立即回退 FTS。
+- 召回/回填时 embedding 超时、transient 失败或 HTTP 错误：`vectorEmbedFailures` +1，本轮退回 FTS；同一 turn 不重试。回填超时另记 `vectorBackfillTimeouts`。查询或回填遇到已有推理在跑（`EMBEDDING_BUSY`）是占用而非失败：只记 `vectorEmbedBusy`，不计 `vectorEmbedFailures`，查询立即回退 FTS 且日志降为 `debug`（回填占用期连续查询不应虚增失败数）。
 - local 异步预热失败：`vectorEmbedLoadFailures` +1；其中 `fatal`（缺依赖）再记 `vectorEmbedFatal` +1，本进程停用 local。预热成功/失败日志按错误去重，恢复后复位。
 - 回填成功：`vectorBackfilled` 累计条数，`/状态` 的「已回填」是本进程启动后的累计值。
 - `/状态` 的向量片段：关闭时 `向量：关`；开启时 `向量：开·dim 512·local:bge-small-zh-v1.5:512·已回填 N·最近命中 N·回填超时 N·占用 N`（`remote` 显式开启时显示 `remote:<域名>`）。预热状态本身（`idle`/`loading`/`backoff`/`fatal`）只在日志与 `embedder.state()` 里，不在这行文字中。

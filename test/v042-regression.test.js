@@ -19,7 +19,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { apply, backfillVectors } from '../src/index.js';
+import { apply, backfillVectors, retrieveVectors } from '../src/index.js';
 import { retrieve } from '../src/memory/retrieve.js';
 import { EmbeddingTimeout } from '../src/memory/embedders/index.js';
 import { createLocalEmbedder } from '../src/memory/embedders/local.js';
@@ -553,4 +553,138 @@ test('L2-1 集成：延迟巩固不缩短 Δt（7 小时前原话仍判跨会话
     'Δt 必须从原话时间起算，不被巩固时刻缩短',
   );
   assert.equal(used.first_reneed_at, at + 3600, 'recall 样本保持首次注入时刻');
+});
+
+test('M-1 回归：index 档注入被用上后，后续 full 注入不得把 used 降级回 recall', async (t) => {
+  const temp = makeTempStore();
+  const seeded = seedMemory(temp.store, { now: TEST_NOW, statement: '青柠计划的代号是蓝鲸。' });
+  const at = Math.floor(TEST_NOW / 1000);
+  // 让 R 在 t0+6d 落到 index 档（>=0.05 且 <0.2）：strength=3d、Δt=6d → R≈0.135。
+  temp.store.db
+    .prepare('UPDATE facts SET strength_days = 3 WHERE id = ?')
+    .run(seeded.factId);
+  const ctx = makeApplyCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 365 });
+  t.after(() => {
+    handle.dispose();
+    temp.cleanup();
+  });
+
+  // t0+6d：index 档注入。index 档不写 recall 样本（first_reneed_at 保持 NULL），
+  // 但 fact 已进入 lastRecalledIds/tier 表，下一轮复述即可判为「用上」。
+  ctx.advance(6 * DAY_MS);
+  await ctx.dispatch(
+    'agent/pre-step',
+    turnPayload(1, messages(['user', '青柠计划的代号是什么？']), { id: 'session-1' }),
+    { kind: 'enter', messages: [] },
+  );
+  const recalled = temp.store.getFact(seeded.factId);
+  assert.equal(recalled.first_reneed_at, null, 'index 档不写 recall 样本');
+  assert.equal(recalled.reneed_kind, null);
+  assert.equal(recalled.first_used_at, null);
+
+  // 紧接着复述 → 用上。档位必须是本轮注入的 index（miss），不能拿库内
+  // fidelity=full 猜成 clear（L-4）。
+  await ctx.dispatch(
+    'agent/pre-step',
+    turnPayload(
+      2,
+      messages(
+        ['user', '青柠计划的代号是什么？'],
+        ['assistant', '青柠计划的代号是蓝鲸。'],
+        ['user', '谢谢。'],
+      ),
+      { id: 'session-1' },
+    ),
+    { kind: 'enter', messages: [] },
+  );
+  const used = temp.store.getFact(seeded.factId);
+  assert.equal(used.reneed_kind, 'used');
+  assert.equal(used.first_used_at, at + 6 * DAY_SEC, '用上时间取用上那一刻');
+  assert.equal(used.first_used_tier, 'miss', '档位取本轮实际注入档（index→miss）');
+  assert.equal(used.used_same_context, 0);
+  assert.equal(used.first_reneed_at, null, 'used 行允许没有 recall 样本');
+
+  // 强化后强度上升；等一天让它以 full 档再次注入（R≈0.99）。
+  temp.store.db
+    .prepare('UPDATE facts SET strength_days = 100 WHERE id = ?')
+    .run(seeded.factId);
+  ctx.advance(DAY_MS);
+  await ctx.dispatch(
+    'agent/pre-step',
+    turnPayload(
+      3,
+      messages(['user', '青柠计划的代号？'], ['assistant', '是蓝鲸。'], ['user', '好。']),
+      { id: 'session-1' },
+    ),
+    { kind: 'enter', messages: [] },
+  );
+
+  const after = temp.store.getFact(seeded.factId);
+  assert.equal(after.reneed_kind, 'used', '后续 recall 样本不得把 used 降级');
+  assert.equal(after.first_used_at, used.first_used_at, 'first_used_at 不得被改写');
+  assert.equal(after.first_used_tier, 'miss');
+  assert.equal(after.first_reneed_at, null, '不得补写晚于 first_used_at 的 recall 样本');
+
+  const mainSamples = temp.store.db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM facts
+        WHERE reneed_kind = 'used' AND used_same_context = 0
+          AND first_used_at IS NOT NULL AND observed_at > 0`,
+    )
+    .get();
+  assert.equal(mainSamples.n, 1, 'S0 主样本 SQL 必须命中 1 行');
+  const recallSamples = temp.store.db
+    .prepare("SELECT COUNT(*) AS n FROM facts WHERE reneed_kind = 'recall'")
+    .get();
+  assert.equal(recallSamples.n, 0, 'used 行不得被 recall 对照误计');
+});
+
+test('L-1：查询撞上推理占用只记 vectorEmbedBusy，不虚增 failures/warn', async (t) => {
+  const temp = makeTempStore();
+  t.after(() => temp.cleanup());
+  addVectorFact(temp.store, 1, '晨星');
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const fake = slowModule({ msPerText: 5, gate });
+  const embedder = createLocalEmbedder({
+    model: MODEL,
+    timeoutMs: 300,
+    backfillTimeoutMs: 30_000,
+    loader: async () => fake.module,
+  });
+  t.after(clearTimers);
+  await embedder.warmup();
+  temp.store.configureVectors({ id: embedder.id, dim: embedder.dim, embed: null });
+  const { state, calls, logs } = makeVectorState(temp.store, embedder, { backfillBatchSize: 8 });
+
+  const backfill = backfillVectors(state);
+  try {
+    await delay(10);
+    assert.equal(embedder.busy(), true);
+    // 回填占用期连续两次查询：都回退 FTS，只记 busy。
+    for (let i = 0; i < 2; i += 1) {
+      const result = await retrieveVectors(state, {
+        store: temp.store,
+        query: '项目代号',
+        now: VECTOR_NOW_MS,
+        vector: { enabled: true, dim: DIM, embedder: 'local' },
+      });
+      assert.equal(result.vectorError?.code, 'EMBEDDING_BUSY');
+      assert.ok(result.items.some((item) => item.text.includes('晨星')), 'FTS 结果照常返回');
+    }
+    const snapshot = state.metrics.snapshot();
+    assert.equal(snapshot.vectorEmbedBusy, 2, '每次查询记一次占用');
+    assert.equal(snapshot.vectorEmbedFailures, undefined, '占用不得计入失败');
+    assert.equal(
+      logs.filter((entry) => entry.level === 'warn' && entry.message.includes('embedding failed')).length,
+      0,
+      '占用不打 warn（降为 debug）',
+    );
+  } finally {
+    release();
+    await backfill;
+  }
 });

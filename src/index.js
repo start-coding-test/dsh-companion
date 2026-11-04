@@ -383,6 +383,11 @@ function createWiringState({ host, platform, store, config, metrics, embedder = 
      * 只描述本次注入的对照口径；「用上」时另按用上时刻重算 used_same_context。
      */
     lastRecallSamples: new Map(),
+    /**
+     * v0.4.2/L-4：本批注入的实际档位（id → clear/ambiguous/miss）。index 档
+     * 也记（miss），只供「用上」时写 first_used_tier，不写 recall 样本。
+     */
+    lastRecallTiers: new Map(),
     /** 最近一段转录（用于巩固模型草稿）；当前激活 scope 的视图。 */
     transcript: [],
     /** H3：每个 scope 各自的转录，切换会话时恢复，避免跨会话串味。 */
@@ -974,6 +979,7 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
     if (isNewTurn) {
       state.lastRecalledIds = [];
       state.lastRecallSamples = new Map();
+      state.lastRecallTiers = new Map();
       state.lastRecallScope = scope;
     }
     return;
@@ -988,6 +994,7 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
     if (isNewTurn) {
       state.lastRecalledIds = [];
       state.lastRecallSamples = new Map();
+      state.lastRecallTiers = new Map();
       state.lastRecallScope = scope;
     }
     return;
@@ -996,6 +1003,8 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
   state.lastRecalledIds = [];
   const samples = state.lastRecallSamples instanceof Map ? state.lastRecallSamples : new Map();
   state.lastRecallSamples = new Map();
+  const tiers = state.lastRecallTiers instanceof Map ? state.lastRecallTiers : new Map();
+  state.lastRecallTiers = new Map();
   const userText = lastUserText(messages);
   const confirmed = isConfirmation(userText);
   const alpha = confirmed ? CONFIRM_ALPHA : DEFAULT_ALPHA;
@@ -1023,7 +1032,7 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
       }
       state.metrics.inc('reinforcements');
       // v8/S-M1：复述命中即「用上」；v9 起按用上那一刻记录 used 样本。
-      markUsedReneed(state, id, fact, at, samples.get(id));
+      markUsedReneed(state, id, fact, at, samples.get(id), tiers.get(id));
       state.platform.log('debug', '[dsh-companion] reinforced recalled fact', {
         id,
         alpha,
@@ -1102,13 +1111,20 @@ function factOriginTime(state, fact) {
  * @param {object|null} fact
  * @param {number} atSeconds 本轮强化时刻（Unix 秒）
  * @param {{at?: number, tier?: string, sameContext?: boolean}|undefined} sample
+ * @param {string|undefined} injectionTier 本轮注入的实际档位（L-4，含 index 档
+ *   的 miss）；取不到时退回 sample.tier，再退回库内 fact.fidelity 兜底
  */
-function markUsedReneed(state, id, fact, atSeconds, sample) {
+function markUsedReneed(state, id, fact, atSeconds, sample, injectionTier) {
   const store = state.store;
   if (store === null || store === undefined || typeof store.markReneedUsed !== 'function') return;
-  let tier = sample?.tier;
+  let tier = injectionTier;
   if (tier !== 'clear' && tier !== 'ambiguous' && tier !== 'miss') {
+    tier = sample?.tier;
+  }
+  if (tier !== 'clear' && tier !== 'ambiguous' && tier !== 'miss') {
+    // 兜底：本轮注入档位未记到（旧状态/直接调用），只能用库内 fidelity 猜。
     tier = fact?.fidelity === 'gist' ? 'ambiguous' : 'clear';
+    if (fact?.fidelity === 'index') tier = 'miss';
   }
   const sameContext = isSameContextSample({
     at: atSeconds,
@@ -1296,10 +1312,13 @@ function vectorConfig(state) {
  * 并退回纯 FTS，绝不阻塞当前 turn。
  * E-M1：local 依赖未安装（fatal，已停用）时直接走纯 FTS，不再每轮尝试。
  * @param {object} state
+ * 导出仅供回归测试直接验证「占用只记 busy」的指标口径；属于内部 API，
+ * 不承诺对外稳定。
+ *
  * @param {object} input retrieve() 参数
  * @returns {Promise<object>}
  */
-async function retrieveVectors(state, input) {
+export async function retrieveVectors(state, input) {
   const disabled = state.embedder !== null
     && state.embedder !== undefined
     && state.embedder.disabled === true;
@@ -1311,9 +1330,15 @@ async function retrieveVectors(state, input) {
     })
     : await retrieve({ ...input, embedder: state.embedder });
   if (result !== null && typeof result === 'object' && result.vectorError) {
-    if (result.vectorError.code === 'EMBEDDING_BUSY') state.metrics.inc('vectorEmbedBusy');
-    state.metrics.inc('vectorEmbedFailures');
-    state.platform.log('warn', '[dsh-companion] embedding failed; falling back to FTS', result.vectorError);
+    if (result.vectorError.code === 'EMBEDDING_BUSY') {
+      // L-1：占用不是失败（回填推理仍在跑，下一轮会好），只记 busy；与
+      // docs/embedding.md 口径一致，回填占用期不虚增 failures、不打 warn。
+      state.metrics.inc('vectorEmbedBusy');
+      state.platform.log('debug', '[dsh-companion] embedding busy; falling back to FTS', result.vectorError);
+    } else {
+      state.metrics.inc('vectorEmbedFailures');
+      state.platform.log('warn', '[dsh-companion] embedding failed; falling back to FTS', result.vectorError);
+    }
   }
   return result;
 }
@@ -2042,6 +2067,8 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
  * episode 仍在当前 surface），统计口径排除；样本同时放进 state.lastRecallSamples。
  * v9/S2-M1：样本里的 at/tier 不再被后续注入沿用；「用上」时由 markUsedReneed
  * 按用上那一刻重算，recall 样本保持首次注入时的值作对照。
+ * v0.4.2/L-4：全部注入 fact 的实际档位另记在 state.lastRecallTiers（index 档为
+ * miss），供「用上」写 first_used_tier；index 档仍不写 recall 样本。
  *
  * @param {object} state
  * @param {{items: object[]}} recalled
@@ -2059,12 +2086,19 @@ function recordRecalledFacts(state, recalled, assembled, scope = SCOPE, at = Dat
   const atSeconds = Math.floor(Number(at) / 1000);
   const ids = [];
   const samples = new Map();
+  const tiers = new Map();
   for (const item of recalled.items) {
     if (item === null || typeof item !== 'object') continue;
     if (item.kind !== 'fact' || typeof item.id !== 'string') continue;
     if (droppedIds.has(item.id)) continue;
     if (ids.includes(item.id)) continue;
     ids.push(item.id);
+    // v0.4.2/L-4：记下本轮注入的实际档位（index 档也记 miss），供「用上」时
+    // 写 first_used_tier；只有 full/gist 才继续写 recall 样本（markFirstReneed）。
+    tiers.set(
+      item.id,
+      item.fidelity === 'full' ? 'clear' : item.fidelity === 'gist' ? 'ambiguous' : 'miss',
+    );
     if (item.fidelity !== 'full' && item.fidelity !== 'gist') continue;
     const tier = item.fidelity === 'full' ? 'clear' : 'ambiguous';
     let fact = null;
@@ -2102,6 +2136,7 @@ function recordRecalledFacts(state, recalled, assembled, scope = SCOPE, at = Dat
   }
   state.lastRecalledIds = ids;
   state.lastRecallSamples = samples;
+  state.lastRecallTiers = tiers;
   state.lastRecallScope = scope;
   state.lastRecallAssistant = lastAssistantText(state.transcript);
   state.assistantCountAtRecall = countAssistantRows(state.transcript);
