@@ -277,7 +277,12 @@ test('巩固层不把召回块当用户发言：窗口文本只含真实用户�
     assert.doesNotMatch(prompt, /\[相关记忆\]/u, '召回块不得作为用户发言进入巩固窗口');
     assert.doesNotMatch(prompt, /8000/u, '召回块正文不得进入巩固窗口（否则会自我巩固）');
     // 召回块仍在 surface 上（随会话保留到压缩），只是被巩固层排除。
-    assert.equal(session.surface.nodes.length, 3, '用户消息 + 召回消息 + turn2 用户消息');
+    // 不断言节点总数：后续 turn 是否再召回取决于检索实现（recency 兜底等）。
+    const recallEvents = session.events.filter(
+      (event) => event.type === 'user/message' && event.data?.source?.kind === RECALL_KIND,
+    );
+    assert.ok(recallEvents.some((event) => event.data.id === recall.id), '召回声明的召回块必须仍在 surface 上');
+    assert.ok(session.surface.nodes.includes(recallEvents[0].seq));
   } finally {
     handle.dispose();
     temp.cleanup();
