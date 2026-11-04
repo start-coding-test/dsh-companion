@@ -156,10 +156,11 @@ test('memory_search：显式跨 scope 返回 scope_denied，未传时用当前 t
     );
     const search = toolOf(ctx, 'memory_search');
 
-    const own = await search.execute({ query: '极光在哪里' });
+    // 查询含 2 个有效 bigram（极光/夜空），满足 V4-M1 词法门槛。
+    const own = await search.execute({ query: '极光夜空' });
     assert.ok(own.items.some((item) => /极光/u.test(item.text)), '默认应检索当前 thread scope');
 
-    const denied = await search.execute({ query: '极光在哪里', scope: 'main' });
+    const denied = await search.execute({ query: '极光夜空', scope: 'main' });
     assert.deepEqual(denied, { ok: false, reason: 'scope_denied', scope: 'main' });
   } finally {
     handle.dispose();

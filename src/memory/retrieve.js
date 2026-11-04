@@ -11,11 +11,14 @@
  *       score = 0.6 * rel + 0.4 * R
  * 装入：按 score 降序，累计 Math.ceil(text.length / 2) 个 token，超预算即截断。
  *
- * v0.4.4 / V3-M3 相关性门槛（全部在打分之前完成）：
- *   1) 查询门：skipSmallTalk 开启时，长度 <4、纯算术/符号、常见问候词直接跳过
- *      （返回空结果，不读库、不算向量）。空查询仍走 recency-only 通道。
- *   2) 候选门：非空查询的候选必须命中 FTS/bigram，或向量余弦 ≥ minVectorScore；
- *      两者都没有的候选（例如旧行为里补位的 recency 项）直接丢弃。
+ * v0.4.4 / V4-M1 相关性门槛（全部在打分之前完成）：
+ *   1) 查询门：skipSmallTalk 开启时，长度 <recall.minQueryChars（默认 2）、
+ *      纯算术/符号、常见问候词直接跳过（返回空结果，不读库、不算向量）。
+ *      空查询仍走 recency-only 通道。
+ *   2) 候选门：非空查询的候选必须有「有效词法命中」或向量余弦 ≥ minVectorScore；
+ *      有效命中 = 去掉停用 bigram（今天/我们/一下/什么/怎么…）及其相邻跨词
+ *      bigram 后，命中 ≥2 个不同 bigram，或命中比例 ≥30%；两者都没有的
+ *      候选（例如旧行为里补位的 recency 项）直接丢弃。
  *   3) 统计：过滤后为空时调用方不会注入、不写召回样本；vectorHits 只数真正
  *      达到阈值且进入注入的向量命中。
  *
@@ -38,8 +41,12 @@ const RECENT_WINDOW_MS = 7 * DAY_MS;
 export const MIN_RECALL_R = 0.05;
 export const DEFAULT_BUDGET_TOKENS = 2050;
 export const DEFAULT_LIMIT = 20;
-/** V3-M3：查询门的最短有效长度（按码点计）。 */
-export const MIN_QUERY_CHARS = 4;
+/** V4-M1：查询门的最短有效长度（按码点计；可被 recall.minQueryChars 覆盖）。 */
+export const MIN_QUERY_CHARS = 2;
+/** V4-M1：判定词法命中「够相关」所需的最少不同 bigram 数。 */
+export const LEXICAL_MIN_HITS = 2;
+/** V4-M1：或按查询有效 bigram 数的命中比例判定（≥30%）。 */
+export const LEXICAL_MIN_HIT_RATIO = 0.3;
 /** V3-M3：纯算术/符号查询（卡上给定的形态）。 */
 const ARITHMETIC_ONLY_RE = /^[\d\s+\-*/=？?]+$/u;
 /** V3-M3：常见问候/客套词（归一化后整串匹配）。 */
@@ -55,6 +62,96 @@ const EDGE_SYMBOL_RE = /^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$/gu;
 const LEXICAL_TOKEN_LIMIT = 12;
 /** V3-M3：参与 OR 词法检索的 token 至少要含一个字母/数字/CJK 字符。 */
 const LEXICAL_TOKEN_RE = /[\p{L}\p{N}]/u;
+
+/**
+ * V4-M1：停用 bigram（功能词/寒暄词）。
+ *
+ * 这些 bigram 在自然语句里几乎必然出现，命中它们不能证明候选相关；它们既
+ * 不计入命中数，也不计入命中比例的分母。与停用 bigram 相邻的跨词 bigram
+ * （如「蓝鲸是什么动物」里的「是什」「么动」）同样是噪声，在
+ * contentQueryBigrams 中按出现位置一并剔除。
+ */
+export const STOP_BIGRAMS = new Set([
+  '今天', '明天', '昨天', '现在', '刚才', '以前', '以后', '时候',
+  '我们', '你们', '他们', '她们', '它们', '咱们', '大家', '自己',
+  '一下', '一些', '一点', '一个', '一样',
+  '什么', '怎么', '怎么样', '怎样', '如何', '为什么', '是不是', '有没有',
+  '可以', '可能', '应该', '需要', '知道', '觉得',
+  '这个', '那个', '这些', '那些', '这样', '那样', '这里', '那里', '哪个', '哪些',
+  '就是', '还是', '但是', '因为', '所以', '如果', '已经', '然后', '而且', '或者',
+  '不过', '其实', '真的', '非常', '比较', '有点', '帮我', '请问', '谢谢', '你好',
+  '没有', '不是',
+]);
+
+/**
+ * V4-M1：拉丁停用词按「整 token」匹配（不做子串覆盖，避免把 java 里的 a
+ * 之类误伤）。这些词常见于英文问句，单独命中不构成相关性证据。
+ */
+const STOP_LATIN_WORDS = new Set([
+  'a', 'an', 'the', 'is', 'are', 'am', 'was', 'were', 'be', 'been',
+  'i', 'you', 'we', 'they', 'he', 'she', 'it', 'my', 'your', 'our', 'their',
+  'what', 'how', 'why', 'when', 'where', 'who', 'which', 'this', 'that',
+  'to', 'of', 'in', 'on', 'at', 'for', 'with', 'about', 'and', 'or', 'not',
+  'do', 'does', 'did', 'can', 'could', 'should', 'would', 'will',
+  'please', 'thanks', 'thank', 'hello', 'hi', 'hey', 'ok', 'okay',
+]);
+
+/**
+ * V4-M1：把查询切成「有效 bigram」，用于词法命中质量判定。
+ *
+ * 1) 与 toBigrams 同一套归一化（NFKC + 小写）后切 bigram；
+ * 2) 停用 bigram 及其覆盖的字符位置上的跨词 bigram 全部剔除；
+ * 3) 拉丁停用词按整 token 剔除；
+ * 4) 只保留含字母/数字/CJK 的 token。
+ *
+ * 结果既用于 OR 词法检索（少查无意义的 token），也作为命中比例的分母。
+ * 查询全是停用词时返回空数组——这类查询（「今天怎么样」）不会产生任何
+ * 词法候选，也就不会注入。
+ *
+ * @param {unknown} query
+ * @returns {string[]} 去重后的有效 bigram 列表（保持首次出现顺序）
+ */
+export function contentQueryBigrams(query) {
+  if (typeof query !== 'string') return [];
+  const text = query.normalize('NFKC').toLowerCase();
+  if (text.trim() === '') return [];
+  const tokens = [...new Set(splitTokens(toBigrams(text)))];
+  if (tokens.length === 0) return [];
+
+  // 标记停用 bigram 在原文中占用的码元位置。
+  const covered = new Uint8Array(text.length);
+  for (const stop of STOP_BIGRAMS) {
+    for (let at = text.indexOf(stop); at !== -1; at = text.indexOf(stop, at + 1)) {
+      const end = Math.min(at + stop.length, text.length);
+      for (let i = at; i < end; i += 1) covered[i] = 1;
+    }
+  }
+
+  const kept = [];
+  for (const token of tokens) {
+    if (!LEXICAL_TOKEN_RE.test(token)) continue;
+    if (STOP_LATIN_WORDS.has(token)) continue;
+    if (STOP_BIGRAMS.has(token)) continue;
+    // 只要 token 在原文中有一次出现不与停用 bigram 重叠，就算有效。
+    let free = false;
+    for (let at = text.indexOf(token); at !== -1; at = text.indexOf(token, at + 1)) {
+      let blocked = false;
+      const end = Math.min(at + token.length, text.length);
+      for (let i = at; i < end; i += 1) {
+        if (covered[i] === 1) {
+          blocked = true;
+          break;
+        }
+      }
+      if (!blocked) {
+        free = true;
+        break;
+      }
+    }
+    if (free) kept.push(token);
+  }
+  return kept;
+}
 
 /**
  * V3-M3 查询门：判断查询是否属于「不值得召回」的小聊/符号/短查询。
@@ -263,6 +360,23 @@ function conservativeFidelity(stored, fromR) {
 }
 
 /**
+ * V4-M1：词法命中是否达到相关性门槛。
+ *
+ * 命中 ≥2 个不同有效 bigram，或命中数 / 有效查询 bigram 数 ≥30% 即算过门。
+ * 命中集合为空、查询没有有效 bigram（全是停用词）时一律不放行。
+ * @param {{tokens: Set<string>}|undefined} hit
+ * @param {number} queryBigramCount
+ * @returns {boolean}
+ */
+function lexicalHitQualifies(hit, queryBigramCount) {
+  if (hit === undefined) return false;
+  const hits = hit.tokens.size;
+  if (hits === 0) return false;
+  if (hits >= LEXICAL_MIN_HITS) return true;
+  return queryBigramCount > 0 && hits / queryBigramCount >= LEXICAL_MIN_HIT_RATIO;
+}
+
+/**
  * 四档检索入口。
  *
  * @param {{
@@ -310,11 +424,14 @@ export async function retrieve({
   const textQuery = typeof query === 'string' ? query : String(query ?? '');
   const hasQuery = textQuery.trim() !== '';
   // 查询门在算查询向量、读库之前，避免为「1+1」这类查询做任何召回工作。
-  // 空查询不走查询门（保留 recency-only 通道）。
-  if (hasQuery && recallCfg.skipSmallTalk && isTrivialQuery(textQuery)) {
+  // 空查询不走查询门（保留 recency-only 通道）；门槛长度由 recall.minQueryChars 控制。
+  if (hasQuery && recallCfg.skipSmallTalk
+    && isTrivialQuery(textQuery, { minChars: recallCfg.minQueryChars })) {
     return { items: [], tokens: 0, usedIds: [], truncated: false };
   }
+  // 打分（rel）仍用全部 bigram；词法候选与命中质量只看有效 bigram（V4-M1）。
   const queryTokens = [...new Set(splitTokens(toBigrams(textQuery)))];
+  const lexicalTokens = hasQuery ? contentQueryBigrams(textQuery) : [];
   // P2-b：只有显式开启且嵌入器可用时才走向量；关闭时以下路径与 v0.2.0 一致。
   const vectorEnabled = vector !== null
     && typeof vector === 'object'
@@ -354,19 +471,26 @@ export async function retrieve({
   /** @type {Map<string, {type:'fact'|'episode', id:string, rrf?:number, vector?:boolean}>} */
   const candidates = new Map();
   const searchLimit = Math.max(1, maxItems * 2);
-  // V3-M3：词法命中单独留一份，作为「候选有没有相关性证据」的判据。
-  /** @type {Map<string, {type:'fact'|'episode', id:string}>} */
+  // V4-M1：词法命中单独留一份，记录每个候选命中的「有效 bigram」集合，
+  // 作为「候选有没有足够相关性证据」的判据（任意一个常见 bigram 命中不再放行）。
+  /** @type {Map<string, {type:'fact'|'episode', id:string, tokens:Set<string>}>} */
   const lexicalHits = new Map();
   if (hasQuery) {
     // Store.searchBigram 的 MATCH 是 AND 语义（toMatchQuery 把每个 bigram 用
     // AND 连接），自然语句「青柠计划的代号是什么」几乎不可能全中；所以这里
-    // 逐 token OR 查，得到「至少命中一个 bigram」的候选集合——这正是 V3-M3
-    // 要求的「必须命中 FTS/bigram」。token 数封顶，避免长句退化成全表扫描。
-    for (const token of queryTokens.slice(0, LEXICAL_TOKEN_LIMIT)) {
+    // 逐 token OR 查，得到候选集合，再按命中质量过门。token 数封顶，避免长句
+    // 退化成全表扫描。
+    for (const token of lexicalTokens.slice(0, LEXICAL_TOKEN_LIMIT)) {
       if (!LEXICAL_TOKEN_RE.test(token)) continue;
       for (const hit of store.searchBigram(token, { scope, limit: searchLimit }) ?? []) {
         if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
-        lexicalHits.set(`${hit.type}:${hit.id}`, { type: hit.type, id: hit.id });
+        const key = `${hit.type}:${hit.id}`;
+        let entry = lexicalHits.get(key);
+        if (entry === undefined) {
+          entry = { type: hit.type, id: hit.id, tokens: new Set() };
+          lexicalHits.set(key, entry);
+        }
+        entry.tokens.add(token);
       }
     }
   }
@@ -471,13 +595,16 @@ export async function retrieve({
     });
     if (R < MIN_RECALL_R) continue;
 
-    // V3-M3 候选门：非空查询必须命中 FTS/bigram，或向量余弦 ≥ minVectorScore。
+    // V4-M1 候选门：非空查询必须有「有效词法命中」（≥2 个不同 bigram，或
+    // 命中比例 ≥30%），或向量余弦 ≥ minVectorScore。
     if (hasQuery) {
       const key = `${candidate.type}:${candidate.id}`;
       const vectorScore = candidate.type === 'fact' ? vectorScores.get(candidate.id) : undefined;
       const vectorQualified = Number.isFinite(vectorScore)
         && vectorScore >= recallCfg.minVectorScore;
-      if (!lexicalHits.has(key) && !vectorQualified) continue;
+      if (!vectorQualified && !lexicalHitQualifies(lexicalHits.get(key), lexicalTokens.length)) {
+        continue;
+      }
     }
 
     const rel = relativeScore(candidate.type, row, new Set(queryTokens), queryTokens.length);

@@ -78,6 +78,10 @@ const RECALL_DEFAULTS = Object.freeze({
   minVectorScore: 0.35,
   // 查询门：短查询、纯符号/算术、常见问候词一律跳过召回。
   skipSmallTalk: true,
+  // V4-M1：查询门的最短有效长度（按码点计，首尾标点不计），统一 2。
+  // 2 字节中文实体（「蓝鲸」「生日」）因此可召回；拉丁 2 字母词仍会被
+  // 问候词/算术/停用词等规则过滤，见 docs/usage.md「召回相关性门槛」。
+  minQueryChars: 2,
 });
 
 Object.defineProperty(DEFAULT_VALUES, 'recall', {
@@ -324,7 +328,7 @@ function normalizeVector(raw, warnings) {
  *
  * @param {unknown} raw
  * @param {string[]} [warnings]
- * @returns {Readonly<{minVectorScore: number, skipSmallTalk: boolean}>}
+ * @returns {Readonly<{minVectorScore: number, skipSmallTalk: boolean, minQueryChars: number}>}
  */
 export function normalizeRecall(raw, warnings = []) {
   const defaults = DEFAULTS.recall;
@@ -332,7 +336,7 @@ export function normalizeRecall(raw, warnings = []) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ConfigError('recall', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
   }
-  const allowed = new Set(['minVectorScore', 'skipSmallTalk']);
+  const allowed = new Set(['minVectorScore', 'skipSmallTalk', 'minQueryChars']);
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) warnings.push(`unknown config field "recall.${key}" ignored`);
   }
@@ -355,7 +359,17 @@ export function normalizeRecall(raw, warnings = []) {
       `must be a boolean, got ${JSON.stringify(skipSmallTalk)}`,
     );
   }
-  return Object.freeze({ minVectorScore, skipSmallTalk });
+  const minQueryChars = raw.minQueryChars === undefined
+    ? defaults.minQueryChars
+    : raw.minQueryChars;
+  if (typeof minQueryChars !== 'number' || !Number.isInteger(minQueryChars)
+    || minQueryChars < 1 || minQueryChars > 64) {
+    throw new ConfigError(
+      'recall.minQueryChars',
+      `must be an integer within 1..64, got ${JSON.stringify(minQueryChars)}`,
+    );
+  }
+  return Object.freeze({ minVectorScore, skipSmallTalk, minQueryChars });
 }
 
 /**

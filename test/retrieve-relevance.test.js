@@ -49,19 +49,21 @@ function addFact(store) {
 
 // ---------------------------------------------------------------- 查询门
 
-test('V3-M3 isTrivialQuery：短查询/纯算术/问候词/纯符号都判为小聊', () => {
-  assert.equal(MIN_QUERY_CHARS, 4);
-  for (const query of ['生日', '蓝鲸', 'hi', '你好', '1+1', '12 * 3 = ?', '？？', '  ', '\n\t', 'ok', 'Thanks!']) {
+test('V4-M1 isTrivialQuery：短查询/纯算术/问候词/纯符号判为小聊，2 字实体放行', () => {
+  assert.equal(MIN_QUERY_CHARS, 2);
+  for (const query of ['hi', '你好', '1+1', '12 * 3 = ?', '？？', '  ', '\n\t', 'ok', 'Thanks!']) {
     assert.equal(isTrivialQuery(query), true, `${JSON.stringify(query)} 应被判为小聊查询`);
   }
-  for (const query of ['青柠计划的代号是什么？', '项目代号', '明天要开会吗']) {
+  // V4-M1：中文 2 字实体（生日/蓝鲸）与 2-3 字短查询不再被长度门拦下。
+  for (const query of ['生日', '蓝鲸', '吃药没', '青柠计划的代号是什么？', '项目代号', '明天要开会吗']) {
     assert.equal(isTrivialQuery(query), false, `${JSON.stringify(query)} 不应被判为小聊查询`);
   }
-  // minChars 可调：显式放宽后 2 字查询不再被长度门拦下。
-  assert.equal(isTrivialQuery('蓝鲸', { minChars: 2 }), false);
+  // minChars 可配置：收紧后 2 字查询被拦下；放宽到 1 后单个 CJK 字也放行。
+  assert.equal(isTrivialQuery('蓝鲸', { minChars: 3 }), true);
+  assert.equal(isTrivialQuery('鲸', { minChars: 1 }), false);
 });
 
-test('V3-M3 查询门：短查询/问候词不召回，也不读库', async (t) => {
+test('V4-M1 查询门：问候/算术不召回也不读库，2 字实体查询可召回', async (t) => {
   const store = openStore(t);
   const fact = addFact(store);
   const originalSearch = store.searchBigram;
@@ -71,7 +73,7 @@ test('V3-M3 查询门：短查询/问候词不召回，也不读库', async (t) 
     return originalSearch.apply(store, args);
   };
   try {
-    for (const query of ['蓝鲸', '青柠', '你好', '1+1', 'hi']) {
+    for (const query of ['你好', '1+1', 'hi']) {
       const result = await retrieve({ store, query, now: TEST_NOW, vector: VECTOR_ON });
       assert.deepEqual(result.items, [], `${JSON.stringify(query)} 不应召回`);
       assert.deepEqual(result.usedIds, []);
@@ -79,11 +81,20 @@ test('V3-M3 查询门：短查询/问候词不召回，也不读库', async (t) 
       assert.equal(result.truncated, false);
     }
     assert.equal(searchCalls, 0, '查询门应在读库之前生效');
+    // V4-M1：2 字实体查询不再被查询门拦下，词法命中可召回。
+    for (const query of ['蓝鲸', '青柠']) {
+      const result = await retrieve({ store, query, now: TEST_NOW, vector: VECTOR_ON });
+      assert.ok(
+        result.items.some((item) => item.id === fact.id),
+        `${JSON.stringify(query)} 应召回该事实`,
+      );
+    }
+    assert.ok(searchCalls > 0);
     assert.ok(store.getFact(fact.id), '事实本身不应被动过');
   } finally {
     store.searchBigram = originalSearch;
   }
-  // skipSmallTalk=false 时短查询照常走召回。
+  // skipSmallTalk=false 时问候词也照常走召回。
   const kept = await retrieve({
     store,
     query: '蓝鲸',
@@ -198,22 +209,40 @@ test('V3-M3 minVectorScore=0：任何非零向量命中都算相关（边界语�
 
 // ---------------------------------------------------------------- 配置
 
-test('V3-M3 recall 配置：默认值、合法覆盖、非法值抛 ConfigError', () => {
-  assert.deepEqual(normalizeRecall(undefined), { minVectorScore: 0.35, skipSmallTalk: true });
-  assert.deepEqual(normalizeRecall({}), { minVectorScore: 0.35, skipSmallTalk: true });
+test('V4-M1 recall 配置：默认值、minQueryChars 覆盖、非法值抛 ConfigError', () => {
+  assert.deepEqual(normalizeRecall(undefined), {
+    minVectorScore: 0.35,
+    skipSmallTalk: true,
+    minQueryChars: 2,
+  });
+  assert.deepEqual(normalizeRecall({}), {
+    minVectorScore: 0.35,
+    skipSmallTalk: true,
+    minQueryChars: 2,
+  });
   assert.deepEqual(
-    normalizeRecall({ minVectorScore: 0.5, skipSmallTalk: false }),
-    { minVectorScore: 0.5, skipSmallTalk: false },
+    normalizeRecall({ minVectorScore: 0.5, skipSmallTalk: false, minQueryChars: 4 }),
+    { minVectorScore: 0.5, skipSmallTalk: false, minQueryChars: 4 },
   );
   // 0 与 1 都是合法边界。
   assert.equal(normalizeRecall({ minVectorScore: 0 }).minVectorScore, 0);
   assert.equal(normalizeRecall({ minVectorScore: 1 }).minVectorScore, 1);
+  // minQueryChars 边界：1..64 的整数。
+  assert.equal(normalizeRecall({ minQueryChars: 1 }).minQueryChars, 1);
+  assert.equal(normalizeRecall({ minQueryChars: 64 }).minQueryChars, 64);
 
   for (const bad of [-0.1, 1.1, Number.NaN, Number.POSITIVE_INFINITY, '0.5', null]) {
     assert.throws(
       () => normalizeRecall({ minVectorScore: bad }),
       (error) => error instanceof ConfigError && /minVectorScore/.test(error.field ?? ''),
       `minVectorScore=${String(bad)} 应抛 ConfigError`,
+    );
+  }
+  for (const bad of [0, -1, 1.5, 65, Number.NaN, '2', null]) {
+    assert.throws(
+      () => normalizeRecall({ minQueryChars: bad }),
+      (error) => error instanceof ConfigError && /minQueryChars/.test(error.field ?? ''),
+      `minQueryChars=${String(bad)} 应抛 ConfigError`,
     );
   }
   assert.throws(
@@ -232,10 +261,12 @@ test('V3-M3 recall 配置：默认值、合法覆盖、非法值抛 ConfigError'
   assert.match(warnings[0], /recall\.futureKey/);
 
   // 经 normalizeConfig 也生效；recall 与 vector 一样不进 DEFAULTS 的 16 键安装面。
-  const cfg = normalizeConfig({ recall: { minVectorScore: 0.6 } });
+  const cfg = normalizeConfig({ recall: { minVectorScore: 0.6, minQueryChars: 3 } });
   assert.equal(cfg.recall.minVectorScore, 0.6);
+  assert.equal(cfg.recall.minQueryChars, 3);
   assert.equal(Object.keys(DEFAULTS).includes('recall'), false, 'recall 应是 DEFAULTS 的非枚举键');
   assert.equal(Object.keys(DEFAULTS).includes('vector'), false, 'vector 先例保持不变');
+  assert.equal(Object.keys(DEFAULTS).length, 16, '安装面仍应保持 16 键');
 });
 
 test('V3-M3 retrieve 接受 config.recall，非法配置在检索时 fail-fast', async (t) => {
