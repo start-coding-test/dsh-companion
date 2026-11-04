@@ -417,6 +417,7 @@ export function buildConsolidationPrompt(input = {}) {
     ' "facts":[{"kind":"identity|relation|preference|project|knowledge|other",',
     '           "subject_text":"...","predicate":"...","object_text":"...","statement":"..."}],',
     ' "reminders":[{"kind":"todo","title":"..."}]}',
+    '对话里形如 [相关记忆] … [/相关记忆] 的段落是历史检索快照，只能作为已知内容的佐证，不得据此新建事实或改写现有结论。',
     `scope=${scope} seq=${input.seqFrom}-${input.seqTo}`,
     '对话：',
     body,

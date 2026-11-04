@@ -164,6 +164,12 @@ const COMMAND_HINT_TEXT_PREFIX = '宿主只注册 ASCII 命令名';
 /** 召回块文本标记（assemble 渲染）；surface 记录只有 role/text，没有 source。 */
 const RECALL_MARKER = '[相关记忆]';
 
+/**
+ * V4-L2：召回块结束标记。注入块会随会话保留到下一次压缩，平台摘要若原样
+ * 复述召回内容，单看开头标记无法确定剔除边界；成对标记让巩固前能整段剔除。
+ */
+const RECALL_END_MARKER = '[/相关记忆]';
+
 /** 转录快照：只保留最近 N 条 / N 字符，供巩固模型使用。 */
 const TRANSCRIPT_MAX_MESSAGES = 40;
 const TRANSCRIPT_MAX_CHARS = 6000;
@@ -2481,6 +2487,43 @@ function isRecallRecord(record) {
 }
 
 /**
+ * V4-L2：从任意文本里剔除完整的 `[相关记忆] … [/相关记忆]` 片段。
+ *
+ * 召回块本身会随会话保留到下一次压缩；平台压缩摘要可能把它复述进摘要节点，
+ * 而摘要节点又在下一轮进入巩固窗口（source.kind 在 surface 层已丢失）。
+ * 这里按成对标记整段删除，保留摘要里的普通对话内容。
+ *
+ * 标记不全（只有开头、没有结尾）时保持原文不动：宁可交给提示词规则，
+ * 也不做「删除剩余全文」之类会误伤摘要后文的猜测。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function scrubRecallBlocks(text) {
+  if (typeof text !== 'string' || !text.includes(RECALL_MARKER)) return text;
+  let output = '';
+  let cursor = 0;
+  while (cursor < text.length) {
+    const start = text.indexOf(RECALL_MARKER, cursor);
+    if (start < 0) {
+      output += text.slice(cursor);
+      break;
+    }
+    const end = text.indexOf(RECALL_END_MARKER, start + RECALL_MARKER.length);
+    if (end < 0) {
+      // 没有结束标记：无法安全确定边界，保留原文。
+      output += text.slice(cursor);
+      break;
+    }
+    output += text.slice(cursor, start);
+    cursor = end + RECALL_END_MARKER.length;
+    if (text[cursor] === '\r') cursor += 1;
+    if (text[cursor] === '\n') cursor += 1;
+  }
+  return output.replace(/[ \t]+$/u, '');
+}
+
+/**
  * 返回把召回注入记录文本清空的 surface 快照副本。
  *
  * 只清文本、不动 `seqs`/`nodes`：选区边界与 token 计量口径保持不变
@@ -2493,10 +2536,19 @@ function isRecallRecord(record) {
  */
 function withoutRecallRecords(snapshot) {
   const records = Array.isArray(snapshot?.records) ? snapshot.records : null;
-  if (records === null || !records.some((record) => isRecallRecord(record))) return snapshot;
+  if (records === null) return snapshot;
+  // V4-L2：摘要节点可能把召回块夹在正文中（不是以标记开头），这类记录也要剔除。
+  const needsScrub = records.some((record) => isRecallRecord(record)
+    || (typeof record?.text === 'string' && record.text.includes(RECALL_MARKER)));
+  if (!needsScrub) return snapshot;
   return {
     ...snapshot,
-    records: records.map((record) => (isRecallRecord(record) ? { ...record, text: '' } : record)),
+    records: records.map((record) => {
+      if (isRecallRecord(record)) return { ...record, text: '' };
+      if (typeof record?.text !== 'string') return record;
+      const text = scrubRecallBlocks(record.text);
+      return text === record.text ? record : { ...record, text };
+    }),
   };
 }
 

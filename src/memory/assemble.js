@@ -196,7 +196,9 @@ function dropLowestRecall(entries, dropped) {
 function recallBlockFor(entries) {
   if (entries.length === 0) return '';
   const lines = entries.map((entry) => recallLine(entry.item));
-  return `[相关记忆]\n${lines.join('\n')}`;
+  // V4-L2：成对标记。摘要若原样复述召回块，巩固前可据此整段剔除，
+  // 避免注入内容经「压缩摘要 → 巩固」回流成新事实。
+  return `[相关记忆]\n${lines.join('\n')}\n[/相关记忆]`;
 }
 
 /**

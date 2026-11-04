@@ -318,8 +318,10 @@ test('V3-H1：召回块不进入巩固窗口（不被自我巩固）', async () 
       .map((block) => block.text)
       .join('\n');
 
+    // 提示词固定说明行会引用标记本身，因此只检查「对话：」之后的选区正文。
+    const body = prompt.slice(prompt.indexOf('对话：'));
     assert.match(prompt, /预算额度是多少/u, '真实用户发言必须进入巩固窗口');
-    assert.doesNotMatch(prompt, /\[相关记忆\]/u, '召回块不得作为用户发言进入巩固窗口');
+    assert.doesNotMatch(body, /\[相关记忆\]/u, '召回块不得作为用户发言进入巩固窗口');
     assert.doesNotMatch(prompt, /8000/u, '召回块正文不得进入巩固窗口');
   } finally {
     handle.dispose();

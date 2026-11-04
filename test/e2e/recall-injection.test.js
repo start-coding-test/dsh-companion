@@ -273,8 +273,10 @@ test('巩固层不把召回块当用户发言：窗口文本只含真实用户�
       .map((block) => block.text)
       .join('\n');
 
+    // 提示词固定说明行会引用标记本身，因此只检查「对话：」之后的选区正文。
+    const regionBody = prompt.slice(prompt.indexOf('对话：'));
     assert.match(prompt, /预算额度是多少/u, '真实用户发言必须进入巩固窗口');
-    assert.doesNotMatch(prompt, /\[相关记忆\]/u, '召回块不得作为用户发言进入巩固窗口');
+    assert.doesNotMatch(regionBody, /\[相关记忆\]/u, '召回块不得作为用户发言进入巩固窗口');
     assert.doesNotMatch(prompt, /8000/u, '召回块正文不得进入巩固窗口（否则会自我巩固）');
     // 召回块仍在 surface 上（随会话保留到压缩），只是被巩固层排除。
     // 不断言节点总数：后续 turn 是否再召回取决于检索实现（recency 兜底等）。
