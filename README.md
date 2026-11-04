@@ -4,14 +4,14 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.2 待发布**（2026-11-04）。`node --test` 全绿；最终用例数由发布卡按发布时实测填写（v0.4.1 为 646 个用例 / 16 个套件）。
+当前状态：**v0.4.2 已发布**（2026-11-04）。`node --test` 全绿：667 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/Los_Angeles` 三时区）。
 
 ## v0.4.2 变更摘要
 
 - **S0 只按「真正用上」标定（S2-M1 / L2-1）**：`used` 在用上那一刻单独记录 `first_used_at` / `first_used_tier` / `used_same_context`，不再沿用首次注入的时间与标记；same_context 在用上时重新判定，same_context 的 used 可被后续非 same_context used 覆盖一次；`first_reneed_*` 保留为 recall 对照。Δt 与 6h 判定统一用 `observed_at`（原话时间）。schema 升至 v9（见 [docs/s0-calibration.md](docs/s0-calibration.md)）。
 - **回填独立超时与单飞（E2-M1 / L2-3）**：新增 `vector.backfillTimeoutMs`（默认 30000），查询仍用 `vector.embedTimeoutMs`（默认 300）；`vector.backfillBatchSize` 默认 8；推理单飞，超时批次未结束前不再起新批；查询遇忙立即回退 FTS；加载单飞复用同一 promise。`/状态` 增加「回填超时 / 占用」计数（见 [docs/embedding.md](docs/embedding.md)）。
 - **v0.4.1 用例数修正（L2-2）**：按标签实测 v0.4.0 为 626、v0.4.1 为 646，CHANGELOG 的「639 → 646」更正为「626 → 646」。
-- **复审**：v0.4.2 发布前独立复审待产出；v0.4.1 及更早变更见 [CHANGELOG](CHANGELOG.md)，未做项与真机联调清单见 [docs/known-debt.md](docs/known-debt.md)。
+- **复审**：v0.4.2 发布前独立复审 pass（H=0 / M=0），见 [docs/review-v8.md](docs/review-v8.md)；复审提出的 M-1 与 L-1/L-2/L-4 已在发布前修完。v0.4.1 及更早变更见 [CHANGELOG](CHANGELOG.md)，未做项与真机联调清单见 [docs/known-debt.md](docs/known-debt.md)。
 
 ## v0.4.1 变更摘要
 
@@ -235,4 +235,5 @@ node --test test/e2e   # 只跑端到端
 - [P2 批复审（v0.3.0）](docs/review-v4.md)
 - [v0.4.0 发布前复审（v0.3.2 修复核验）](docs/review-v5.md)
 - [v0.4.1 发布前复审（E-M1 / S-M1+L-2 修复核验）](docs/review-v6.md)
+- [v0.4.2 发布前复审（S2-M1 / E2-M1 / L2 修复核验）](docs/review-v8.md)
 - [变更记录](CHANGELOG.md)

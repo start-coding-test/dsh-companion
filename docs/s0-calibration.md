@@ -20,6 +20,7 @@
 | --- | --- | --- | --- |
 | 用上·清晰 | 召回注入且下一轮复述重叠 ≥0.6；用上时 `R ≥ 0.5`（`full`） | `first_used_tier = clear` | `used` |
 | 用上·模糊 | 同上；用上时 `0.2 ≤ R < 0.5`（`gist`） | `first_used_tier = ambiguous` | `used` |
+| 用上·沉睡档 | 同上；用上时 `0.05 ≤ R < 0.2`（`index` 档注入后紧接复述） | `first_used_tier = miss` | `used` |
 | 漏·去重 | 巩固去重命中同一 key 的旧行，而旧行已 `index`（0.05≤R<0.2，沉睡）/ `dormant`（遗忘）/ 墓碑 | `first_reneed_tier = miss` | `dedupe` |
 | 漏·纠正 | 用户明说「你又忘了」或指出旧事实记错，且能定位到旧 fact | `first_reneed_tier = miss` | `correction` |
 | 仅注入（对照） | 召回注入但下一轮未见复述用上 | `first_reneed_tier` = `clear` / `ambiguous` | `recall` |
@@ -76,7 +77,7 @@
 | `reneed_kind` | TEXT | `recall`（仅注入，对照）/ `used`（用上，主样本）/ `dedupe` / `correction` |
 | `same_context` | INTEGER | `1` = 首次再需要事件发生在同会话即时上下文（Δt<6h 或来源 episode 仍在 surface）；只约束 recall/dedupe/correction 对照 |
 | `first_used_at` | INTEGER | 首次「用上」的 Unix 秒：same_context 的 `used` 先记录，之后首次非 same_context 用上覆盖一次；已有非 same_context 不再覆盖 |
-| `first_used_tier` | TEXT | 用上时的档位 `clear` / `ambiguous` |
+| `first_used_tier` | TEXT | 用上时的档位 `clear` / `ambiguous` / `miss`（`miss` 对应 index 沉睡档注入后被用上） |
 | `used_same_context` | INTEGER | `1` = 该次用上仍是同会话即时上下文；`0` = 主样本 |
 
 - **写入口径**：`recall` / `dedupe` / `correction` 关注首次再需要，走 `store.markFirstReneed(id, {at, tier, kind, sameContext})`，`first_reneed_at` 只写一次；`used` 走 `store.markReneedUsed(id, {at, tier, sameContext})`，写 `first_used_at = 当前用上时刻`、`first_used_tier = 本轮实际注入档位`（index 档记为 `miss`，不用库内 `fidelity` 反猜）、`used_same_context = 当场重新判定的 same_context`，并只把 `reneed_kind` 升级为 `used`，不改 `first_reneed_*`。`used_same_context` 的覆盖条件是 `NULL` 或「已有 `1`、本次 `0`」；已有 `0` 不再覆盖；`dedupe` / `correction` 不会被 `used` 改写。

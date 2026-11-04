@@ -2,22 +2,27 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
-## [0.4.2] - 2026-11-04（草稿，待 t6 定稿）
+## [0.4.2] - 2026-11-04
 
-v0.4.1 代码评审的 S2-M1 / E2-M1 修复，并带 L2-1 / L2-2 / L2-3。schema 升至 v9（旧库自动升级）；仍为零第三方运行时依赖；remote embedding 默认关闭。发布前独立复审见 `docs/review-v7.md`（待产出）；**测试总数由发布卡按发布时实测填写，本稿不预填**。
+v0.4.1 代码评审的 S2-M1 / E2-M1 修复，并带 L2-1 / L2-2 / L2-3。schema 升至 v9（旧库自动升级）；仍为零第三方运行时依赖；remote embedding 默认关闭。发布前独立复审见 `docs/review-v8.md`（pass，H=0 / M=0；复审提出的 M-1 与 L-1/L-2/L-4 已在发布前修完，L-5 文档档位语义已同步）。
 
 ### Fixed
 
-- **S2-M1 `used` 升级不再沿用首次注入的时间/档位/same_context**：新增 `first_used_at` / `first_used_tier` / `used_same_context`，在真正被用上的那一刻写入，并按 `observed_at`（原话时间）当场重新判定 same_context；「首次用上」定义为首次非 same_context 的用上，same_context 的 used 照常记录、之后可被非 same_context 的 used 覆盖一次，已经是非 same_context 的不再覆盖。`first_reneed_*` 保留为 recall 对照样本，不被 used 改写。schema v9。
+- **S2-M1 `used` 升级不再沿用首次注入的时间/档位/same_context**：新增 `first_used_at` / `first_used_tier` / `used_same_context`，在真正被用上的那一刻写入，并按 `observed_at`（原话时间）当场重新判定 same_context；「首次用上」定义为首次非 same_context 的用上，same_context 的 used 照常记录、之后可被非 same_context 的 used 覆盖一次，已经是非 same_context 的不再覆盖。`first_reneed_*` 保留为 recall 对照样本，不被 used 改写，used 行允许 `first_reneed_at` 为 `NULL`。
+- **M-1 后续 recall 样本不得降级 used 行**：`markFirstReneed` 对 `reneed_kind='used'` 的行整体跳过；index 档注入被用上后，full/gist 档再次注入不会把 kind 改回 `recall`、也不会补写晚于 `first_used_at` 的 `first_reneed_at`，S0 主样本与 recall 对照不再互相污染。
+- **L-4 用上档位取本轮实际注入档**：`index` 档注入后紧接复述用上时，`first_used_tier` 记 `miss`，不再用库内 `fidelity` 反猜成 `clear`。
 - **E2-M1 回填独立超时、推理单飞与查询回退 FTS**：新增 `vector.backfillTimeoutMs`（默认 30000ms，1–600000），回填用独立超时、查询仍用 `vector.embedTimeoutMs`（默认 300ms）；`vector.backfillBatchSize` 默认从 50 降到 8（仍允许 1–50）。local 推理单飞：同一时刻只允许一个底层推理，超时只截断等待、不取消底层计算，超时批次未结束前不再起新批；idle-probe 遇忙跳过并记 `vectorEmbedBusy`；查询遇忙立即回退纯 FTS，不排队。超时记 `vectorBackfillTimeouts`，`/状态` 追加「回填超时 N·占用 M」。
+- **L-1 占用与失败指标分离**：查询遇 `EMBEDDING_BUSY` 只记 `vectorEmbedBusy`、日志降为 `debug`，不再计入 `vectorEmbedFailures`、不打 `warn`；回填占用期连续查询不会虚增失败数。
 - **L2-1 same_context / Δt 改用 `observed_at`**：same_context 判定与 Δt 统一从原话时间起算，取不到时按来源 episode 的 observed/started/created 时间回退，最后才用事实的 `created_at`；避免深睡/延迟巩固把 Δt 算短、6h 判定偏严。
 - **L2-3 加载单飞**：`loadInFlight` 只在底层加载真正 settle 后清空；`doLoad` 不再自套 `loadTimeoutMs`，等待方超时只放弃等待；退避后的重试复用同一个未结束的 promise，不再并行起第二个加载。
 
 ### Changed
 
-- **schema v8→v9**：`facts` 增加 `first_used_at` / `first_used_tier` / `used_same_context` 与 `ix_facts_used` 索引；v8→v9 只推进版本，列由打开时检测补齐，重复打开幂等，旧行新列为 `NULL`；`fact_vectors` 与已有数据不变。
-- **L2-2 修正 v0.4.1 用例数口径**：按标签实测，v0.4.0 为 626、v0.4.1 为 646，v0.4.1 的「639 → 646」改为「626 → 646」（+20）；测试套件仍为 16。
-- **文档**：`docs/s0-calibration.md` 改用 `first_used_at` / `used_same_context` 主样本口径，说明 Δt 以 `observed_at` 起算、recall 仅对照、same_context used 可被覆盖与选择偏差；`docs/embedding.md` 补回填超时、批量 8、推理/加载单飞、查询回退与指标；`docs/known-debt.md` 更新 D-4 真机项与 L2 关闭状态；README 状态、配置表与已知限制同步为 v0.4.2；`docs/usage.md` 同步 `/状态` 文案、配置示例与 schema 演进。
+- **schema v8→v9**：`facts` 增加 `first_used_at` / `first_used_tier` / `used_same_context` 与 `ix_facts_used` 索引；v8→v9 只推进版本，列由打开时检测补齐，重复打开幂等，旧行新列为 `NULL`；`fact_vectors` 与已有数据不变。`reneed_kind` 触发器改为由 `RENEED_KINDS` 常量生成（L-2），不再维护两处字面量。
+- **L-3 判定（不收紧）**：`vector.backfillBatchSize` 维持允许 1–50、默认 8；复审原文「8–16」按「默认值建议」理解，不把上限收紧到 16。
+- **L2-2 修正 v0.4.1 用例数口径**：按标签实测，v0.4.0 为 626、v0.4.1 为 646，v0.4.1 的「639 → 646」改为「626 → 646」（+20）。
+- **测试**：646 → 667 个用例 / 16 个套件（新增 S2-M1 用上语义、v8→v9 迁移、M-1 与 L-1 回归）；默认、`TZ=UTC`、`TZ=America/Los_Angeles` 三时区全绿。
+- **文档**：`docs/s0-calibration.md` 改用 `first_used_at` / `used_same_context` 主样本口径，说明 Δt 以 `observed_at` 起算、recall 仅对照、same_context used 可被覆盖与选择偏差，并补 `first_used_tier=miss`（沉睡档用上）定义；`docs/embedding.md` 补回填超时、批量 8、推理/加载单飞、查询回退与 busy/failures 指标口径；`docs/known-debt.md` 更新 D-4 真机项与 L2 关闭状态；README 状态、配置表与已知限制同步为 v0.4.2；`docs/usage.md` 同步 `/状态` 文案、配置示例与 schema 演进。
 
 ## [0.4.1] - 2026-11-04
 

@@ -120,7 +120,7 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **S2-M1 `used` 升级锁死首次注入时间/档位/same_context**：v0.4.2 修复，commit `890f028`。新增 `first_used_at` / `first_used_tier` / `used_same_context`（schema v9），用上那一刻写入并按 `observed_at` 重新判定 same_context；「首次」指首次非 same_context 用上，same_context 的 used 可被后续非 same_context used 覆盖一次，reverse 不覆盖；`first_reneed_*` 保留为 recall 对照样本。SQL 与口径见 [s0-calibration.md](s0-calibration.md)。
 - **E2-M1 回填共用 300ms 超时且推理/加载叠加**：v0.4.2 修复，commit `a99de84`。回填独立 `vector.backfillTimeoutMs`（默认 30s）、`backfillBatchSize` 默认 8；推理单飞，超时批次未结束前不再起新批；查询遇忙立即回退 FTS；加载单飞复用同一 promise。真机参数校准仍见 D-4（未关闭）。
 - **L2-1 same_context / Δt 以 `created_at` 计时**：v0.4.2 修复，commit `890f028`。same_context 判定与 Δt 统一从 `observed_at`（原话时间）起算，取不到时按 episode 时间回退，代码注释与 SQL 同步说明。
-- **L2-2 CHANGELOG 用例数口径不一致**：v0.4.2 修正。核对 v0.4.0 tag 实测 626、v0.4.1 tag 实测 646，v0.4.1 的「639 → 646」改为真实口径「626 → 646」（+20）；v0.4.2 最终测试数由发布卡按实测填写。
+- **L2-2 CHANGELOG 用例数口径不一致**：v0.4.2 修正。核对 v0.4.0 tag 实测 626、v0.4.1 tag 实测 646，v0.4.1 的「639 → 646」改为真实口径「626 → 646」（+20）；v0.4.2 按发布时实测为 646 → 667（+21，16 个套件）。
 - **L2-3 `loadTimeoutMs` 超时后重试可能并行加载**：v0.4.2 修复，commit `a99de84`。`loadInFlight` 只在底层 settle 后清空，`doLoad` 不再自套超时，重试复用未结束的 promise，`status=loading` 依据该 promise。
 - **E-M1 local embedding 无超时、首次加载阻塞 turn**：v0.4.1 修复，commit `7270417`。加载等待与推理都受 `vector.embedTimeoutMs`（默认 300ms）约束；启动/idle-probe 异步预热，加载期间本轮走纯 FTS；缺依赖 fatal 停用，网络/超时/初始化 transient 退避（1/2/4/8s，第 5 次失败后 60s 长冷却，不永久停用）。测试与文档见 [embedding.md](embedding.md)。
 - **S-M1 W5 把「被注入」当「被需要」、未排除同会话即时召回**：v0.4.1 修复，commit `39addbb`。`reneed_kind` 增加 `used`（复述重叠 ≥0.6 升级，保留首次时间/档位）；新增 `same_context`（Δt<6h 或来源 episode 仍在 surface），统计排除。schema v8。v0.4.2 的 S2-M1 进一步改为用上时单独记录，见上。
