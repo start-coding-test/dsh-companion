@@ -213,6 +213,9 @@ export function apply(ctx, rawConfig) {
       timeoutMs: embedder.timeoutMs,
     });
   }
+  // E-M1：local 模型异步预热（首次下载/ONNX 初始化），不阻塞首轮 turn；
+  // 失败只记日志/指标，召回本轮回退 FTS，idle-probe 按退避重试。
+  prewarmEmbedder(state);
 
   const disposers = [];
   const track = (disposer) => {
@@ -327,6 +330,8 @@ function createWiringState({ host, platform, store, config, metrics, embedder = 
     embedder,
     /** W4：本进程已回填的向量条数（/状态 展示）。 */
     vectorBackfilled: 0,
+    /** E-M1：local 预热状态标记（'idle' / 'ready' / 最近一次失败键），用于日志去重。 */
+    embedderWarmupState: 'idle',
     scheduler: null,
     proactive: null,
     /** M4：每日 token 累计（按配置时区的日键复位）。 */
@@ -1129,6 +1134,51 @@ function refreshBudget(state, at = state.platform.now()) {
 }
 
 /**
+ * E-M1：异步预热 local embedding。启动与 idle-probe 触发，绝不 await 在 turn 路径上。
+ * 失败只记 metric 与日志：transient 由 idle-probe 按指数退避重试；
+ * fatal（ERR_MODULE_NOT_FOUND / Cannot find module）停用 local，召回保持纯 FTS。
+ * @param {object} state
+ */
+function prewarmEmbedder(state) {
+  const { embedder, platform } = state;
+  if (embedder === null || embedder === undefined || typeof embedder.warmup !== 'function') return;
+  if (embedder.disabled === true) return;
+  let pending;
+  try {
+    pending = embedder.warmup();
+  } catch (error) {
+    pending = Promise.reject(error);
+  }
+  Promise.resolve(pending).then(
+    () => {
+      if (state.embedderWarmupState === 'ready') return;
+      state.embedderWarmupState = 'ready';
+      platform.log('info', '[dsh-companion] local embedding model ready', {
+        embedder: embedder.id,
+        timeoutMs: embedder.timeoutMs,
+      });
+    },
+    (error) => {
+      const kind = error?.kind ?? (error?.fatal === true ? 'fatal' : 'transient');
+      state.metrics.inc('vectorEmbedLoadFailures');
+      if (kind === 'fatal') state.metrics.inc('vectorEmbedFatal');
+      const key = `${kind}:${error?.code ?? ''}:${error?.message ?? ''}`;
+      // 同一错误只记一次日志，避免 idle-probe 每 60s 刷屏；恢复由成功分支复位。
+      if (state.embedderWarmupState === key) return;
+      state.embedderWarmupState = key;
+      platform.log(kind === 'fatal' ? 'warn' : 'info',
+        '[dsh-companion] local embedding warmup failed; recall falls back to FTS', {
+          embedder: embedder.id,
+          kind,
+          code: error?.code ?? null,
+          reason: error?.message ?? String(error),
+          retryAt: typeof embedder.state === 'function' ? embedder.state().nextRetryAt : 0,
+        });
+    },
+  );
+}
+
+/**
  * W4：召回用的 vector 配置。embedder 未装配（关闭、none、remote 未启用、
  * local 未安装）时强制 enabled=false，走纯 FTS，避免拿错维度/旧向量。
  * @param {object} state
@@ -1142,12 +1192,22 @@ function vectorConfig(state) {
 /**
  * W4：带 embedder 的召回入口。embedding 失败（未安装/超时/网络）只记 metric
  * 并退回纯 FTS，绝不阻塞当前 turn。
+ * E-M1：local 依赖未安装（fatal，已停用）时直接走纯 FTS，不再每轮尝试。
  * @param {object} state
  * @param {object} input retrieve() 参数
  * @returns {Promise<object>}
  */
 async function retrieveVectors(state, input) {
-  const result = await retrieve({ ...input, embedder: state.embedder });
+  const disabled = state.embedder !== null
+    && state.embedder !== undefined
+    && state.embedder.disabled === true;
+  const result = disabled
+    ? await retrieve({
+      ...input,
+      embedder: null,
+      vector: { ...(input.vector ?? state.config.vector), enabled: false },
+    })
+    : await retrieve({ ...input, embedder: state.embedder });
   if (result !== null && typeof result === 'object' && result.vectorError) {
     state.metrics.inc('vectorEmbedFailures');
     state.platform.log('warn', '[dsh-companion] embedding failed; falling back to FTS', result.vectorError);
@@ -1164,6 +1224,10 @@ async function retrieveVectors(state, input) {
 export async function backfillVectors(state) {
   const { store, embedder, config, metrics, platform } = state;
   if (config.vector.enabled !== true || embedder === null || embedder.kind === 'hash') return 0;
+  if (typeof embedder.status === 'function' && embedder.status() !== 'ready') {
+    prewarmEmbedder(state);
+    return 0;
+  }
   let written = 0;
   try {
     const rows = store.listVectorBackfill({
@@ -2193,6 +2257,8 @@ function startScheduler(state) {
       maybeRetryConsolidation(state);
       // M4：每 60s 读一次 RSS；warn 只记 metric，stop_dispatch/main_only 降级。
       runRssCheck(state);
+      // E-M1：local 模型预热/退避重试；未就绪期间 backfill 直接跳过。
+      prewarmEmbedder(state);
       // W4：空闲时回填一批缺失/不匹配的向量；失败不阻塞后续闲聊。
       await backfillVectors(state);
       if (proactiveBlocked(state)) return;

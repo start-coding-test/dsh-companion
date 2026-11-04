@@ -433,6 +433,11 @@ export async function retrieve({
     result.vectorError = {
       name: embeddingError?.name ?? 'Error',
       code: embeddingError?.code ?? null,
+      // E-M1：transient（超时/网络/初始化中）与 fatal（依赖未安装）可判别，
+      // 调用方据此记指标，但本轮一律已退回 FTS，不向用户抛错。
+      kind: embeddingError?.kind ?? null,
+      transient: embeddingError?.transient === true,
+      fatal: embeddingError?.fatal === true,
       message: embeddingError?.message ?? String(embeddingError),
     };
   }

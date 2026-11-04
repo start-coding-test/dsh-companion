@@ -25,8 +25,9 @@ export { EmbeddingTimeout, EmbeddingUnavailable };
  *   embedTimeoutMs?: number,
  *   remote?: {enabled?: boolean, endpoint?: string, apiKeyEnv?: string, timeoutMs?: number},
  * }} [vectorConfig]
- * @param {{loader?: () => Promise<unknown>, fetch?: typeof fetch, env?: Record<string, string|undefined>}} [deps]
- * @returns {null | {id: string, dim: number, embed: (texts: string[]) => Promise<Float32Array[]>, embedQuery?: (texts: string|string[]) => Promise<Float32Array[]>}}
+ * @param {{loader?: () => Promise<unknown>, fetch?: typeof fetch, env?: Record<string, string|undefined>,
+ *   now?: () => number, retryBaseMs?: number, maxLoadAttempts?: number, loadTimeoutMs?: number}} [deps]
+ * @returns {null | {id: string, dim: number, embed: (texts: string[]) => Promise<Float32Array[]>, embedQuery?: (texts: string|string[]) => Promise<Float32Array[]>, warmup?: () => Promise<unknown>}}
  */
 export function createEmbedder(vectorConfig = {}, deps = {}) {
   const config = vectorConfig === null || typeof vectorConfig !== 'object' ? {} : vectorConfig;
@@ -41,6 +42,12 @@ export function createEmbedder(vectorConfig = {}, deps = {}) {
       prefixQuery: config.prefixQuery,
       dim: undefined,
       loader: deps.loader,
+      // E-M1：前台等待加载与推理都套 config.vector.embedTimeoutMs。
+      timeoutMs: config.embedTimeoutMs,
+      loadTimeoutMs: deps.loadTimeoutMs,
+      retryBaseMs: deps.retryBaseMs,
+      maxLoadAttempts: deps.maxLoadAttempts,
+      now: deps.now,
     });
   }
   if (kind === 'remote') {
