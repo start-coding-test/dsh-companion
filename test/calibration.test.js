@@ -221,9 +221,25 @@ test('config.example.yml：16 个键齐全且与 DEFAULTS 一致', () => {
   assert.match(text, /idleMs: 1800000/);
 });
 
-test('persona.example.md：可复制 JSON 与 DEFAULT_CARD 一致', () => {
-  const text = readFileSync(resolve(REPO_ROOT, 'persona.example.md'), 'utf8');
-  const matched = /```json\n([\s\S]*?)\n```/.exec(text);
+/**
+ * 从 persona 示例中抽出 ```json 代码块。
+ * Windows 全新检出（core.autocrlf=true）是 CRLF，正则必须同时接受 \n 与 \r\n。
+ * @param {string} text
+ * @returns {unknown}
+ */
+function parsePersonaCard(text) {
+  const matched = /```json\r?\n([\s\S]*?)\r?\n```/u.exec(text);
   assert.ok(matched, '缺少 ```json 代码块');
-  assert.deepEqual(JSON.parse(matched[1]), DEFAULT_CARD);
+  return JSON.parse(matched[1]);
+}
+
+test('persona.example.md：可复制 JSON 与 DEFAULT_CARD 一致（LF/CRLF 均可解析）', () => {
+  const text = readFileSync(resolve(REPO_ROOT, 'persona.example.md'), 'utf8');
+  // 仓库检出可能是 LF（Linux/CI）或 CRLF（Windows core.autocrlf=true），两种都要能解析。
+  const lf = text.replace(/\r\n/gu, '\n');
+  const crlf = lf.replace(/\n/gu, '\r\n');
+  assert.deepEqual(parsePersonaCard(lf), DEFAULT_CARD);
+  assert.deepEqual(parsePersonaCard(crlf), DEFAULT_CARD);
+  // 覆盖「原文件本身就是 CRLF」与「原文件是 LF」两种检出。
+  assert.deepEqual(parsePersonaCard(text), DEFAULT_CARD);
 });

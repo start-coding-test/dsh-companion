@@ -197,10 +197,13 @@ test('E-M1：依赖未安装（Cannot find module）→ fatal，停用 local 且
 
 test('E-M1：首轮网络错 → transient，指数退避后重试可用', async () => {
   let loads = 0;
+  // 退避窗口用 100ms（而不是 1ms），让「窗口内不重试」的断言不依赖调度顺序；
+  // 整套并发运行时 1ms 定时器可能在断言前就到期，status 从 backoff 变 idle。
+  const retryBaseMs = 100;
   const embedder = createEmbedder(
     { embedder: 'local', embedTimeoutMs: 300 },
     {
-      retryBaseMs: 1,
+      retryBaseMs,
       loader: async () => {
         loads += 1;
         if (loads === 1) {
@@ -218,11 +221,19 @@ test('E-M1：首轮网络错 → transient，指数退避后重试可用', async
   });
   assert.equal(embedder.status(), 'backoff');
   assert.equal(embedder.disabled, false, '网络错误不得一次失败即永久停用');
-  // 退避窗口内再次触发不会立刻打网络。
-  await assert.rejects(embedder.warmup(), (error) => error.transient === true);
-  assert.equal(loads, 1, '退避窗口内复用同一 transient 错误');
+  const state = embedder.state();
+  assert.ok(state.nextRetryAt > Date.now(), '退避窗口应尚未到期');
 
-  await delay(10);
+  // 退避窗口内再次触发不会立刻打网络（warmup 与 embed 都复用同一 transient 错误）。
+  await assert.rejects(embedder.warmup(), (error) => error.transient === true);
+  await assert.rejects(embedder.embed(['项目代号']), (error) => error.transient === true);
+  assert.equal(loads, 1, '退避窗口内复用同一 transient 错误');
+  assert.equal(embedder.status(), 'backoff');
+
+  // 显式等待真实计时器越过退避窗口（不用 10ms + 假设，避免并发下的竞态）。
+  await new Promise((resolve) => {
+    setTimeout(resolve, retryBaseMs + 50);
+  });
   const [vec] = await embedder.embedQuery(['项目代号']);
   assert.ok(vec instanceof Float32Array);
   assert.equal(vec.length, DIM);
