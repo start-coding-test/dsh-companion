@@ -21,8 +21,9 @@
  *   node scripts/probe/run-headless.mjs [--task "..." ] [--dsh <path>] [--timeout <ms>]
  *   node scripts/probe/run-headless.mjs --plugin [--dsh <path>] [--keep-home]
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
@@ -40,6 +41,7 @@ const PLUGIN_HOME = join(REPO_ROOT, '.data', 'plugin-gate-home');
 const PLUGIN_DB = join(REPO_ROOT, '.data', 'plugin-gate', 'companion.db');
 const PLUGIN_MARKER = '[dsh-companion] scheduler started';
 const PLUGIN_FAILURE_MARKER = 'did not activate';
+const PLUGIN_LOG = join(REPO_ROOT, '.data', 'plugin-gate.log');
 
 const HELP = `Gate 0 headless 探针采集器
 
@@ -54,7 +56,8 @@ const HELP = `Gate 0 headless 探针采集器
                      pre-step/surface（模型凭据缺失时也能拿到第 2 个 pre-step）
   --plugin           C-H1 发布门：用 --patch 把本仓库真插件（src/index.js）挂到
                      headless，跑一次并断言出现 "[dsh-companion] scheduler started"、
-                     且没有 "did not activate"。退出码 0=通过，1=未通过，2=找不到 DSH
+                     且没有 "did not activate"。退出码 0=通过，1=未通过，2=找不到 DSH；
+                     完整 stdout/stderr 落盘到 .data/plugin-gate.log
   --dsh <path>       DSH CLI 路径（默认依次尝试 DSH_CLI 环境变量、PATH、常见安装目录）
   --timeout <ms>     子进程超时，默认 120000
   --keep-home        保留临时 DSH_HOME（默认也会保留，便于查看日志；目录在 .data/ 下）
@@ -280,44 +283,90 @@ function printSummary(summary) {
  * 启动一次 headless 子进程并收集输出。
  * @returns {Promise<{exitCode:number|null,timedOut:boolean,stdout:string,stderr:string}>}
  */
-function runHeadless(launch, env, args, timeoutMs) {
+/**
+ * 收集子进程输出直到退出/超时；`finish()` 在结束回调里读取最终输出，
+ * 便于 pipe 与文件两种 stdio 形态共用同一套等待逻辑。
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {() => { stdout: string, stderr: string }} finish
+ * @param {number} timeoutMs
+ * @returns {Promise<{exitCode:number|null,timedOut:boolean,stdout:string,stderr:string}>}
+ */
+function collectRun(child, finish, timeoutMs) {
   return new Promise((resolvePromise) => {
-    let child;
-    try {
-      child = spawn(launch.command, args, {
-        cwd: REPO_ROOT,
-        env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: true,
-        shell: launch.shell,
-      });
-    } catch (error) {
-      // 某些沙箱里 spawn 直接抛（EPERM），按一次失败运行上报，交调用方判定。
-      resolvePromise({ exitCode: null, timedOut: false, stdout: '', stderr: `spawn error: ${error.message}` });
-      return;
-    }
-    let stdout = '';
-    let stderr = '';
     let timedOut = false;
-    child.stdout?.on('data', (chunk) => {
-      stdout = (stdout + chunk.toString('utf8')).slice(-20_000);
-    });
-    child.stderr?.on('data', (chunk) => {
-      stderr = (stderr + chunk.toString('utf8')).slice(-20_000);
-    });
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill();
     }, timeoutMs);
-    child.once('error', (error) => {
+    const settle = (code, extra = '') => {
       clearTimeout(timer);
-      resolvePromise({ exitCode: null, timedOut, stdout, stderr: `${stderr}\nspawn error: ${error.message}` });
-    });
-    child.once('close', (code) => {
-      clearTimeout(timer);
-      resolvePromise({ exitCode: code, timedOut, stdout, stderr });
-    });
+      const output = finish();
+      resolvePromise({
+        exitCode: code,
+        timedOut,
+        stdout: output.stdout,
+        stderr: output.stderr + extra,
+      });
+    };
+    child.once('error', (error) => settle(null, `\nspawn error: ${error.message}`));
+    child.once('close', (code) => settle(code));
   });
+}
+
+/** @param {string} value @param {number} limit @returns {string} 保留末尾 limit 字符 */
+function tail(value, limit) {
+  return value.length > limit ? value.slice(-limit) : value;
+}
+
+function runHeadless(launch, env, args, timeoutMs) {
+  const options = { cwd: REPO_ROOT, env, windowsHide: true, shell: launch.shell };
+  let child;
+  try {
+    child = spawn(launch.command, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+  } catch (error) {
+    // 部分沙箱（包括本仓库的云端验证环境）禁止带管道的 spawn（EPERM），但允许
+    // stdio 指向文件描述符。文件型 stdio 收集完再回放，语义与 pipe 版本一致，
+    // 让字面 verify 命令在这些环境里也能真实跑一次 headless。
+    let dir;
+    try {
+      dir = mkdtempSync(join(tmpdir(), 'dsh-headless-'));
+      const outPath = join(dir, 'stdout.log');
+      const errPath = join(dir, 'stderr.log');
+      const outFd = openSync(outPath, 'w');
+      const errFd = openSync(errPath, 'w');
+      let fallback;
+      try {
+        fallback = spawn(launch.command, args, { ...options, stdio: ['ignore', outFd, errFd] });
+      } finally {
+        closeSync(outFd);
+        closeSync(errFd);
+      }
+      return collectRun(fallback, () => ({
+        stdout: tail(readFileSync(outPath, 'utf8'), 20_000),
+        stderr: tail(readFileSync(errPath, 'utf8'), 20_000),
+      }), timeoutMs).then((result) => {
+        rmSync(dir, { recursive: true, force: true });
+        return result;
+      });
+    } catch (fallbackError) {
+      if (dir !== undefined) rmSync(dir, { recursive: true, force: true });
+      return Promise.resolve({
+        exitCode: null,
+        timedOut: false,
+        stdout: '',
+        stderr: `spawn error: ${error.message}; file fallback failed: ${fallbackError.message}`,
+      });
+    }
+  }
+  let stdout = '';
+  let stderr = '';
+  child.stdout?.on('data', (chunk) => {
+    stdout = tail(stdout + chunk.toString('utf8'), 20_000);
+  });
+  child.stderr?.on('data', (chunk) => {
+    stderr = tail(stderr + chunk.toString('utf8'), 20_000);
+  });
+  return collectRun(child, () => ({ stdout, stderr }), timeoutMs);
 }
 
 /**
@@ -434,8 +483,26 @@ async function runPluginGate(options) {
     `plugin-gate: exit=${run.exitCode}${run.timedOut ? ' (timeout)' : ''} schedulerStarted=${started} didNotActivate=${inactive}\n`,
   );
 
+  // 完整输出落盘，作为发布门证据（含 marker 原文；失败时也保留现场）。
+  mkdirSync(dirname(PLUGIN_LOG), { recursive: true });
+  writeFileSync(PLUGIN_LOG, [
+    `plugin-gate: ${new Date().toISOString()}`,
+    `plugin: ${PLUGIN_ENTRY}`,
+    `overlay: ${patch}`,
+    `dsh: ${located.path}`,
+    `args: ${args.map((arg) => JSON.stringify(arg)).join(' ')}`,
+    `exit: ${run.exitCode}${run.timedOut ? ' (timeout)' : ''}`,
+    '--- stdout ---',
+    redact(run.stdout),
+    '--- stderr ---',
+    redact(run.stderr),
+    '',
+  ].join('\n'));
+
   if (started && !inactive) {
-    process.stdout.write(`plugin-gate: PASS (${PLUGIN_MARKER})\n`);
+    const markerLine = combined.split(/\r?\n/).find((line) => line.includes(PLUGIN_MARKER)) ?? PLUGIN_MARKER;
+    process.stdout.write(`plugin-gate: PASS (${markerLine.trim()})\n`);
+    process.stdout.write(`plugin-gate: full log ${PLUGIN_LOG}\n`);
     return 0;
   }
 

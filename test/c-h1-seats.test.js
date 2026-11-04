@@ -72,3 +72,35 @@ test('apply 在裸 ctx 上不读 Context 属性也能安装（席位回落进程
   assert.equal(typeof handle.dispose, 'function');
   handle.dispose();
 });
+
+test('adapter：函数形 logger 把日志镜像到 stderr，发布门才看得到 marker', () => {
+  const lines = [];
+  const original = process.stderr.write;
+  process.stderr.write = (chunk) => {
+    lines.push(String(chunk));
+    return true;
+  };
+  try {
+    // headless 宿主：logger 是函数对象，info() 调用成功但没有可见 sink。
+    const headlessLogger = Object.assign(() => {}, {
+      debug() {},
+      info() {},
+      warn() {},
+      error() {},
+    });
+    const adapter = createAdapter({ logger: headlessLogger, get: () => undefined });
+    assert.equal(adapter.log('info', '[dsh-companion] scheduler started', { jobs: 6 }), true);
+    const mirrored = lines.join('');
+    assert.ok(mirrored.includes('[dsh-companion] scheduler started'), 'marker 必须写到 stderr');
+    assert.ok(mirrored.includes('{"jobs":6}'), 'meta 一并镜像，便于真机排查');
+
+    lines.length = 0;
+    // 桌面宿主：logger 是普通对象，照旧只写宿主 sink，不污染 stderr。
+    const desktopLogger = { debug() {}, info() {}, warn() {}, error() {} };
+    const desktop = createAdapter({ logger: desktopLogger, get: () => undefined });
+    desktop.log('info', 'desktop only');
+    assert.deepEqual(lines, []);
+  } finally {
+    process.stderr.write = original;
+  }
+});

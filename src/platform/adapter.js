@@ -116,6 +116,12 @@ export function createAdapter(ctx, opts = {}) {
   /** Context 自有属性（不在 inject 约束内）；cordis 根上下文一定持有 logger。 */
   const logger = ctx.logger;
 
+  // headless 宿主的 logger 是带 exporters 的函数（`ctx.get('logger')` 为 undefined），
+  // 调用 `info()` 既不抛错也没有可见 sink（C-H1 真机实测：启动日志被吞）。
+  // 这类宿主上把日志镜像到 stderr，发布门（scripts/probe/run-headless.mjs --plugin）
+  // 才有可断言的通道；桌面宿主的 logger 是普通对象，不会走这条镜像。
+  const mirrorToStderr = typeof logger === 'function' && typeof process.stderr?.write === 'function';
+
   /**
    * 时钟：优先 opts.now（apply 传入的席位），其次宿主 `ctx.get('now')`，
    * 最后回落 Date.now()。绝不直接读 `ctx.now`：cordis 4 里它是未声明 service，
@@ -216,10 +222,19 @@ export function createAdapter(ctx, opts = {}) {
       throw new TypeError(`log(level): unsupported level "${String(level)}"`);
     }
     const sink = logger?.[level];
-    if (typeof sink !== 'function') return false;
-    if (meta === undefined) sink.call(logger, message);
-    else sink.call(logger, message, meta);
-    return true;
+    const wrote = typeof sink === 'function';
+    if (wrote) {
+      if (meta === undefined) sink.call(logger, message);
+      else sink.call(logger, message, meta);
+    }
+    if (mirrorToStderr) {
+      try {
+        process.stderr.write(`${message}${meta === undefined ? '' : ` ${JSON.stringify(meta)}`}\n`);
+      } catch {
+        // stderr 不可写时忽略：日志不能反过来影响插件运行。
+      }
+    }
+    return wrote;
   }
 
   /**
