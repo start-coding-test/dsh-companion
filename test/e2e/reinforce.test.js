@@ -101,6 +101,9 @@ test('apply：注入 → assistant 复述 → 下一轮强化 α=2，recall_coun
   const before = temp.store.getFact(seeded.factId);
   assert.equal(before.recall_count, 0);
   assert.equal(before.strength_days, 14);
+  assert.equal(before.first_reneed_at, Math.floor(TEST_NOW / 1000));
+  assert.equal(before.first_reneed_tier, 'clear', 'full 档命中记 clear');
+  assert.equal(before.reneed_kind, 'recall');
 
   // 一天后：assistant 复述了 fact，用户只回了「谢谢」（无确认词）→ α=2。
   ctx.advance(DAY_MS);
@@ -124,6 +127,9 @@ test('apply：注入 → assistant 复述 → 下一轮强化 α=2，recall_coun
   assert.ok(after.strength_days > before.strength_days, '强度应上升');
   assert.ok(Math.abs(after.strength_days - expected) < 1e-6, 'S′ 应匹配 α=2 公式');
   assert.equal(after.last_reinforced_at, Math.floor(ctx.now() / 1000));
+  assert.equal(after.first_reneed_at, before.first_reneed_at, '二次注入不覆盖首次样本');
+  assert.equal(after.first_reneed_tier, 'clear');
+  assert.equal(after.reneed_kind, 'recall');
 
   const events = reinforcementEvents(temp.store, seeded.factId);
   assert.equal(events.length, 1, '应写一条 REINFORCE 审计');
@@ -147,6 +153,11 @@ test('apply：注入 → assistant 复述 → 下一轮强化 α=2，recall_coun
   );
   assert.equal(temp.store.getFact(seeded.factId).recall_count, 1, '每轮最多强化一次');
   assert.equal(reinforcementEvents(temp.store, seeded.factId).length, 1);
+  assert.equal(
+    temp.store.getFact(seeded.factId).first_reneed_at,
+    Math.floor(TEST_NOW / 1000),
+    '同 turn 后续 step 不覆盖首次样本',
+  );
 });
 
 test('apply：用户确认词 + assistant 复述 → α=4', async (t) => {
@@ -264,5 +275,33 @@ test('apply：含「对」的子串（对比一下）不算确认语 → α=2（
   const events = reinforcementEvents(temp.store, seeded.factId);
   assert.equal(events.length, 1);
   assert.equal(events[0].detail.alpha, 2);
+});
+
+test('apply：gist 档召回记 ambiguous（R 0.2–0.5）', async (t) => {
+  const temp = makeTempStore();
+  const seeded = seedMemory(temp.store, { now: TEST_NOW, statement: FACT_STATEMENT });
+  const ctx = makeApplyCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14 });
+  t.after(() => {
+    handle.dispose();
+    temp.cleanup();
+  });
+
+  // R = exp(-1.2) ≈ 0.30，落在 gist 档（0.2 ≤ R < 0.5）。
+  const at = Math.floor(TEST_NOW / 1000);
+  temp.store.db
+    .prepare('UPDATE facts SET strength_days = 1, last_reinforced_at = ? WHERE id = ?')
+    .run(at - Math.round(1.2 * 86_400), seeded.factId);
+
+  await ctx.dispatch(
+    'agent/pre-step',
+    turnPayload(1, messages(['user', '青柠计划的代号是什么？'])),
+    { kind: 'enter', messages: [] },
+  );
+
+  const row = temp.store.getFact(seeded.factId);
+  assert.equal(row.first_reneed_at, at);
+  assert.equal(row.first_reneed_tier, 'ambiguous', 'gist 档命中记 ambiguous');
+  assert.equal(row.reneed_kind, 'recall');
 });
 

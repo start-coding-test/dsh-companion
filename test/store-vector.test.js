@@ -222,8 +222,8 @@ test('W4：searchVector 只召回 embedder_id 匹配的投影', async () => {
   });
 });
 
-test('migrate：v4 库升级到 v6，只建 fact_vectors 并保留既有事实', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'dsh-store-v6-'));
+test('migrate：v4 库升级到 v7，补建 fact_vectors 并保留既有事实', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-store-v7-'));
   const path = join(dir, 'companion.db');
   try {
     const first = Store.open(path);
@@ -232,7 +232,7 @@ test('migrate：v4 库升级到 v6，只建 fact_vectors 并保留既有事实',
     first.close();
 
     const second = Store.open(path);
-    assert.equal(second.getMeta('schema_version'), '6');
+    assert.equal(second.getMeta('schema_version'), '7');
     assert.ok(second.getFact(fact.id));
     const table = second.db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fact_vectors'")
@@ -244,7 +244,7 @@ test('migrate：v4 库升级到 v6，只建 fact_vectors 并保留既有事实',
   }
 });
 
-test('migrate：v5 库补 embedder_id 并把旧行回填为 hash:<dim>', () => {
+test('migrate：v5 库补 embedder_id、升级到 v7 并把旧行回填为 hash:<dim>', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-store-v5-'));
   const path = join(dir, 'companion.db');
   try {
@@ -257,7 +257,7 @@ test('migrate：v5 库补 embedder_id 并把旧行回填为 hash:<dim>', () => {
 
     const second = Store.open(path);
     try {
-      assert.equal(second.getMeta('schema_version'), '6');
+      assert.equal(second.getMeta('schema_version'), '7');
       const columns = second.db
         .prepare("PRAGMA table_info('fact_vectors')")
         .all()

@@ -52,7 +52,7 @@
 - **伪造时钟只验证公式**：注入 `now` 可验证 `t=S→R≈0.37`、`R=0.2→t≈1.61S`、`R=0.5→t≈0.69S` 以及四档边界；它不产生「什么时候被需要」——那是用户行为，只能等真实日志。
 - 只用窗口内已观测的再需要样本算 P90，会因右删失偏低；叠加单用户、单场景、两周，结论只定方向，定值要更长窗口。
 
-## 5. 埋点字段（t7 落地：schema v6 → v7）
+## 5. 埋点字段（schema v7 已落地）
 
 `facts` 增三列，均 nullable；旧行迁移后为 `NULL`（历史样本只能当删失，不回填）：
 
@@ -80,7 +80,7 @@
 
 1. **上埋点**：升级 schema v7，确认旧行三列为 `NULL`；手工造一次召回，验证只写一次、二次不覆盖。
 2. **计时**：记下 `:from`（上线后第一条新事实的时间），跑满 14 天；冻结 S0/α/prompt/模型，期间不做手工记忆编辑；异常事件（出差、冲刺）记备注。
-3. **导出**：用下面 SQL（表名/列名以现有 schema 为准；`:from/:to/:scope` 由脚本注入）；同时 `VACUUM INTO` 备份一份 DB，保证分位数可复算。
+3. **导出**：用下面 SQL（schema v7；`:from/:to/:scope` 由脚本注入）；同时 `VACUUM INTO` 备份一份 DB，保证分位数可复算。
 
 ```sql
 -- 首次再需要样本：未强化、非 pinned；Δt 从写入起算
@@ -94,7 +94,7 @@ WITH s AS (
     AND f.first_reneed_at <= :to
     AND f.recall_count = 0          -- 只在强化时 +1（store.reinforceFact）
     AND f.salience <> 'pinned'
-    AND f.source_kind <> 'inferred' -- 当前无写入；见 §5
+    AND f.source_kind <> 'inferred' -- 当前巩固路径不写此值；历史遗留若有则排除，见 §5
 )
 SELECT * FROM s ORDER BY salience, dt_days;
 ```

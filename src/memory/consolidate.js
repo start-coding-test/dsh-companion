@@ -16,6 +16,7 @@
  * 本模块只做编排，不直接持有连接、不改 store.js。
  */
 
+import { decayOf } from './reinforce.js';
 import { renderBoard, stageBoard } from './state-board.js';
 
 /** 硬阈值：活跃 turn 中到 40k token 也必须巩固（安全阀）。 */
@@ -352,6 +353,30 @@ function factKey(fact) {
 }
 
 /**
+ * 去重命中的旧行是否已「沉睡/遗忘/墓碑」：这类命中说明事实在需要时已经
+ * 掉出可召回档，按 W5「漏·去重」记 first_reneed。active 但 R<0.2 也算
+ * （遗忘降级按日跑，可能滞后；口径与 retrieve 的 index 档一致）。
+ *
+ * @param {object} row
+ * @param {number} at Unix 秒
+ * @returns {boolean}
+ */
+function isReneedMissRow(row, at) {
+  if (row.deleted_at !== null && row.deleted_at !== undefined) return true;
+  if (row.status === 'tombstoned' || row.status === 'dormant') return true;
+  if (row.status !== 'active' || row.salience === 'pinned') return false;
+  const strengthDays = Number(row.strength_days);
+  const lastReinforcedAt = Number(row.last_reinforced_at);
+  if (!Number.isFinite(strengthDays) || strengthDays <= 0) return false;
+  if (!Number.isFinite(lastReinforcedAt)) return false;
+  return decayOf({
+    strengthDays,
+    lastReinforcedAt,
+    now: at,
+  }) < 0.2;
+}
+
+/**
  * 允许的选区文本：非空字符串才采用；空串/纯空白视为「没有选区文本」。
  * 非字符串（且非 null/undefined）直接报编程错误，避免把对象拼进提示词。
  * @param {unknown} value
@@ -518,20 +543,43 @@ export async function consolidate(input = {}) {
     });
 
     // facts：key+value 完全相同的跳过（MVP 的「cos 去重」简化）。
-    // 分页读取全量事实，避免 limit=500 截断后重复写入（L1）。
-    const seen = new Set();
+    // 分页读取全量事实（含墓碑），避免 limit=500 截断后重复写入（L1）。
+    // W5：命中已沉睡/遗忘/墓碑的旧行时，在同一事务写「漏·去重」埋点；
+    // 不插入草稿、不复活旧行。
+    const byKey = new Map();
     for (let offset = 0; ; offset += FACT_PAGE_SIZE) {
-      const page = store.listFacts({ scope, limit: FACT_PAGE_SIZE, offset });
+      const page = store.listFacts({
+        scope,
+        limit: FACT_PAGE_SIZE,
+        offset,
+        includeDeleted: true,
+      });
       for (const row of page) {
-        seen.add(factKey({ subject_text: row.subject_text, predicate: row.predicate, object_text: row.object_text }));
+        const key = factKey(row);
+        const entry = byKey.get(key) ?? { active: null, miss: null };
+        if (isReneedMissRow(row, at)) {
+          entry.miss ??= row;
+        } else if (
+          row.status === 'active'
+          && (row.deleted_at === null || row.deleted_at === undefined)
+        ) {
+          entry.active ??= row;
+        }
+        byKey.set(key, entry);
       }
       if (page.length < FACT_PAGE_SIZE) break;
     }
     let insertedFacts = 0;
     for (const fact of facts) {
       const key = factKey(fact);
-      if (seen.has(key)) continue;
-      seen.add(key);
+      const existing = byKey.get(key);
+      if (existing) {
+        if (existing.active === null && existing.miss !== null) {
+          store.markFirstReneed?.(existing.miss.id, { at, tier: 'miss', kind: 'dedupe' });
+        }
+        continue;
+      }
+      byKey.set(key, { active: null, miss: null });
       store.insertFact({
         scope,
         kind: fact.kind,

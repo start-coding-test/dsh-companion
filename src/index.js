@@ -1837,31 +1837,49 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
 
   const injection = extractRecallBlock(assembled?.messages);
   if (injection === '') return null;
-  recordRecalledFacts(state, recalled, assembled, scope);
+  recordRecalledFacts(state, recalled, assembled, scope, platform.now());
   return { inject: [{ type: 'text', text: injection }] };
 }
 
 /**
  * 记录本轮真正进入注入块的 fact id（预算裁切丢掉的召回不算），
  * 以及注入时刻的 assistant 快照，供下一轮「用上」判定。
+ * 同时把 full/gist 档的首次再需要写进 facts.first_reneed_*（W5）；写失败
+ * 只告警，不影响本轮召回注入。
  * @param {object} state
  * @param {{items: object[]}} recalled
  * @param {object} assembled
  * @param {string} [scope] 本轮注入所属的会话作用域
+ * @param {number} [at] 注入时刻（毫秒），与 platform.now() 同口径
  */
-function recordRecalledFacts(state, recalled, assembled, scope = SCOPE) {
+function recordRecalledFacts(state, recalled, assembled, scope = SCOPE, at = Date.now()) {
   const dropped = Array.isArray(assembled?.dropped?.recall) ? assembled.dropped.recall : [];
   const droppedIds = new Set(
     dropped
       .map((item) => (item !== null && typeof item === 'object' ? item.id : null))
       .filter((id) => typeof id === 'string'),
   );
+  const atSeconds = Math.floor(Number(at) / 1000);
   const ids = [];
   for (const item of recalled.items) {
     if (item === null || typeof item !== 'object') continue;
     if (item.kind !== 'fact' || typeof item.id !== 'string') continue;
     if (droppedIds.has(item.id)) continue;
-    if (!ids.includes(item.id)) ids.push(item.id);
+    if (ids.includes(item.id)) continue;
+    ids.push(item.id);
+    if (item.fidelity !== 'full' && item.fidelity !== 'gist') continue;
+    try {
+      state.store?.markFirstReneed?.(item.id, {
+        at: atSeconds,
+        tier: item.fidelity === 'full' ? 'clear' : 'ambiguous',
+        kind: 'recall',
+      });
+    } catch (error) {
+      state.platform?.log?.('warn', '[dsh-companion] mark first reneed failed', {
+        id: item.id,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
   }
   state.lastRecalledIds = ids;
   state.lastRecallScope = scope;
@@ -3103,6 +3121,8 @@ export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date
         status: 'active',
       });
       newId = inserted.id;
+      // W5：用户纠正旧事实即「漏·纠正」；已有首次样本时不覆盖。
+      store.markFirstReneed?.(id, { at: atSeconds, tier: 'miss', kind: 'correction' });
       store.updateFact(id, { status: 'superseded', superseded_by: newId });
       deleteFactFtsRow(store, id);
       if (markSensitive) {

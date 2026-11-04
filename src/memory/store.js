@@ -41,8 +41,10 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  * v5：新增 fact_vectors（P2-b 可选向量召回），只建表、不动既有数据。
  * v6：fact_vectors 增加 embedder_id（W4 可插拔 embedding），旧行回填
  *     `hash:<dim>`，避免换模型后新旧向量混用。
+ * v7：facts 增加 first_reneed_at/first_reneed_tier/reneed_kind（W5 S0 标定
+ *     首次再需要埋点），旧行保持 NULL 作为删失样本。
  */
-const SCHEMA_VERSION = '6';
+const SCHEMA_VERSION = '7';
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
 
@@ -56,6 +58,10 @@ export const SALIENCE_STRENGTH_DAYS = Object.freeze({
 });
 
 const SALIENCE_VALUES = new Set(Object.keys(SALIENCE_STRENGTH_DAYS));
+
+/** W5 首次再需要的档位与来源（store.markFirstReneed 校验用）。 */
+const RENEED_TIERS = new Set(['clear', 'ambiguous', 'miss']);
+const RENEED_KINDS = new Set(['recall', 'dedupe', 'correction']);
 
 const EVENT_ACTIONS = new Set([
   'ADD', 'UPDATE', 'SUPERSEDE', 'MERGE', 'NOOP', 'SKIP',
@@ -216,6 +222,9 @@ CREATE TABLE IF NOT EXISTS facts (
   purge_payload       TEXT,
   created_at          INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at          INTEGER NOT NULL DEFAULT (unixepoch()),
+  first_reneed_at     INTEGER,
+  first_reneed_tier   TEXT,
+  reneed_kind         TEXT,
   CONSTRAINT ck_fact_pin_decay CHECK ((salience = 'pinned' AND strength_days IS NULL)
                                    OR (salience <> 'pinned' AND strength_days IS NOT NULL))
 );
@@ -717,10 +726,13 @@ export class Store {
       .get();
     const from = row ? String(row.value) : 'missing';
     if (from !== SCHEMA_VERSION) this.#migrateFrom(from);
-    // v6 的 embedder 索引放在迁移之后建：v5 旧表此时才补上 embedder_id 列。
-    this.#db.exec(
-      'CREATE INDEX IF NOT EXISTS ix_fact_vectors_embedder ON fact_vectors(embedder_id)',
-    );
+    // v6/v7 的列与索引放在迁移之后处理：旧表此时才补上 embedder_id 与
+    // first_reneed_* 列。ALTER 按列检测，重复调用安全。
+    this.#ensureFactsReneedColumns();
+    this.#db.exec(`
+      CREATE INDEX IF NOT EXISTS ix_fact_vectors_embedder ON fact_vectors(embedder_id);
+      CREATE INDEX IF NOT EXISTS ix_facts_reneed ON facts(scope, first_reneed_at);
+    `);
     this.#ensureScopeRow('main');
   }
 
@@ -753,7 +765,29 @@ export class Store {
   }
 
   /**
-   * 升级旧库；支持 v3 → v4 → v5 → v6。
+   * 给旧 facts 表补 W5 的三列（nullable）。逐列检测，兼容任意旧版本。
+   * 三列都只是新增，不重建表、不动既有行；旧行保持 NULL。
+   */
+  #ensureFactsReneedColumns() {
+    const columns = new Set(
+      this.#db
+        .prepare("PRAGMA table_info('facts')")
+        .all()
+        .map((column) => column.name),
+    );
+    if (!columns.has('first_reneed_at')) {
+      this.#db.exec('ALTER TABLE facts ADD COLUMN first_reneed_at INTEGER');
+    }
+    if (!columns.has('first_reneed_tier')) {
+      this.#db.exec('ALTER TABLE facts ADD COLUMN first_reneed_tier TEXT');
+    }
+    if (!columns.has('reneed_kind')) {
+      this.#db.exec('ALTER TABLE facts ADD COLUMN reneed_kind TEXT');
+    }
+  }
+
+  /**
+   * 升级旧库；支持 v3 → v4 → v5 → v6 → v7。
    *
    * v3 的 `consolidations.upto_seq` 是插件自增 turn 计数，与平台 surface seq
    * 不可比（H1）。开发期尚无用户数据，直接清空巩固行（facts/episodes 保留），
@@ -764,9 +798,17 @@ export class Store {
    *
    * v5 → v6 给 fact_vectors 补 embedder_id：v5 旧行都是 hashEmbed 产物，
    * 回填为 `hash:<dim>`；其余新旧不匹配行留空，由空闲回填重建。
+   *
+   * v6 → v7 只推进版本号；first_reneed_* 三列由 migrate() 统一补，旧行 NULL。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
+    if (from === '6') {
+      this.#db
+        .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
+        .run(SCHEMA_VERSION);
+      return;
+    }
     if (from === '5') {
       this.#db.exec('BEGIN IMMEDIATE');
       try {
@@ -1178,6 +1220,37 @@ export class Store {
   }
 
   // --------------------------------------------------------------- facts
+
+  /**
+   * 记录一条事实的「首次再需要」（W5 S0 标定）。幂等：只有
+   * first_reneed_at 为 NULL 时才写，后到的 recall/correction 不覆盖首次样本。
+   *
+   * @param {string} id
+   * @param {{at?: number|Date, tier: 'clear'|'ambiguous'|'miss',
+   *          kind: 'recall'|'dedupe'|'correction'}} options
+   * @returns {boolean} 是否本次写入（false = 已有首次样本或行不存在）
+   */
+  markFirstReneed(id, options = {}) {
+    const factId = requireString(id, 'first_reneed.id');
+    const tier = requireString(options.tier, 'first_reneed.tier');
+    if (!RENEED_TIERS.has(tier)) {
+      throw new TypeError(`[store] invalid first_reneed.tier: ${String(tier)}`);
+    }
+    const kind = requireString(options.kind, 'first_reneed.kind');
+    if (!RENEED_KINDS.has(kind)) {
+      throw new TypeError(`[store] invalid first_reneed.kind: ${String(kind)}`);
+    }
+    const at = epochOr(options.at, nowSeconds());
+    const info = this.#db
+      .prepare(
+        `UPDATE facts
+            SET first_reneed_at = ?, first_reneed_tier = ?, reneed_kind = ?,
+                updated_at = unixepoch()
+          WHERE id = ? AND first_reneed_at IS NULL`,
+      )
+      .run(at, tier, kind, factId);
+    return Number(info.changes) > 0;
+  }
 
   /**
    * 写入一条事实并同步 FTS。
