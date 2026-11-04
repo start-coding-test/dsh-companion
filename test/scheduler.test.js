@@ -343,7 +343,7 @@ function setupProactive(t, { cap = 3, target } = {}) {
   return { store, platform, clockState, gate, targetState };
 }
 
-test('安静时段 23:00–08:00 不发送，08:00 后把相邻消息合并成一条', async (t) => {
+test('安静时段 23:00–08:00 不发送，08:00 后各自补发（提醒不合并）', async (t) => {
   const { gate, platform } = setupProactive(t);
   gate.enqueue({ kind: 'reminder', text: '该喝水了', at: local(15, 23, 30) });
   const quiet = await gate.flush(local(15, 23, 30));
@@ -356,12 +356,14 @@ test('安静时段 23:00–08:00 不发送，08:00 后把相邻消息合并成�
 
   const morning = await gate.flush(local(16, 8, 0));
   assert.equal(morning.quiet, false);
-  assert.equal(morning.sent, 1);
-  assert.equal(morning.merged, 1);
-  assert.equal(platform.calls.length, 1);
+  // V4-H1：提醒不参与合并，两条各自独立投递，不得拼成一条。
+  assert.equal(morning.sent, 2);
+  assert.equal(morning.merged, 0);
+  assert.equal(platform.calls.length, 2);
   assert.equal(platform.calls[0].sessionId, 'main');
   assert.match(platform.calls[0].text, /该喝水了/);
-  assert.match(platform.calls[0].text, /早点休息/);
+  assert.doesNotMatch(platform.calls[0].text, /早点休息/);
+  assert.match(platform.calls[1].text, /早点休息/);
 });
 
 test('每日硬上限 3 条：超出部分保留 backlog，次日再发', async (t) => {
@@ -431,20 +433,36 @@ test('dedupeKey 120 分钟内不重发，超过后放行', async (t) => {
   assert.equal(platform.calls.length, 2);
 });
 
-test('10 分钟合并窗口：同类相邻消息合并，仍只占 1 条预算', async (t) => {
+test('10 分钟合并窗口：同类相邻消息合并，仍只占 1 条预算（提醒不合并）', async (t) => {
   const { gate, platform } = setupProactive(t, { cap: 10 });
-  gate.enqueue({ kind: 'reminder', text: 'A', at: local(15, 10, 0) });
-  gate.enqueue({ kind: 'reminder', text: 'B', at: local(15, 10, 5) });
-  gate.enqueue({ kind: 'reminder', text: 'C', at: local(15, 10, 20) });
+  gate.enqueue({ kind: 'task_report', text: 'A', at: local(15, 10, 0) });
+  gate.enqueue({ kind: 'task_report', text: 'B', at: local(15, 10, 5) });
+  gate.enqueue({ kind: 'task_report', text: 'C', at: local(15, 10, 20) });
 
   const report = await gate.flush(local(15, 10, 30));
-  assert.equal(report.sent, 2);
+  assert.equal(report.sent, 1);
   assert.equal(report.merged, 1);
-  assert.equal(platform.calls.length, 2);
+  assert.equal(platform.calls.length, 1);
   assert.match(platform.calls[0].text, /A/);
   assert.match(platform.calls[0].text, /B/);
   assert.doesNotMatch(platform.calls[0].text, /C/);
-  assert.match(platform.calls[1].text, /C/);
+  // task_report 单类上限 1：A+B 合并占唯一名额，窗口外的 C 本轮被压掉。
+  assert.equal(report.suppressed, 1);
+});
+
+test('enqueue 同一 dedupeKey 只保留一份（V4-H1）', async (t) => {
+  const { gate, platform } = setupProactive(t, { cap: 10 });
+  const first = gate.enqueue({ kind: 'reminder', text: '提醒：X', dedupeKey: 'reminder:1', at: local(15, 10, 0) });
+  assert.equal(first.duplicate, false);
+  const second = gate.enqueue({ kind: 'reminder', text: '提醒：X', dedupeKey: 'reminder:1', at: local(15, 10, 30) });
+  assert.equal(second.duplicate, true);
+  assert.equal(second.queued, 1);
+  assert.equal(gate.stats(local(15, 10, 30)).backlog, 1);
+
+  const report = await gate.flush(local(15, 10, 30));
+  assert.equal(report.sent, 1);
+  assert.equal(platform.calls.length, 1);
+  assert.equal(platform.calls[0].text, '提醒：X');
 });
 
 test('backlog 超过 5 条丢弃最旧', async (t) => {
@@ -457,8 +475,8 @@ test('backlog 超过 5 条丢弃最旧', async (t) => {
   assert.equal(stats.dropped, 2);
 
   await gate.flush(local(15, 10, 0));
-  assert.equal(platform.calls.length, 1); // chat 单类上限 1
-  assert.equal(platform.calls[0].text, 'm3'); // m1/m2 已被丢弃
+  assert.equal(platform.calls.length, 1); // chat 相邻消息合并后只占 1 条上限
+  assert.equal(platform.calls[0].text, 'm3\n\nm4\n\nm5\n\nm6\n\nm7'); // m1/m2 已被丢弃
 });
 
 test('没有 main 会话：投递失败保留积压，恢复后补发', async (t) => {
@@ -575,14 +593,14 @@ test('合并消息保留全部钩子（每条都在合并后的投递里回调�
   const { gate, platform } = setupProactive(t, { cap: 10 });
   const calls = [];
   gate.enqueue({
-    kind: 'reminder',
+    kind: 'task_report',
     text: 'A',
     at: local(15, 10, 0),
     onAttempt: () => { calls.push('A:attempt'); return true; },
     onSent: () => { calls.push('A:sent'); },
   });
   gate.enqueue({
-    kind: 'reminder',
+    kind: 'task_report',
     text: 'B',
     at: local(15, 10, 3),
     onAttempt: () => { calls.push('B:attempt'); return true; },
@@ -593,6 +611,33 @@ test('合并消息保留全部钩子（每条都在合并后的投递里回调�
   assert.equal(report.sent, 1);
   assert.equal(platform.calls.length, 1);
   assert.deepEqual(calls, ['A:attempt', 'B:attempt', 'A:sent', 'B:sent']);
+});
+
+test('合并条中被取消的一份不拖累其余（onAttempt false 只剔除该份并回调 onFailed）', async (t) => {
+  const { gate, platform } = setupProactive(t, { cap: 10 });
+  const calls = [];
+  gate.enqueue({
+    kind: 'task_report',
+    text: '保留',
+    at: local(15, 10, 0),
+    onAttempt: () => { calls.push('keep:attempt'); return true; },
+    onSent: () => { calls.push('keep:sent'); },
+  });
+  gate.enqueue({
+    kind: 'task_report',
+    text: '取消',
+    at: local(15, 10, 3),
+    onAttempt: () => { calls.push('drop:attempt'); return false; },
+    onFailed: () => { calls.push('drop:failed'); },
+  });
+  const report = await gate.flush(local(15, 10, 10));
+  assert.equal(report.merged, 1);
+  assert.equal(report.sent, 1);
+  assert.equal(report.suppressed, 1);
+  assert.equal(platform.calls.length, 1);
+  assert.match(platform.calls[0].text, /保留/);
+  assert.doesNotMatch(platform.calls[0].text, /取消/);
+  assert.deepEqual(calls, ['keep:attempt', 'drop:attempt', 'drop:failed', 'keep:sent']);
 });
 
 test('backlog 溢出丢弃最旧消息时回调它的 onFailed（避免停在占位态）', (t) => {

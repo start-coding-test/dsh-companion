@@ -343,3 +343,169 @@ test('v9 → v10 迁移：reminders 支持 delivering 与 delivery_attempts，�
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// --------------------------------------------------- V4-H1：队列去重 / 退避 / 合并
+
+test('V4-H1：prompt 首次抛错后下一次 tick 只送达一条，文本不重复', async () => {
+  const temp = makeTempStore();
+  temp.store.setMeta('main_session_id', 'main-1');
+  const ctx = makeCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath });
+  try {
+    const reminder = dueReminder(temp.store, '交房租');
+    ctx.fail('sessionController.prompt');
+    await firstTick(ctx);
+
+    const failed = temp.store.getReminder(reminder.id);
+    assert.equal(failed.status, 'pending');
+    assert.equal(failed.delivery_attempts, 1);
+    // 失败退避：30s 后才允许下一次重试。
+    assert.equal(failed.next_fire_at, toEpochSeconds(TEST_NOW + 60_000) + 30);
+
+    ctx.failures.delete('sessionController.prompt');
+    ctx.advance(30_000);
+    await ctx.fireTimers();
+    await settle(50);
+
+    // FakeCtx 会保留失败那次调用记录，所以共 2 次；第二次必须是单条、正文只出现一次标题。
+    const texts = promptTexts(ctx).filter((text) => text.includes('交房租'));
+    assert.equal(texts.length, 2);
+    assert.equal(texts[1], '提醒：交房租');
+    assert.equal((texts[1].match(/交房租/gu) ?? []).length, 1);
+
+    const delivered = temp.store.getReminder(reminder.id);
+    assert.equal(delivered.status, 'fired');
+    assert.equal(delivered.delivery_attempts, 2);
+    assert.equal(
+      temp.store.db.prepare("SELECT COUNT(*) AS n FROM reminders WHERE status = 'delivering'").get().n,
+      0,
+      '不得残留已 claim 未投递的行',
+    );
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});
+
+test('V4-H1：安静时段跨夜后早上只发一条（同一提醒不重复入队）', async () => {
+  const temp = makeTempStore();
+  temp.store.setMeta('main_session_id', 'main-1');
+  const ctx = makeCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath, quietStart: '17:01', quietEnd: '17:10' });
+  try {
+    const reminder = dueReminder(temp.store, '早点休息');
+    await firstTick(ctx); // 17:01 起处于安静时段：入队但不投递
+    assert.equal(promptTexts(ctx).length, 0);
+
+    // 安静时段内继续 tick：dedupeKey 稳定为 reminder:<id>，不得堆出副本。
+    ctx.advance(30_000);
+    await ctx.fireTimers();
+    await settle(50);
+    ctx.advance(30_000);
+    await ctx.fireTimers();
+    await settle(50);
+    assert.equal(promptTexts(ctx).length, 0);
+
+    ctx.advance(480_000); // 17:10:00，安静时段结束（end 为开区间）
+    await ctx.fireTimers();
+    await settle(50);
+
+    const texts = promptTexts(ctx);
+    assert.equal(texts.length, 1);
+    assert.match(texts[0], /早点休息/);
+    const row = temp.store.getReminder(reminder.id);
+    assert.equal(row.status, 'fired');
+    assert.equal(row.delivery_attempts, 1);
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});
+
+test('V4-H1：失败退避 30s→60s→120s，3 个 tick 内不会把 attempts 耗尽', async () => {
+  const temp = makeTempStore();
+  temp.store.setMeta('main_session_id', 'main-1');
+  const ctx = makeCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath });
+  try {
+    const reminder = dueReminder(temp.store, '吃药');
+    const t0 = toEpochSeconds(TEST_NOW + 60_000);
+    ctx.fail('sessionController.prompt');
+
+    await firstTick(ctx); // 17:01:00 第一次失败 → 退避 30s
+    let row = temp.store.getReminder(reminder.id);
+    assert.equal(row.status, 'pending');
+    assert.equal(row.delivery_attempts, 1);
+    assert.equal(row.next_fire_at, t0 + 30);
+
+    ctx.advance(30_000); // 17:01:30 第二次失败 → 退避 60s
+    await ctx.fireTimers();
+    await settle(50);
+    row = temp.store.getReminder(reminder.id);
+    assert.equal(row.status, 'pending');
+    assert.equal(row.delivery_attempts, 2);
+    assert.equal(row.next_fire_at, t0 + 30 + 60);
+
+    ctx.advance(30_000); // 17:02:00 退避未到：不得提前重试、不得累加 attempts
+    await ctx.fireTimers();
+    await settle(50);
+    row = temp.store.getReminder(reminder.id);
+    assert.equal(row.status, 'pending');
+    assert.equal(row.delivery_attempts, 2, '退避未到不得消耗 attempts');
+    assert.equal(promptTexts(ctx).filter((text) => text.includes('吃药')).length, 2);
+
+    ctx.advance(30_000); // 17:02:30 第三次失败 → attempts 到上限，置 expired
+    await ctx.fireTimers();
+    await settle(50);
+    row = temp.store.getReminder(reminder.id);
+    assert.equal(row.delivery_attempts, 3);
+    assert.equal(row.status, 'expired');
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});
+
+test('V4-H1：队列中一条提醒被取消时其余照常送达，无 delivering 残留', async () => {
+  const temp = makeTempStore();
+  temp.store.setMeta('main_session_id', 'main-1');
+  const ctx = makeCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath, proactiveDailyCap: 1 });
+  try {
+    const first = dueReminder(temp.store, '交周报');
+    const second = dueReminder(temp.store, '开会');
+    // 让「交周报」严格早于「开会」到点：dueReminders 按 next_fire_at 排序，
+    // 两条同时到点时顺序由随机 UUID 决定，测试会不稳定。
+    const secondDueAt = toEpochSeconds(TEST_NOW) - 30;
+    temp.store.db
+      .prepare('UPDATE reminders SET due_at = ?, next_fire_at = ? WHERE id = ?')
+      .run(secondDueAt, secondDueAt, second.id);
+    await firstTick(ctx); // 日上限 1：只发第一条，第二条留在 backlog
+
+    const sent = promptTexts(ctx).filter((text) => text.includes('交周报') || text.includes('开会'));
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /交周报/);
+    assert.equal(temp.store.getReminder(first.id).status, 'fired');
+    assert.equal(temp.store.getReminder(second.id).status, 'pending');
+
+    // 用户取消第二条（没有 cancel API，直接改库模拟）。
+    temp.store.db
+      .prepare("UPDATE reminders SET status = 'cancelled', closed_at = unixepoch() WHERE id = ?")
+      .run(second.id);
+
+    ctx.advance(30_000);
+    await ctx.fireTimers();
+    await settle(50);
+
+    assert.equal(promptTexts(ctx).filter((text) => text.includes('开会')).length, 0);
+    assert.equal(temp.store.getReminder(second.id).status, 'cancelled');
+    assert.equal(temp.store.getReminder(first.id).status, 'fired');
+    assert.equal(
+      temp.store.db.prepare("SELECT COUNT(*) AS n FROM reminders WHERE status = 'delivering'").get().n,
+      0,
+    );
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});

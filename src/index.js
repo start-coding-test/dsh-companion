@@ -2890,16 +2890,28 @@ function startScheduler(state) {
 }
 
 /**
- * 把到点的提醒转成主动消息（V3-H2 两阶段投递）。
+ * 把到点的提醒转成主动消息（V3-H2 两阶段投递，V4-H1 队列/退避加固）。
  *
  * 这里只入队并挂上状态机钩子，不再提前把行标成 fired：
- *   onAttempt → store.claimReminderDelivery（pending/snoozed → delivering，attempts+1）
+ *   onAttempt → 复核最新行后 claim（pending/snoozed → delivering，attempts+1）
  *   onSent    → store.markReminderDelivered（delivering → fired）
- *   onFailed  → store.markReminderDeliveryFailed（delivering → pending，保留 last_fire_key）
+ *   onFailed  → store.markReminderDeliveryFailed（delivering → pending + 退避）
  * 投递失败/进程崩溃时行仍可重试；启动时 recoverReminderDeliveries 兜底回收。
  *
+ * 队列语义（V4-H1）：
+ * - dedupeKey 稳定为 `reminder:<id>`（不含 tick 秒），配合 proactive.enqueue 的
+ *   同键跳过，安静时段/日上限/退避期间每个 tick 重复入队只会保留一份。
+ * - fireKey 用发生时刻 `next_fire_at`（不是 tick 秒）：同一次到点在多次失败重试中
+ *   保持同一个 fireKey，claimReminderDelivery 只在 fireKey 变化时才累加 attempts。
+ * - onAttempt 返回 false 表示本轮不投递：行已不是 pending/snoozed、已删除，或
+ *   next_fire_at 被推后到未来（失败退避 30s→60s→120s 尚未到期）。proactive 会对
+ *   该份回调 onFailed，若已 claim 成功则释放回 pending，不会留下 delivering 残留。
+ * - onFailed 由 store.markReminderDeliveryFailed 按 attempts 写入退避后的
+ *   next_fire_at；attempts 达上限（3）才置 expired，因此连续 3 个 30s tick 不会
+ *   直接把提醒耗成 expired（30s/60s/120s 退避下第 3 次重试最早在约 3.5 分钟后）。
+ *
  * @param {object} state
- * @returns {number} 本次入队条数
+ * @returns {number} 本次入队条数（因同 id 已排队而跳过的不计）
  */
 function fireDueReminders(state) {
   const { store, platform, proactive } = state;
@@ -2921,17 +2933,28 @@ function fireDueReminders(state) {
       });
       continue;
     }
-    const fireKey = String(seconds);
-    proactive?.enqueue({
+    const result = proactive?.enqueue({
       kind: 'reminder',
       text: `提醒：${row.title}`,
-      dedupeKey: `reminder:${row.id}:${seconds}`,
+      dedupeKey: `reminder:${row.id}`,
       at: now,
-      onAttempt: () => store.claimReminderDelivery(row.id, fireKey, REMINDER_MAX_DELIVERY_ATTEMPTS),
+      onAttempt: () => {
+        const fresh = store.getReminder(row.id);
+        if (fresh === null || fresh === undefined) return false;
+        if (fresh.status !== 'pending' && fresh.status !== 'snoozed') return false;
+        if (Number(fresh.next_fire_at) > Math.floor(platform.now() / 1000)) return false;
+        return store.claimReminderDelivery(
+          fresh.id,
+          String(fresh.next_fire_at),
+          REMINDER_MAX_DELIVERY_ATTEMPTS,
+        );
+      },
       onSent: () => store.markReminderDelivered(row.id),
-      onFailed: () => store.markReminderDeliveryFailed(row.id),
+      onFailed: () => store.markReminderDeliveryFailed(row.id, {
+        now: Math.floor(platform.now() / 1000),
+      }),
     });
-    queued += 1;
+    if (result?.duplicate !== true) queued += 1;
   }
   return queued;
 }

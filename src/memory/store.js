@@ -62,6 +62,16 @@ const DEFAULT_PURGE_DAYS = 7;
 /** 提醒两阶段投递的最大尝试次数（超过后过期，避免死循环重试）。 */
 export const REMINDER_MAX_DELIVERY_ATTEMPTS = 3;
 
+/**
+ * 提醒投递失败后的重试退避（秒）。
+ *
+ * 第 n 次失败（`delivery_attempts = n`）按下标 `n - 1` 取值：30s → 60s → 120s，
+ * 超出数组长度后沿用最后一档。退避直接写入 `next_fire_at`：失败一次就往后推，
+ * 而不是让调度器每个 tick（30s）立刻重试——否则约 3 个 tick 就可能把
+ * `delivery_attempts` 耗尽并把提醒置 `expired`（v0.4.4 评审 V4-H1）。
+ */
+export const REMINDER_RETRY_BACKOFF_SECONDS = Object.freeze([30, 60, 120]);
+
 /** S0 默认遗忘强度（天）；pinned = null 表示不衰减。 */
 export const SALIENCE_STRENGTH_DAYS = Object.freeze({
   trivial: 3,
@@ -1823,18 +1833,52 @@ export class Store {
   }
 
   /**
-   * 两阶段投递第二步（失败）：delivering → pending，保留 last_fire_key 供重试。
+   * 两阶段投递第二步（失败）：delivering → pending，并写入退避后的 `next_fire_at`。
+   *
+   * - 保留 `last_fire_key`：同一 occurrence 的重复 claim 不重复计数；
+   * - 按 `delivery_attempts` 取退避 30s → 60s → 120s（见
+   *   `REMINDER_RETRY_BACKOFF_SECONDS`），避免失败后每个 tick（30s）立刻重试、
+   *   约 3 个 tick 就把 attempts 耗尽置 `expired`；
+   * - attempts 已达上限：直接置 `expired`，不再无限重试。
+   *
+   * 只对 `delivering` 行生效；对尚未 claim 的 `pending` 行是空操作（返回 false），
+   * 因此调用方可以对「本轮没轮到投递」的条目无脑回调 onFailed 而不会改动它们。
+   * 读-改-写之间用 `delivery_attempts = ?` 做乐观校验，避免覆盖并发改动。
+   *
    * @param {string} id
-   * @returns {boolean}
+   * @param {{now?: number|Date}} [options] now 为退避起点的 Unix 秒（缺省当前时间）
+   * @returns {boolean} 是否真的释放（或置过期）了一行
    */
-  markReminderDeliveryFailed(id) {
+  markReminderDeliveryFailed(id, options = {}) {
+    const reminderId = requireString(id, 'reminders.id');
+    const row = this.getReminder(reminderId);
+    if (row === null || row.status !== 'delivering') return false;
+    const attempts = Number(row.delivery_attempts ?? 0);
+    if (attempts >= REMINDER_MAX_DELIVERY_ATTEMPTS) {
+      const expired = this.#db
+        .prepare(
+          `UPDATE reminders
+              SET status = 'expired', updated_at = unixepoch()
+            WHERE id = ? AND status = 'delivering' AND delivery_attempts = ?`,
+        )
+        .run(reminderId, attempts);
+      return Number(expired.changes) > 0;
+    }
+    const now = epochOr(options.now, nowSeconds());
+    const backoffIndex = Math.min(
+      Math.max(attempts - 1, 0),
+      REMINDER_RETRY_BACKOFF_SECONDS.length - 1,
+    );
+    const retryAt = now + REMINDER_RETRY_BACKOFF_SECONDS[backoffIndex];
     const info = this.#db
       .prepare(
         `UPDATE reminders
-            SET status = 'pending', updated_at = unixepoch()
-          WHERE id = ? AND status = 'delivering'`,
+            SET status = 'pending',
+                next_fire_at = ?,
+                updated_at = unixepoch()
+          WHERE id = ? AND status = 'delivering' AND delivery_attempts = ?`,
       )
-      .run(requireString(id, 'reminders.id'));
+      .run(retryAt, reminderId, attempts);
     return Number(info.changes) > 0;
   }
 

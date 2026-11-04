@@ -236,16 +236,16 @@ test('T11c 验收：V2/V10/V15/V16 + 提醒线', async (t) => {
     proactive.enqueue({ kind: 'task_report', text: '任务完成：整理文档。', dedupeKey: 't-1', at: now });
     const capped = await proactive.flush(now);
     assert.equal(capped.sent, 2);
-    assert.equal(capped.merged, 1, '同一窗口内的两条提醒应合并');
+    assert.equal(capped.merged, 0, 'V4-H1：提醒不参与合并，两条各自投递');
     assert.equal(prompts.length, 3);
-    assert.equal(capped.deferred, 0);
+    assert.equal(capped.deferred, 1, '任务汇报留到下一轮（日上限已满）');
     assert.equal(proactive.stats(now).remainingToday, 0);
 
     // 日上限后再来的消息不得突破 3 条。
     proactive.enqueue({ kind: 'chat', text: '再加一句。', dedupeKey: 'c-2', at: now });
     const extra = await proactive.flush(now);
     assert.equal(extra.sent, 0);
-    assert.equal(extra.deferred, 1, '超额消息留在 backlog，不丢也不发');
+    assert.equal(extra.deferred, 2, '超额消息留在 backlog，不丢也不发');
     assert.equal(prompts.length, 3);
 
     // 调度器补扫：04:30 启动，6h 内的 4 个每日任务各补一次；重启不重复。
