@@ -62,7 +62,20 @@ dsh-companion/
         dbPath: ./.data/companion.db
 ```
 
-> 以上仅为示例，**尚未写入用户 profile**。本地开发时 `name` 可指向本目录的绝对路径；改完重载 profile 生效。
+> 以上仅为示例，**尚未写入用户 profile**；`name: 'dsh-companion'` 走包名解析，只在插件已作为包安装、能被 Node 解析到时成立。改完重载 profile 生效。
+
+本地开发直接引用仓库时，`name` 必须指到**入口文件 `src/index.js`**，不能只指仓库目录：
+
+```yaml
+- insert:
+    - id: dsh-companion
+      # 绝对路径；也可写相对 patch 文件所在目录的路径（./dsh-companion/src/index.js）或 file:// URL
+      name: 'D:/path/to/dsh-companion/src/index.js'
+      config:
+        dbPath: ./.data/companion.db
+```
+
+DSH 会把 `name` 转成 `file://` URL 再动态 import：绝对路径按 `pathToFileURL` 转换，`./` 开头按 `cordis.patch.yml` 所在目录锚定，`file://` URL 原样使用，三种写法指向同一个入口文件即可。**不要指向目录**（如 `D:/path/to/dsh-companion`）：ESM 不做目录解析，会抛 `ERR_UNSUPPORTED_DIR_IMPORT`（`Directory import '...' is not supported resolving ES modules`），插件不激活；`package.json` 的 `main`/`exports` 只对包名解析生效，不能把目录变成可导入的入口。入口注册内容见「开发与测试」。
 
 ## 配置
 
