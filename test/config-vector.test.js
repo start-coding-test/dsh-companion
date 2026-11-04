@@ -24,7 +24,8 @@ test('vector 默认：关闭、256 维、hash embedder 及可插拔默认键', (
     prefixQuery: true,
     embedderId: '',
     embedTimeoutMs: 300,
-    backfillBatchSize: 50,
+    backfillTimeoutMs: 30_000,
+    backfillBatchSize: 8,
     remote: { enabled: false, endpoint: '', apiKeyEnv: '', timeoutMs: 300 },
   });
   assert.ok(Object.isFrozen(cfg.vector));
@@ -44,7 +45,8 @@ test('vector 部分覆盖：未提供的子键回落到默认值', () => {
   assert.equal(cfg.vector.enabled, true);
   assert.equal(cfg.vector.dim, 256);
   assert.equal(cfg.vector.embedder, 'hash');
-  assert.equal(cfg.vector.backfillBatchSize, 50);
+  assert.equal(cfg.vector.backfillBatchSize, 8);
+  assert.equal(cfg.vector.backfillTimeoutMs, 30_000);
 });
 
 test('vector 未知子键：只 warning，不影响其它配置', () => {
@@ -92,6 +94,7 @@ test('vector 可插拔子键：localModel/prefixQuery/embedderId/超时/回填�
       prefixQuery: false,
       embedderId: 'my-local',
       embedTimeoutMs: 1200,
+      backfillTimeoutMs: 45_000,
       backfillBatchSize: 12,
     },
   });
@@ -99,6 +102,7 @@ test('vector 可插拔子键：localModel/prefixQuery/embedderId/超时/回填�
   assert.equal(cfg.vector.prefixQuery, false);
   assert.equal(cfg.vector.embedderId, 'my-local');
   assert.equal(cfg.vector.embedTimeoutMs, 1200);
+  assert.equal(cfg.vector.backfillTimeoutMs, 45_000);
   assert.equal(cfg.vector.backfillBatchSize, 12);
   assert.ok(Object.isFrozen(cfg.vector));
 });
@@ -154,6 +158,9 @@ test('vector 可插拔子键非法值逐项报 ConfigError(field)', () => {
   }
   for (const embedTimeoutMs of [0, -1, 60_001, 1.5, '300']) {
     expectConfigError({ vector: { embedTimeoutMs } }, 'vector.embedTimeoutMs');
+  }
+  for (const backfillTimeoutMs of [0, -1, 600_001, 1.5, '30000']) {
+    expectConfigError({ vector: { backfillTimeoutMs } }, 'vector.backfillTimeoutMs');
   }
   for (const backfillBatchSize of [0, 51, 2.5, '10']) {
     expectConfigError({ vector: { backfillBatchSize } }, 'vector.backfillBatchSize');

@@ -51,8 +51,11 @@ const VECTOR_DEFAULTS = Object.freeze({
   embedderId: '',
   // 全局默认超时；vector.remote.timeoutMs 可单独覆盖。
   embedTimeoutMs: 300,
-  // 空闲回填每批条数，硬上限 50。
-  backfillBatchSize: 50,
+  // E2-M1：回填推理的独立超时。默认 30s，覆盖 2C 上 bge-small int8
+  // 单批几十条的推理耗时；查询仍用 embedTimeoutMs（默认 300ms）。
+  backfillTimeoutMs: 30_000,
+  // 空闲回填每批条数，硬上限 50；默认 8，避免单批推理撑爆前台超时窗口。
+  backfillBatchSize: 8,
   remote: Object.freeze({
     enabled: false,
     endpoint: '',
@@ -143,7 +146,7 @@ function requirePositiveNumber(cfg, field) {
  * @returns {Readonly<{
  *   enabled: boolean, dim: number, embedder: 'hash'|'local'|'remote'|'none',
  *   localModel: string, prefixQuery: boolean, embedderId: string,
- *   embedTimeoutMs: number, backfillBatchSize: number,
+ *   embedTimeoutMs: number, backfillTimeoutMs: number, backfillBatchSize: number,
  *   remote: Readonly<{enabled: boolean, endpoint: string, apiKeyEnv: string, timeoutMs: number}>,
  * }>}
  */
@@ -157,7 +160,7 @@ function normalizeVector(raw, warnings) {
   }
   const allowed = new Set([
     'enabled', 'dim', 'embedder', 'localModel', 'prefixQuery', 'embedderId',
-    'embedTimeoutMs', 'backfillBatchSize', 'remote',
+    'embedTimeoutMs', 'backfillTimeoutMs', 'backfillBatchSize', 'remote',
   ]);
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) warnings.push(`unknown config field "vector.${key}" ignored`);
@@ -195,6 +198,16 @@ function normalizeVector(raw, warnings) {
     throw new ConfigError(
       'vector.embedTimeoutMs',
       `must be an integer within 1..60000, got ${JSON.stringify(embedTimeoutMs)}`,
+    );
+  }
+  const backfillTimeoutMs = raw.backfillTimeoutMs === undefined
+    ? defaults.backfillTimeoutMs
+    : raw.backfillTimeoutMs;
+  if (typeof backfillTimeoutMs !== 'number' || !Number.isInteger(backfillTimeoutMs)
+    || backfillTimeoutMs < 1 || backfillTimeoutMs > 600_000) {
+    throw new ConfigError(
+      'vector.backfillTimeoutMs',
+      `must be an integer within 1..600000, got ${JSON.stringify(backfillTimeoutMs)}`,
     );
   }
   const backfillBatchSize = raw.backfillBatchSize === undefined
@@ -261,6 +274,7 @@ function normalizeVector(raw, warnings) {
     prefixQuery,
     embedderId,
     embedTimeoutMs,
+    backfillTimeoutMs,
     backfillBatchSize,
     remote: Object.freeze({
       enabled: remoteEnabled,

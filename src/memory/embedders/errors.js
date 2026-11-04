@@ -43,3 +43,23 @@ export class EmbeddingTimeout extends EmbeddingUnavailable {
     this.timeoutMs = options.timeoutMs;
   }
 }
+
+/**
+ * E2-M1：同一 embedder 已有推理在跑。
+ *
+ * 单飞：查询遇到占用直接抛本错误（retrieve 据此回退纯 FTS，不排队等待）；
+ * idle-probe 回填遇到占用跳过本次 tick。超时的推理在底层真正结束前
+ * 仍算占用，避免 Promise.race 超时后叠加第二批。
+ */
+export class EmbeddingBusy extends EmbeddingUnavailable {
+  /**
+   * @param {string} message
+   * @param {{cause?: unknown, timeoutMs?: number}} [options]
+   */
+  constructor(message, options = {}) {
+    super(message, { cause: options.cause, transient: true });
+    this.name = 'EmbeddingBusy';
+    this.code = 'EMBEDDING_BUSY';
+    this.timeoutMs = options.timeoutMs;
+  }
+}

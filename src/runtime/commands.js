@@ -554,7 +554,8 @@ function formatTokenSnapshot(metrics, budget) {
 
 /**
  * 向量召回状态片段（P2-b / W4）：关闭时只显示「关」，开启时显示 dim、embedder
- * 与本进程已回填条数、最近命中。旧 budget 形状（无 embedder）保持原格式。
+ * 与本进程已回填条数、最近命中；E2-M1 追加回填超时/推理占用计数。
+ * 旧 budget 形状（无 embedder）保持原格式。
  * @param {object} [budget]
  * @returns {string}
  */
@@ -566,7 +567,10 @@ function formatVectorText(budget) {
   if (typeof vector.embedder !== 'string' || vector.embedder === '') {
     return `｜向量：开·dim ${dim}·最近命中 ${lastHits}`;
   }
-  return `｜向量：开·dim ${dim}·${vector.embedder}·已回填 ${Number(vector.backfilled) || 0}·最近命中 ${lastHits}`;
+  const timeouts = Number(vector.backfillTimeouts) || 0;
+  const busy = Number(vector.embedBusy) || 0;
+  return `｜向量：开·dim ${dim}·${vector.embedder}·已回填 ${Number(vector.backfilled) || 0}·最近命中 ${lastHits}`
+    + `·回填超时 ${timeouts}·占用 ${busy}`;
 }
 
 /** @param {object} store @param {string} scope */

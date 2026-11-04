@@ -7,27 +7,26 @@
  * 默认模型 Xenova/bge-small-zh-v1.5（MIT、24M 参数、512 维、int8 约 23.9MB）。
  * 查询侧按 BGE 官方用法加指令前缀；入库事实不加（prefixQuery=false 可关）。
  *
- * E-M1：首次加载会下载约 24MB 模型并初始化 ONNX，可能耗时数秒到数十秒。
- * 因此：
- *   - 加载是异步预热（warmup()）：启动/idle-probe 触发，不阻塞 turn；
- *   - 任何**前台等待**（embed/embedQuery 等模型就绪）以 `timeoutMs`
- *     （config.vector.embedTimeoutMs，默认 300）为上限，超时抛
- *     `EmbeddingTimeout`（transient），召回本轮直接走 FTS；
- *   - 推理同样以 `timeoutMs` 为上限；
- *   - 后台加载本身另有 `loadTimeoutMs` 硬上限（默认 180s），只用于避免
- *     下载/初始化永久挂起，不参与 turn 等待；
- *   - 依赖未安装（ERR_MODULE_NOT_FOUND / Cannot find module）→ fatal，停用 local；
- *   - 网络/超时/初始化失败 → transient，按指数退避重试（最多 maxLoadAttempts 次，
- *     随后进入长冷却，不会一次失败即永久停用）。
+ * E2-M1：回填与查询的超时/占用分离：
+ *   - 查询/前台等待仍以 `timeoutMs`（config.vector.embedTimeoutMs，默认 300）为上限；
+ *   - 空闲回填的推理以 `backfillTimeoutMs`（config.vector.backfillTimeoutMs，
+ *     默认 30s）为上限，避免几十条 bge-small int8 必然超过 300ms；
+ *   - 推理单飞：同一 embedder 同时最多一个 in-flight。查询遇到占用直接抛
+ *     `EmbeddingBusy`（调用方回退纯 FTS，不排队）；idle-probe 回填遇到占用
+ *     跳过本次 tick。`Promise.race` 超时后底层推理仍算占用，直到真正结束
+ *     才允许下一批，避免批次叠加；
+ *   - 加载单飞（L2-3）：同一时刻最多一个加载 promise。`loadTimeoutMs` 只放弃
+ *     等待，不取消底层加载；重试复用尚未结束的 promise，不再并行起第二个。
  */
 
-import { EmbeddingTimeout, EmbeddingUnavailable } from './errors.js';
+import { EmbeddingBusy, EmbeddingTimeout, EmbeddingUnavailable } from './errors.js';
 import { normalizeTexts, rowsFromResponse, toFloat32 } from './util.js';
 
 const DEFAULT_MODEL = 'Xenova/bge-small-zh-v1.5';
 const DEFAULT_DIM = 512;
 const QUERY_INSTRUCTION = '为这个句子生成表示以用于检索相关文章：';
 const DEFAULT_TIMEOUT_MS = 300;
+const DEFAULT_BACKFILL_TIMEOUT_MS = 30_000;
 const DEFAULT_LOAD_TIMEOUT_MS = 180_000;
 const DEFAULT_RETRY_BASE_MS = 1_000;
 const DEFAULT_RETRY_MAX_MS = 60_000;
@@ -127,6 +126,7 @@ function outputRows(output, expectedCount) {
  *   dim?: number,
  *   loader?: () => Promise<unknown>,
  *   timeoutMs?: number,
+ *   backfillTimeoutMs?: number,
  *   loadTimeoutMs?: number,
  *   retryBaseMs?: number,
  *   retryMaxMs?: number,
@@ -145,9 +145,11 @@ export function createLocalEmbedder(options = {}) {
   const loader = typeof options.loader === 'function'
     ? options.loader
     : () => import('@huggingface/transformers');
-  // E-M1：前台等待与推理的统一上限（config.vector.embedTimeoutMs）。
+  // E-M1：查询/前台等待与推理的统一上限（config.vector.embedTimeoutMs）。
   const timeoutMs = positiveInt(options.timeoutMs, DEFAULT_TIMEOUT_MS);
-  // 后台加载硬上限：只防永久挂起，不参与 turn 等待；至少 30s 以覆盖首次下载。
+  // E2-M1：回填推理的独立上限（config.vector.backfillTimeoutMs）。
+  const backfillTimeoutMs = positiveInt(options.backfillTimeoutMs, DEFAULT_BACKFILL_TIMEOUT_MS);
+  // 后台加载硬上限：只放弃本次等待，不取消底层加载；至少 30s 以覆盖首次下载。
   const loadTimeoutMs = positiveInt(
     options.loadTimeoutMs,
     Math.max(timeoutMs * 20, DEFAULT_LOAD_TIMEOUT_MS),
@@ -159,8 +161,14 @@ export function createLocalEmbedder(options = {}) {
 
   /** @type {unknown} 已加载的 transformers.js pipeline */
   let extractor = null;
-  /** @type {Promise<unknown>|null} 正在进行的后台预热 */
-  let extractorPromise = null;
+  /**
+   * L2-3：底层加载 promise 单飞。只有真正 settle 才清空——
+   * loadTimeoutMs 只让等待方放弃，不取消、也不清空它，重试复用同一个。
+   * @type {Promise<unknown>|null}
+   */
+  let loadInFlight = null;
+  /** E2-M1：当前推理 promise（底层，超时后仍保留到真正结束）。 */
+  let inferenceInFlight = null;
   /** @type {Error|null} 依赖未安装等永久失败：停用 local，不再重试。 */
   let fatalError = null;
   /** @type {Error|null} 最近一次加载失败（transient 时用于同一退避窗口内直接复用）。 */
@@ -173,7 +181,7 @@ export function createLocalEmbedder(options = {}) {
   function statusOf() {
     if (fatalError !== null) return 'fatal';
     if (extractor !== null) return 'ready';
-    if (extractorPromise !== null) return 'loading';
+    if (loadInFlight !== null) return 'loading';
     if (lastError !== null && now() < nextRetryAt) return 'backoff';
     return 'idle';
   }
@@ -201,17 +209,16 @@ export function createLocalEmbedder(options = {}) {
     );
   }
 
+  /**
+   * 真正执行加载（含依赖 import 与 pipeline 初始化）。
+   * L2-3：这里不套 loadTimeoutMs——超时只由等待方的 withTimeout 表达，
+   * 底层加载保留在 loadInFlight 里供重试复用，避免并行第二个加载。
+   * @returns {Promise<unknown>}
+   */
   async function doLoad() {
     let mod;
     try {
-      mod = await withTimeout(
-        Promise.resolve().then(() => loader()),
-        loadTimeoutMs,
-        () => new EmbeddingTimeout(
-          `[embedder:local] model load exceeded ${loadTimeoutMs}ms`,
-          { timeoutMs: loadTimeoutMs },
-        ),
-      );
+      mod = await loader();
     } catch (error) {
       throw classifyLoadFailure(error);
     }
@@ -222,30 +229,18 @@ export function createLocalEmbedder(options = {}) {
       });
     }
     try {
-      return await withTimeout(
-        Promise.resolve().then(() => mod.pipeline('feature-extraction', model, { dtype: 'q8' })),
-        loadTimeoutMs,
-        () => new EmbeddingTimeout(
-          `[embedder:local] model initialization exceeded ${loadTimeoutMs}ms`,
-          { timeoutMs: loadTimeoutMs },
-        ),
-      );
+      return await mod.pipeline('feature-extraction', model, { dtype: 'q8' });
     } catch (error) {
       throw classifyLoadFailure(error);
     }
   }
 
   /**
-   * E-M1：异步预热。不阻塞调用方；失败只 reject（由调用方决定是否记日志）。
-   * 退避窗口内重复调用立即拿到同一 transient 错误，不再打网络。
+   * 打开（或复用）唯一的加载 promise；成功/失败状态在底层 settle 时记录。
    * @returns {Promise<unknown>}
    */
-  function warmup() {
-    if (extractor !== null) return Promise.resolve(extractor);
-    if (fatalError !== null) return Promise.reject(fatalError);
-    if (extractorPromise !== null) return extractorPromise;
-    if (lastError !== null && now() < nextRetryAt) return Promise.reject(lastError);
-    extractorPromise = (async () => {
+  function beginLoad() {
+    const pending = (async () => {
       try {
         const loaded = await doLoad();
         extractor = loaded;
@@ -268,11 +263,45 @@ export function createLocalEmbedder(options = {}) {
           }
         }
         throw lastError;
-      } finally {
-        extractorPromise = null;
       }
     })();
-    return extractorPromise;
+    loadInFlight = pending;
+    const clear = () => {
+      if (loadInFlight === pending) loadInFlight = null;
+    };
+    // 失败由等待方处理；这里挂一个空 handler 只为在超时后仍能清空并避免 unhandled。
+    pending.then(clear, clear);
+    return pending;
+  }
+
+  /**
+   * E-M1/L2-3：异步预热。不阻塞调用方；失败只 reject（由调用方决定是否记日志）。
+   * 退避窗口内重复调用立即拿到同一 transient 错误，不再打网络；
+   * 已有未结束的加载时复用它，等待上限仍是 loadTimeoutMs（只放弃等待不取消）。
+   * @returns {Promise<unknown>}
+   */
+  function warmup() {
+    if (extractor !== null) return Promise.resolve(extractor);
+    if (fatalError !== null) return Promise.reject(fatalError);
+    if (loadInFlight !== null) {
+      return withTimeout(
+        loadInFlight,
+        loadTimeoutMs,
+        () => new EmbeddingTimeout(
+          `[embedder:local] model load still pending after ${loadTimeoutMs}ms; reusing the same load`,
+          { timeoutMs: loadTimeoutMs },
+        ),
+      );
+    }
+    if (lastError !== null && now() < nextRetryAt) return Promise.reject(lastError);
+    return withTimeout(
+      beginLoad(),
+      loadTimeoutMs,
+      () => new EmbeddingTimeout(
+        `[embedder:local] model load exceeded ${loadTimeoutMs}ms; continuing in background`,
+        { timeoutMs: loadTimeoutMs },
+      ),
+    );
   }
 
   /**
@@ -294,28 +323,58 @@ export function createLocalEmbedder(options = {}) {
     );
   }
 
-  async function embedRaw(texts) {
-    const batch = normalizeTexts(texts);
-    if (batch.length === 0) return [];
-    const ready = await ensureExtractor();
-    let output;
+  /**
+   * 单飞推理：已有 in-flight 时直接抛 EmbeddingBusy（不排队）。
+   * 超时只截断本次等待，inferenceInFlight 保留到底层 settle，防止批次叠加。
+   * @param {unknown} ready
+   * @param {string[]} batch
+   * @param {number} waitMs
+   * @param {string} label
+   * @returns {Promise<unknown>}
+   */
+  async function inferOnce(ready, batch, waitMs, label) {
+    if (inferenceInFlight !== null) {
+      throw new EmbeddingBusy(
+        `[embedder:local] inference already in flight; query falls back to FTS`,
+        { timeoutMs: waitMs },
+      );
+    }
+    const pending = Promise.resolve().then(() => ready(batch, { pooling: 'mean', normalize: true }));
+    inferenceInFlight = pending;
+    const clear = () => {
+      if (inferenceInFlight === pending) inferenceInFlight = null;
+    };
+    pending.then(clear, clear);
     try {
-      output = await withTimeout(
-        Promise.resolve().then(() => ready(batch, { pooling: 'mean', normalize: true })),
-        timeoutMs,
+      return await withTimeout(
+        pending,
+        waitMs,
         () => new EmbeddingTimeout(
-          `[embedder:local] inference timed out after ${timeoutMs}ms`,
-          { timeoutMs },
+          `[embedder:local] ${label} timed out after ${waitMs}ms`,
+          { timeoutMs: waitMs },
         ),
       );
     } catch (error) {
-      if (error instanceof EmbeddingTimeout) throw error;
+      if (error instanceof EmbeddingTimeout || error instanceof EmbeddingBusy) throw error;
       throw new EmbeddingUnavailable('[embedder:local] inference failed', {
         cause: error,
         transient: true,
         kind: 'transient',
       });
     }
+  }
+
+  /**
+   * @param {string[]} texts
+   * @param {number} waitMs 推理等待上限（查询=timeoutMs，回填=backfillTimeoutMs）
+   * @param {string} label 仅用于超时消息
+   * @returns {Promise<Float32Array[]>}
+   */
+  async function embedRaw(texts, waitMs, label) {
+    const batch = normalizeTexts(texts);
+    if (batch.length === 0) return [];
+    const ready = await ensureExtractor();
+    const output = await inferOnce(ready, batch, waitMs, label);
     const rows = outputRows(output, batch.length);
     for (const row of rows) {
       if (row.length !== dim) {
@@ -334,9 +393,12 @@ export function createLocalEmbedder(options = {}) {
     model,
     prefixQuery,
     timeoutMs,
+    backfillTimeoutMs,
     loadTimeoutMs,
     /** E-M1：异步预热（启动 / idle-probe 调用）；失败不抛给调用方，除非显式 await。 */
     warmup,
+    /** E2-M1：是否有推理在跑（查询遇占用回退 FTS，回填遇占用跳过本次）。 */
+    busy: () => inferenceInFlight !== null,
     /** @returns {'idle'|'loading'|'ready'|'backoff'|'fatal'} */
     status: () => statusOf(),
     /** 诊断快照：/状态 或日志可用。 */
@@ -361,12 +423,21 @@ export function createLocalEmbedder(options = {}) {
       return fatalError !== null;
     },
     /**
-     * 入库/普通文本：不加指令前缀。
+     * 入库/普通文本：不加指令前缀，使用查询/前台的 timeoutMs。
      * @param {string[]} texts
      * @returns {Promise<Float32Array[]>}
      */
     async embed(texts) {
-      return embedRaw(texts);
+      return embedRaw(texts, timeoutMs, 'inference');
+    },
+    /**
+     * E2-M1：空闲回填专用；使用独立的 backfillTimeoutMs，避免几十条推理
+     * 被查询的 300ms 上限截断。
+     * @param {string[]} texts
+     * @returns {Promise<Float32Array[]>}
+     */
+    async embedBackfill(texts) {
+      return embedRaw(texts, backfillTimeoutMs, 'backfill inference');
     },
     /**
      * 查询文本：prefixQuery=true 时加 BGE 检索指令前缀。
@@ -375,8 +446,8 @@ export function createLocalEmbedder(options = {}) {
      */
     async embedQuery(texts) {
       const batch = normalizeTexts(Array.isArray(texts) ? texts : [texts]);
-      if (!prefixQuery) return embedRaw(batch);
-      return embedRaw(batch.map((text) => `${QUERY_INSTRUCTION}${text}`));
+      if (!prefixQuery) return embedRaw(batch, timeoutMs, 'query inference');
+      return embedRaw(batch.map((text) => `${QUERY_INSTRUCTION}${text}`), timeoutMs, 'query inference');
     },
   };
 }

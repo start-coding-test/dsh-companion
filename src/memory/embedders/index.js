@@ -11,9 +11,9 @@
 import { createHashEmbedder } from './hash.js';
 import { createLocalEmbedder } from './local.js';
 import { createRemoteEmbedder } from './remote.js';
-import { EmbeddingTimeout, EmbeddingUnavailable } from './errors.js';
+import { EmbeddingBusy, EmbeddingTimeout, EmbeddingUnavailable } from './errors.js';
 
-export { EmbeddingTimeout, EmbeddingUnavailable };
+export { EmbeddingBusy, EmbeddingTimeout, EmbeddingUnavailable };
 
 /**
  * @param {{
@@ -23,6 +23,7 @@ export { EmbeddingTimeout, EmbeddingUnavailable };
  *   prefixQuery?: boolean,
  *   embedderId?: string,
  *   embedTimeoutMs?: number,
+ *   backfillTimeoutMs?: number,
  *   remote?: {enabled?: boolean, endpoint?: string, apiKeyEnv?: string, timeoutMs?: number},
  * }} [vectorConfig]
  * @param {{loader?: () => Promise<unknown>, fetch?: typeof fetch, env?: Record<string, string|undefined>,
@@ -42,8 +43,10 @@ export function createEmbedder(vectorConfig = {}, deps = {}) {
       prefixQuery: config.prefixQuery,
       dim: undefined,
       loader: deps.loader,
-      // E-M1：前台等待加载与推理都套 config.vector.embedTimeoutMs。
+      // E-M1/E2-M1：查询等待加载/推理用 config.vector.embedTimeoutMs；
+      // 空闲回填走独立的 backfillTimeoutMs，两者互不挤占。
       timeoutMs: config.embedTimeoutMs,
+      backfillTimeoutMs: config.backfillTimeoutMs,
       loadTimeoutMs: deps.loadTimeoutMs,
       retryBaseMs: deps.retryBaseMs,
       maxLoadAttempts: deps.maxLoadAttempts,

@@ -1311,6 +1311,7 @@ async function retrieveVectors(state, input) {
     })
     : await retrieve({ ...input, embedder: state.embedder });
   if (result !== null && typeof result === 'object' && result.vectorError) {
+    if (result.vectorError.code === 'EMBEDDING_BUSY') state.metrics.inc('vectorEmbedBusy');
     state.metrics.inc('vectorEmbedFailures');
     state.platform.log('warn', '[dsh-companion] embedding failed; falling back to FTS', result.vectorError);
   }
@@ -1320,6 +1321,8 @@ async function retrieveVectors(state, input) {
 /**
  * W4：空闲回填本批（≤backfillBatchSize）缺失/不匹配的向量。
  * E-M1：local 尚未预热完成时不占用 idle-probe，只触发/续接预热。
+ * E2-M1：回填用 embedder.embedBackfill（backfillTimeoutMs），与查询超时分离；
+ * 同一 embedder 已有推理在跑时跳过本 tick 并记 vectorEmbedBusy，不排队叠加。
  * 失败只记 metric 与 warn，不抛出，不阻塞 idle-probe。
  * @param {object} state
  * @returns {Promise<number>} 本批写入条数
@@ -1331,6 +1334,11 @@ export async function backfillVectors(state) {
     prewarmEmbedder(state);
     return 0;
   }
+  // E2-M1：上一次超时的推理在底层结束前仍算占用——本 tick 直接跳过。
+  if (typeof embedder.busy === 'function' && embedder.busy()) {
+    metrics.inc('vectorEmbedBusy');
+    return 0;
+  }
   let written = 0;
   try {
     const rows = store.listVectorBackfill({
@@ -1339,7 +1347,10 @@ export async function backfillVectors(state) {
       limit: config.vector.backfillBatchSize,
     });
     if (rows.length === 0) return 0;
-    const vectors = await embedder.embed(rows.map((row) => row.text));
+    const embedBatch = typeof embedder.embedBackfill === 'function'
+      ? embedder.embedBackfill.bind(embedder)
+      : embedder.embed.bind(embedder);
+    const vectors = await embedBatch(rows.map((row) => row.text));
     if (!Array.isArray(vectors) || vectors.length !== rows.length) {
       throw new Error(
         `[dsh-companion] embedder returned ${Array.isArray(vectors) ? vectors.length : 'non-array'} vectors for ${rows.length} texts`,
@@ -1360,9 +1371,17 @@ export async function backfillVectors(state) {
       metrics.inc('vectorBackfilled', written);
     }
   } catch (error) {
+    const code = error?.code ?? null;
+    if (code === 'EMBEDDING_TIMEOUT') {
+      metrics.inc('vectorBackfillTimeouts');
+    } else if (code === 'EMBEDDING_BUSY') {
+      // 竞态下仍可能撞上刚起的推理；本批跳过，下一 tick 再试。
+      metrics.inc('vectorEmbedBusy');
+      return written;
+    }
     metrics.inc('vectorEmbedFailures');
     platform.log('warn', '[dsh-companion] vector backfill failed', {
-      code: error?.code ?? null,
+      code,
       reason: error?.message ?? String(error),
     });
   }
@@ -1377,6 +1396,9 @@ export async function backfillVectors(state) {
 function budgetInfo(state) {
   refreshBudget(state);
   const rssLimits = rssLimitsFromConfig(state.config).gib;
+  const metricsSnapshot = typeof state.metrics?.snapshot === 'function'
+    ? state.metrics.snapshot()
+    : {};
   return {
     dailyTokens: state.budget.dailyTokens,
     dailyLimit: DAILY_TOKEN_LIMIT,
@@ -1395,6 +1417,8 @@ function budgetInfo(state) {
       embedder: state.embedder?.id ?? null,
       backfilled: state.vectorBackfilled,
       lastHits: state.lastVectorHits,
+      backfillTimeouts: metricsSnapshot.vectorBackfillTimeouts ?? 0,
+      embedBusy: metricsSnapshot.vectorEmbedBusy ?? 0,
     },
   };
 }
