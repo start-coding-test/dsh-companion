@@ -4,7 +4,17 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**MVP 0.3.2**（2026-11-04），`node --test` 全绿（551 个用例 / 16 个套件），git tag `v0.3.2`。
+当前状态：**0.4.0 待发布**（2026-11-04 文档收口，`node --test` 全绿：626 个用例 / 16 个套件；版本号与 tag 由发布卡统一处理）。
+
+## v0.4.0 变更摘要（待发布）
+
+- **外部压缩重锚**：按 surface 位置取替换节点；压缩吞掉未巩固内容时把锚点前挪到平台摘要之前，让摘要进入下一次巩固，并用 `compactionLostUnconsolidated` 记丢失量。锚到起点时写哨兵 `-1`，重启后不会回退旧水位（R-M1/R-L1/R-L2）。
+- **执行槽日志**：`thread_run` 带 `goal` 持有执行槽到线程空闲；create 分支直接传会话句柄，reuse 反查失败与 900s 兜底都会写 `warn`，并记 `threadSlotFallback` / `threadSlotTimeout`（R-M2）。
+- **RSS 三档可配置**：`rssWarnGiB` / `rssStopGiB` / `rssMainOnlyGiB`，4G 云端可按预算降到 `2.2` / `2.4` / `2.6`（N-M3；公式见 [docs/calibration.md](docs/calibration.md)）。
+- **确认词边界**：只有整句或独立小句的「对 / 是 / 记住了」等才触发强化，避免「对比一下」这类子串误判（N-L1）。
+- **Embedding 可插拔**：`vector.embedder` 支持 `hash` / `local` / `remote` / `none`；向量按 `embedder_id` 隔离，换模型后由 idle-probe 分批回填（W4，见 [docs/embedding.md](docs/embedding.md)）。
+- **S0 评测埋点**：`facts.first_reneed_at` / `first_reneed_tier` / `reneed_kind` 记录首次再需要，schema v7（W5，流程见 [docs/s0-calibration.md](docs/s0-calibration.md)）。
+- **本轮未做项与真机联调清单**：见 [docs/known-debt.md](docs/known-debt.md)。
 
 ## 目录结构
 
@@ -74,22 +84,28 @@ dsh-companion/
 | `vector.dim` | `256` | 向量维度（`hashEmbed` 桶数） | 整数 `8`–`4096` |
 | `vector.embedder` | `"hash"` | 向量化实现 | `hash` / `local` / `remote` / `none`；详见 [docs/embedding.md](docs/embedding.md) |
 | `vector.localModel` | `"Xenova/bge-small-zh-v1.5"` | local 模型 id（需可选安装 `@huggingface/transformers`） | 非空字符串 |
+| `vector.prefixQuery` | `true` | local 查询是否加中文检索指令前缀 | 布尔 |
+| `vector.embedderId` | `""` | remote 的向量 id；空则用 `remote:<host>` | 非空字符串或空串 |
+| `vector.embedTimeoutMs` | `300` | embedding 超时（毫秒） | 整数 `1`–`60000` |
 | `vector.remote.enabled` | `false` | remote 必须显式开启；开启后原文会发到第三方 | 布尔 |
+| `vector.remote.endpoint` | `""` | remote embedding 端点 | 开启时必须是 `http(s)` URL |
+| `vector.remote.apiKeyEnv` | `""` | 读取 API key 的环境变量名 | 非空字符串或空串 |
+| `vector.remote.timeoutMs` | `300` | remote 超时；缺省继承 `embedTimeoutMs` | 整数 `1`–`60000` |
 | `vector.backfillBatchSize` | `50` | idle-probe 每批回填条数 | 整数 `1`–`50` |
 
-token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 新增可选的 `vector.*`（默认关闭；`DEFAULTS.vector` 不可枚举，首次安装自检按 16 个键输出，含 RSS 三档）；治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
+token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
-**外部压缩自动重锚**：平台或用户 `/compact` 压缩掉当前水位节点后，下一次 pre-step 会按 surface 位置把水位重锚到替换节点之后；如果压缩越过了旧水位（有尚未巩固的内容被平台摘要吞掉），锚点会前挪到替换节点之前，让这段摘要进入下一次巩固，不会静默停摆、也不会永久丢掉未巩固内容。重锚值写入 `schema_meta`（锚到起点时写哨兵 `-1`，避免重启后回退旧水位）；`/状态` 显示「水位重锚：N 次」与「未巩固被压缩：N 个节点」。
+**外部压缩自动重锚**：平台或用户 `/compact` 压缩掉当前水位节点后，下一次 pre-step 会按 surface 位置把水位重锚到替换节点之后；如果压缩越过了旧水位（有尚未巩固的内容被平台摘要吞掉），锚点会前挪到替换节点之前，让这段摘要进入下一次巩固，不会静默停摆、也不会永久丢掉未巩固内容。重锚值写入 `schema_meta`（锚到起点时写哨兵 `-1`，避免重启后回退旧水位）；`/状态` 显示「水位重锚：N 次」与「未巩固被压缩：N 个节点」。**R-L3 边界**：被压缩区间里尚未巩固的原始对话已经从 surface 消失，只能以平台摘要的形式进入记忆库；摘要没有保留的细节无法恢复，重要内容不要依赖外部压缩来保存。
 
 **按 scope 的待压缩槽**：主会话与各线程各自持有待压缩区间（`pending_compact`），线程巩固不再覆盖主会话的待压缩目标。
 
-**单执行槽**：`task_run` 与带 `goal` 的 `thread_run` 共用同一个执行槽；槽被占用时 `thread_run` 立即返回 `busy`，不会并发出第二个执行态。
+**单执行槽**：`task_run` 与带 `goal` 的 `thread_run` 共用同一个执行槽；`thread_run` 会持槽到线程 `whenIdle`（900s 兜底），期间 `task_run` 只排队或返回 `busy`，不会并发出第二个执行态。create 分支直接使用会话句柄，reuse 反查失败与 900s 兜底都会写 `warn`，并记 `threadSlotFallback` / `threadSlotTimeout` 便于真机定位。
 
-**每日 token 熔断**：按 `timezone` 的本地日界累计每日 token 用量，达到 `3,000,000` 后进入熔断：拒绝新的 `task_run`、暂停主动消息，`/成本` 与 `/状态` 会显示「已熔断」；本地日界翻篇自动复位。该上限固定为 3M，v0.3.2 不提供配置键。
+**每日 token 熔断**：按 `timezone` 的本地日界累计每日 token 用量，达到 `3,000,000` 后进入熔断：拒绝新的 `task_run`、暂停主动消息，`/成本` 与 `/状态` 会显示「已熔断」；本地日界翻篇自动复位。该上限固定为 3M，v0.4.0 仍不提供配置键。
 
-**RSS 三档降级**：每 60 秒检查一次进程 RSS；三档阈值可配置（`rssWarnGiB` / `rssStopGiB` / `rssMainOnlyGiB`，默认 `2.95` / `3.0` / `3.15`GiB，须满足 `0 < warn < stop < mainOnly`）。`≥warn` 只记指标（不降级）、`≥stop` 停 `task_run` 与主动消息、`≥mainOnly` 再停线程创建；恢复后自动解除。4G 云端按自检公式 `min(userLimit, totalmem×0.75−512MiB)` 预算只有 2.5GiB，默认 3.0GiB 的 stop 可能晚于 OOM，建议把三档降到 `2.2` / `2.4` / `2.6`；不要超过总内存 75%（4GiB 即 3.0GiB）。`/状态` 会显示当前生效的三档值。
+**RSS 三档降级**：每 60 秒检查一次进程 RSS；三档阈值可配置（`rssWarnGiB` / `rssStopGiB` / `rssMainOnlyGiB`，默认 `2.95` / `3.0` / `3.15`GiB，须满足 `0 < warn < stop < mainOnly`）。`≥warn` 只记指标（不降级）、`≥stop` 停 `task_run` 与主动消息、`≥mainOnly` 再停线程创建；恢复后自动解除。4G 云端按自检公式 `min(userLimit, totalmem×0.75−512MiB)` 预算只有 2.5GiB，默认 3.0GiB 的 stop 可能晚于 OOM，建议把三档降到 `2.2` / `2.4` / `2.6`，**同时开 1–2GB swap**；不要超过总内存 75%（4GiB 即 3.0GiB）。公式与 4G 示例见 [docs/calibration.md](docs/calibration.md)，`/状态` 会显示当前生效的三档值。
 
 ## 首次安装自检
 
@@ -154,7 +170,7 @@ node scripts/calibrate/run.mjs
 
 - 默认关闭（`vector.enabled: false`），检索走 v0.2.0 的 bigram FTS 路径，结果与旧版逐字节一致，且不读向量表。
 - 开启后 `hybridSearch` 用 RRF（`1/(60+rank)`）融合 FTS 与向量两路并去重；向量路只召回 active、normal、未删除、非 `sensitive/secret` 且 R ≥ 0.05 的事实。
-- `vector.embedder` 支持 `hash`（默认，字符 bigram 哈希，零依赖但非语义）、`local`（可选依赖 `@huggingface/transformers`，默认 `Xenova/bge-small-zh-v1.5` 512 维 int8）与 `remote`（默认关闭，显式 `vector.remote.enabled: true` 才启用；会把原文发到第三方，见 [docs/embedding.md](docs/embedding.md#remote)）。
+- `vector.embedder` 支持 `hash`（默认，字符 bigram 哈希，零依赖但非语义）、`local`（可选依赖 `@huggingface/transformers`，默认 `Xenova/bge-small-zh-v1.5` 512 维 int8）、`remote`（默认关闭，显式 `vector.remote.enabled: true` 才启用；会把原文发到第三方，见 [docs/embedding.md](docs/embedding.md#remote)）与 `none`（等价关闭）。
 - 向量按 `embedder_id` 隔离：换模型后旧向量不再参与召回；local/remote 的缺失向量由 idle-probe 分批回填（≤ `vector.backfillBatchSize`，默认 50）。
 - 开启后 `/状态` 显示「向量：开·dim 256·hash:256·已回填 N·最近命中 N」；embedding 超时/未安装时退回 FTS 并记 `vectorEmbedFailures`。
 - 旧库升级到 schema v7 会补 `facts.first_reneed_*` 三列（旧行 NULL）；v6 的向量迁移仍把旧向量行标成 `hash:<dim>`，hash 在下次写入/编辑/强化时重建，local/remote 由空闲回填补齐。
@@ -177,7 +193,7 @@ node scripts/calibrate/run.mjs
 - 平台管理的会话 JSONL 不在插件控制范围内，插件无法删除。
 - **单人模型**：主会话与线程按 `scope` 隔离（线程为 `thread:<key>`），但仍是单人使用，不是多人协作。
 - **task_run 串行**：worker 全局单槽、忙时排队至多 2 个；软超时 600s 只告警，硬超时 900s 两段式取消（先中止当前轮、再清空排队）。熔断或 RSS 降级时 `task_run` 会在入队前被拒绝（`daily_budget_exceeded` / `memory_pressure`）。
-- **预算/内存保护**：每日 3M token 上限固定；RSS 三档可配置（`rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`，默认 2.95/3.0/3.15GiB，4G 机器建议 2.2/2.4/2.6）。RSS warn 只记 metric，stop 起才停派发；保护读数读取失败时按 `ok` 放行，不会因此中断会话。
+- **预算/内存保护**：每日 3M token 上限固定；RSS 三档可配置（`rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`，默认 2.95/3.0/3.15GiB，4G 机器建议 2.2/2.4/2.6 并开 1–2GB swap，公式见 [docs/calibration.md](docs/calibration.md)）。RSS warn 只记 metric，stop 起才停派发；保护读数读取失败时按 `ok` 放行，不会因此中断会话。
 - **自愈重试受调度 tick 约束**：巩固重试与轻闲聊都挂在 idle-probe（60s）上；熔断或 RSS ≥ stop_dispatch 期间重试会被顺延（事件与失败态保留，只是延后），恢复后继续推进。
 - **subagent 仍见全局人格段**：平台的 system prompt 段没有 per-session 文本；插件只能让 subagent 跳过召回、巩固与写库，无法移除人格 / 记忆提示段。
 - **schema v4 迁移清空 consolidations**：seq 语义切换为 surface 位置序时，开发期迁移会清空 `consolidations` 并重置 `episodes.consolidation_id`；事实、提醒与状态板不受影响。
@@ -201,10 +217,12 @@ node --test test/e2e   # 只跑端到端
 ## 设计与评审文档
 
 - [使用手册](docs/usage.md)
+- [Embedding 可插拔（W4）](docs/embedding.md)
+- [S0 标定流程](docs/s0-calibration.md)
+- [已知技术债与真机联调清单](docs/known-debt.md)
 - [平台 API 摘录](docs/platform-api.md)
 - [Gate 0 探针说明](docs/gate0-probe.md)
 - [安装自检与校准](docs/calibration.md)
-- [S0 标定流程](docs/s0-calibration.md)
 - [外部评审报告 v1](docs/review-v1.md)
 - [v0.1.1 关闭核验](docs/review-v2.md)
 - [P1 批复审（v0.2.0）](docs/review-v3.md)

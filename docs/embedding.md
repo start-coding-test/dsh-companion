@@ -1,6 +1,6 @@
 # Embedding 可插拔（W4）
 
-向量召回默认仍关闭（`vector.enabled: false`）。开启后，`vector.embedder` 决定查询与事实如何向量化；检索只比较**同一个 embedder id** 生成的向量，换模型不会拿旧向量硬算。
+向量召回默认仍关闭（`vector.enabled: false`）。开启后，`vector.embedder` 决定查询与事实如何向量化；检索只比较**同一个 embedder id** 生成的向量，换模型不会拿旧向量硬算。配置键总表见 [README](../README.md#配置)，开启与排障步骤见 [usage.md](usage.md#向量召回可选)。
 
 ## 接口
 
@@ -56,9 +56,9 @@ vector:
 
 **隐私例外**：remote 会把记忆原文（回填时）和用户查询（召回时）发到第三方，7 天物理删除只覆盖本机 SQLite，管不到第三方日志。开启时启动日志会写 `warn`（含目标域名），`/状态` 显示 `remote:<域名>`；敏感/secret/墓碑事实在 embedding 前已被过滤，不会进入回填批次。
 
-## 存储与回填（schema v6）
+## 存储与回填（schema v7）
 
-- `fact_vectors` 新增 `embedder_id TEXT NOT NULL DEFAULT ''`；v5→v6 迁移把旧行填成 `hash:<dim>`。
+- `fact_vectors` 新增 `embedder_id TEXT NOT NULL DEFAULT ''`；v5→v6 迁移把旧行填成 `hash:<dim>`。v6→v7 只给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind`，不改 `fact_vectors` 结构与数据。
 - 检索/混合检索只召回当前 `embedder_id`（以及当前维度）的行；换模型后旧向量自动失效。
 - hash 写入路径同步投影；local/remote 是异步实现，写入时先不投影，由 idle-probe 每批 ≤ `vector.backfillBatchSize`（默认 50）回填缺失/不匹配的活跃事实。回填失败只记 metric，下次 tick 继续。
 - `/状态`：`向量：关`；开启后 `向量：开·dim 512·local:bge-small-zh-v1.5:512·已回填 N·最近命中 N`。remote 未显式 `enabled: true` 时仍显示「关」，也不会发隐私告警。
@@ -87,3 +87,10 @@ vector:
 - embedding 超时/未安装/HTTP 错误：`vectorEmbedFailures` +1，本轮退回 FTS；同一 turn 不重试。
 - 回填成功：`vectorBackfilled` 累计条数，`/状态` 的「已回填」是本进程启动后的累计值。
 - 所有测试均不联网：local 用注入的 fake loader，remote 用注入的 fetch。
+
+## 相关文档
+
+- [README 配置表](../README.md#配置)与[向量召回](../README.md#向量召回可选)
+- [使用手册：向量召回](usage.md#向量召回可选)
+- [S0 标定流程](s0-calibration.md)（`facts.first_reneed_*` 埋点，与向量表无关）
+- [已知技术债与真机联调清单](known-debt.md)
