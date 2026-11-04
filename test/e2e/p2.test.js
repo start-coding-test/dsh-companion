@@ -716,7 +716,7 @@ test('恢复后向量缺失：召回不崩溃，下次写入重建投影后向�
   try {
     const vectorOnly = await retrieve({
       store: target.store,
-      query: '周六',
+      query: '搬家定在哪天',
       scope: 'main',
       now: TEST_NOW,
       vector: VECTOR_ON,

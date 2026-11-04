@@ -427,10 +427,10 @@ test('/记忆 改 后下一轮召回注入新内容，旧内容不再注入', as
 
     invokeCommand(ctx, 'memory', ` 改 ${old.id} 我改喝无糖美式`);
 
-    const fresh = await recallInjection({ store: temp.store, query: '美式', scope: 'main', now: TEST_NOW });
+    const fresh = await recallInjection({ store: temp.store, query: '无糖美式', scope: 'main', now: TEST_NOW });
     assert.match(fresh.injected, /我改喝无糖美式/u);
 
-    const stale = await recallInjection({ store: temp.store, query: '喝咖啡', scope: 'main', now: TEST_NOW });
+    const stale = await recallInjection({ store: temp.store, query: '早上喝咖啡', scope: 'main', now: TEST_NOW });
     assert.doesNotMatch(stale.injected, /我习惯早上喝咖啡/u);
   } finally {
     handle.dispose();

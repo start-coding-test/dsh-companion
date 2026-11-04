@@ -11,6 +11,14 @@
  *       score = 0.6 * rel + 0.4 * R
  * 装入：按 score 降序，累计 Math.ceil(text.length / 2) 个 token，超预算即截断。
  *
+ * v0.4.4 / V3-M3 相关性门槛（全部在打分之前完成）：
+ *   1) 查询门：skipSmallTalk 开启时，长度 <4、纯算术/符号、常见问候词直接跳过
+ *      （返回空结果，不读库、不算向量）。空查询仍走 recency-only 通道。
+ *   2) 候选门：非空查询的候选必须命中 FTS/bigram，或向量余弦 ≥ minVectorScore；
+ *      两者都没有的候选（例如旧行为里补位的 recency 项）直接丢弃。
+ *   3) 统计：过滤后为空时调用方不会注入、不写召回样本；vectorHits 只数真正
+ *      达到阈值且进入注入的向量命中。
+ *
  * 时间戳兼容：Store 落库统一为 Unix 秒；本模块对外允许秒或毫秒，
  * 内部归一化到毫秒后再套用卡上的 86400000 常量。
  *
@@ -23,12 +31,53 @@
 
 import { toBigrams } from './bigram.js';
 import { DEFAULT_VECTOR_DIM, hashEmbed, hybridSearch, searchVector } from './vector.js';
+import { DEFAULTS, normalizeRecall } from '../config.js';
 
 const DAY_MS = 86_400_000;
 const RECENT_WINDOW_MS = 7 * DAY_MS;
 export const MIN_RECALL_R = 0.05;
 export const DEFAULT_BUDGET_TOKENS = 2050;
 export const DEFAULT_LIMIT = 20;
+/** V3-M3：查询门的最短有效长度（按码点计）。 */
+export const MIN_QUERY_CHARS = 4;
+/** V3-M3：纯算术/符号查询（卡上给定的形态）。 */
+const ARITHMETIC_ONLY_RE = /^[\d\s+\-*/=？?]+$/u;
+/** V3-M3：常见问候/客套词（归一化后整串匹配）。 */
+const GREETING_WORDS = new Set([
+  '你好', '您好', '大家好', '嗨', '哈喽', '哈啰', '在吗', '在么', '在不在',
+  '早安', '早上好', '午安', '晚安', '谢谢', '多谢', '感谢', '好的', '好',
+  '收到', '再见', '拜拜', '辛苦了',
+  'hi', 'hey', 'hello', 'yo', 'ok', 'okay', 'thanks', 'thank you', 'thankyou',
+  'bye', 'goodbye', 'good morning', 'good afternoon', 'good night',
+]);
+const EDGE_SYMBOL_RE = /^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$/gu;
+/** V3-M3：OR 词法检索的 token 上限（每个 token 一次 FTS 查询）。 */
+const LEXICAL_TOKEN_LIMIT = 12;
+/** V3-M3：参与 OR 词法检索的 token 至少要含一个字母/数字/CJK 字符。 */
+const LEXICAL_TOKEN_RE = /[\p{L}\p{N}]/u;
+
+/**
+ * V3-M3 查询门：判断查询是否属于「不值得召回」的小聊/符号/短查询。
+ *
+ * 归一化会去掉首尾空白与标点符号，再做四项判断：
+ * 归一化后为空（纯符号）、长度 < minChars、纯算术、常见问候词。
+ * 空查询不经过本函数（调用方保留 recency-only 语义）。
+ *
+ * @param {unknown} query
+ * @param {{minChars?: number}} [options]
+ * @returns {boolean}
+ */
+export function isTrivialQuery(query, { minChars = MIN_QUERY_CHARS } = {}) {
+  if (typeof query !== 'string') return true;
+  const text = query.trim();
+  if (text === '') return true;
+  const core = text.replace(EDGE_SYMBOL_RE, '');
+  if (core === '') return true;
+  if ([...core].length < minChars) return true;
+  if (ARITHMETIC_ONLY_RE.test(core)) return true;
+  const greeting = core.replace(/\p{P}/gu, '').replace(/\s+/gu, ' ').trim().toLowerCase();
+  return GREETING_WORDS.has(greeting);
+}
 
 const FIDELITY_RANK = Object.freeze({ full: 3, gist: 2, index: 1, dormant: 0 });
 
@@ -239,6 +288,8 @@ export async function retrieve({
   limit = DEFAULT_LIMIT,
   vector = null,
   embedder = null,
+  recall = null,
+  config = null,
 } = {}) {
   if (!store || typeof store.searchBigram !== 'function'
     || typeof store.getFact !== 'function' || typeof store.getEpisode !== 'function') {
@@ -247,6 +298,9 @@ export async function retrieve({
   const nowMs = toMillis(now);
   if (nowMs === null) throw new TypeError('[retrieve] invalid now');
 
+  // V3-M3：门槛配置优先级 recall 参数 → 完整 config.recall → DEFAULTS.recall；
+  // 非法值在这里抛 ConfigError（与 normalizeConfig 同一口径）。
+  const recallCfg = normalizeRecall(recall ?? config?.recall ?? DEFAULTS.recall);
   const budget = Number.isFinite(Number(budgetTokens))
     ? Math.max(0, Math.trunc(Number(budgetTokens)))
     : DEFAULT_BUDGET_TOKENS;
@@ -254,6 +308,12 @@ export async function retrieve({
     ? Math.trunc(Number(limit))
     : DEFAULT_LIMIT;
   const textQuery = typeof query === 'string' ? query : String(query ?? '');
+  const hasQuery = textQuery.trim() !== '';
+  // 查询门在算查询向量、读库之前，避免为「1+1」这类查询做任何召回工作。
+  // 空查询不走查询门（保留 recency-only 通道）。
+  if (hasQuery && recallCfg.skipSmallTalk && isTrivialQuery(textQuery)) {
+    return { items: [], tokens: 0, usedIds: [], truncated: false };
+  }
   const queryTokens = [...new Set(splitTokens(toBigrams(textQuery)))];
   // P2-b：只有显式开启且嵌入器可用时才走向量；关闭时以下路径与 v0.2.0 一致。
   const vectorEnabled = vector !== null
@@ -291,9 +351,25 @@ export async function retrieve({
     ? () => queryVec
     : (text) => hashEmbed(text, vectorDim);
 
-  /** @type {Map<string, {type:'fact'|'episode', id:string}>} */
+  /** @type {Map<string, {type:'fact'|'episode', id:string, rrf?:number, vector?:boolean}>} */
   const candidates = new Map();
   const searchLimit = Math.max(1, maxItems * 2);
+  // V3-M3：词法命中单独留一份，作为「候选有没有相关性证据」的判据。
+  /** @type {Map<string, {type:'fact'|'episode', id:string}>} */
+  const lexicalHits = new Map();
+  if (hasQuery) {
+    // Store.searchBigram 的 MATCH 是 AND 语义（toMatchQuery 把每个 bigram 用
+    // AND 连接），自然语句「青柠计划的代号是什么」几乎不可能全中；所以这里
+    // 逐 token OR 查，得到「至少命中一个 bigram」的候选集合——这正是 V3-M3
+    // 要求的「必须命中 FTS/bigram」。token 数封顶，避免长句退化成全表扫描。
+    for (const token of queryTokens.slice(0, LEXICAL_TOKEN_LIMIT)) {
+      if (!LEXICAL_TOKEN_RE.test(token)) continue;
+      for (const hit of store.searchBigram(token, { scope, limit: searchLimit }) ?? []) {
+        if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
+        lexicalHits.set(`${hit.type}:${hit.id}`, { type: hit.type, id: hit.id });
+      }
+    }
+  }
   let vectorScores = new Map();
   if (useVector) {
     // 单独取一次向量命中，用于 /状态 的「最近命中」统计；融合本身走 hybridSearch。
@@ -325,36 +401,49 @@ export async function retrieve({
         vector: hit.type === 'fact' && vectorScores.has(hit.id),
       });
     }
+    // OR 词法命中可能多于 hybridSearch 的 AND 命中，合并进来供打分。
+    for (const [key, hit] of lexicalHits) {
+      if (candidates.has(key)) continue;
+      candidates.set(key, {
+        type: hit.type,
+        id: hit.id,
+        rrf: 0,
+        vector: hit.type === 'fact' && vectorScores.has(hit.id),
+      });
+    }
   } else {
-    for (const hit of store.searchBigram(textQuery, { scope, limit: searchLimit }) ?? []) {
-      if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
-      candidates.set(`${hit.type}:${hit.id}`, { type: hit.type, id: hit.id });
+    for (const [key, hit] of lexicalHits) {
+      candidates.set(key, { type: hit.type, id: hit.id });
     }
   }
 
-  // recency 补位：最近 7 天（按发生时间）未命中的 top3。
-  const recent = [];
-  const listLimit = Math.max(10, maxItems * 2);
-  for (const row of store.listFacts({ scope, limit: listLimit }) ?? []) {
-    const ts = toMillis(row.observed_at);
-    if (ts !== null && ts >= nowMs - RECENT_WINDOW_MS) {
-      recent.push({ type: 'fact', id: row.id, ts });
+  // recency 补位：仅空查询时保留「最近 7 天的 top3」。
+  // 非空查询不再用 recency 硬凑候选——那正是 V3-M3 之前「任意查询都注入」
+  // 的来源；无关候选在打分前就会被相关性门槛丢掉，这里提前省掉读库开销。
+  if (!hasQuery) {
+    const recent = [];
+    const listLimit = Math.max(10, maxItems * 2);
+    for (const row of store.listFacts({ scope, limit: listLimit }) ?? []) {
+      const ts = toMillis(row.observed_at);
+      if (ts !== null && ts >= nowMs - RECENT_WINDOW_MS) {
+        recent.push({ type: 'fact', id: row.id, ts });
+      }
     }
-  }
-  for (const row of store.listEpisodes({ scope, limit: listLimit }) ?? []) {
-    const ts = toMillis(row.started_at);
-    if (ts !== null && ts >= nowMs - RECENT_WINDOW_MS) {
-      recent.push({ type: 'episode', id: row.id, ts });
+    for (const row of store.listEpisodes({ scope, limit: listLimit }) ?? []) {
+      const ts = toMillis(row.started_at);
+      if (ts !== null && ts >= nowMs - RECENT_WINDOW_MS) {
+        recent.push({ type: 'episode', id: row.id, ts });
+      }
     }
-  }
-  recent.sort((a, b) => b.ts - a.ts || a.id.localeCompare(b.id));
-  let recentAdded = 0;
-  for (const row of recent) {
-    if (recentAdded >= 3) break;
-    const key = `${row.type}:${row.id}`;
-    if (candidates.has(key)) continue;
-    candidates.set(key, { type: row.type, id: row.id });
-    recentAdded += 1;
+    recent.sort((a, b) => b.ts - a.ts || a.id.localeCompare(b.id));
+    let recentAdded = 0;
+    for (const row of recent) {
+      if (recentAdded >= 3) break;
+      const key = `${row.type}:${row.id}`;
+      if (candidates.has(key)) continue;
+      candidates.set(key, { type: row.type, id: row.id });
+      recentAdded += 1;
+    }
   }
 
   /** @type {Array<{kind:'fact'|'episode', id:string, text:string,
@@ -381,6 +470,15 @@ export async function retrieve({
       pinned,
     });
     if (R < MIN_RECALL_R) continue;
+
+    // V3-M3 候选门：非空查询必须命中 FTS/bigram，或向量余弦 ≥ minVectorScore。
+    if (hasQuery) {
+      const key = `${candidate.type}:${candidate.id}`;
+      const vectorScore = candidate.type === 'fact' ? vectorScores.get(candidate.id) : undefined;
+      const vectorQualified = Number.isFinite(vectorScore)
+        && vectorScore >= recallCfg.minVectorScore;
+      if (!lexicalHits.has(key) && !vectorQualified) continue;
+    }
 
     const rel = relativeScore(candidate.type, row, new Set(queryTokens), queryTokens.length);
     const fidelity = conservativeFidelity(row.fidelity ?? 'full', fidelityOf(R));
@@ -427,7 +525,12 @@ export async function retrieve({
 
   const result = { items, tokens, usedIds, truncated };
   if (useVector) {
-    result.vectorHits = usedIds.filter((id) => vectorScores.has(id)).length;
+    // V3-M3：只有真正过门（≥ minVectorScore）的向量命中才计入，避免
+    // hash 向量对任意查询的非零相似度把 /状态 的 vectorHits 虚增。
+    result.vectorHits = usedIds.filter((id) => {
+      const score = vectorScores.get(id);
+      return Number.isFinite(score) && score >= recallCfg.minVectorScore;
+    }).length;
   }
   if (embeddingError !== null) {
     result.vectorError = {

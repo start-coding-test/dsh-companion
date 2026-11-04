@@ -516,6 +516,19 @@ vector:
     apiKeyEnv: DSH_EMBED_API_KEY
 ```
 
+调整召回相关性门槛（v0.4.4 起默认启用；与 `vector` 一样是可选段，不参与 16 键安装自检）：
+
+```yaml
+recall:
+  # 向量余弦低于该值且没有 FTS/bigram 命中的候选直接丢弃（0..1）。
+  minVectorScore: 0.35
+  # 长度 <4、纯算术/符号、常见问候词直接跳过召回，避免「1+1」「你好」注入记忆。
+  skipSmallTalk: true
+```
+
+`minVectorScore` 取 0 表示任何非零向量命中都算相关，取 1 表示只认完全一致的向量；
+`skipSmallTalk: false` 可关掉短查询/小聊过滤（此时仍受 `minVectorScore` 与词法命中的约束）。
+
 2C4G 云端把 RSS 三档下调到预算 2.5GiB 以内（公式 `min(userLimit, totalmem×0.75−512MiB)`；
 三档须递增且不超过总内存 75%，4GiB 即 3.0GiB）：
 

@@ -168,7 +168,7 @@ test('retrieve：score 降序、pinned 优先、R 与档位正确', async () => 
       observed_at: daysAgo(60),
     });
 
-    const result = await retrieve({ store, query: '生日', now: NOW_MS });
+    const result = await retrieve({ store, query: '生日是五月', now: NOW_MS });
     assert.equal(result.items.length, 4);
     assert.equal(result.truncated, false);
     assert.deepEqual(result.items.map((item) => item.id), [
@@ -326,17 +326,17 @@ test('retrieve：空查询只回最近 7 天的 top3', async () => {
   });
 });
 
-test('retrieve：查询无命中时 recency 候选仍可返回', async () => {
+test('retrieve：查询无命中时不返回 recency 候选（V3-M3 相关性门槛）', async () => {
   await withStore(async (store) => {
-    const recent = addFact(store, {
+    addFact(store, {
       statement: '完全无关的近期记录',
       observed_at: daysAgo(1),
       last_reinforced_at: daysAgo(1),
     });
-    const result = await retrieve({ store, query: '生日', now: NOW_MS });
-    assert.equal(result.items.length, 1);
-    assert.equal(result.items[0].id, recent.id);
-    assert.ok(result.items[0].score >= 0.5);
+    const result = await retrieve({ store, query: '今天天气如何', now: NOW_MS });
+    assert.deepEqual(result.items, []);
+    assert.equal(result.tokens, 0);
+    assert.equal(result.truncated, false);
   });
 });
 
@@ -349,7 +349,7 @@ test('retrieve：情景（episode）也参与召回与渲染', async () => {
       last_reinforced_at: daysAgo(1),
     });
 
-    const result = await retrieve({ store, query: '生日', now: NOW_MS });
+    const result = await retrieve({ store, query: '生日计划', now: NOW_MS });
     const item = result.items.find((entry) => entry.id === episode.id);
     assert.ok(item);
     assert.equal(item.kind, 'episode');

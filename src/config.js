@@ -71,6 +71,22 @@ Object.defineProperty(DEFAULT_VALUES, 'vector', {
   configurable: false,
 });
 
+// V3-M3：召回相关性门槛。同样不参与 16 键安装自检/示例配置输出（与 vector 一致），
+// 但用户显式配置 recall.* 时照常校验。
+const RECALL_DEFAULTS = Object.freeze({
+  // 向量通道的最低余弦相似度；低于它的候选只靠 FTS/bigram 命中才有资格进召回。
+  minVectorScore: 0.35,
+  // 查询门：短查询、纯符号/算术、常见问候词一律跳过召回。
+  skipSmallTalk: true,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'recall', {
+  value: RECALL_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -286,6 +302,48 @@ function normalizeVector(raw, warnings) {
 }
 
 /**
+ * 校验 recall 配置（V3-M3）。未知子键只 warning；非法值 fail-fast。
+ *
+ * 该节默认不参与 Object.keys(DEFAULTS) 的 16 键安装自检（与 vector 一致），
+ * 但 retrieve() 会用它给召回设默认门槛。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{minVectorScore: number, skipSmallTalk: boolean}>}
+ */
+export function normalizeRecall(raw, warnings = []) {
+  const defaults = DEFAULTS.recall;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('recall', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['minVectorScore', 'skipSmallTalk']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "recall.${key}" ignored`);
+  }
+  const minVectorScore = raw.minVectorScore === undefined
+    ? defaults.minVectorScore
+    : raw.minVectorScore;
+  if (typeof minVectorScore !== 'number' || !Number.isFinite(minVectorScore)
+    || minVectorScore < 0 || minVectorScore > 1) {
+    throw new ConfigError(
+      'recall.minVectorScore',
+      `must be a finite number within 0..1, got ${JSON.stringify(minVectorScore)}`,
+    );
+  }
+  const skipSmallTalk = raw.skipSmallTalk === undefined
+    ? defaults.skipSmallTalk
+    : raw.skipSmallTalk;
+  if (typeof skipSmallTalk !== 'boolean') {
+    throw new ConfigError(
+      'recall.skipSmallTalk',
+      `must be a boolean, got ${JSON.stringify(skipSmallTalk)}`,
+    );
+  }
+  return Object.freeze({ minVectorScore, skipSmallTalk });
+}
+
+/**
  * 合并默认值并校验配置；未知字段只产生 warning，不阻断。
  * @param {Record<string, unknown>} [raw]
  * @returns {Readonly<Record<string, unknown>>} 冻结后的配置（含 warnings 数组）
@@ -355,6 +413,7 @@ export function normalizeConfig(raw = {}) {
   }
 
   cfg.vector = normalizeVector(input.vector === undefined ? DEFAULTS.vector : input.vector, warnings);
+  cfg.recall = normalizeRecall(input.recall === undefined ? DEFAULTS.recall : input.recall, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

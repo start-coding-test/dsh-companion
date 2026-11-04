@@ -129,12 +129,12 @@ test('一轮完整链路：巩固只 staged，压缩成功才发布，下一轮�
   );
 
   // 下一轮：新事实可被召回并注入进 user 消息。
-  const nextTurn = await runTurn({ store, platform, query: '预算', history, open: false });
+  const nextTurn = await runTurn({ store, platform, query: '预算多少', history, open: false });
   assert.ok(
     nextTurn.recalled.items.some((item) => item.text.includes('8000')),
     '下一轮召回应看到新事实',
   );
-  const injection = await recallInjection({ store, query: '预算', now: TEST_NOW });
+  const injection = await recallInjection({ store, query: '预算多少', now: TEST_NOW });
   assert.match(injection.injected, /8000/);
 });
 

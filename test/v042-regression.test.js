@@ -175,7 +175,7 @@ test('S2-M1 集成：首次注入未用、第二次注入才用上 → 取第二
     'agent/pre-step',
     turnPayload(
       2,
-      messages(['user', '青柠计划的代号是？'], ['assistant', '我先查一下。'], ['user', '好']),
+      messages(['user', '青柠计划的代号是？'], ['assistant', '我先查一下。'], ['user', '继续查一下代号']),
       { id: 'session-1' },
     ),
     { kind: 'enter', messages: [] },
@@ -193,7 +193,7 @@ test('S2-M1 集成：首次注入未用、第二次注入才用上 → 取第二
       messages(
         ['user', '青柠计划的代号是？'],
         ['assistant', '青柠计划的代号是蓝鲸。'],
-        ['user', '好。'],
+        ['user', '继续确认代号'],
       ),
       { id: 'session-1' },
     ),
