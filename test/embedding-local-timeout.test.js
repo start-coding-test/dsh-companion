@@ -197,9 +197,9 @@ test('E-M1：依赖未安装（Cannot find module）→ fatal，停用 local 且
 
 test('E-M1：首轮网络错 → transient，指数退避后重试可用', async () => {
   let loads = 0;
-  // 退避窗口用 100ms（而不是 1ms），让「窗口内不重试」的断言不依赖调度顺序；
+  // 退避窗口用 300ms（而不是 1ms），让「窗口内不重试」的断言不依赖调度顺序；
   // 整套并发运行时 1ms 定时器可能在断言前就到期，status 从 backoff 变 idle。
-  const retryBaseMs = 100;
+  const retryBaseMs = 300;
   const embedder = createEmbedder(
     { embedder: 'local', embedTimeoutMs: 300 },
     {

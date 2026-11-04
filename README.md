@@ -173,7 +173,7 @@ node scripts/calibrate/run.mjs
 - `vector.embedder` 支持 `hash`（默认，字符 bigram 哈希，零依赖但非语义）、`local`（可选依赖 `@huggingface/transformers`，默认 `Xenova/bge-small-zh-v1.5` 512 维 int8）、`remote`（默认关闭，显式 `vector.remote.enabled: true` 才启用；会把原文发到第三方，见 [docs/embedding.md](docs/embedding.md#remote)）与 `none`（等价关闭）。
 - 向量按 `embedder_id` 隔离：换模型后旧向量不再参与召回；local/remote 的缺失向量由 idle-probe 分批回填（≤ `vector.backfillBatchSize`，默认 50）。
 - 开启后 `/状态` 显示「向量：开·dim 256·hash:256·已回填 N·最近命中 N」；embedding 超时/未安装时退回 FTS 并记 `vectorEmbedFailures`。
-- 旧库升级到 schema v7 会补 `facts.first_reneed_*` 三列（旧行 NULL）；v6 的向量迁移仍把旧向量行标成 `hash:<dim>`，hash 在下次写入/编辑/强化时重建，local/remote 由空闲回填补齐。
+- 旧库升级到 schema v8 会补 `facts.first_reneed_*` 三列与 `same_context`（旧行分别为 NULL / 0）；v6 的向量迁移仍把旧向量行标成 `hash:<dim>`，hash 在下次写入/编辑/强化时重建，local/remote 由空闲回填补齐。
 
 ## 记忆与遗忘
 
@@ -182,12 +182,13 @@ node scripts/calibrate/run.mjs
 - `/记忆 忘掉` 只做标记（S1）；7 天冷静期内仍可恢复，到期由每日 03:30 的清理任务物理删除。
 - 被遗忘、被取代或标记为 secret 的内容不会被召回；此时珞然会直接说「不记得了」，不编造。
 - 每日 03:00 的 deep-sleep 执行睡眠期巩固（有模型时）、遗忘降级、FTS 孤儿 GC 与状态板 staged 重渲染，并写审计。
-- **评测埋点**：`facts.first_reneed_at` / `first_reneed_tier` / `reneed_kind` 记录每条事实第一次被再需要（召回 full/gist、去重命中沉睡/墓碑、用户纠正）；schema v7 起写入，流程见 [S0 标定](docs/s0-calibration.md)。
+- **评测埋点**：`facts.first_reneed_at` / `first_reneed_tier` / `reneed_kind` / `same_context` 记录每条事实第一次被再需要（召回 full/gist、下一轮复述用上、去重命中沉睡/墓碑、用户纠正）；同会话即时召回标 `same_context=1`，统计时排除。schema v8 起写入，流程见 [S0 标定](docs/s0-calibration.md)。
 
 ## 已知限制
 
 - **FTS 为 bigram 近似**：没有分词器或同义词，召回依赖字面 bigram 与时间衰减；同义改写可能召回不到（可选向量召回可缓解，但见下条）。
 - **向量召回默认关闭且效果取决于 embedder**：`hash` 只是字符 bigram 哈希投影，不是语义 embedding；`local` 需要可选安装 `@huggingface/transformers` 并首次联网下载模型；`remote` 会把原文发到第三方（隐私例外见 [docs/embedding.md](docs/embedding.md)）。`vector.embedder` 已支持 `hash`/`local`/`remote`/`none`，任一实现失败都会退回 FTS。
+- **local 加载与推理受 `vector.embedTimeoutMs` 约束**：前台每轮最多等 300ms（含首次加载等待），超时即本轮退回纯 FTS、不向用户报错；模型在启动与 idle-probe 异步预热，加载期间只跳过向量路。缺可选依赖会停用 local（fatal），网络/初始化等临时失败按 1/2/4/8s 退避、第 5 次后冷却 60s 再试，不会永久关闭（见 [docs/embedding.md](docs/embedding.md#local-的超时与异步预热e-m1)）。
 - **旧加密文件（v1）不认证 header**：v0.3.0 及更早版本导出的密文没有 AAD 绑定，`id`/`created_at` 等 header 字段仍可被伪造；新文件（`format: "v2"`）已认证。需要时可解密后用同一口令重新导出。
 - **无跨设备备份**：数据库只在本机；backup 任务只在本机按日期滚动保留 7 份。需要搬移时用 `/记忆 导出` 与 `importAll`（见「导出、恢复与加密」）。
 - 平台管理的会话 JSONL 不在插件控制范围内，插件无法删除。

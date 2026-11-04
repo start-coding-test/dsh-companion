@@ -241,7 +241,8 @@ test('E-M1 集成：首次网络错 → transient 退避，窗口过后真实召
   await withStore(async (store) => {
     addFact(store);
     let loads = 0;
-    const retryBaseMs = 120;
+    // 退避窗口留足余量（300ms），避免并发下计时器在断言前到期。
+    const retryBaseMs = 300;
     const embedder = createEmbedder(
       { embedder: 'local', dim: DIM, embedTimeoutMs: 300 },
       {

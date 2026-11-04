@@ -1,4 +1,4 @@
-# 已知技术债与真机联调清单（v0.4.0）
+# 已知技术债与真机联调清单（v0.4.1）
 
 > 本文只记录**本轮未做项、已知限制与待真机确认项**，不新增设计判据、不改需求。
 > Gate 0 九项直接引用 `memory/docs/07-风险与里程碑.md` §7.5（判据原文以该文档为准）；探针细节见 [gate0-probe.md](gate0-probe.md)，待实测问题见 [h1-h3-probe.md](h1-h3-probe.md)。
@@ -27,7 +27,7 @@
 | 编号 | 待测问题 | 现状 | 影响 | 建议排期 | 验收方式 |
 | --- | --- | --- | --- | --- | --- |
 | P-1 | `sessionQuery.readSurface(session.id)` 在长会话 pre-step 的耗时 | H1 已确认 seq 来源与区间，未测长会话耗时 | 会话节点多时 pre-step 变慢，可能拖慢每轮 | 两周评测前 | 构造 1k/5k 节点会话，记录 p50/p95；若随节点数线性增长则加缓存或索引 |
-| P-2 | `session/event` 是否在本轮 pre-step 前交付新消息（索引新鲜度） | H2 已确认 `payload.messages` 只含本步新消息，新鲜度未测 | 晚一轮会漏巩固当轮内容 | 两周评测前 | 跑 `npm run probe:headless -- --two-turn`，对比新消息 seq 与 pre-step 入参；缺本轮消息则调整注入点 |
+| P-2 | `session/event` 是否在本轮 pre-step 前交付新消息（索引新鲜度） | H2 已确认 `payload.messages` 只含本步新消息，新鲜度未测；L-3（平台摘要节点身份）并入本项 | 晚一轮会漏巩固当轮内容；摘要节点归属不清会重复/漏算 surface | 两周评测前 | 跑 `npm run probe:headless -- --two-turn`，对比新消息 seq 与 pre-step 入参；同时核对平台摘要节点的 `agent`/`session` 归属与 seq 口径；缺本轮消息则调整注入点 |
 | P-3 | 线程会话 `header.agentPreset` 是否持久化 | 未测 | 重启后线程可能丢人格/preset | 线程功能真机验收前 | 建带 preset 的线程，重启 DSH，读 thread session header 确认仍在 |
 | P-4 | subagent pre-step 的 payload 是否带 `origin==='subagent'` 且 `parentSession` 指向父会话 | 未测（headless 只能模拟单会话） | subagent 识别失败会误召回/误写库 | GUI 联调时 | GUI 派一个 subagent，抓 pre-step payload，断言两个字段；不满足则改子会话识别 |
 
@@ -51,6 +51,10 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 
 ## 4. 本轮未做项（技术债）
 
+按处理阶段分两类：**P1 前必须**（会影响两周评测结论或 P1 功能）、**真机阶段**（需真实 DSH/目标机器才能确认）。未列出的旧债保持原状；E-M1/S-M1/L-2 已修，见 §5。
+
+### P1 前必须
+
 ### D-1 N-M4 / W1：worker 没有 token 上限（P1 前必须）
 
 - **现状**：`src/task/worker.js` 只有软超时 600s（告警）与硬超时 900s（两段式取消）：`DEFAULT_SOFT_MS` / `DEFAULT_HARD_MS`。没有按估算 token 的软/硬阈值，回执也没有 `status=partial`；preset 中未发现 `auto:false`。评审 v0.3.2 将 N-M4/W1 与 N-L1 列为两周评测前置，N-M4 必须在 P1 前完成（N-L1 已在 v0.4.0 完成）。
@@ -72,9 +76,25 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **建议排期**：低优先级补丁，P1 前；与 deep-sleep 其他规则改动一起测。
 - **验收方式**：`deepConsolidate` 改为读主会话自己的 transcript（或同时校验主会话快照）；单测覆盖「主空/线程非空」不写、「主非空/线程空」写入、「两者都有」按主会话写；回归现有 deep-sleep 用例。
 
+### D-6 L-1：remote 查询侧没有敏感过滤（P1）
+
+- **现状**：隐私过滤只作用在**事实行**上——`store.listVectorBackfill` 只取 active + normal + 未删除 + 非 `sensitive`，`govern` 命中敏感词的事实也不会进入 embedder（[remote.js](../src/memory/embedders/remote.js) 顶部注释）。但召回查询是用户当前输入（`retrieve.js:273` 调 `embedder.embedQuery([textQuery])`），查询文本不经 `isSensitiveText`，开启 remote 时会原样 POST 到第三方 endpoint。
+- **影响**：用户在对话里提到秘密/敏感内容时，即使事实行被过滤，查询原文仍会出境；「敏感事实不发送」的承诺只覆盖写侧，不覆盖读侧。
+- **建议排期**：P1 前；与 remote 正式开放同时。
+- **验收方式**：在 remote 路径加查询侧过滤/开关（命中敏感词则跳过向量查询、只走 FTS，并记 metric），单测覆盖「敏感查询不调 fetch」「普通查询照常」；文档与 `/状态` 说明查询也会发送；用一个含敏感词的输入抓 fetch 断言 0 请求。
+
+### D-7 L-5：remote 调用没有上限/熔断（P1）
+
+- **现状**：remote 每次召回发一次查询请求、回填每批一次；失败只 `throw EmbeddingUnavailable/EmbeddingTimeout`，由 `retrieveVectors` 记 `vectorEmbedFailures` 并回退 FTS，下一轮继续尝试。没有每轮/每日调用次数上限，也没有 local 那样的退避/长冷却（E-M1 只加在 local）。
+- **影响**：endpoint 故障或计费接口被频繁触发时会持续产生请求与费用；用户无法用配置封顶。
+- **建议排期**：P1 前；在 remote 正式开放前完成。
+- **验收方式**：加可配置的调用上限（如每轮 1 次、每日 N 次）与失败退避/熔断，超限直接走 FTS 并记 metric；单测覆盖超限不 fetch、冷却后恢复、正常路径不回归；文档补配置项与 `/状态` 观测。
+
+### 真机阶段
+
 ### D-4 W4：local embedding 未在真机加载与计量
 
-- **现状**：`local` 通过动态 `import('@huggingface/transformers')` 加载 `Xenova/bge-small-zh-v1.5`（512 维 int8），是可选依赖；测试全部使用注入的 fake loader，未在真实 Electron/Node 上加载模型，也未测首次下载、加载耗时与 RSS 增量。remote 同样只用注入 fetch。
+- **现状**：`local` 通过动态 `import('@huggingface/transformers')` 加载 `Xenova/bge-small-zh-v1.5`（512 维 int8），是可选依赖；测试全部使用注入的 fake loader，未在真实 Electron/Node 上加载模型，也未测首次下载、加载耗时与 RSS 增量。remote 同样只用注入 fetch。E-M1（v0.4.1）已给加载/推理加超时与异步预热、失败分类与退避，**但真实加载路径、首次下载与内存增量仍未在真机验证**。
 - **影响**：真机上可能因原生 ONNX、网络、内存不足而加载失败；失败会静默退回 FTS，用户以为已开启语义召回；4G 机器上模型内存可能叠加到 RSS 红线。
 - **建议排期**：推荐用户开启 `local` 前完成；最迟 P1 前，与 Linux 2C4G 复测一起。
 - **验收方式**：在 Windows DSH（Electron）与 Linux 纯 Node 各装一次可选依赖，首次加载 + 批量 embed 10 条；断言 `/状态` 显示 `local:bge-small-zh-v1.5:512`、维度 512、回填计数增长；记录首次下载/加载耗时与 RSS 增量；卸载依赖后确认 `EmbeddingUnavailable` 并回退 FTS，不阻塞召回。
@@ -86,7 +106,20 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **建议排期**：云端发布前必须；与 D-4 同批做。
 - **验收方式**：Linux 2C4G、swap 1–2GB、DSH headless；按 [calibration.md](calibration.md) 配 RSS 2.2/2.4/2.6（`threadMaxActive` 先设 2–3）；跑 24h 混合负载，记录常驻/峰值 RSS、warn/stop/main_only 触发与恢复、无 OOM；再把结果回填 Gate 0-4。
 
-## 5. 关联文档
+### D-8 L-4：RSS 默认值与 3.2GB 红线的单位待 07 明确（P1 / 真机）
+
+- **现状**：代码默认三档 `2.95/3.0/3.15`（GiB），Gate 0-4 与 07 §7.5 的红线写作 **3.2GB**；GiB 与 GB 差约 7%（3.2GB ≈ 2.98GiB），按默认 stop 3.0GiB 实际已越过按 GB 解释的红线。07 未写明单位，也没说明默认三档是否应随目标机器 4G 下调。本文不新增判据，只记录待澄清点。
+- **影响**：单位解释不同会改变 Gate 0-4 的通过/不通过判定；真机按 3.0GiB stop 运行时可能先触红线而未触发告警。
+- **建议排期**：P1 前由 07 明确单位与默认值口径；真机复测（D-5）按明确后的数值执行。
+- **验收方式**：07 补一句单位（GB 或 GiB）并给出 4G 机器的推荐默认；代码/文档/自检表三处数值一致；D-5 的复测记录引用该口径。
+
+## 5. 已关闭（本轮修复）
+
+- **E-M1 local embedding 无超时、首次加载阻塞 turn**：v0.4.1 修复，commit `7270417`。加载等待与推理都受 `vector.embedTimeoutMs`（默认 300ms）约束；启动/idle-probe 异步预热，加载期间本轮走纯 FTS；缺依赖 fatal 停用，网络/超时/初始化 transient 退避（1/2/4/8s，第 5 次失败后 60s 长冷却，不永久停用）。测试与文档见 [embedding.md](embedding.md)。
+- **S-M1 W5 把「被注入」当「被需要」、未排除同会话即时召回**：v0.4.1 修复，commit `39addbb`。`reneed_kind` 增加 `used`（复述重叠 ≥0.6 升级，保留首次时间/档位）；新增 `same_context`（Δt<6h 或来源 episode 仍在 surface），统计排除。schema v8。样本口径见 [s0-calibration.md](s0-calibration.md) §1。
+- **L-2 确认词长度上限**：v0.4.1 修复，同 commit `39addbb`。`isConfirmation` 去标点/空白后超过 `CONFIRM_MAX_CHARS=10` 直接不算确认。
+
+## 6. 关联文档
 
 - [README](../README.md)：配置表、v0.4.0 变更摘要、已知限制
 - [使用手册](usage.md)：执行槽、向量召回、外部压缩与水位重锚、FAQ
