@@ -35,37 +35,95 @@ const GOAL_MAX_CODEPOINTS = 2000;
  */
 const THREAD_SLOT_HOLD_MAX_MS = 900_000;
 
+/** 可注入定时器，便于测试 900s 兜底路径而不真的等待。 */
+const DEFAULT_TIMERS = Object.freeze({
+  setTimeout: (callback, ms) => setTimeout(callback, ms),
+  clearTimeout: (handle) => clearTimeout(handle),
+});
+
 /**
  * 槽位保持到线程空闲：thread_run 已经把目标投递进去，真正的执行是线程会话；
  * 只有等它 whenIdle 才算这次执行结束，否则 task_run 会与它并行成第二个执行态。
- * whenIdle 不可用/抛错时立即释放（宁可弱保证，也不泄漏槽位）。
+ * whenIdle 不可用/抛错时立即释放（宁可弱保证，也不泄漏槽位），并留下
+ * warn 日志与 threadSlotFallback 计数；900s 兜底强制释放同样可观测。
+ *
+ * target 优先传 createSession 返回的句柄（含 agent），避免线程刚创建/刚解除
+ * 归档时 ctx.agents 反查不到而直接退化；只有 reuse 分支才传会话 id。
  *
  * @param {object} platform
- * @param {string} sessionId
+ * @param {string|object} target 会话 id 或 createSession 返回的 {agent}
+ * @param {{sessionId?:string, action?:string, key?:string, metrics?:object,
+ *   timers?:{setTimeout:Function, clearTimeout:Function}}} [context]
  */
-function holdExecSlotUntilIdle(platform, sessionId) {
+function holdExecSlotUntilIdle(platform, target, {
+  sessionId,
+  action,
+  key,
+  metrics,
+  timers = DEFAULT_TIMERS,
+} = {}) {
+  const baseMeta = { action, key, sessionId };
   let released = false;
+  let timer = null;
+  const stopTimer = () => {
+    if (timer === null) return;
+    const pending = timer;
+    timer = null;
+    try {
+      timers.clearTimeout(pending);
+    } catch {
+      // 定时器已触发/已回收：释放路径不应因此中断。
+    }
+  };
   const release = () => {
     if (released) return;
     released = true;
+    stopTimer();
     releaseExecSlot();
   };
+  const warn = (message, meta = {}) => {
+    try {
+      platform?.log?.('warn', message, { ...baseMeta, ...meta });
+    } catch {
+      // 日志失败不能影响槽位释放。
+    }
+  };
+  const fallback = (error) => {
+    const reason = error instanceof Error ? error.message : String(error ?? 'unknown');
+    try {
+      metrics?.inc?.('threadSlotFallback');
+    } catch {
+      // metrics 不可用时释放仍然优先。
+    }
+    warn('[tools] thread_run: whenIdle unavailable; exec slot released early', { reason });
+    release();
+  };
+
   if (typeof platform?.whenIdle !== 'function') {
     release();
     return;
   }
-  let timer = null;
   try {
-    const idle = Promise.resolve(platform.whenIdle(sessionId));
-    timer = setTimeout(release, THREAD_SLOT_HOLD_MAX_MS);
+    const idle = Promise.resolve(platform.whenIdle(target));
+    timer = timers.setTimeout(() => {
+      timer = null;
+      try {
+        metrics?.inc?.('threadSlotTimeout');
+      } catch {
+        // 计数失败不能阻止兜底释放。
+      }
+      warn('[tools] thread_run: exec slot force-released after idle timeout', {
+        maxMs: THREAD_SLOT_HOLD_MAX_MS,
+      });
+      release();
+    }, THREAD_SLOT_HOLD_MAX_MS);
     if (typeof timer?.unref === 'function') timer.unref();
     idle.then(
-      () => { if (timer) clearTimeout(timer); release(); },
-      () => { if (timer) clearTimeout(timer); release(); },
+      () => release(),
+      (error) => fallback(error),
     );
-  } catch {
-    if (timer) clearTimeout(timer);
-    release();
+  } catch (error) {
+    fallback(error);
   }
 }
 
@@ -87,6 +145,8 @@ const LIMIT_SCHEMA = Object.freeze({
  *   （pre-step 记录）；undefined=尚未路由（按 main），null=subagent（拒绝记忆工具）。
  * @param {() => {allowTask?: boolean, allowThread?: boolean, taskReason?: string,
  *   threadReason?: string}} [deps.budgetGate] M4 执行前闸门（每日熔断/RSS 降级）。
+ * @param {{inc:Function}} [deps.metrics] 计数器（thread_run 槽位兜底/超时）。
+ * @param {{setTimeout:Function, clearTimeout:Function}} [deps.timers] 可注入定时器。
  * @returns {Array<{name:string, description:string, parameters:object, execute:Function}>}
  */
 export function createTools({
@@ -99,6 +159,8 @@ export function createTools({
   timeZone = DEFAULT_TIMEZONE,
   currentScope,
   budgetGate,
+  metrics,
+  timers = DEFAULT_TIMERS,
   vector,
 } = {}) {
   if (store === null || store === undefined) {
@@ -394,6 +456,9 @@ export function createTools({
           return { ok: false, action: 'reject', key: plan.key ?? key, reason: plan.reason };
         }
 
+        // 新建分支返回的句柄直接用于 whenIdle，避免线程尚未进入 ctx.agents 时退化。
+        let createdHandle = null;
+
         const run = async () => {
           const nowSec = Math.floor(nowMs() / 1000);
           if (plan.action === 'reuse') {
@@ -459,6 +524,7 @@ export function createTools({
             cwd: targetCwd,
             agentPreset: 'companion-thread',
           });
+          createdHandle = created;
           const sessionId = sessionIdOf(created);
           if (sessionId === null) {
             throw new Error('[tools] thread_run: createSession() returned no session id');
@@ -504,7 +570,14 @@ export function createTools({
           if (result?.ok === true && result.prompted === true
             && typeof result.sessionId === 'string' && result.sessionId !== '') {
             handedOff = true;
-            holdExecSlotUntilIdle(platform, result.sessionId);
+            // create 用刚返回的句柄；reuse 只能靠会话 id 反查，反查失败会走 fallback 日志。
+            holdExecSlotUntilIdle(platform, createdHandle ?? result.sessionId, {
+              sessionId: result.sessionId,
+              action: result.action,
+              key: result.key,
+              metrics,
+              timers,
+            });
           }
           return result;
         } finally {

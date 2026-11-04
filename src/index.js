@@ -239,7 +239,7 @@ export function apply(ctx, rawConfig) {
       }));
     }
     registerCommands(platform, store, config, metrics, track, () => state.currentScope, () => budgetInfo(state), state);
-    registerTools(platform, store, config, track, () => state.currentScope, () => toolBudgetGate(state));
+    registerTools(platform, store, config, track, () => state.currentScope, () => toolBudgetGate(state), metrics);
     track(startScheduler(state));
   } catch (error) {
     for (const disposer of disposers.splice(0).reverse()) {
@@ -511,8 +511,9 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
  * @param {(disposer: Function) => void} track
  * @param {() => (string|null)} [currentScope]
  * @param {() => object|undefined} [budgetGate] M4：task_run/thread_run 的预算/内存闸门
+ * @param {{inc:Function}} [metrics] 计数器（thread_run 槽位日志/兜底）
  */
-function registerTools(platform, store, config, track, currentScope, budgetGate) {
+function registerTools(platform, store, config, track, currentScope, budgetGate, metrics) {
   if (!platform.capabilities.tools) return;
   const tools = createTools({
     store,
@@ -524,6 +525,7 @@ function registerTools(platform, store, config, track, currentScope, budgetGate)
     timeZone: config.timezone,
     currentScope,
     budgetGate,
+    metrics,
     vector: config.vector,
   });
   for (const tool of tools) {

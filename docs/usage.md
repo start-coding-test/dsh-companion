@@ -312,6 +312,17 @@ health | archived | 体检 | 2026-10-20
 - `unarchive-unavailable`：复用已归档线程，但宿主没有 `workspaceRegistry.unarchiveSession`。
 - `prompt-unavailable`：宿主没有 `sessionController.prompt`，无法投递目标。
 
+#### 执行槽：`thread_run` 与 `task_run` 共用
+
+`thread_run`（带 `goal`）和 `task_run` 共用同一个执行槽（全局 1 个），但忙时行为
+不同，这是有意的差异：
+
+- `thread_run`：槽被占用时立即返回 `{ "ok": false, "reason": "busy" }`，不排队。
+- `task_run`：槽被占用时排队（最多 2 个），队列满才返回 `busy`。
+
+主会话收到 `thread_run` 的 `busy` 时，应告诉用户「正在执行上一个任务，稍后继续」，
+不要立刻重试或改用其他工具抢占执行槽。
+
 ### `task_run`
 
 把一件独立任务交给串行 worker 执行。worker 是独立会话（不注入长期记忆），
