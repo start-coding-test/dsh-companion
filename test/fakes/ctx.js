@@ -211,11 +211,15 @@ export class FakeCtx {
           this._failAt('sessionQuery.readSurface');
           const session = this.sessions.get(sessionId);
           if (session === undefined) return this._value('sessionQuery.readSurface', null);
+          // 平台语义：events 与 session.surface.nodes 逐位 1:1，只含当前 surface；
+          // 压缩后的替换节点在 bySeq 里（未必进过 events），必须按 surface 顺序取。
           return this._value('sessionQuery.readSurface', {
             session: session.header,
             inheritedEventCount: 0,
             capturedThroughSeq: session.surface.nodes.at(-1) ?? null,
-            events: session.events.filter((event) => event !== null),
+            events: session.surface.nodes
+              .map((seq) => session.bySeq.get(seq))
+              .filter((event) => event !== null && event !== undefined),
             ...(session.eventsTruncated ? { truncated: true } : {}),
           });
         },

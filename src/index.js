@@ -487,10 +487,14 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
         if (!result.handled) {
           return { kind: 'error', text: `未识别的命令参数；用法：${alias.prefix} [参数]` };
         }
-        const reanchors = Number(metrics.snapshot?.().watermarkReanchors) || 0;
+        const metricSnapshot = typeof metrics.snapshot === 'function' ? metrics.snapshot() : {};
+        const reanchors = Number(metricSnapshot.watermarkReanchors) || 0;
+        // R-M1：外部压缩吞掉未巩固节点时，把丢失量也放进 /状态，便于观测。
+        const lostUnconsolidated = Number(metricSnapshot.compactionLostUnconsolidated) || 0;
         const text = alias.name === 'status'
           ? `${result.reply}\n${formatChatStatus(state, platform.now())}`
             + (reanchors > 0 ? `\n水位重锚：${reanchors} 次` : '')
+            + (lostUnconsolidated > 0 ? `\n未巩固被压缩：${lostUnconsolidated} 个节点` : '')
           : result.reply;
         return { kind: 'success', text };
       },
@@ -651,14 +655,59 @@ function initialWatermark(store, scope) {
 }
 
 /**
- * N-H1：水位不在当前 surface 时重锚，避免巩固永久停摆。
+ * R-M1/R-L1：按位置计算外部压缩后的重锚点。
+ *
+ * `previous` / `current` 都是按 surface 位置排列的 seq 列表（不是数值排序）：
+ * 1. 旧水位在 `previous` 里的位置之后还有节点从 current 消失 → 这些节点是被外部
+ *    压缩吞掉且尚未巩固的内容；此时锚点取替换节点（平台摘要）在 current 里的
+ *    前一个节点，让摘要本身进入下一次巩固窗口 `(afterSeq, end]`；
+ * 2. 没有丢未巩固内容 → 锚点取替换节点，保持旧语义（摘要不重复巩固）；
+ * 3. 认不出替换节点（seq 被重映射）→ 从 current 第一个节点重来；
+ * 4. 没有上一版快照 → 0（整段重来，宁可重抽一次，也不能静默断档）。
+ *
+ * 「替换节点」= current 中按位置第一个不在 previous 里的节点。不能用
+ * `Math.min(fresh)`：平台把摘要追加在日志末尾（seq 最大），而重编号场景下
+ * 数值最小的 fresh 节点未必在位置最前；巩固窗口只认位置。
+ *
+ * @param {number[]|null|undefined} previous 上一版 surface seq（按位置）
+ * @param {number[]|null|undefined} current 当前 surface seq（按位置）
+ * @param {number} watermark 旧水位
+ * @returns {{anchor: number, mode: 'no-history'|'replacement'|'replacement-lost'|'remapped', lost: number}}
+ */
+export function resolveReanchor(previous, current, watermark) {
+  const seqs = Array.isArray(current) ? current.filter((seq) => Number.isFinite(seq)) : [];
+  const prev = Array.isArray(previous) ? previous.filter((seq) => Number.isFinite(seq)) : [];
+  if (seqs.length === 0 || prev.length === 0) {
+    return { anchor: 0, mode: 'no-history', lost: 0 };
+  }
+  const known = new Set(prev);
+  const currentSeqs = new Set(seqs);
+  const fresh = seqs.filter((seq) => !known.has(seq));
+  if (fresh.length === 0) {
+    return { anchor: seqs[0], mode: 'remapped', lost: 0 };
+  }
+  const replacement = fresh[0];
+  const replacementIdx = seqs.indexOf(replacement);
+  const oldIdx = prev.indexOf(Number(watermark));
+  // oldIdx = -1（旧水位也不在上一版里）时按最保守口径：被移除节点全算丢失。
+  const lost = prev.filter((seq, index) => index > oldIdx && !currentSeqs.has(seq)).length;
+  if (lost > 0) {
+    return {
+      anchor: replacementIdx > 0 ? seqs[replacementIdx - 1] : 0,
+      mode: 'replacement-lost',
+      lost,
+    };
+  }
+  return { anchor: replacement, mode: 'replacement', lost: 0 };
+}
+
+/**
+ * N-H1/R-M1：水位不在当前 surface 时重锚，避免巩固永久停摆或静默丢掉未巩固内容。
  *
  * 平台压缩会把一段节点换成一个**追加在日志末尾的摘要节点**（seq 不在压缩前的
- * surface 里）。因此：
- * 1. 有上一版 surface seq 时，取「第一个不在旧集合里」的 seq 作为锚点——它是替换
- *    节点，摘要是平台写的，不重复巩固，从它之后开始；
- * 2. 旧集合里一个新 seq 都没有（seq 被重映射）→ 从当前 surface 第一个节点重来；
- * 3. 没有上一版快照（冷启动即失效）→ 锚点归零，整段重来（宁可重抽一次，也不能静默断档）。
+ * surface 里）；重锚位置由 {@link resolveReanchor} 按 surface 位置计算：
+ * 压缩越过旧水位时把锚点前挪到替换节点之前（让摘要进入巩固窗口），否则锚在
+ * 替换节点之后；无历史归零、seq 重映射时从当前第一个节点重来。
  *
  * @param {object} state
  * @param {string} scope
@@ -672,30 +721,26 @@ function ensureWatermark(state, scope, snapshot) {
   if (seqs.length === 0 || seqs.includes(current)) return current;
 
   const previous = state.prevSurfaceSeqsByScope?.get?.(scope) ?? null;
-  let anchor = 0;
-  let mode = 'no-history';
-  if (Array.isArray(previous) && previous.length > 0) {
-    const known = new Set(previous);
-    const fresh = seqs.filter((seq) => !known.has(seq));
-    if (fresh.length > 0) {
-      anchor = Math.min(...fresh);
-      mode = 'replacement';
-    } else {
-      anchor = seqs[0];
-      mode = 'remapped';
-    }
-  }
+  const { anchor, mode, lost } = resolveReanchor(previous, seqs, current);
 
   setWatermark(state, scope, anchor);
   writeWatermarkAnchor(state.store, scope, anchor);
   state.metrics.inc('watermarkReanchors');
-  state.platform.log('warn', '[dsh-companion] stale watermark re-anchored after external compaction', {
-    scope,
-    watermark: current,
-    anchor,
-    mode,
-    nodes: seqs.length,
-  });
+  if (lost > 0) state.metrics.inc('compactionLostUnconsolidated', lost);
+  state.platform.log(
+    'warn',
+    lost > 0
+      ? '[dsh-companion] stale watermark re-anchored after external compaction (compactionLostUnconsolidated)'
+      : '[dsh-companion] stale watermark re-anchored after external compaction',
+    {
+      scope,
+      watermark: current,
+      anchor,
+      mode,
+      lost,
+      nodes: seqs.length,
+    },
+  );
   return anchor;
 }
 
@@ -786,7 +831,15 @@ async function runPreStep(state, payload) {
   await refreshSurface(state, payload, usage?.nodes ?? null);
   // N-H1：平台自动压缩 / 用户 /compact 会让旧水位从 surface 消失；先重锚再谈巩固，
   // 否则 planRegion 永远返回 stale-watermark，该 scope 静默停摆。
-  ensureWatermark(state, scope, state.surfaceSnapshotByScope.get(scope) ?? state.surfaceSnapshot);
+  const snapshotBefore = state.surfaceSnapshotByScope.get(scope) ?? state.surfaceSnapshot;
+  const watermarkBefore = watermarkOf(state, scope);
+  const anchor = ensureWatermark(state, scope, snapshotBefore);
+  if (anchor !== watermarkBefore) {
+    // R-M1：外部压缩把旧区间换成了从日志末尾追加的替换节点，正文索引里还没有它；
+    // 不回填一次，巩固窗口会因 missing>0 被跳过，平台摘要就永远进不了记忆库。
+    const refreshed = await refreshSurface(state, payload, usage?.nodes ?? null, { forceRebuild: true });
+    if (refreshed !== null) ensureWatermark(state, scope, refreshed);
+  }
 
   if (isNewTurn) {
     // 先补上一轮写库后未完成的两段式压缩（平台只允许 turn 内压缩）。
