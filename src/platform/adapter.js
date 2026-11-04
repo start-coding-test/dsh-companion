@@ -15,27 +15,45 @@ function unavailable(code, what) {
 }
 
 /**
- * 校验注入项是完整平台消息（V3-H1）。
+ * 校验注入项是完整平台消息（V3-H1 + V4-L1）。
  *
  * 平台把 `decision.messages` 的每一项当消息 append 到会话
  * （`dsh-agent-loop/lib/index.js:1067`），`dsh-session` 随后校验
- * id/role/source/content（`dsh-session/lib/index.js:1186-1219`）。这里先检查
- * 插件可控的最小形状：role 必须是非空字符串，content 必须是数组或字符串。
- * （id/source 由注入方负责；召回注入见 src/index.js 的 recallMessage。）
+ * id/role/source/content（`dsh-session/lib/index.js:1186-1219`）。这里按平台
+ * 消费顺序校验插件可控的完整形状：
+ * - `id` 必须是非空字符串（缺了冷读会话报 "lacks an identified message"，
+ *   `dsh-session/lib/index.js:1200`）；
+ * - `role` 必须是字面量 `'user'`（注入一律 user/message）；
+ * - `content` 必须是非空 ContentBlock 数组；
+ * - `source` 必须是对象且 `source.kind` 是非空字符串（`dsh-agent-loop` 读
+ *   `message.source.kind`，裸块会崩 "Cannot read properties of undefined"）。
+ *
+ * 任一不满足都在插件侧抛 TypeError，报错信息点名字段（V4-L1）。
  *
  * @param {unknown} message
  * @param {number} index
  * @returns {void}
  */
 function assertInjectedMessage(message, index) {
+  const where = `onPreStep "inject"[${index}]`;
   if (message === null || typeof message !== 'object' || Array.isArray(message)) {
-    throw new TypeError(`onPreStep "inject"[${index}] must be a platform message object`);
+    throw new TypeError(`${where} must be a platform message object`);
   }
-  if (typeof message.role !== 'string' || message.role === '') {
-    throw new TypeError(`onPreStep "inject"[${index}] must have a string "role"`);
+  if (typeof message.id !== 'string' || message.id === '') {
+    throw new TypeError(`${where} must have a non-empty string "id"`);
   }
-  if (!Array.isArray(message.content) && typeof message.content !== 'string') {
-    throw new TypeError(`onPreStep "inject"[${index}] must have "content" as an array or string`);
+  if (message.role !== 'user') {
+    throw new TypeError(`${where} must have "role" of 'user'`);
+  }
+  if (!Array.isArray(message.content) || message.content.length === 0) {
+    throw new TypeError(`${where} must have "content" as a non-empty array`);
+  }
+  const source = message.source;
+  if (source === null || typeof source !== 'object' || Array.isArray(source)) {
+    throw new TypeError(`${where} must have "source" as an object`);
+  }
+  if (typeof source.kind !== 'string' || source.kind === '') {
+    throw new TypeError(`${where} must have a non-empty string "source.kind"`);
   }
 }
 
@@ -49,7 +67,8 @@ function assertInjectedMessage(message, index) {
  *   把 `decision.messages` 当消息 append 到会话
  *   （`dsh-agent-loop/lib/index.js:1067` 读 `message.source.kind`），裸块会在
  *   真机上崩 `Cannot read properties of undefined (reading 'kind')`（V3-H1）。
- *   形状不对时这里直接抛 TypeError，把问题留在插件侧；
+ *   形状不对时这里直接抛 TypeError，把问题留在插件侧。V4-L1 起还校验
+ *   `id` 与 `source.kind`（`dsh-session:1200` 的 identified message 校验）；
  * - { messages: ContentBlock[] }：整体替换本批进入消息；
  * - { reject: true } 或 { kind: 'reject' }：拒绝本步。
  *

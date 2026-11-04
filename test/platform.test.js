@@ -66,9 +66,16 @@ test('onPreStep 注入：追加到进入批次并保留决策字段', async () =
   const ctx = new FakeCtx();
   const adapter = createAdapter(ctx);
   let received;
+  // V4-L1：注入项必须是完整平台消息（id/role/content/source.kind）。
+  const injected = {
+    id: 'recall-1',
+    role: 'user',
+    content: [{ type: 'text', text: '<memory/>' }],
+    source: { kind: 'companion-recall', form: 'snapshot', sections: [] },
+  };
   adapter.onPreStep((payload, decision) => {
     received = { payload, decision };
-    return { inject: [{ role: 'user', content: '<memory/>' }] };
+    return { inject: [injected] };
   });
 
   const payload = {
@@ -88,7 +95,7 @@ test('onPreStep 注入：追加到进入批次并保留决策字段', async () =
   assert.equal(decision.kind, 'enter');
   assert.deepEqual(decision.messages, [
     { role: 'user', content: 'hi' },
-    { role: 'user', content: '<memory/>' },
+    injected,
   ]);
   assert.equal(decision.startsRequestSeries, true, '必须保留上游决策字段');
   assert.equal(received.payload, payload);
@@ -400,7 +407,8 @@ test('onPreStep 注入裸内容块：TypeError，不再把 undefined source 留�
         { agent, messages: [{ role: 'user', content: 'hi' }], turn: 1, step: 0 },
         () => ({ kind: 'enter', messages: [] }),
       ),
-    (error) => error instanceof TypeError && /"role"/u.test(error.message),
+    // V4-L1：裸块最先缺的是 id（平台的必填字段），错误必须点名字段。
+    (error) => error instanceof TypeError && /"id"/u.test(error.message),
   );
 });
 
@@ -429,6 +437,121 @@ test('onPreStep 注入形状校验：role 与 content 非法都抛 TypeError', a
       `inject=${JSON.stringify(inject)} 应被拒绝`,
     );
   }
+});
+
+// ------------------------------------------------- V4-L1：id 与 source.kind 必填
+
+/** 合法注入消息（形状对齐 src/index.js 的 recallMessage）。 */
+function validInject(overrides = {}) {
+  return {
+    id: 'recall-1',
+    role: 'user',
+    content: [{ type: 'text', text: '[相关记忆]\\n- 预算 8000' }],
+    source: {
+      kind: 'companion-recall',
+      form: 'snapshot',
+      sections: [{ name: 'recall', text: '...' }],
+    },
+    ...overrides,
+  };
+}
+
+test('onPreStep 注入缺 id 或 id 非法：TypeError 点名字段', async () => {
+  const cases = [
+    [{ id: undefined }, /"id"/u],
+    [{ id: '' }, /"id"/u],
+    [{ id: 42 }, /"id"/u],
+  ];
+  for (const [overrides, pattern] of cases) {
+    const ctx = new FakeCtx();
+    const adapter = createAdapter(ctx);
+    const message = validInject(overrides);
+    if (overrides.id === undefined) delete message.id;
+    adapter.onPreStep(() => ({ inject: [message] }));
+    await assert.rejects(
+      () =>
+        ctx.dispatch(
+          'agent/pre-step',
+          { agent, messages: [], turn: 1, step: 0 },
+          () => ({ kind: 'enter', messages: [] }),
+        ),
+      (error) => error instanceof TypeError && pattern.test(error.message)
+        && error.message.includes('"id"'),
+      `inject.id=${JSON.stringify(overrides.id)} 应被拒绝`,
+    );
+  }
+});
+
+test('onPreStep 注入缺 source 或 source.kind 非法：TypeError 点名字段', async () => {
+  const cases = [
+    [{ source: undefined }, /"source"/u],
+    [{ source: null }, /"source"/u],
+    [{ source: 'companion-recall' }, /"source"/u],
+    [{ source: [] }, /"source"/u],
+    [{ source: {} }, /"source\.kind"/u],
+    [{ source: { kind: '' } }, /"source\.kind"/u],
+    [{ source: { kind: 42 } }, /"source\.kind"/u],
+  ];
+  for (const [overrides, pattern] of cases) {
+    const ctx = new FakeCtx();
+    const adapter = createAdapter(ctx);
+    const message = validInject(overrides);
+    if (overrides.source === undefined) delete message.source;
+    adapter.onPreStep(() => ({ inject: [message] }));
+    await assert.rejects(
+      () =>
+        ctx.dispatch(
+          'agent/pre-step',
+          { agent, messages: [], turn: 1, step: 0 },
+          () => ({ kind: 'enter', messages: [] }),
+        ),
+      (error) => error instanceof TypeError && pattern.test(error.message),
+      `inject.source=${JSON.stringify(overrides.source)} 应被拒绝`,
+    );
+  }
+});
+
+test('onPreStep 注入 role/content 不合规：TypeError 点名字段', async () => {
+  const cases = [
+    [{ role: 'assistant' }, /"role"/u],
+    [{ role: 'system' }, /"role"/u],
+    [{ role: '' }, /"role"/u],
+    [{ content: [] }, /"content"/u],
+    [{ content: 'text' }, /"content"/u],
+    [{ content: undefined }, /"content"/u],
+  ];
+  for (const [overrides, pattern] of cases) {
+    const ctx = new FakeCtx();
+    const adapter = createAdapter(ctx);
+    const message = validInject(overrides);
+    if (overrides.content === undefined) delete message.content;
+    adapter.onPreStep(() => ({ inject: [message] }));
+    await assert.rejects(
+      () =>
+        ctx.dispatch(
+          'agent/pre-step',
+          { agent, messages: [], turn: 1, step: 0 },
+          () => ({ kind: 'enter', messages: [] }),
+        ),
+      (error) => error instanceof TypeError && pattern.test(error.message),
+      `inject=${JSON.stringify(overrides)} 应被拒绝`,
+    );
+  }
+});
+
+test('onPreStep 注入真实召回消息形状：通过且原样追加', async () => {
+  const message = validInject();
+  const ctx = new FakeCtx();
+  const adapter = createAdapter(ctx);
+  adapter.onPreStep(() => ({ inject: [message] }));
+
+  const decision = await ctx.dispatch(
+    'agent/pre-step',
+    { agent, messages: [], turn: 1, step: 0 },
+    () => ({ kind: 'enter', messages: [] }),
+  );
+  assert.deepEqual(decision.messages, [message]);
+  assert.equal(decision.messages[0], message);
 });
 
 test('onPreStep 注入完整平台消息：原样追加，不被改写', async () => {
