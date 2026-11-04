@@ -2,6 +2,26 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.5] - 2026-11-05
+
+v0.4.4 发布后评审（V4）的修复：提醒失败不再卡在 `delivering`，inject 消息形状校验点名到字段，召回加词法门槛并支持 2 字实体与短查询配置，召回块经压缩摘要回流完成调查与防线。仍为零第三方运行时依赖，无 schema 变更；发布前独立复审 pass（H=0 / M=0），见 [docs/review-v10.md](docs/review-v10.md)。
+
+### Fixed
+
+- **V4-H1 提醒投递失败卡 `delivering` / 重复入队**：队列键固定为 `reminder:<id>`（不再带 tick 秒），安静时段、日上限与退避期间的重复扫描只保留一份；提醒不再参与文本合并，投递前钩子逐份判定，被剔除的份回调 `onFailed`，不会留下「已 claim 未投递」的行。失败回 `pending` 时按 30s → 60s 退避（第 1/2 次），`delivery_attempts` 达到 3 次才置 `expired`；同一发生时刻复用为 `last_fire_key`，重复 tick 不额外消耗 attempts；崩溃残留的 `delivering` 启动时回收为 `pending` 补发。
+- **V4-L1 inject 消息形状校验**：`mergeDecision` 对每个 `patch.inject` 元素调用 `assertInjectedMessage`，按 `id` / `role` / `content` / `source.kind` 逐项校验，错误信息以 `onPreStep "inject"[i]` 点名具体字段并抛 `TypeError`；合法召回消息原样追加，行为不变。
+- **V4-M1 召回词法门槛 / 短查询**：查询长度门槛降到 `recall.minQueryChars=2`（此前写死 4），2–3 字 CJK 实体（「蓝鲸」「生日」「吃药没」）可召回；非空查询要求命中 ≥2 个不同有效 bigram 或命中比例 ≥30%，停用 bigram（今天/我们/一下/什么/怎么/可以…）及其重叠跨词 bigram 不计入命中与分母，纯寒暄查询不再注入。`recall.minQueryChars` 为 1..64 整数，非法值 `ConfigError` fail-fast。
+
+### Changed
+
+- **V4-L2 召回块经压缩摘要回流（调查 + 防线）**：召回块改为带 `[相关记忆] … [/相关记忆]` 成对标记；巩固窗口与转录对成对片段整段剔除，仅残留开头标记时保守保留原文；巩固提示词明确标记段是历史快照、不得据此新建事实。残余风险（标记被摘要截断）仍依赖标记完整性，结论与复现见 [docs/recall-compaction.md](docs/recall-compaction.md)。
+- **文档**：`docs/usage.md` 增提醒队列/退避与 `minQueryChars` 说明；`docs/recall-compaction.md` 记录 V4-L2 调查；退避段落与实现对齐（第 3 次失败直接 `expired`，120s 档在当前上限下不可达）。
+- **测试**：新增 `test/v045-regression.test.js` 跨 H1/L1/M1/L2 集成回归 6 例，`test/v045-m1-recall-quality.test.js` 52 条混合库召回质量 5 例，并扩充提醒投递、inject 校验、召回压缩用例；用例总数 743 → 766 / 16 个套件。
+
+### Verified
+
+- 三时区 `node --test`（默认 / `TZ=UTC` / `TZ=America/Los_Angeles`）766/766 pass、0 fail；`test/e2e/plugin-smoke.test.js` 4/4、`test/e2e/*.test.js` 127/127；工作树干净，发布门通过。
+
 ## [0.4.4] - 2026-11-04
 
 v0.4.3 云端真机回报与代码评审的必修项修复：召回注入契约、提醒两阶段投递与 fired 语义、线程能力门控、服务访问与回收、主会话重绑、召回相关性门、编辑重抽、日志级别与中文命令提示。仍为零第三方运行时依赖；schema 升至 v10（旧库自动升级）。

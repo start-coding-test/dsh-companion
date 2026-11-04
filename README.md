@@ -4,7 +4,15 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.4 已发布**（2026-11-04）。`node --test` 全绿：743 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/Los_Angeles` 三时区）。
+当前状态：**v0.4.5 已发布**（2026-11-05）。`node --test` 全绿：766 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/Los_Angeles` 三时区）。
+
+## v0.4.5 变更摘要
+
+- **提醒投递不再卡 `delivering`（V4-H1）**：队列键固定为 `reminder:<id>`，安静时段/日上限/退避期间不会堆出多份；提醒不参与文本合并，投递前逐份判定；失败按 30s → 60s 退避（第 1/2 次），第 3 次才 `expired`，启动回收崩溃残留的 `delivering`。
+- **inject 形状校验点名到字段（V4-L1）**：`patch.inject` 的每个元素校验 `id` / `role` / `content` / `source.kind`，不合法抛 `TypeError` 并以 `onPreStep "inject"[i]` 点名；合法召回消息原样通过。
+- **召回词法门槛与 2 字实体（V4-M1）**：`recall.minQueryChars` 默认 2（此前写死 4），2–3 字 CJK 实体可召回；非空查询需 ≥2 个有效 bigram 命中或 ≥30% 命中比例，停用 bigram 不计入；纯寒暄/短查询在读库前短路。
+- **召回块经压缩摘要回流（V4-L2）**：召回块带 `[相关记忆] … [/相关记忆]` 成对标记，巩固窗口与转录整段剔除、标记不全时保守保留；提示词明确不得据此新建事实，残余风险与结论见 [docs/recall-compaction.md](docs/recall-compaction.md)。
+- **复审**：发布前独立复审 pass（H=0 / M=0 / L=2，Low 项已随发布修完），见 [docs/review-v10.md](docs/review-v10.md)。完整条目见 [CHANGELOG](CHANGELOG.md)。
 
 ## v0.4.4 变更摘要
 
