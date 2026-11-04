@@ -154,9 +154,16 @@ export function createAdapter(ctx, opts = {}) {
 
   // headless 宿主的 logger 是带 exporters 的函数（`ctx.get('logger')` 为 undefined），
   // 调用 `info()` 既不抛错也没有可见 sink（C-H1 真机实测：启动日志被吞）。
-  // 这类宿主上把日志镜像到 stderr，发布门（scripts/probe/run-headless.mjs --plugin）
-  // 才有可断言的通道；桌面宿主的 logger 是普通对象，不会走这条镜像。
+  // 这类宿主上把 info 及以上日志镜像到 stderr，发布门
+  // （scripts/probe/run-headless.mjs --plugin）才有可断言的通道；桌面宿主的
+  // logger 是普通对象，不会走这条镜像。
+  //
+  // V3-L1：debug 也曾被全量镜像，headless 跑一轮会把 stderr 刷成调试流。默认
+  // 只镜像 info/warn/error；确实要看 debug 时显式设置
+  // DSH_COMPANION_MIRROR_DEBUG=1（发布门不设置，保持输出可断言）。
   const mirrorToStderr = typeof logger === 'function' && typeof process.stderr?.write === 'function';
+  const mirrorDebug = process.env.DSH_COMPANION_MIRROR_DEBUG === '1';
+  const MIRROR_LEVELS = new Set(['info', 'warn', 'error']);
 
   /**
    * 时钟：优先 opts.now（apply 传入的席位），其次宿主 `ctx.get('now')`，
@@ -186,6 +193,18 @@ export function createAdapter(ctx, opts = {}) {
     return typeof value === 'string' && value !== '' ? value : undefined;
   };
 
+  /**
+   * H3②：线程/任务工具的能力探测。只读 `ctx.get('sessionController')`，
+   * **绝不实际 createSession**；三个方法缺一个就视为宿主不支持。
+   * @returns {boolean}
+   */
+  const hasThreadControl = () => {
+    const controller = service('sessionController');
+    return typeof controller?.createSession === 'function'
+      && typeof controller?.prompt === 'function'
+      && typeof controller?.cancel === 'function';
+  };
+
   const capabilities = Object.freeze({
     get systemPrompt() {
       return typeof service('systemPrompt')?.section === 'function';
@@ -204,10 +223,15 @@ export function createAdapter(ctx, opts = {}) {
       return typeof service('compaction')?.compactRegion === 'function';
     },
     get sessionController() {
-      const controller = service('sessionController');
-      return typeof controller?.createSession === 'function'
-        && typeof controller?.prompt === 'function'
-        && typeof controller?.cancel === 'function';
+      return hasThreadControl();
+    },
+    /**
+     * H3②：线程/任务工具的能力门槛，与 `sessionController` 同源。
+     * 为 false 时接线层**不要注册** thread_run/task_run/thread_* 工具
+     * （见 docs/platform-api.md §5）。
+     */
+    get threadTools() {
+      return hasThreadControl();
     },
     get archive() {
       return typeof service('workspaceRegistry')?.archiveSession === 'function';
@@ -263,7 +287,7 @@ export function createAdapter(ctx, opts = {}) {
       if (meta === undefined) sink.call(logger, message);
       else sink.call(logger, message, meta);
     }
-    if (mirrorToStderr) {
+    if (mirrorToStderr && (mirrorDebug || MIRROR_LEVELS.has(level))) {
       try {
         process.stderr.write(`${message}${meta === undefined ? '' : ` ${JSON.stringify(meta)}`}\n`);
       } catch {

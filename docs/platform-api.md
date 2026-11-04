@@ -64,6 +64,41 @@
   阶段 2（选区间并 `compactRegion`）顺延到下一次 `agent/pre-step`，在 open turn 内执行。
   没有下一次 turn 时压缩保持 pending，由 40K 安全阀在下一轮优先处理。
 
+### 1.3 `sessionController` 由谁提供（V3-H3①，v0.4.4 调查）
+
+- **服务名与实现**：`@deepseek-ai/dsh-api-session-controller` 在构造函数里
+  `super(ctx, 'sessionController', { namespace: 'session' })`
+  （`dsh-api-session-controller/lib/index.js:2952`）。
+- **装载方**：唯一挂载点是 web 应用 bundle `dsh-web-app/cordis.patch.yml:121-122`
+  （`- id: session-controller` / `name: '@deepseek-ai/dsh-api-session-controller'`），
+  依赖声明见 `dsh-web-app/package.json:64`。
+- **桌面宿主**：`dsh-desktop-host` 启动 `desktop` profile
+  （`dsh-desktop-host/lib/index.js:218-230`），真实机器
+  `~/.dsh/profiles/desktop/package.json` 的 bundles 组合
+  `["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-web-app", …]`，`cordis.yml: []`。
+  因为 desktop profile 组合了 `dsh-web-app`，**桌面 / Web GUI 宿主 present=true**，
+  不需要任何 patch。
+- **headless / one-shot / SDK**：`dsh-headless/cordis.patch.yml` 注明
+  “mounts no Host, HTTP server, Web runtime, or browser plugin”，不含
+  session-controller 行；`dsh-sdk-app`、`dsh-sdk-minimal` 的 patch 也没有。
+  发布门 `scripts/probe/run-headless.mjs:485,620` 跑 `--profile headless --patch`，
+  真机探针因此报 `present=false`（`scripts/probe/probe-plugin.js:607-611`）。
+- **不是 desktop-only**：任何组合了 `dsh-web-app` 的宿主都有；反过来 headless
+  没有 Host 侧服务，`dsh-api-session-controller/lib/index.js:2917-2930` 的
+  `static inject` 需要 agents / sessions / llm / sessionQuery 等一整套，
+  **不要在 headless 上补 patch 试图启用**，按「不支持」处理。
+- **结论**：`platform.capabilities.threadTools` 是唯一门槛；缺失时按 §5 降级，
+  无需改平台源码。
+
+### 1.4 宿主只注册 ASCII 命令名（V3-L3）
+
+`dsh-commands/lib/index.js:78` 的命令名正则是 `^[a-z][a-z0-9_-]*$`，
+`:103` 的解析正则同样只认 ASCII；用户输入 `/记忆` 不会被平台当命令，
+而是作为普通用户消息发给模型。因此插件注册的命令名必须是 ASCII
+（`memory` / `status` / `cost` / `threads`），中文写法只能按「用户误输入」处理：
+pre-step 用 `commandHintMessage()` 注入一句「请用 /memory、/status、/cost、/threads」
+（完整平台消息形状见 §2.1.1）。
+
 ## 2. 适配层契约
 
 `src/platform/adapter.js` 只依赖 Node 内置模块与 `./errors.js`，不 import 任何
@@ -78,7 +113,7 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 | 方法 | 转发目标 | 说明 |
 | --- | --- | --- |
 | `now()` | `opts.now` → `ctx.now()` → `Date.now()` | 可注入时钟；测试用 FakeCtx 手动推进 |
-| `log(level, message, meta?)` | `ctx.logger[level]` | 无 logger 时安静返回 `false`；非法 level 抛 `TypeError` |
+| `log(level, message, meta?)` | `ctx.logger[level]` | 无 logger 时安静返回 `false`；非法 level 抛 `TypeError`。headless 的函数型 logger 额外镜像到 stderr，但默认只镜像 `info`/`warn`/`error`（V3-L1，`DSH_COMPANION_MIRROR_DEBUG=1` 才带上 `debug`） |
 | `section(spec)` | `ctx.systemPrompt.section(spec)` | 返回平台 disposer |
 | `onPreStep(handler)` | `ctx.on('agent/pre-step', listener)` | 返回 disposer；handler 在 fallback 之后执行，补丁见下 |
 | `every(ms, callback)` | `ctx.interval(callback, ms)` | 返回 disposer；`ms` 必须为正有限数 |
@@ -149,8 +184,10 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 ### 2.2 能力探测与 `PlatformError`
 
 适配器对象上有只读的 `capabilities`（getter，随宿主服务装载实时变化）：
-`systemPrompt`、`preStep`、`timer`、`compaction`、`sessionController`、`archive`、
-`tokenMeter`、`tokenEstimator`、`sessionEvent`、`sessionQuery`、`logger`。调用缺失能力时抛 `PlatformError`：
+`systemPrompt`、`preStep`、`timer`、`compaction`、`sessionController`、`threadTools`、
+`archive`、`tokenMeter`、`tokenEstimator`、`sessionEvent`、`sessionQuery`、`logger`。
+`threadTools` 与 `sessionController` 同源，是线程/任务工具的注册门槛（§5）。
+调用缺失能力时抛 `PlatformError`：
 
 | code | 触发方法 |
 | --- | --- |
@@ -217,3 +254,26 @@ ctx.compactSession(session.id, 7, 8, { remap: [100] });    // 模拟压缩后的
   `sessionController.prompt` 这类单个方法粒度。
 - `fail` / `fail(key, error)` 的 key 用点号路径；`whenIdle` 的 key 为 `agent.whenIdle`。
 - `dispatch(event, payload, fallback)` 按注册顺序执行 waterfall，供 `onPreStep` 测试使用。
+
+## 5. 线程/任务工具的能力门槛（V3-H3②）
+
+适配层提供只读 getter `platform.capabilities.threadTools`（与 `sessionController`
+同源）：`ctx.get('sessionController')` 上 `createSession`、`prompt`、`cancel`
+三个方法都在才为 `true`。探测**只读服务对象，绝不调用 `createSession`**，
+不会在探测阶段创建会话。
+
+接线约定（`src/index.js` 的 `registerTools` / 命令注册）：
+
+- `threadTools === false`：**不注册** `thread_run`、`task_run` 以及所有
+  `thread_*` 工具（含 `thread_list`）。模型看不到这些工具，就不会在 headless /
+  自定义 bundle 上调用后收到 `PlatformError('no-session')`。
+- `threadTools === true`：行为与 v0.4.3 完全一致（工具集合不变）。
+- `/status` 在缺失时多一行：
+  `线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）`；
+  接线层把 `threadsSupported: platform.capabilities.threadTools` 传给
+  `handleCommand`。其余状态行与 `/记忆`、`/成本`、`/线程` 输出不变。
+- 能力清单里曾把 `sessionController` 当纯能力位；v0.4.4 起注册工具一律读
+  `threadTools`，两者目前同源，但后者语义固定在「能否注册线程/任务工具」。
+
+这也解释了 v0.4.3 真机回报里的 `sessionController present=false`：发布门跑的是
+headless profile（见 §1.3），不是桌面宿主；桌面 / Web GUI 宿主 present=true。

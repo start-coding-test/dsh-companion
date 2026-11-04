@@ -321,6 +321,7 @@ test('capabilities 反映宿主能力', () => {
     timer: true,
     compaction: true,
     sessionController: true,
+    threadTools: true,
     archive: true,
     tokenMeter: true,
     tokenEstimator: true,
@@ -338,6 +339,11 @@ test('capabilities 反映宿主能力', () => {
   assert.equal(partial.capabilities.compaction, false);
   assert.equal(partial.capabilities.tokenMeter, false);
   assert.equal(partial.capabilities.sessionController, true);
+  // V3-H3②：线程/任务工具门槛与 sessionController 同源；缺失时为 false。
+  assert.equal(partial.capabilities.threadTools, true);
+  const noSession = createAdapter(new FakeCtx({ missing: ['sessionController'] }));
+  assert.equal(noSession.capabilities.sessionController, false);
+  assert.equal(noSession.capabilities.threadTools, false);
 });
 
 const missingCases = [

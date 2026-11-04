@@ -152,7 +152,9 @@ node scripts/calibrate/run.mjs
 
 命令：`/记忆`（`列表 [关键词]`、`忘掉`、`改 <id> <内容>`、`治理 [--dry-run]`、`导出 [md|json]`、`置顶`、`取消置顶`）、`/成本`、`/线程`、`/状态`、`/别闲聊`、`/恢复闲聊`。
 
-工具（10 个）：`memory_search`、`memory_write`、`memory_update`、`memory_forget`、`reminder_add`、`reminder_done`、`thread_list`、`thread_run`、`task_run`、`cost_report`。
+**宿主只注册 ASCII 命令名。** DSH 的命令名正则只接受 `^[a-z][a-z0-9_-]*$`，所以插件实际注册的是 `memory`、`cost`、`threads`、`status`、`chat-off`、`chat-on`；`/记忆`、`/状态`、`/成本`、`/线程` 只是同一功能的别名提示，直接输入中文命令**不会**被执行。误输入时 pre-step 会回一句「请用 /memory、/status、/cost、/threads」，请改用 ASCII 命令名（参数写法不变，例如 `/memory 忘掉 <id>`）。
+
+工具（宿主提供 `sessionController` 时 10 个）：`memory_search`、`memory_write`、`memory_update`、`memory_forget`、`reminder_add`、`reminder_done`、`thread_list`、`thread_run`、`task_run`、`cost_report`。宿主没有 `sessionController`（例如 headless / one-shot bundle）时**不注册** `thread_list`、`thread_run`、`task_run`，`/状态` 会显示「线程：宿主不支持」；其余工具不受影响。
 
 参数、返回与降级行为见 [docs/usage.md](docs/usage.md)。
 

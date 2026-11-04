@@ -8,7 +8,14 @@
  *   命令层不再直接调用 forgetFact/deleteFact）；
  * - 未知命令返回 { handled: false }，由调用方决定是否交给模型；
  * - 命令回复是给人看的短文本，不塞 JSON。
+ *
+ * V3-L3：平台命令名必须是 ASCII（`dsh-commands/lib/index.js:78` 的
+ * `^[a-z][a-z0-9_-]*$`），用户直接输入 `/记忆` 不会进入命令分发，而会当普通
+ * 文本发给模型。`chineseCommandHint()` / `commandHintMessage()` 供 pre-step
+ * 识别这种误输入并用一句提示把用户导到 ASCII 命令名。
  */
+
+import { randomUUID } from 'node:crypto';
 
 import { forgetMemory } from '../memory/forget.js';
 import { DAILY_TOKEN_LIMIT } from './budget.js';
@@ -25,6 +32,59 @@ const MEMORY_COMMANDS = new Set(['记忆', '成本', '线程', '状态']);
 const MAX_FORGET = 5;
 const RSS_LEVEL_NAMES = Object.freeze(['ok', 'warn', 'stop_dispatch', 'main_only']);
 
+/** V3-L3：宿主只注册 ASCII 命令名，给误输入中文命令的用户一句固定提示。 */
+export const CHINESE_COMMAND_HINT = '请用 /memory、/status、/cost、/threads';
+
+/** V3-L3：会被 pre-step 识别为「中文命令误输入」的前缀。 */
+const CHINESE_COMMAND_PREFIXES = Object.freeze(['/记忆', '/状态', '/成本', '/线程']);
+
+/** V3-L3：提示注入消息的 source.kind，便于转录/巩固与普通用户发言区分。 */
+export const COMMAND_HINT_SOURCE_KIND = 'companion-command-hint';
+
+/**
+ * 识别用户误输入的中文命令。
+ *
+ * 只按前缀判断（`/记忆`、`/状态`、`/成本`、`/线程`），不解析参数；返回的是
+ * 给用户看的 ASCII 命令提示，不是该命令的执行结果。识别不到返回 null。
+ *
+ * @param {unknown} text 用户输入
+ * @returns {string|null}
+ */
+export function chineseCommandHint(text) {
+  if (typeof text !== 'string') return null;
+  const raw = text.trimStart();
+  return CHINESE_COMMAND_PREFIXES.some((prefix) => raw.startsWith(prefix))
+    ? CHINESE_COMMAND_HINT
+    : null;
+}
+
+/**
+ * 为误输入的中文命令构造 pre-step 注入消息（完整平台消息，V3-H1 形状）。
+ *
+ * 平台把 pre-step 的 `decision.messages` 逐条当 user/message 追加
+ * （`dsh-agent-loop/lib/index.js:1067`），因此必须是 `{id, role, content,
+ * source}` 而不是裸内容块。消息本身是给模型的一句指令：用固定提示回复用户。
+ * 接线层只在本轮（turn）第一次 pre-step 时调用一次，避免每 step 重复注入。
+ *
+ * @param {unknown} text 用户输入
+ * @returns {{id: string, role: 'user', content: object[], source: object}|null}
+ */
+export function commandHintMessage(text) {
+  const hint = chineseCommandHint(text);
+  if (hint === null) return null;
+  const raw = String(text).trimStart();
+  const prefix = CHINESE_COMMAND_PREFIXES.find((item) => raw.startsWith(item));
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{
+      type: 'text',
+      text: `宿主只注册 ASCII 命令名，${prefix} 不会被执行。请直接回复用户一句：${hint}`,
+    }],
+    source: { kind: COMMAND_HINT_SOURCE_KIND },
+  };
+}
+
 /**
  * 解析并执行一条用户命令。
  *
@@ -38,6 +98,10 @@ const RSS_LEVEL_NAMES = Object.freeze(['ok', 'warn', 'stop_dispatch', 'main_only
  * @param {{dailyTokens?: number, dailyLimit?: number, tripped?: boolean,
  *   rssLevel?: string, rssLevelCode?: number, rssMB?: number,
  *   rssLimits?: {warnGiB?: number, stopGiB?: number, mainOnlyGiB?: number}}} [options.budget] M4 预算/RSS 快照
+ * @param {boolean} [options.threadsSupported] H3②：宿主是否提供 sessionController
+ *   （即线程/任务工具是否已注册）；false 时 /状态 明确显示「线程：宿主不支持」
+ * @param {{id?: string|null, binding?: string}} [options.mainSession] V3-M2：
+ *   当前主会话 id 与绑定模式（latest-user / first），/状态 展示用
  * @returns {{handled: boolean, reply: string}}
  */
 export function handleCommand({
@@ -48,6 +112,8 @@ export function handleCommand({
   metrics,
   timeZone = DEFAULT_TIMEZONE,
   budget,
+  threadsSupported,
+  mainSession,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -76,7 +142,10 @@ export function handleCommand({
   if (command === '线程') {
     return { handled: true, reply: formatThreads(store.listThreads({ limit: 100 }), timeZone) };
   }
-  return { handled: true, reply: formatStatus(store, scope, metrics, timeZone, budget) };
+  return {
+    handled: true,
+    reply: formatStatus(store, scope, metrics, timeZone, budget, { threadsSupported, mainSession }),
+  };
 }
 
 /**
@@ -426,8 +495,8 @@ function formatGiB(value) {
   return String(Math.round(n * 100) / 100);
 }
 
-/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] */
-function formatStatus(store, scope, metrics, timeZone, budget) {
+/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] @param {{threadsSupported?: boolean, mainSession?: {id?: string|null, binding?: string}}} [options] */
+function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   const stats = store.stats();
   const tables = [
     'entities', 'episodes', 'facts', 'reminders', 'state_board', 'state_board_rev',
@@ -445,6 +514,20 @@ function formatStatus(store, scope, metrics, timeZone, budget) {
   const limitsText = formatRssLimits(budget);
   const lines = [`状态：${counts} / ${fts}${tokenText}`];
   if (limitsText !== null) lines.push(limitsText);
+  // H3②：宿主没有 sessionController 时不注册线程/任务工具，状态里说清楚，
+  // 免得用户以为 /线程 为空是数据问题。
+  if (options.threadsSupported === false) {
+    lines.push('线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）');
+  }
+  // V3-M2：主会话绑定对排障关键（提醒投错会话时先看这里）。
+  const mainSession = options.mainSession;
+  if (mainSession !== null && mainSession !== undefined && typeof mainSession === 'object') {
+    const binding = typeof mainSession.binding === 'string' && mainSession.binding !== ''
+      ? mainSession.binding
+      : 'latest-user';
+    const id = typeof mainSession.id === 'string' && mainSession.id !== '' ? mainSession.id : '未绑定';
+    lines.push(`主会话：${id}（绑定 ${binding}）`);
+  }
   lines.push(`水位 ${scope}：${watermark}`, `最近 job：${jobText}`, failureText);
   return lines.join('\n');
 }
