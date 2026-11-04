@@ -133,15 +133,22 @@ test('每日 token 熔断：拒绝 task_run、停主动、命令展示、跨日�
   await settle(50);
   assert.equal(temp.store.getReminder(reminder.id).status, 'pending');
 
-  // 跨本地日界：自动复位，提醒恢复投递。
+  // 跨本地日界：自动复位，提醒回到可投递状态。
   ctx.advance(DAY_MS);
   await ctx.fireTimers(1);
-  await waitFor(() => temp.store.getReminder(reminder.id).status === 'fired', {
-    label: 'reminder fired after daily reset',
-  });
+  await settle(50);
+  // 复位后的本地时间是 00:30，仍在安静时段：行保持 pending、队列保留，等安静时段结束再投递。
+  assert.equal(temp.store.getReminder(reminder.id).status, 'pending');
   const recovered = command(ctx, 'cost');
   assert.doesNotMatch(recovered.text, /已熔断/u);
   assert.match(recovered.text, /今日配额 0 \/ 3000000/u);
+
+  // 安静时段结束（08:01）：积压的提醒真正投递并置 fired。
+  ctx.advance(7.5 * 60 * 60 * 1000 + 60_000);
+  await ctx.fireTimers(1);
+  await waitFor(() => temp.store.getReminder(reminder.id).status === 'fired', {
+    label: 'reminder fired after quiet hours',
+  });
 
   // 熔断解除后任务入口恢复：不再因日预算被拒。
   const recoveredTask = await tool(ctx, 'task_run').execute({ goal: '跨日恢复后的任务' });

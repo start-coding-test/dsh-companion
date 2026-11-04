@@ -51,10 +51,16 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  * v9：facts 新增 first_used_at/first_used_tier/used_same_context，记录首次
  *     「被用上」（S2-M1）：时间/档位取用上那一刻，same_context 当场重新判定。
  *     first_reneed_* 与 same_context 原样保留给 recall 样本作对照；旧行新列为 NULL。
+ * v10：reminders.status 合法值增加 `delivering`（两阶段投递：先占位再置 fired），
+ *     并新增 delivery_attempts 计数（重启回收与重试上限）。SQLite 不能改 CHECK，
+ *     由 #ensureRemindersDeliveryColumns 幂等重建表，旧行 delivery_attempts=0。
  */
-const SCHEMA_VERSION = '9';
+const SCHEMA_VERSION = '10';
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
+
+/** 提醒两阶段投递的最大尝试次数（超过后过期，避免死循环重试）。 */
+export const REMINDER_MAX_DELIVERY_ATTEMPTS = 3;
 
 /** S0 默认遗忘强度（天）；pinned = null 表示不衰减。 */
 export const SALIENCE_STRENGTH_DAYS = Object.freeze({
@@ -269,9 +275,10 @@ CREATE TABLE IF NOT EXISTS reminders (
   next_fire_at      INTEGER,
   last_fire_key     TEXT,
   status            TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','fired','snoozed','done','cancelled','expired')),
+                    CHECK (status IN ('pending','delivering','fired','snoozed','done','cancelled','expired')),
   closed_at         INTEGER,
   source_episode_id TEXT REFERENCES episodes(id),
+  delivery_attempts INTEGER NOT NULL DEFAULT 0,
   created_at        INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at        INTEGER NOT NULL DEFAULT (unixepoch()),
   deleted_at        INTEGER
@@ -747,6 +754,9 @@ export class Store {
     if (upgrading) this.#db.exec('BEGIN IMMEDIATE');
     try {
       if (upgrading) this.#migrateFrom(from);
+      // v10：reminders 增加 delivering 状态与 delivery_attempts；SQLite 改不了
+      // CHECK，按列检测后重建表（幂等，新库直接命中「列已存在」）。
+      this.#ensureRemindersDeliveryColumns();
       // v6/v7/v8/v9 的列与索引放在迁移之后处理：旧表此时才补上 embedder_id 与
       // first_reneed_*/same_context/first_used_* 列。ALTER 按列检测，重复调用安全。
       this.#ensureFactsReneedColumns();
@@ -885,10 +895,12 @@ export class Store {
    * v8 → v9 只推进版本号；first_used_ 三列与 used_same_context 由 migrate()
    * 统一补（#ensureFactsReneedColumns），旧行 NULL，不需要回填：没有「用上」
    * 记录就是 NULL，不能用 recall 样本反推。
+   * v9 → v10 只推进版本号；reminders 的 delivering 状态与 delivery_attempts
+   * 由 migrate() 统一重建（#ensureRemindersDeliveryColumns）。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
-    if (from === '8' || from === '7' || from === '6') {
+    if (from === '9' || from === '8' || from === '7' || from === '6') {
       this.#db
         .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
         .run(SCHEMA_VERSION);
@@ -935,6 +947,61 @@ export class Store {
     this.#db
       .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
       .run(SCHEMA_VERSION);
+  }
+
+  /**
+   * v10：reminders 增加 `delivering` 状态与 delivery_attempts。
+   *
+   * SQLite 无法修改 CHECK 约束，因此旧表按「是否已有 delivery_attempts 列」判定，
+   * 需要时整表重建（新 DDL 与原表一致，只多一列并放宽 status CHECK）。重建必须
+   * 在新库/旧库都幂等：新库 SCHEMA_SQL 已含该列，直接返回；索引在 DROP TABLE 时
+   * 会一并删除，重建后补回。调用方（migrate）已包在 BEGIN IMMEDIATE 里。
+   */
+  #ensureRemindersDeliveryColumns() {
+    const columns = this.#db
+      .prepare("PRAGMA table_info('reminders')")
+      .all()
+      .map((column) => column.name);
+    if (columns.includes('delivery_attempts')) return;
+    this.#db.exec(`
+      DROP TABLE IF EXISTS reminders_v10;
+      CREATE TABLE reminders_v10 (
+        id                TEXT PRIMARY KEY,
+        scope             TEXT NOT NULL DEFAULT 'main',
+        kind              TEXT NOT NULL CHECK (kind IN ('todo','schedule','repeat','commitment')),
+        title             TEXT NOT NULL,
+        detail            TEXT,
+        counterparty      TEXT,
+        due_at            INTEGER,
+        due_granularity   TEXT CHECK (due_granularity IN ('exact','day','week','month','none')),
+        rrule             TEXT,
+        next_fire_at      INTEGER,
+        last_fire_key     TEXT,
+        status            TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending','delivering','fired','snoozed','done','cancelled','expired')),
+        closed_at         INTEGER,
+        source_episode_id TEXT REFERENCES episodes(id),
+        delivery_attempts INTEGER NOT NULL DEFAULT 0,
+        created_at        INTEGER NOT NULL DEFAULT (unixepoch()),
+        updated_at        INTEGER NOT NULL DEFAULT (unixepoch()),
+        deleted_at        INTEGER
+      );
+      INSERT INTO reminders_v10 (
+        id, scope, kind, title, detail, counterparty, due_at, due_granularity, rrule,
+        next_fire_at, last_fire_key, status, closed_at, source_episode_id,
+        delivery_attempts, created_at, updated_at, deleted_at
+      )
+        SELECT id, scope, kind, title, detail, counterparty, due_at, due_granularity, rrule,
+               next_fire_at, last_fire_key, status, closed_at, source_episode_id,
+               0, created_at, updated_at, deleted_at
+          FROM reminders;
+      DROP TABLE reminders;
+      ALTER TABLE reminders_v10 RENAME TO reminders;
+      CREATE INDEX IF NOT EXISTS ix_rm_fire ON reminders(status, next_fire_at)
+        WHERE status IN ('pending','snoozed');
+      CREATE INDEX IF NOT EXISTS ix_rm_done ON reminders(closed_at)
+        WHERE status IN ('done','cancelled');
+    `);
   }
 
   close() {
@@ -1702,6 +1769,123 @@ export class Store {
           ORDER BY next_fire_at ASC, id ASC LIMIT ?`,
       )
       .all(...args, limit);
+  }
+
+  /**
+   * 两阶段投递第一步：把到点提醒占位为 `delivering` 并记下本次 fire key。
+   *
+   * 只有 pending/snoozed 且未超重试上限的行能占位成功；占位成功返回 true，
+   * 调用方随后才真正调用 platform.prompt。delivery_attempts 按「不同 fireKey」
+   * 计数：同一 tick 内 reminders 与 idle-probe 两次 flush 对同一条提醒重试不会
+   * 重复消耗预算。失败回 pending 时保留 last_fire_key 供下次重试。
+   *
+   * @param {string} id
+   * @param {string} fireKey
+   * @param {number} [maxAttempts]
+   * @returns {boolean} 是否占位成功
+   */
+  claimReminderDelivery(id, fireKey, maxAttempts = REMINDER_MAX_DELIVERY_ATTEMPTS) {
+    const key = requireString(fireKey, 'reminders.last_fire_key');
+    const max = Number.isInteger(maxAttempts) && maxAttempts > 0
+      ? maxAttempts
+      : REMINDER_MAX_DELIVERY_ATTEMPTS;
+    const info = this.#db
+      .prepare(
+        `UPDATE reminders
+            SET status = 'delivering',
+                last_fire_key = ?,
+                delivery_attempts = delivery_attempts
+                  + (CASE WHEN last_fire_key IS ? THEN 0 ELSE 1 END),
+                updated_at = unixepoch()
+          WHERE id = ?
+            AND status IN ('pending','snoozed')
+            AND deleted_at IS NULL
+            AND delivery_attempts < ?`,
+      )
+      .run(key, key, requireString(id, 'reminders.id'), max);
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * 两阶段投递第二步（成功）：delivering → fired。
+   * @param {string} id
+   * @returns {boolean}
+   */
+  markReminderDelivered(id) {
+    const info = this.#db
+      .prepare(
+        `UPDATE reminders
+            SET status = 'fired', updated_at = unixepoch()
+          WHERE id = ? AND status = 'delivering'`,
+      )
+      .run(requireString(id, 'reminders.id'));
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * 两阶段投递第二步（失败）：delivering → pending，保留 last_fire_key 供重试。
+   * @param {string} id
+   * @returns {boolean}
+   */
+  markReminderDeliveryFailed(id) {
+    const info = this.#db
+      .prepare(
+        `UPDATE reminders
+            SET status = 'pending', updated_at = unixepoch()
+          WHERE id = ? AND status = 'delivering'`,
+      )
+      .run(requireString(id, 'reminders.id'));
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * 启动回收：把上次进程崩溃时留下的 `delivering` 行收回 pending。
+   *
+   * 未超上限的回到 pending 等待重试；已达上限的直接 expired，避免死循环。
+   * 幂等，可在每次启动时无条件调用。
+   *
+   * @param {number} [maxAttempts]
+   * @returns {{recovered: number, expired: number}}
+   */
+  recoverReminderDeliveries(maxAttempts = REMINDER_MAX_DELIVERY_ATTEMPTS) {
+    const max = Number.isInteger(maxAttempts) && maxAttempts > 0
+      ? maxAttempts
+      : REMINDER_MAX_DELIVERY_ATTEMPTS;
+    const recovered = this.#db
+      .prepare(
+        `UPDATE reminders
+            SET status = 'pending', updated_at = unixepoch()
+          WHERE status = 'delivering' AND delivery_attempts < ?`,
+      )
+      .run(max);
+    const expired = this.#db
+      .prepare(
+        `UPDATE reminders
+            SET status = 'expired', updated_at = unixepoch()
+          WHERE status = 'delivering' AND delivery_attempts >= ?`,
+      )
+      .run(max);
+    return {
+      recovered: Number(recovered.changes) || 0,
+      expired: Number(expired.changes) || 0,
+    };
+  }
+
+  /**
+   * 重试次数用尽：提醒置 expired（不再投递）。
+   * @param {string} id
+   * @returns {boolean}
+   */
+  expireReminder(id) {
+    const info = this.#db
+      .prepare(
+        `UPDATE reminders
+            SET status = 'expired', updated_at = unixepoch()
+          WHERE id = ? AND status IN ('pending','snoozed','delivering')
+            AND deleted_at IS NULL`,
+      )
+      .run(requireString(id, 'reminders.id'));
+    return Number(info.changes) > 0;
   }
 
   /**

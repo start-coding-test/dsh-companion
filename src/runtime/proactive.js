@@ -9,7 +9,12 @@
  * 5. 同一类相邻 ≤10 分钟合并成一条（仍只占 1 条预算）；
  * 6. backlog 超过 5 条时丢弃最旧（enqueue 时执行）。
  *
- * 唯一投递通道是 `platform.prompt('main', text)`（10 §2.3：唤醒 main 一轮）。
+ * 唯一投递通道是 `platform.prompt(target(), text)`（10 §2.3：唤醒 main 一轮）。
+ * target 由接线层按 identity 解析出的「当前主会话 id」提供，不得传字面量 'main'；
+ * 取不到主会话与投递失败同路径处理（保留 backlog 等待重试）。
+ * 投递前后可选钩子（onAttempt/onSent/onFailed，如提醒的两阶段状态机）由 enqueue 携带：
+ * onAttempt 在真正投递前调用（返回 false 表示本轮放弃该条），onSent 成功、onFailed 失败
+ * 或队列溢出丢弃时调用，均 best-effort，不影响闸门自身的计数。
  * 每次发送成功写一条 memory_events 事件（table_name='proactive',
  * detail.kind='proactive_sent'），重启后可恢复当日计数与 dedupe 窗口。
  * 仅使用 Node 内置能力。
@@ -70,11 +75,12 @@ function parseDetail(detail) {
  * @param {object} options
  * @param {object} options.store 需提供 appendEvent（发送记账；listEvents 可选，用于重启恢复）
  * @param {{prompt: Function}} options.platform 平台适配器窄接口
+ * @param {() => (string|null)} options.target 解析当前主会话 id（无主会话返回 null）
  * @param {Record<string, unknown>} [options.config] 已校验配置（缺省用 DEFAULTS）
  * @param {() => number|Date} [options.clock]
  * @returns {{enqueue: Function, flush: Function, stats: Function}}
  */
-export function createProactive({ store, platform, config, clock = Date.now } = {}) {
+export function createProactive({ store, platform, config, target, clock = Date.now } = {}) {
   if (store === null || typeof store !== 'object') {
     throw new TypeError('createProactive(store): store must be an object');
   }
@@ -83,6 +89,9 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
   }
   if (platform === null || typeof platform !== 'object' || typeof platform.prompt !== 'function') {
     throw new TypeError('createProactive(platform): platform.prompt is required');
+  }
+  if (typeof target !== 'function') {
+    throw new TypeError('createProactive(target): target must resolve the current main session id');
   }
   if (typeof clock !== 'function') {
     throw new TypeError('createProactive(clock): clock must be a function');
@@ -105,7 +114,8 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
 
   const nowMs = () => normalizeNow(clock());
 
-  /** @type {{kind: string, text: string, at: number, seq: number, dedupeKey: string|null}[]} */
+  /** @type {{kind: string, text: string, at: number, seq: number, dedupeKey: string|null,
+   *   hooks: {onAttempt?: Function, onSent?: Function, onFailed?: Function}[]}[]} */
   const queue = [];
   /** @type {Map<string, number>} dedupeKey → 最近发送时刻（ms） */
   const dedupe = new Map();
@@ -181,7 +191,8 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
 
   /**
    * 入队（同步）。backlog 超过 MAX_BACKLOG 时丢弃最旧的一条。
-   * @param {{kind?: string, text: string, dedupeKey?: string, at?: number|Date}} msg
+   * @param {{kind?: string, text: string, dedupeKey?: string, at?: number|Date,
+   *   onAttempt?: Function, onSent?: Function, onFailed?: Function}} msg
    * @returns {{queued: number, dropped: number}}
    */
   function enqueue(msg) {
@@ -200,13 +211,42 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
       ? msg.dedupeKey.trim()
       : null;
     const at = msg.at === undefined ? nowMs() : normalizeNow(msg.at);
+    const hooks = [];
+    if (typeof msg.onAttempt === 'function' || typeof msg.onSent === 'function'
+      || typeof msg.onFailed === 'function') {
+      hooks.push({ onAttempt: msg.onAttempt, onSent: msg.onSent, onFailed: msg.onFailed });
+    }
 
-    queue.push({ kind, text, at, seq: seq++, dedupeKey });
+    queue.push({ kind, text, at, seq: seq++, dedupeKey, hooks });
     while (queue.length > MAX_BACKLOG) {
-      queue.shift();
+      const droppedItem = queue.shift();
       dropped += 1;
+      runHooks(droppedItem, 'onFailed');
     }
     return { queued: queue.length, dropped };
+  }
+
+  /**
+   * 执行一条消息上的某类钩子；钩子异常只记入报告，不影响闸门计数。
+   * @param {object|null} item
+   * @param {'onAttempt'|'onSent'|'onFailed'} name
+   * @param {{error?: unknown}} [report]
+   * @returns {boolean} 是否全部允许（onAttempt 返回 false 表示放弃该条）
+   */
+  function runHooks(item, name, report) {
+    if (item === null || item === undefined || !Array.isArray(item.hooks)) return true;
+    let allowed = true;
+    for (const hook of item.hooks) {
+      const fn = hook?.[name];
+      if (typeof fn !== 'function') continue;
+      try {
+        if (fn() === false) allowed = false;
+      } catch (error) {
+        if (report !== undefined) report.error = report.error ?? error;
+        else console.warn('[proactive] hook failed:', error);
+      }
+    }
+    return allowed;
   }
 
   /**
@@ -272,6 +312,7 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
       if (previous !== null && previous.kind === head.kind
         && Math.abs(head.at - previous.at) <= MERGE_WINDOW_MS) {
         previous.text = `${previous.text}\n\n${head.text}`;
+        if (Array.isArray(previous.hooks)) previous.hooks.push(...head.hooks);
         if (previous.dedupeKey === null) previous.dedupeKey = head.dedupeKey;
         report.merged += 1;
         continue;
@@ -281,13 +322,38 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
     }
 
     // 第二遍：真正投递；失败时把剩余候选放回队首，保留 backlog
+    // 主会话 id 每轮解析一次；取不到与投递失败同路径（保留 backlog 等下次重试）
+    let sessionId = null;
+    try {
+      const resolved = target();
+      sessionId = typeof resolved === 'string' && resolved.trim() !== '' ? resolved : null;
+    } catch (error) {
+      report.error = error;
+      sessionId = null;
+    }
+    if (sessionId === null) {
+      const remaining = candidates.map((candidate) => ({ ...candidate }));
+      queue.unshift(...remaining);
+      for (const candidate of remaining) runHooks(candidate, 'onFailed', report);
+      if (candidates.length > 0) report.failed += 1;
+      report.error = report.error ?? new Error('[proactive] no main session');
+      report.deferred += queue.length;
+      return report;
+    }
+
     for (let index = 0; index < candidates.length; index += 1) {
       const item = candidates[index];
+      // 投递前钩子：返回 false 表示本轮放弃该条（如提醒已被取消/已到重试上限）
+      if (!runHooks(item, 'onAttempt', report)) {
+        report.suppressed += 1;
+        continue;
+      }
       try {
-        await platform.prompt('main', item.text);
+        await platform.prompt(sessionId, item.text);
       } catch (error) {
         report.failed += 1;
         const remaining = candidates.slice(index).map((candidate) => ({ ...candidate }));
+        for (const candidate of remaining) runHooks(candidate, 'onFailed', report);
         queue.unshift(...remaining);
         report.error = error;
         break;
@@ -298,6 +364,7 @@ export function createProactive({ store, platform, config, clock = Date.now } = 
       if (item.dedupeKey !== null) dedupe.set(item.dedupeKey, at);
       report.sent += 1;
       report.items.push({ kind: item.kind, text: item.text });
+      runHooks(item, 'onSent', report);
       try {
         recordSent(item, at);
       } catch (error) {

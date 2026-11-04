@@ -124,6 +124,21 @@ describe('normalizeConfig', () => {
     assert.equal(cfg.rssMainOnlyGiB, 2.6);
     assert.deepEqual(cfg.warnings, []);
   });
+
+  // V3-M2：主会话绑定模式（latest-user | first）
+  test('session.mainBinding 默认 latest-user', () => {
+    assert.deepEqual(normalizeConfig().session, { mainBinding: 'latest-user' });
+  });
+
+  test('session.mainBinding 接受 first，未知子键给警告', () => {
+    const cfg = normalizeConfig({ session: { mainBinding: 'first', foo: 1 } });
+    assert.equal(cfg.session.mainBinding, 'first');
+    assert.ok(cfg.warnings.some((warning) => /session\.foo/u.test(warning)));
+  });
+
+  test('session.mainBinding 非法值抛 ConfigError', () => {
+    expectConfigError({ session: { mainBinding: 'newest' } }, 'session.mainBinding');
+  });
 });
 
 describe('normalizeConfig 非法输入', () => {

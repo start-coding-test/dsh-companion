@@ -267,13 +267,47 @@ test('subagent：pre-step 直接跳过（零召回、零模型、零写库），
   }
 });
 
-test('未知主会话仍按 main 处理，并在日志中告警', async () => {
+test('未知主会话在收到真实用户输入后重绑 main_session_id（latest-user）', async () => {
   const temp = makeTempStore();
   const { ctx } = makeCtx();
   const first = ctx.addSession({ id: 'main-1' });
   const second = ctx.addSession({ id: 'main-2' });
   seedFact(temp.store, 'main', '蓝鲸是海洋哺乳动物');
   const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
+  try {
+    await ctx.dispatch(
+      'agent/pre-step',
+      payload(ctx, first, 1, '蓝鲸是什么动物？'),
+      { kind: 'enter', messages: [] },
+    );
+    const decision = await ctx.dispatch(
+      'agent/pre-step',
+      payload(ctx, second, 1, '蓝鲸是什么动物？'),
+      { kind: 'enter', messages: [] },
+    );
+    assert.match(decisionText(decision), /蓝鲸是海洋哺乳动物/u);
+    // 默认 latest-user：第二个带真实用户输入的会话成为主会话。
+    assert.equal(temp.store.getMeta('main_session_id'), 'main-2');
+    assert.ok(
+      ctx.logs.some((row) => row.level === 'info' && /rebound/iu.test(row.message)),
+    );
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});
+
+test('session.mainBinding=first：未知主会话保持只告警不重绑', async () => {
+  const temp = makeTempStore();
+  const { ctx } = makeCtx();
+  const first = ctx.addSession({ id: 'main-1' });
+  const second = ctx.addSession({ id: 'main-2' });
+  seedFact(temp.store, 'main', '蓝鲸是海洋哺乳动物');
+  const handle = apply(ctx, {
+    dbPath: temp.dbPath,
+    retainTokens: 4,
+    session: { mainBinding: 'first' },
+  });
   try {
     await ctx.dispatch(
       'agent/pre-step',

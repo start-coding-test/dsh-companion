@@ -24,7 +24,7 @@ import { copyFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 import { isQuietAt, normalizeConfig } from './config.js';
-import { Store } from './memory/store.js';
+import { REMINDER_MAX_DELIVERY_ATTEMPTS, Store } from './memory/store.js';
 import { retrieve } from './memory/retrieve.js';
 import { createEmbedder } from './memory/embedders/index.js';
 import { assemble } from './memory/assemble.js';
@@ -66,7 +66,7 @@ import {
   scanCommitmentFollowups,
 } from './scheduler/commitments.js';
 import { createAdapter } from './platform/adapter.js';
-import { MAIN_SCOPE, classifySession, threadScope } from './session/identity.js';
+import { MAIN_SCOPE, MAIN_BINDING_LATEST, MAIN_SESSION_META_KEY, classifySession, threadScope } from './session/identity.js';
 import {
   BUDGET_REASONS,
   DAILY_TOKEN_LIMIT,
@@ -323,6 +323,8 @@ export function apply(ctx, rawConfig, hooks = {}) {
   }
   const metrics = createMetrics({ clock: platform.now });
   const state = createWiringState({ platform, store, config, metrics, embedder, seats });
+  // V3-H2：先把上次进程崩溃时残留的 delivering 提醒收回 pending，避免永久卡住。
+  recoverReminderDeliveries(state);
   if (embedder !== null && embedder.kind === 'remote') {
     // W4：remote 会把原文发到第三方，启动时必须显式告警（隐私例外见 docs/embedding.md）。
     platform.log('warn', '[dsh-companion] vector.embedder=remote enabled; memory text will be sent to a third party', {
@@ -482,6 +484,8 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     currentScope: SCOPE,
     /** H3：最近一次身份路由结果（诊断用）。 */
     currentSession: null,
+    /** V3-M2：最近一次解析出的主会话 id（schema_meta 的缓存，提醒投递用）。 */
+    mainSessionId: null,
     /** 已注入召回的 turn 集合（同一 scope 的同一 turn 只注入一次）。 */
     turnSeen: new Set(),
     /** 本轮注入的 fact id（H5：下一轮判断是否被用上）。 */
@@ -637,6 +641,11 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             metrics,
             timeZone: config.timezone,
             budget: typeof budgetInfo === 'function' ? budgetInfo() : undefined,
+            // V3-M2：/状态 展示当前主会话与绑定模式。
+            mainSession: {
+              id: currentMainSessionId(state),
+              binding: mainBindingOf(config),
+            },
           });
         } catch (error) {
           return {
@@ -733,6 +742,78 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
 // -------------------------------------------------------------- 主管线
 
 /**
+ * 判断本轮 payload 是否含「真实用户输入」（V3-M2）。
+ *
+ * latest-user 绑定只认真实输入：runtime-context 注入、召回注入（companion-recall
+ * 或 [相关记忆] 前缀）都不算，探针/发布门因此不会抢占 main_session_id。
+ *
+ * @param {unknown} messages payload.messages
+ * @returns {boolean}
+ */
+function hasRealUserInput(messages) {
+  if (!Array.isArray(messages)) return false;
+  for (const message of messages) {
+    if (message === null || typeof message !== 'object') continue;
+    if (message.role !== 'user') continue;
+    const sourceKind = message.source?.kind;
+    if (sourceKind === 'runtime-context' || sourceKind === RECALL_SOURCE_KIND) continue;
+    const blocks = Array.isArray(message.content)
+      ? message.content
+      : (message.type === 'text' ? [message] : []);
+    for (const block of blocks) {
+      if (block === null || typeof block !== 'object') continue;
+      if (block.type !== 'text' || typeof block.text !== 'string') continue;
+      const text = block.text.trim();
+      if (text === '' || text.startsWith(RECALL_MARKER)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * 当前主会话 id（M2）：以 schema_meta 的 main_session_id 为准，缺省回退内存值。
+ * 提醒投递与 /状态 都用它，避免再出现字面量 'main'。
+ * @param {object} state
+ * @returns {string|null}
+ */
+function currentMainSessionId(state) {
+  try {
+    const persisted = state.store.getMeta(MAIN_SESSION_META_KEY);
+    if (typeof persisted === 'string' && persisted !== '') return persisted;
+  } catch {
+    // meta 读失败时退回内存快照。
+  }
+  return typeof state.mainSessionId === 'string' && state.mainSessionId !== '' ? state.mainSessionId : null;
+}
+
+/** @param {object} config @returns {'latest-user'|'first'} */
+function mainBindingOf(config) {
+  return config?.session?.mainBinding ?? MAIN_BINDING_LATEST;
+}
+
+/**
+ * 启动回收：把上次进程崩溃时残留的 delivering 提醒收回 pending（超上限的过期）。
+ * 幂等；没有残留时零写入。
+ * @param {object} state
+ * @returns {{recovered: number, expired: number}}
+ */
+function recoverReminderDeliveries(state) {
+  try {
+    const result = state.store.recoverReminderDeliveries(REMINDER_MAX_DELIVERY_ATTEMPTS);
+    if (result.recovered > 0 || result.expired > 0) {
+      state.platform.log('info', '[dsh-companion] reminder deliveries recovered on startup', result);
+    }
+    return result;
+  } catch (error) {
+    state.platform.log('warn', '[dsh-companion] reminder delivery recovery failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return { recovered: 0, expired: 0 };
+  }
+}
+
+/**
  * H3：把当前 pre-step 的 agent 路由到 main / thread / subagent。
  * 没有 payload.agent 的旧调用按 main 处理，保持既有测试行为。
  * @param {object} state
@@ -748,8 +829,13 @@ function routeSession(state, payload) {
   const identity = classifySession(payload.agent, {
     store: state.store,
     logger: (level, message, meta) => state.platform.log(level, message, meta),
+    binding: mainBindingOf(state.config),
+    hasUserInput: hasRealUserInput(payload.messages),
   });
   state.currentSession = identity;
+  if (typeof identity.mainSessionId === 'string' && identity.mainSessionId !== '') {
+    state.mainSessionId = identity.mainSessionId;
+  }
   if (identity.kind === 'subagent') {
     state.currentScope = null;
     state.metrics.inc('subagentSkips');
@@ -764,6 +850,9 @@ function routeSession(state, payload) {
     scope: state.currentScope,
     sessionId: identity.sessionId,
     threadKey: identity.key ?? null,
+    mainSessionId: identity.mainSessionId ?? null,
+    mainBinding: mainBindingOf(state.config),
+    rebound: identity.rebound === true,
   });
   return identity;
 }
@@ -2628,6 +2717,8 @@ function startScheduler(state) {
         content: [{ type: 'text', text }],
       }),
     },
+    // V3-H2：投递目标是 identity 解析出的当前主会话 id，不再是字面量 'main'。
+    target: () => currentMainSessionId(state),
     config,
     clock: platform.now,
   });
@@ -2689,9 +2780,16 @@ function startScheduler(state) {
 }
 
 /**
- * 把到点的提醒转成主动消息，并标记为 fired。
+ * 把到点的提醒转成主动消息（V3-H2 两阶段投递）。
+ *
+ * 这里只入队并挂上状态机钩子，不再提前把行标成 fired：
+ *   onAttempt → store.claimReminderDelivery（pending/snoozed → delivering，attempts+1）
+ *   onSent    → store.markReminderDelivered（delivering → fired）
+ *   onFailed  → store.markReminderDeliveryFailed（delivering → pending，保留 last_fire_key）
+ * 投递失败/进程崩溃时行仍可重试；启动时 recoverReminderDeliveries 兜底回收。
+ *
  * @param {object} state
- * @returns {number} 本次处理条数
+ * @returns {number} 本次入队条数
  */
 function fireDueReminders(state) {
   const { store, platform, proactive } = state;
@@ -2699,23 +2797,33 @@ function fireDueReminders(state) {
   const seconds = Math.floor(now / 1000);
   const due = store.dueReminders({ now: seconds, limit: 50 });
   if (due.length === 0) return 0;
-  const mark = store.db.prepare(
-    `UPDATE reminders
-        SET status = 'fired', last_fire_key = ?, updated_at = unixepoch()
-      WHERE id = ? AND status IN ('pending', 'snoozed')`,
-  );
+  let queued = 0;
   for (const row of due) {
     // 承诺由 runCommitmentFollowups 单独处理（每日最多一次、文案不同）。
     if (row.kind === 'commitment') continue;
-    mark.run(String(seconds), row.id);
+    const attempts = Number(row.delivery_attempts ?? 0);
+    if (attempts >= REMINDER_MAX_DELIVERY_ATTEMPTS) {
+      // 重试用尽：不再无限重试，置 expired 留痕。
+      store.expireReminder(row.id);
+      platform.log('warn', '[dsh-companion] reminder delivery attempts exhausted; expired', {
+        id: row.id,
+        attempts,
+      });
+      continue;
+    }
+    const fireKey = String(seconds);
     proactive?.enqueue({
       kind: 'reminder',
       text: `提醒：${row.title}`,
       dedupeKey: `reminder:${row.id}:${seconds}`,
       at: now,
+      onAttempt: () => store.claimReminderDelivery(row.id, fireKey, REMINDER_MAX_DELIVERY_ATTEMPTS),
+      onSent: () => store.markReminderDelivered(row.id),
+      onFailed: () => store.markReminderDeliveryFailed(row.id),
     });
+    queued += 1;
   }
-  return due.length;
+  return queued;
 }
 
 /* ------------------------------------------------------------------------- */

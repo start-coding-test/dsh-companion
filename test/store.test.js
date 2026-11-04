@@ -60,7 +60,7 @@ test('Store.open 建出 11 张业务/辅助表与 2 张 FTS 虚表', () => {
   const version = store.db
     .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
     .get();
-  assert.equal(version.value, '9');
+  assert.equal(version.value, '10');
 
   // 状态板占位行
   const board = store.getBoardState('main');
@@ -692,7 +692,7 @@ test('v3 库迁移到 v4：加 compaction_start_seq、清空 consolidations、ep
     const version = migrated.db
       .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
       .get();
-    assert.equal(version.value, '9');
+    assert.equal(version.value, '10');
     const columns = migrated.db
       .prepare("PRAGMA table_info('consolidations')")
       .all()

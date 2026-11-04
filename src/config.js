@@ -87,6 +87,21 @@ Object.defineProperty(DEFAULT_VALUES, 'recall', {
   configurable: false,
 });
 
+// V3-M2：main_session_id 绑定模式。同样不参与 16 键安装自检/示例配置输出，
+// 但用户显式配置 session.* 时照常校验。
+const SESSION_DEFAULTS = Object.freeze({
+  // latest-user：最近一次真实用户输入的非线程会话成为主会话（探针/发布门不抢占）。
+  // first：首个非线程会话钉死（旧行为，排障用）。
+  mainBinding: 'latest-user',
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'session', {
+  value: SESSION_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -344,6 +359,36 @@ export function normalizeRecall(raw, warnings = []) {
 }
 
 /**
+ * 校验 session 配置（V3-M2）。未知子键只 warning；非法值 fail-fast。
+ *
+ * 该节默认不参与 Object.keys(DEFAULTS) 的 16 键安装自检（与 vector/recall 一致），
+ * routeSession 用它决定 main_session_id 的重绑策略。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{mainBinding: 'latest-user'|'first'}>}
+ */
+export function normalizeSession(raw, warnings = []) {
+  const defaults = DEFAULTS.session;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('session', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['mainBinding']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "session.${key}" ignored`);
+  }
+  const mainBinding = raw.mainBinding === undefined ? defaults.mainBinding : raw.mainBinding;
+  if (mainBinding !== 'latest-user' && mainBinding !== 'first') {
+    throw new ConfigError(
+      'session.mainBinding',
+      `must be "latest-user" or "first", got ${JSON.stringify(mainBinding)}`,
+    );
+  }
+  return Object.freeze({ mainBinding });
+}
+
+/**
  * 合并默认值并校验配置；未知字段只产生 warning，不阻断。
  * @param {Record<string, unknown>} [raw]
  * @returns {Readonly<Record<string, unknown>>} 冻结后的配置（含 warnings 数组）
@@ -414,6 +459,7 @@ export function normalizeConfig(raw = {}) {
 
   cfg.vector = normalizeVector(input.vector === undefined ? DEFAULTS.vector : input.vector, warnings);
   cfg.recall = normalizeRecall(input.recall === undefined ? DEFAULTS.recall : input.recall, warnings);
+  cfg.session = normalizeSession(input.session, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

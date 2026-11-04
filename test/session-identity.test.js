@@ -11,8 +11,11 @@ import { Store } from '../src/memory/store.js';
 import { createTools } from '../src/runtime/tools.js';
 import * as registry from '../src/thread/registry.js';
 import {
+  MAIN_BINDING_FIRST,
+  MAIN_BINDING_LATEST,
   MAIN_SESSION_META_KEY,
   classifySession,
+  normalizeMainBinding,
   threadScope,
 } from '../src/session/identity.js';
 
@@ -158,6 +161,108 @@ test('classifySession：首个 main 持久化 main_session_id，重载后沿用�
   } finally {
     store.close();
   }
+});
+
+test('classifySession：latest-user 收到真实用户输入时重绑新的主会话', () => {
+  const store = Store.open(':memory:');
+  try {
+    const logs = [];
+    const logger = (level, message, meta) => logs.push({ level, message, meta });
+    classifySession(
+      { id: 'main-1', session: { id: 'main-1', header: { version: 4 } } },
+      { store, logger },
+    );
+    const rebound = classifySession(
+      { id: 'main-2', session: { id: 'main-2', header: { version: 4 } } },
+      { store, logger, hasUserInput: true },
+    );
+    assert.equal(rebound.kind, 'main');
+    assert.equal(rebound.scope, 'main');
+    assert.equal(rebound.rebound, true);
+    assert.equal(rebound.reboundFrom, 'main-1');
+    assert.equal(rebound.mainSessionId, 'main-2');
+    assert.equal(store.getMeta(MAIN_SESSION_META_KEY), 'main-2');
+    assert.ok(
+      logs.some(
+        (row) =>
+          row.level === 'info' &&
+          /rebound/iu.test(row.message) &&
+          row.meta?.previous === 'main-1' &&
+          row.meta?.sessionId === 'main-2',
+      ),
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test('classifySession：latest-user 但无真实用户输入时只标记待重绑，不改 meta', () => {
+  const store = Store.open(':memory:');
+  try {
+    const logs = [];
+    const logger = (level, message, meta) => logs.push({ level, message, meta });
+    classifySession(
+      { id: 'main-1', session: { id: 'main-1', header: { version: 4 } } },
+      { store, logger },
+    );
+    const probe = classifySession(
+      { id: 'probe-1', session: { id: 'probe-1', header: { version: 4 } } },
+      { store, logger },
+    );
+    assert.equal(probe.unknownMain, true);
+    assert.equal(probe.pendingRebind, true);
+    assert.equal(probe.mainSessionId, 'main-1');
+    assert.equal(store.getMeta(MAIN_SESSION_META_KEY), 'main-1');
+
+    // 同一会话再次出现不再重复 warn，降为 debug。
+    const again = classifySession(
+      { id: 'probe-1', session: { id: 'probe-1', header: { version: 4 } } },
+      { store, logger },
+    );
+    assert.equal(again.pendingRebind, true);
+    assert.ok(
+      logs.some(
+        (row) => row.level === 'debug' && /not rebound/iu.test(row.message),
+      ),
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test('classifySession：binding=first 保持旧主会话，即使有新用户输入', () => {
+  const store = Store.open(':memory:');
+  try {
+    const logs = [];
+    const logger = (level, message, meta) => logs.push({ level, message, meta });
+    classifySession(
+      { id: 'main-1', session: { id: 'main-1', header: { version: 4 } } },
+      { store, logger, binding: 'first' },
+    );
+    const other = classifySession(
+      { id: 'main-2', session: { id: 'main-2', header: { version: 4 } } },
+      { store, logger, binding: 'first', hasUserInput: true },
+    );
+    assert.equal(other.unknownMain, true);
+    assert.equal(other.rebound, undefined);
+    assert.equal(other.mainSessionId, 'main-1');
+    assert.equal(store.getMeta(MAIN_SESSION_META_KEY), 'main-1');
+    assert.ok(
+      logs.some(
+        (row) => row.level === 'warn' && /unexpected main session id/iu.test(row.message),
+      ),
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test('normalizeMainBinding：默认 latest-user，非法值抛 TypeError', () => {
+  assert.equal(normalizeMainBinding(undefined), MAIN_BINDING_LATEST);
+  assert.equal(normalizeMainBinding(null), MAIN_BINDING_LATEST);
+  assert.equal(normalizeMainBinding('latest-user'), MAIN_BINDING_LATEST);
+  assert.equal(normalizeMainBinding('first'), MAIN_BINDING_FIRST);
+  assert.throws(() => normalizeMainBinding('newest'), /session\.mainBinding/u);
 });
 
 test('Store：threads.session_id 唯一 + getThreadBySessionId', () => {

@@ -210,6 +210,7 @@ test('T11c 验收：V2/V10/V15/V16 + 提醒线', async (t) => {
     const proactive = createProactive({
       store,
       config,
+      target: () => 'main',
       clock: () => now,
       platform: {
         async prompt(sessionId, text) {

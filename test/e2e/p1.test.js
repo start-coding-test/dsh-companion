@@ -443,6 +443,8 @@ test('/记忆 改 后下一轮召回注入新内容，旧内容不再注入', as
 test('承诺 e2e：reminders tick 到期跟进一次，同一天不重复，写 commitment_followup 审计', async () => {
   const temp = makeTempStore();
   const ctx = makeCtx();
+  // 模拟上一会话已绑定主会话：提醒投递目标由 identity 解析，不再用字面量 'main'。
+  temp.store.setMeta('main_session_id', 'main-session');
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const nowSeconds = toEpochSeconds(TEST_NOW);
@@ -484,6 +486,8 @@ test('承诺 e2e：安静时段不打扰、行保持 pending，早上补发一�
   const quietNow = at('2026-11-05T23:30:00');
   const temp = makeTempStore();
   const ctx = makeCtx({ now: quietNow });
+  // 模拟上一会话已绑定主会话：提醒投递目标由 identity 解析，不再用字面量 'main'。
+  temp.store.setMeta('main_session_id', 'main-session');
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const quietSeconds = Math.floor(quietNow / 1000);
@@ -515,6 +519,8 @@ test('承诺 e2e：安静时段不打扰、行保持 pending，早上补发一�
 test('承诺 e2e：完成后不再跟进', async () => {
   const temp = makeTempStore();
   const ctx = makeCtx();
+  // 模拟上一会话已绑定主会话：提醒投递目标由 identity 解析，不再用字面量 'main'。
+  temp.store.setMeta('main_session_id', 'main-session');
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const nowSeconds = toEpochSeconds(TEST_NOW);
@@ -545,6 +551,8 @@ test('承诺 e2e：完成后不再跟进', async () => {
 test('承诺 e2e：敏感标题不进入消息正文与审计 detail', async () => {
   const temp = makeTempStore();
   const ctx = makeCtx();
+  // 模拟上一会话已绑定主会话：提醒投递目标由 identity 解析，不再用字面量 'main'。
+  temp.store.setMeta('main_session_id', 'main-session');
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const nowSeconds = toEpochSeconds(TEST_NOW);

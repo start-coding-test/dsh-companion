@@ -329,6 +329,8 @@ test('命令：6 个 ASCII 名；/别闲聊 与 /恢复闲聊 经 schema_meta �
 test('承诺接线：reminders tick 跟进一次，第二天重置；done 后不再跟进', async () => {
   const temp = makeTempStore();
   const ctx = makeCtx();
+  // 模拟上一会话已绑定主会话：提醒投递目标由 identity 解析，不再用字面量 'main'。
+  temp.store.setMeta('main_session_id', 'main-session');
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const reminder = temp.store.insertReminder({
@@ -382,6 +384,8 @@ test('承诺接线：安静时段不打扰，行保持 pending，早上补发一
   const quietNow = Date.parse('2026-11-05T23:30:00+08:00');
   const temp = makeTempStore();
   const ctx = makeCtx({ now: quietNow });
+  // 模拟上一会话已绑定主会话：提醒投递目标由 identity 解析，不再用字面量 'main'。
+  temp.store.setMeta('main_session_id', 'main-session');
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const reminder = temp.store.insertReminder({
@@ -412,6 +416,8 @@ test('承诺接线：安静时段不打扰，行保持 pending，早上补发一
 test('承诺接线：敏感标题不进入消息正文与审计 detail', async () => {
   const temp = makeTempStore();
   const ctx = makeCtx();
+  // 模拟上一会话已绑定主会话：提醒投递目标由 identity 解析，不再用字面量 'main'。
+  temp.store.setMeta('main_session_id', 'main-session');
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const reminder = temp.store.insertReminder({

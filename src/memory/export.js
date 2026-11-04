@@ -83,7 +83,7 @@ export function formatStamp(now = Date.now()) {
  * 导出该常量，因此这里仅作为 schema_meta 缺失时的兜底；正常情况下导出应
  * 读取数据库里的实际版本，而不是猜。
  */
-const CURRENT_SCHEMA_VERSION = '9';
+const CURRENT_SCHEMA_VERSION = '10';
 
 /**
  * 读取导出 payload 应写入的 schema_version：优先 store.getMeta，

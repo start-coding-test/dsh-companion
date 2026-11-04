@@ -328,17 +328,19 @@ function makePlatform() {
   };
 }
 
-function setupProactive(t, { cap = 3 } = {}) {
+function setupProactive(t, { cap = 3, target } = {}) {
   const store = memoryStore(t);
   const platform = makePlatform();
   const clockState = { now: local(15, 10, 0) };
+  const targetState = { id: 'main' };
   const gate = createProactive({
     store,
     platform,
+    target: target ?? (() => targetState.id),
     config: normalizeConfig({ proactiveDailyCap: cap }),
     clock: () => clockState.now,
   });
-  return { store, platform, clockState, gate };
+  return { store, platform, clockState, gate, targetState };
 }
 
 test('安静时段 23:00–08:00 不发送，08:00 后把相邻消息合并成一条', async (t) => {
@@ -482,7 +484,7 @@ test('发送记录写 store（memory_events），重启后恢复当日计数与 
   const platform = makePlatform();
   const clockState = { now: local(15, 10, 0) };
   const config = normalizeConfig({ proactiveDailyCap: 3 });
-  const first = createProactive({ store, platform, config, clock: () => clockState.now });
+  const first = createProactive({ store, platform, target: () => 'main', config, clock: () => clockState.now });
 
   first.enqueue({ kind: 'chat', text: '你好', dedupeKey: 'greet', at: local(15, 10, 0) });
   await first.flush(local(15, 10, 0));
@@ -497,7 +499,7 @@ test('发送记录写 store（memory_events），重启后恢复当日计数与 
 
   // 模拟进程重启：新实例从事件恢复预算与 dedupe
   clockState.now = local(15, 10, 5);
-  const second = createProactive({ store, platform, config, clock: () => clockState.now });
+  const second = createProactive({ store, platform, target: () => 'main', config, clock: () => clockState.now });
   assert.equal(second.stats(local(15, 10, 5)).sentToday, 1);
   assert.equal(second.stats(local(15, 10, 5)).byKind.chat, 1);
 
@@ -505,6 +507,108 @@ test('发送记录写 store（memory_events），重启后恢复当日计数与 
   const duplicate = await second.flush(local(15, 10, 5));
   assert.equal(duplicate.sent, 0);
   assert.equal(duplicate.suppressed, 1);
+});
+
+// ------------------------------------------- V3-H2：投递目标与两阶段钩子
+
+test('target() 为空：不投递、保留 backlog，恢复后补发', async (t) => {
+  const { gate, platform, targetState } = setupProactive(t, { cap: 10 });
+  gate.enqueue({ kind: 'task_report', text: '汇报', at: local(15, 10, 0) });
+  gate.enqueue({ kind: 'chat', text: '闲聊', at: local(15, 10, 0) });
+
+  targetState.id = null;
+  const failed = await gate.flush(local(15, 10, 0));
+  assert.equal(failed.sent, 0);
+  assert.equal(failed.failed, 1);
+  assert.match(String(failed.error?.message), /no main session/);
+  assert.equal(platform.calls.length, 0);
+  assert.equal(gate.stats(local(15, 10, 0)).backlog, 2);
+
+  targetState.id = 'main-2';
+  const retried = await gate.flush(local(15, 10, 1));
+  assert.equal(retried.sent, 2);
+  assert.equal(platform.calls.length, 2);
+  assert.equal(platform.calls[0].sessionId, 'main-2');
+  assert.equal(platform.calls[1].sessionId, 'main-2');
+});
+
+test('投递钩子：成功走 onAttempt→onSent，失败走 onAttempt→onFailed 且保留 backlog', async (t) => {
+  const { gate, platform } = setupProactive(t, { cap: 10 });
+  const calls = [];
+  const hooksFor = (name) => ({
+    onAttempt: () => { calls.push(`${name}:attempt`); return true; },
+    onSent: () => { calls.push(`${name}:sent`); },
+    onFailed: () => { calls.push(`${name}:failed`); },
+  });
+  gate.enqueue({ kind: 'reminder', text: 'A', at: local(15, 10, 0), ...hooksFor('A') });
+  gate.enqueue({ kind: 'reminder', text: 'B', at: local(15, 10, 30), ...hooksFor('B') });
+
+  platform.state.mode = 'fail';
+  const failed = await gate.flush(local(15, 10, 40));
+  assert.equal(failed.failed, 1);
+  assert.deepEqual(calls, ['A:attempt', 'A:failed', 'B:failed']);
+  assert.equal(gate.stats(local(15, 10, 40)).backlog, 2);
+
+  platform.state.mode = 'ok';
+  calls.length = 0;
+  const retried = await gate.flush(local(15, 10, 41));
+  assert.equal(retried.sent, 2);
+  assert.deepEqual(calls, ['A:attempt', 'A:sent', 'B:attempt', 'B:sent']);
+});
+
+test('onAttempt 返回 false：本轮放弃该条，不请求投递也不回队列', async (t) => {
+  const { gate, platform } = setupProactive(t, { cap: 10 });
+  gate.enqueue({
+    kind: 'reminder',
+    text: '已取消的提醒',
+    at: local(15, 10, 0),
+    onAttempt: () => false,
+  });
+  const report = await gate.flush(local(15, 10, 0));
+  assert.equal(report.sent, 0);
+  assert.equal(report.suppressed, 1);
+  assert.equal(platform.calls.length, 0);
+  assert.equal(gate.stats(local(15, 10, 0)).backlog, 0);
+});
+
+test('合并消息保留全部钩子（每条都在合并后的投递里回调一次）', async (t) => {
+  const { gate, platform } = setupProactive(t, { cap: 10 });
+  const calls = [];
+  gate.enqueue({
+    kind: 'reminder',
+    text: 'A',
+    at: local(15, 10, 0),
+    onAttempt: () => { calls.push('A:attempt'); return true; },
+    onSent: () => { calls.push('A:sent'); },
+  });
+  gate.enqueue({
+    kind: 'reminder',
+    text: 'B',
+    at: local(15, 10, 3),
+    onAttempt: () => { calls.push('B:attempt'); return true; },
+    onSent: () => { calls.push('B:sent'); },
+  });
+  const report = await gate.flush(local(15, 10, 10));
+  assert.equal(report.merged, 1);
+  assert.equal(report.sent, 1);
+  assert.equal(platform.calls.length, 1);
+  assert.deepEqual(calls, ['A:attempt', 'B:attempt', 'A:sent', 'B:sent']);
+});
+
+test('backlog 溢出丢弃最旧消息时回调它的 onFailed（避免停在占位态）', (t) => {
+  const { gate } = setupProactive(t, { cap: 10 });
+  const failed = [];
+  gate.enqueue({
+    kind: 'chat',
+    text: 'm1',
+    at: local(15, 10, 0),
+    onFailed: () => failed.push('m1'),
+  });
+  for (let index = 2; index <= 7; index += 1) {
+    gate.enqueue({ kind: 'chat', text: `m${index}`, at: local(15, 10, 0) });
+  }
+  // 只有 m1 带 onFailed；溢出丢 m1、m2，钩子只对 m1 回调。
+  assert.deepEqual(failed, ['m1']);
 });
 
 // --------------------------------------------------- M1：显式时区（不读 TZ）
@@ -539,6 +643,7 @@ test('timeZone 覆盖：主动闸门安静时段按配置分区（America/New_Yo
   const gate = createProactive({
     store,
     platform: { prompt: async (_sessionId, text) => { sent.push(text); } },
+    target: () => 'main',
     config: normalizeConfig({ timezone: 'America/New_York' }),
     clock: () => ny2300,
   });
