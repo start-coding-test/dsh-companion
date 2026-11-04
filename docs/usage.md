@@ -134,7 +134,7 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 最近 job：s2-purge ok upto_seq=0（2026-11-03 03:30）
 ```
 
-最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。
+最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。
 
 `/状态` 末尾还会给出自愈观测（无事件时显示「无」）：
 
@@ -433,7 +433,7 @@ node scripts/decrypt-encrypted.mjs secret.enc --out fact.json
 - `hash`：零依赖、离线、测试与低配机器首选；只做字符 bigram 投影，不是语义向量，同义改写召回有限。
 - `local`：中文语义最好；需可选安装 `@huggingface/transformers`，首次要联网下载模型，占内存与首次加载时间。
 - `remote`：复用已有 embedding 服务、不占本地算力；必须显式开启，事实原文与查询会离开本机（隐私例外），端点不可达或超时会自动退回 FTS。
-- 任一实现失败/超时都只记 `vectorEmbedFailures` 并回退纯 FTS，不影响主流程；不同 `embedder_id` 的向量互不召回，换实现后旧向量等写入或 idle-probe 回填。
+- 任一实现失败/超时都只记 `vectorEmbedFailures` 并回退纯 FTS，不影响主流程；回填超时另记 `vectorBackfillTimeouts`，查询/回填遇推理占用记 `vectorEmbedBusy` 并本轮跳过或回退 FTS。不同 `embedder_id` 的向量互不召回，换实现后旧向量等写入或 idle-probe 回填。
 
 离线对比可跑：
 
@@ -441,7 +441,7 @@ node scripts/decrypt-encrypted.mjs secret.enc --out fact.json
 node scripts/bench-vector.mjs --dim 256 --json
 ```
 
-schema v7 对向量表本身没有新改动：v0.3.0（schema 5）新建 `fact_vectors`；v0.4.0 的 v6 迁移给 `fact_vectors` 增加 `embedder_id` 并把旧行标成 `hash:<dim>`，hash 在下次写入 / 编辑 / 强化时重建，local/remote 的缺失向量由 idle-probe 每批 ≤ `vector.backfillBatchSize`（默认 50）回填，期间开启向量只是暂时召回不到它们，不会报错。v6→v7 只给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind` 三列（旧行 NULL），与向量无关。
+schema v9 对向量表本身没有新改动：v0.3.0（schema 5）新建 `fact_vectors`；v0.4.0 的 v6 迁移给 `fact_vectors` 增加 `embedder_id` 并把旧行标成 `hash:<dim>`，hash 在下次写入 / 编辑 / 强化时重建，local/remote 的缺失向量由 idle-probe 每批 ≤ `vector.backfillBatchSize`（默认 8）回填、回填推理用 `vector.backfillTimeoutMs`（默认 30s），期间开启向量只是暂时召回不到它们，不会报错。v6→v7 给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind` 三列（旧行 NULL）；v7→v8 增加 `same_context`；v8→v9 增加 `first_used_at` / `first_used_tier` / `used_same_context`，用于 S0 标定（见 [s0-calibration.md](s0-calibration.md)）。
 
 ### 外部压缩与水位重锚（v0.4.0）
 
@@ -499,6 +499,8 @@ vector:
   embedder: local
   localModel: Xenova/bge-small-zh-v1.5
   prefixQuery: true
+  backfillBatchSize: 8
+  backfillTimeoutMs: 30000
 ```
 
 接入远程 embedding（默认关闭；会把事实原文与查询发到第三方，敏感/secret/墓碑不回填）：
@@ -593,7 +595,7 @@ rssMainOnlyGiB: 2.6
 
 ### 向量召回为什么没效果？
 
-先确认 `vector.enabled: true`（默认关闭）且 `/状态` 显示「向量：开·dim X·<embedder id>·已回填 N·最近命中 N」。`hash` 只是字符 bigram 哈希投影，不是语义 embedding，中文同义改写召回有限；`local` 需要可选安装 `@huggingface/transformers` 并首次联网下载模型；`remote` 需要显式 `remote.enabled: true` 且 endpoint 可达。旧库升级到 schema v7 后旧向量按 `embedder_id` 隔离，等待写入或 idle-probe 回填；embedding 失败会在日志里出现 `embedding failed; falling back to FTS`。
+先确认 `vector.enabled: true`（默认关闭）且 `/状态` 显示「向量：开·dim X·<embedder id>·已回填 N·最近命中 N·回填超时 N·占用 N」。`hash` 只是字符 bigram 哈希投影，不是语义 embedding，中文同义改写召回有限；`local` 需要可选安装 `@huggingface/transformers` 并首次联网下载模型；`remote` 需要显式 `remote.enabled: true` 且 endpoint 可达。旧库升级到 schema v9 后旧向量按 `embedder_id` 隔离，等待写入或 idle-probe 回填；embedding 失败会在日志里出现 `embedding failed; falling back to FTS`。
 
 ### 主动消息为什么没来？
 
@@ -617,7 +619,7 @@ rssMainOnlyGiB: 2.6
 历史行只作审计。升级到 v0.1.1 时旧库会迁移到 `schema_version=4`：清空 `consolidations`
 （开发期约定，旧值语义不可比）、把 `episodes.consolidation_id` 置空；facts/episodes 不受影响。
 v0.3.0 起 `schema_version=5`：只新增 `fact_vectors`（向量投影）表，既有数据不动。
-v0.4.0 起 `schema_version=7`：v5→v6 先给 `fact_vectors` 增加 `embedder_id`，旧向量行回填为 `hash:<dim>`；v6→v7 再给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind` 三列（旧行 NULL）和 `(scope, first_reneed_at)` 索引，用于 S0 首次再需要标定（见 [s0-calibration.md](s0-calibration.md)）。旧库按列检测逐级推进，无需手工改版本。
+v0.4.0 起 `schema_version=7`：v5→v6 先给 `fact_vectors` 增加 `embedder_id`，旧向量行回填为 `hash:<dim>`；v6→v7 再给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind` 三列（旧行 NULL）和 `(scope, first_reneed_at)` 索引，用于 S0 首次再需要标定（见 [s0-calibration.md](s0-calibration.md)）。v0.4.1 起 `schema_version=8`：增加 `same_context` 与 `used` 升级口径，排除同会话即时召回。v0.4.2 起 `schema_version=9`：增加 `first_used_at` / `first_used_tier` / `used_same_context` 与 `(scope, first_used_at)` 索引，用上那一刻单独记录，recall 样本保留对照（旧行新列为 NULL）。旧库按列检测逐级推进，无需手工改版本。
 
 ### 数据存在哪里？
 

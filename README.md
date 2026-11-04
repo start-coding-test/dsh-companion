@@ -4,7 +4,14 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.1 已发布**（2026-11-04），`node --test` 全绿：646 个用例 / 16 个套件，git tag `v0.4.1`。
+当前状态：**v0.4.2 待发布**（2026-11-04）。`node --test` 全绿；最终用例数由发布卡按发布时实测填写（v0.4.1 为 646 个用例 / 16 个套件）。
+
+## v0.4.2 变更摘要
+
+- **S0 只按「真正用上」标定（S2-M1 / L2-1）**：`used` 在用上那一刻单独记录 `first_used_at` / `first_used_tier` / `used_same_context`，不再沿用首次注入的时间与标记；same_context 在用上时重新判定，same_context 的 used 可被后续非 same_context used 覆盖一次；`first_reneed_*` 保留为 recall 对照。Δt 与 6h 判定统一用 `observed_at`（原话时间）。schema 升至 v9（见 [docs/s0-calibration.md](docs/s0-calibration.md)）。
+- **回填独立超时与单飞（E2-M1 / L2-3）**：新增 `vector.backfillTimeoutMs`（默认 30000），查询仍用 `vector.embedTimeoutMs`（默认 300）；`vector.backfillBatchSize` 默认 8；推理单飞，超时批次未结束前不再起新批；查询遇忙立即回退 FTS；加载单飞复用同一 promise。`/状态` 增加「回填超时 / 占用」计数（见 [docs/embedding.md](docs/embedding.md)）。
+- **v0.4.1 用例数修正（L2-2）**：按标签实测 v0.4.0 为 626、v0.4.1 为 646，CHANGELOG 的「639 → 646」更正为「626 → 646」。
+- **复审**：v0.4.2 发布前独立复审待产出；v0.4.1 及更早变更见 [CHANGELOG](CHANGELOG.md)，未做项与真机联调清单见 [docs/known-debt.md](docs/known-debt.md)。
 
 ## v0.4.1 变更摘要
 
@@ -83,14 +90,15 @@ dsh-companion/
 | `vector.localModel` | `"Xenova/bge-small-zh-v1.5"` | local 模型 id（需可选安装 `@huggingface/transformers`） | 非空字符串 |
 | `vector.prefixQuery` | `true` | local 查询是否加中文检索指令前缀 | 布尔 |
 | `vector.embedderId` | `""` | remote 的向量 id；空则用 `remote:<host>` | 非空字符串或空串 |
-| `vector.embedTimeoutMs` | `300` | embedding 超时（毫秒） | 整数 `1`–`60000` |
+| `vector.embedTimeoutMs` | `300` | 查询侧 embedding 超时（毫秒）；local 同时覆盖「等待加载」与查询推理 | 整数 `1`–`60000` |
+| `vector.backfillTimeoutMs` | `30000` | 回填推理的独立超时（毫秒），不影响查询 | 整数 `1`–`600000` |
 | `vector.remote.enabled` | `false` | remote 必须显式开启；开启后原文会发到第三方 | 布尔 |
 | `vector.remote.endpoint` | `""` | remote embedding 端点 | 开启时必须是 `http(s)` URL |
 | `vector.remote.apiKeyEnv` | `""` | 读取 API key 的环境变量名 | 非空字符串或空串 |
 | `vector.remote.timeoutMs` | `300` | remote 超时；缺省继承 `embedTimeoutMs` | 整数 `1`–`60000` |
-| `vector.backfillBatchSize` | `50` | idle-probe 每批回填条数 | 整数 `1`–`50` |
+| `vector.backfillBatchSize` | `8` | idle-probe 每批回填条数 | 整数 `1`–`50` |
 
-token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
+token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置，v0.4.2 新增 `vector.backfillTimeoutMs` 并把 `backfillBatchSize` 默认降到 8；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
@@ -168,9 +176,9 @@ node scripts/calibrate/run.mjs
 - 默认关闭（`vector.enabled: false`），检索走 v0.2.0 的 bigram FTS 路径，结果与旧版逐字节一致，且不读向量表。
 - 开启后 `hybridSearch` 用 RRF（`1/(60+rank)`）融合 FTS 与向量两路并去重；向量路只召回 active、normal、未删除、非 `sensitive/secret` 且 R ≥ 0.05 的事实。
 - `vector.embedder` 支持 `hash`（默认，字符 bigram 哈希，零依赖但非语义）、`local`（可选依赖 `@huggingface/transformers`，默认 `Xenova/bge-small-zh-v1.5` 512 维 int8）、`remote`（默认关闭，显式 `vector.remote.enabled: true` 才启用；会把原文发到第三方，见 [docs/embedding.md](docs/embedding.md#remote)）与 `none`（等价关闭）。
-- 向量按 `embedder_id` 隔离：换模型后旧向量不再参与召回；local/remote 的缺失向量由 idle-probe 分批回填（≤ `vector.backfillBatchSize`，默认 50）。
-- 开启后 `/状态` 显示「向量：开·dim 256·hash:256·已回填 N·最近命中 N」；embedding 超时/未安装时退回 FTS 并记 `vectorEmbedFailures`。
-- 旧库升级到 schema v8 会补 `facts.first_reneed_*` 三列与 `same_context`（旧行分别为 NULL / 0）；v6 的向量迁移仍把旧向量行标成 `hash:<dim>`，hash 在下次写入/编辑/强化时重建，local/remote 由空闲回填补齐。
+- 向量按 `embedder_id` 隔离：换模型后旧向量不再参与召回；local/remote 的缺失向量由 idle-probe 分批回填（每批 ≤ `vector.backfillBatchSize`，默认 8；回填推理用独立的 `vector.backfillTimeoutMs`，默认 30s，查询仍用 300ms；同一 embedder 只允许一个推理在跑，遇忙跳过/回退 FTS）。
+- 开启后 `/状态` 显示「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」；embedding 超时/未安装时退回 FTS 并记 `vectorEmbedFailures`，回填超时与推理占用分别记 `vectorBackfillTimeouts` / `vectorEmbedBusy`。
+- 旧库升级到 schema v9 会补 `facts.first_reneed_*` 三列、`same_context` 与 `first_used_at` / `first_used_tier` / `used_same_context`（旧行相应为 NULL / 0）；v6 的向量迁移仍把旧向量行标成 `hash:<dim>`，hash 在下次写入/编辑/强化时重建，local/remote 由空闲回填补齐。
 
 ## 记忆与遗忘
 
@@ -179,13 +187,13 @@ node scripts/calibrate/run.mjs
 - `/记忆 忘掉` 只做标记（S1）；7 天冷静期内仍可恢复，到期由每日 03:30 的清理任务物理删除。
 - 被遗忘、被取代或标记为 secret 的内容不会被召回；此时珞然会直接说「不记得了」，不编造。
 - 每日 03:00 的 deep-sleep 执行睡眠期巩固（有模型时）、遗忘降级、FTS 孤儿 GC 与状态板 staged 重渲染，并写审计。
-- **评测埋点**：`facts.first_reneed_at` / `first_reneed_tier` / `reneed_kind` / `same_context` 记录每条事实第一次被再需要（召回 full/gist、下一轮复述用上、去重命中沉睡/墓碑、用户纠正）；同会话即时召回标 `same_context=1`，统计时排除。schema v8 起写入，流程见 [S0 标定](docs/s0-calibration.md)。
+- **评测埋点**：`facts.first_reneed_at` / `first_reneed_tier` / `reneed_kind` / `same_context` 记录首次再需要事件（召回 full/gist、去重命中沉睡/墓碑、用户纠正），作为 recall 对照与漏样本；`first_used_at` / `first_used_tier` / `used_same_context` 在用上那一刻单独记录「首次非 same_context 的用上」，same_context 的 used 可被后续非 same_context used 覆盖一次。Δt 与 same_context 均以 `observed_at` 起算。schema v9 起写入，流程见 [S0 标定](docs/s0-calibration.md)。
 
 ## 已知限制
 
 - **FTS 为 bigram 近似**：没有分词器或同义词，召回依赖字面 bigram 与时间衰减；同义改写可能召回不到（可选向量召回可缓解，但见下条）。
 - **向量召回默认关闭且效果取决于 embedder**：`hash` 只是字符 bigram 哈希投影，不是语义 embedding；`local` 需要可选安装 `@huggingface/transformers` 并首次联网下载模型；`remote` 会把原文发到第三方（隐私例外见 [docs/embedding.md](docs/embedding.md)）。`vector.embedder` 已支持 `hash`/`local`/`remote`/`none`，任一实现失败都会退回 FTS。
-- **local 加载与推理受 `vector.embedTimeoutMs` 约束**：前台每轮最多等 300ms（含首次加载等待），超时即本轮退回纯 FTS、不向用户报错；模型在启动与 idle-probe 异步预热，加载期间只跳过向量路。缺可选依赖会停用 local（fatal），网络/初始化等临时失败按 1/2/4/8s 退避、第 5 次后冷却 60s 再试，不会永久关闭（见 [docs/embedding.md](docs/embedding.md#local-的超时与异步预热e-m1)）。
+- **local 查询受 `vector.embedTimeoutMs`、回填受 `vector.backfillTimeoutMs` 约束**：查询与首次加载等待每轮最多 300ms，超时即本轮退回纯 FTS、不向用户报错；回填默认每批 8 条、最多等 30s，超时只截断等待、底层推理未结束前不会再起新批。模型在启动与 idle-probe 异步预热，加载与推理都单飞，重试复用同一加载 promise；查询遇回填占用立即回退 FTS。缺可选依赖会停用 local（fatal），网络/初始化等临时失败按 1/2/4/8s 退避、第 5 次后冷却 60s 再试，不会永久关闭（见 [docs/embedding.md](docs/embedding.md#local-的超时与异步预热e-m1)）。
 - **旧加密文件（v1）不认证 header**：v0.3.0 及更早版本导出的密文没有 AAD 绑定，`id`/`created_at` 等 header 字段仍可被伪造；新文件（`format: "v2"`）已认证。需要时可解密后用同一口令重新导出。
 - **无跨设备备份**：数据库只在本机；backup 任务只在本机按日期滚动保留 7 份。需要搬移时用 `/记忆 导出` 与 `importAll`（见「导出、恢复与加密」）。
 - 平台管理的会话 JSONL 不在插件控制范围内，插件无法删除。
