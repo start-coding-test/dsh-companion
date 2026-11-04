@@ -2,6 +2,32 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.3] - 2026-11-04
+
+C-H1 / C-M1 修复：插件首次在真实 cordis 宿主上完成激活；本地加载文档改为指向入口文件。仍为零第三方运行时依赖，无 schema 变更。
+
+### Fixed
+
+- **C-H1 插件从未在真实 cordis 宿主上激活**：`src/index.js` 缺少 `export const inject`，cordis 4 对未声明 service 的属性读直接抛 `cannot get property "rssReader" without inject`，`apply()` 在 `ctx.rssReader` 首读即中断（DB 文件存在只是因为 `Store.open` 先于该读点）。修复：声明 `inject = ['systemPrompt', 'timer', 'commands', 'tools']`（均以真机 `.data/probe.json` 的 `capabilities.services.*.present=true` 为准；`ctx.interval` 对应 `timer` service），其余能力一律走 `ctx.get()`（未注册返回 `undefined`，不抛），缺失能力继续走 adapter 的 `unavailable()` 降级；测试席位 `now`/`cwd`/`workspace`/`rssReader`/`companion` 不再从 Context 代理直读，改由 `ctx.get()` 或 `apply(ctx, config, hooks)` 传入，缺省回落 `Date.now()` / `process.cwd()` / `process.memoryUsage().rss`。
+- **旧测试 mock 掩盖 inject 约束**：新增 `test/helpers/strict-ctx.js`（Proxy 版 ctx，读未声明属性抛与 cordis 同文案的错误），12 个 e2e 的 `apply` 全部改经严格代理；`test/fakes/ctx.js` 增加 `ctx.get()`；新增 `test/c-h1-seats.test.js` 锁定席位读法与 logger 镜像行为。
+- **C-M1 加载文档指向目录**：README 不再声称 `name` 可指目录，本地开发必须指向 `src/index.js`（绝对路径 / 相对 patch 文件 / `file://` URL）；指向目录会抛 `ERR_UNSUPPORTED_DIR_IMPORT`，插件不会激活。
+
+### Added
+
+- **`run-headless.mjs --plugin` 发布门**：用 `--patch` 把本仓库真插件挂到 headless，跑一次并断言出现 `[dsh-companion] scheduler started`、且没有 `did not activate`；完整 stdout/stderr 落盘 `.data/plugin-gate.log`（敏感值已 redact），退出码 0=通过、1=未通过、2=找不到 DSH。
+- **headless logger 镜像**：headless 宿主的 `logger` 是函数对象且 `info()` 没有可见 sink（`ctx.get('logger') === undefined`），启动 marker 会被吞；现在函数形 logger 下把日志同时镜像到 stderr，桌面宿主的对象 logger 行为不变。
+
+### Verified
+
+- **真机 gate（Windows x64，DSH 0.2.1-rc.5，宿主 cordis 4.0.5，Node 24.21.0 / Electron 44.7.0）**：`node scripts/probe/run-headless.mjs --plugin --timeout 180000` 通过（发布门退出码 0），`dsh-companion/.data/plugin-gate.log` 第 11 行原文：
+  `[dsh-companion] scheduler started {"jobs":6,"metrics":{"tokensIn":0,"tokensOut":0,"overBudget":0,"recalls":0,"rssMB":219,"capturedAt":1793785046777}}`
+  同一日志中 `did not activate` / `without inject` / `cannot get property` 各 0 次。DSH 子进程 exit=1 仅因本机未配置 `DEEPSEEK_API_KEY`（`MISSING_CREDENTIAL`，预期内；marker 在 `apply()` 内、建会话之前打印）。
+
+### Changed
+
+- **测试**：667 → 674 个用例 / 16 个套件；新增用例覆盖 inject 声明面、严格 mock 的报错行为、席位回落与 logger 镜像。
+- **文档**：`docs/known-debt.md` §1 更新 C-H1 激活口径与本次真机 gate 结果。
+
 ## [0.4.2] - 2026-11-04
 
 v0.4.1 代码评审的 S2-M1 / E2-M1 修复，并带 L2-1 / L2-2 / L2-3。schema 升至 v9（旧库自动升级）；仍为零第三方运行时依赖；remote embedding 默认关闭。发布前独立复审见 `docs/review-v8.md`（pass，H=0 / M=0；复审提出的 M-1 与 L-1/L-2/L-4 已在发布前修完，L-5 文档档位语义已同步）。
