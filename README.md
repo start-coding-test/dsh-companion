@@ -4,9 +4,9 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**0.4.0 待发布**（2026-11-04 文档收口，`node --test` 全绿：626 个用例 / 16 个套件；版本号与 tag 由发布卡统一处理）。
+当前状态：**v0.4.0 已发布**（2026-11-04），`node --test` 全绿：626 个用例 / 16 个套件，git tag `v0.4.0`。
 
-## v0.4.0 变更摘要（待发布）
+## v0.4.0 变更摘要
 
 - **外部压缩重锚**：按 surface 位置取替换节点；压缩吞掉未巩固内容时把锚点前挪到平台摘要之前，让摘要进入下一次巩固，并用 `compactionLostUnconsolidated` 记丢失量。锚到起点时写哨兵 `-1`，重启后不会回退旧水位（R-M1/R-L1/R-L2）。
 - **执行槽日志**：`thread_run` 带 `goal` 持有执行槽到线程空闲；create 分支直接传会话句柄，reuse 反查失败与 900s 兜底都会写 `warn`，并记 `threadSlotFallback` / `threadSlotTimeout`（R-M2）。
@@ -227,4 +227,5 @@ node --test test/e2e   # 只跑端到端
 - [v0.1.1 关闭核验](docs/review-v2.md)
 - [P1 批复审（v0.2.0）](docs/review-v3.md)
 - [P2 批复审（v0.3.0）](docs/review-v4.md)
+- [v0.4.0 发布前复审（v0.3.2 修复核验）](docs/review-v5.md)
 - [变更记录](CHANGELOG.md)

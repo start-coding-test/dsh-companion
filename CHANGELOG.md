@@ -2,6 +2,31 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.0] - 2026-11-04
+
+v0.3.2 评审的 R-M1 / R-L1 / R-M2 / R-L2 / N-L1 / N-M3 修复，并入 W4 embedding 可插拔与 W5 S0 首次再需要埋点。schema 升至 v7；仍为零第三方运行时依赖；remote embedding 默认关闭。复审见 `docs/review-v5.md`（pass，H=0 / M=0 / L=2）。
+
+### Fixed
+
+- **R-M1 / R-L1 外部压缩吞掉未巩固内容**：`resolveReanchor` 按 surface 位置取替换节点（不再 `Math.min`）；压缩跨过旧水位时把锚点前挪到平台摘要之前，让摘要进入下一次巩固，`compactionLostUnconsolidated` 记录丢失节点数；重锚后强制刷新 surface 正文。`/状态` 增加「水位重锚」「未巩固被压缩」。
+- **R-L2 冷启动锚点哨兵**：锚到起点时落库 `-1`，重启后还原为内存水位 0，不再被误判为「已重锚」而跳过整段抽取。
+- **R-M2 thread_run 持槽退化**：create 分支直接传会话句柄；reuse 反查失败与 900s 兜底写 warn 并记 `threadSlotFallback` / `threadSlotTimeout`，随后释放槽。
+- **N-L1 确认词边界**：仅整句 / 独立小句 / 句首短尾的「对、是、记住了」等触发 α=4 强化，并加否定守卫；「对比一下」「好像不太对」不再误判。
+- **N-M3 RSS 三档可配置**：`rssWarnGiB` / `rssStopGiB` / `rssMainOnlyGiB`（默认 2.95/3/3.15GiB，严格递增校验）；4G 云端可降到 2.2/2.4/2.6；`/状态` 显示三档。
+
+### Added
+
+- **W4 embedding 可插拔**：`vector.embedder` 支持 `hash`（默认，零依赖）/ `local`（可选 `@huggingface/transformers`）/ `remote`（默认关闭，显式开启后原文发往第三方端点）/ `none`；`embedder_id` 隔离不同模型的向量，换模型后由 idle-probe 分批回填；失败/超时降级纯 FTS 并记 `vectorEmbedFailures`。
+- **W5 S0 首次再需要埋点**：`facts.first_reneed_at` / `first_reneed_tier` / `reneed_kind` 与 `(scope, first_reneed_at)` 索引，召回 full/gist、去重命中沉睡/墓碑、用户纠正三条路径幂等记录首次样本；流程与 SQL 见 `docs/s0-calibration.md`。
+- **`docs/known-debt.md`**：Gate 0 九项真机联调清单、h1-h3-probe §4 四项待实测、N-M4/W1 / N-L2 / N-L3 / W4 local 真机 / Linux 2C4G 内存复测等未做项与排期。
+
+### Changed
+
+- **schema v5→v7**：v6 给 `fact_vectors` 增加 `embedder_id` 并回填 `hash:<dim>`；v7 给 `facts` 增加 `first_reneed_*` 三列与索引；旧库按列检测逐级迁移，旧向量按 hash 重建，旧事实的埋点三列为 NULL。
+- **测试**：626 个用例 / 16 个套件；默认、`TZ=UTC`、`TZ=America/New_York` 全绿。
+- **文档**：README 增补 v0.4.0 行为、配置与已知限制；usage 增补执行槽、embedding 选型、外部压缩重锚与 schema v7；新增 embedding / known-debt / S0 文档交叉链接。
+- **依赖与兼容**：仍零第三方运行时依赖；`remote` 默认关，未开启时路径与 v0.3.2 一致。
+
 ## [0.3.2] - 2026-11-04
 
 v0.3.1 评审的 N-H1 / N-M1 / N-M2 修复。无配置键变更、无 schema 变更（仍为 v5），升级不需要迁移。
