@@ -16,6 +16,7 @@ import { apply } from '../../src/index.js';
 import { TEST_NOW, makeTempStore, seedMemory } from './helpers.js';
 
 const DAY_MS = 86_400_000;
+const DAY_SEC = 86_400;
 const FACT_STATEMENT = '青柠计划的代号是蓝鲸。';
 
 /** apply 需要的 commands/tools/llm 三个平台服务（不实际使用）。 */
@@ -129,8 +130,15 @@ test('apply：注入 → assistant 复述 → 下一轮强化 α=2，recall_coun
   assert.equal(after.last_reinforced_at, Math.floor(ctx.now() / 1000));
   assert.equal(after.first_reneed_at, before.first_reneed_at, '二次注入不覆盖首次样本');
   assert.equal(after.first_reneed_tier, 'clear');
-  assert.equal(after.reneed_kind, 'used', '复述命中后首次样本升级为 used');
-  assert.equal(after.same_context, 0, '隔天召回不是同会话样本');
+  assert.equal(after.reneed_kind, 'used', '复述命中后记 used 主样本');
+  assert.equal(after.same_context, 1, 'recall 样本：注入当下仍在同会话窗口');
+  assert.equal(after.used_same_context, 0, '用上样本按隔天重算 → 非同会话');
+  assert.equal(
+    after.first_used_at,
+    Math.floor(TEST_NOW / 1000) + DAY_SEC,
+    '用上时间取复述那一刻（不是注入时刻）',
+  );
+  assert.equal(after.first_used_tier, 'clear');
 
   const events = reinforcementEvents(temp.store, seeded.factId);
   assert.equal(events.length, 1, '应写一条 REINFORCE 审计');

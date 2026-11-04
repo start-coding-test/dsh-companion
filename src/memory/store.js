@@ -48,8 +48,11 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  *     S0 主样本），并新增 `same_context` 标记同会话即时召回样本
  *     （旧行默认 0，口径见 docs/s0-calibration.md 与 src/memory/reneed.js）。
  *     `reneed_kind` 的库级校验用幂等触发器实现（等价于 CHECK，避免重建表）。
+ * v9：facts 新增 first_used_at/first_used_tier/used_same_context，记录首次
+ *     「被用上」（S2-M1）：时间/档位取用上那一刻，same_context 当场重新判定。
+ *     first_reneed_* 与 same_context 原样保留给 recall 样本作对照；旧行新列为 NULL。
  */
-const SCHEMA_VERSION = '8';
+const SCHEMA_VERSION = '9';
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
 
@@ -231,6 +234,9 @@ CREATE TABLE IF NOT EXISTS facts (
   first_reneed_tier   TEXT,
   reneed_kind         TEXT,
   same_context        INTEGER NOT NULL DEFAULT 0 CHECK (same_context IN (0,1)),
+  first_used_at       INTEGER,
+  first_used_tier     TEXT,
+  used_same_context   INTEGER CHECK (used_same_context IN (0,1)),
   CONSTRAINT ck_fact_pin_decay CHECK ((salience = 'pinned' AND strength_days IS NULL)
                                    OR (salience <> 'pinned' AND strength_days IS NOT NULL))
 );
@@ -741,13 +747,14 @@ export class Store {
     if (upgrading) this.#db.exec('BEGIN IMMEDIATE');
     try {
       if (upgrading) this.#migrateFrom(from);
-      // v6/v7/v8 的列与索引放在迁移之后处理：旧表此时才补上 embedder_id 与
-      // first_reneed_*/same_context 列。ALTER 按列检测，重复调用安全。
+      // v6/v7/v8/v9 的列与索引放在迁移之后处理：旧表此时才补上 embedder_id 与
+      // first_reneed_*/same_context/first_used_* 列。ALTER 按列检测，重复调用安全。
       this.#ensureFactsReneedColumns();
       this.#ensureReneedKindTriggers();
       this.#db.exec(`
         CREATE INDEX IF NOT EXISTS ix_fact_vectors_embedder ON fact_vectors(embedder_id);
         CREATE INDEX IF NOT EXISTS ix_facts_reneed ON facts(scope, first_reneed_at);
+        CREATE INDEX IF NOT EXISTS ix_facts_used ON facts(scope, first_used_at);
       `);
       this.#ensureScopeRow('main');
       if (upgrading) this.#db.exec('COMMIT');
@@ -792,8 +799,9 @@ export class Store {
   }
 
   /**
-   * 给旧 facts 表补 W5/v8 的列（nullable，same_context 有默认值）。逐列检测，
-   * 兼容任意旧版本。只新增列，不重建表、不动既有行；旧行 same_context=0。
+   * 给旧 facts 表补 W5/v8/v9 的列（nullable，same_context 有默认值）。逐列检测，
+   * 兼容任意旧版本。只新增列，不重建表、不动既有行；旧行 same_context=0，
+   * v8 及更早的行 first_used_ 三列与 used_same_context 为 NULL（没有「用上」记录）。
    */
   #ensureFactsReneedColumns() {
     const columns = new Set(
@@ -813,6 +821,15 @@ export class Store {
     }
     if (!columns.has('same_context')) {
       this.#db.exec('ALTER TABLE facts ADD COLUMN same_context INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!columns.has('first_used_at')) {
+      this.#db.exec('ALTER TABLE facts ADD COLUMN first_used_at INTEGER');
+    }
+    if (!columns.has('first_used_tier')) {
+      this.#db.exec('ALTER TABLE facts ADD COLUMN first_used_tier TEXT');
+    }
+    if (!columns.has('used_same_context')) {
+      this.#db.exec('ALTER TABLE facts ADD COLUMN used_same_context INTEGER');
     }
   }
 
@@ -844,7 +861,7 @@ export class Store {
   }
 
   /**
-   * 升级旧库；支持 v3 → v4 → v5 → v6 → v7 → v8。
+   * 升级旧库；支持 v3 → v4 → v5 → v6 → v7 → v8 → v9。
    *
    * v3 的 `consolidations.upto_seq` 是插件自增 turn 计数，与平台 surface seq
    * 不可比（H1）。开发期尚无用户数据，直接清空巩固行（facts/episodes 保留），
@@ -860,16 +877,14 @@ export class Store {
    *
    * v7 → v8 只推进版本号；same_context 列与 reneed_kind 触发器由 migrate()
    * 统一补，旧行 same_context=0、first_reneed_* 原样保留。
+   *
+   * v8 → v9 只推进版本号；first_used_ 三列与 used_same_context 由 migrate()
+   * 统一补（#ensureFactsReneedColumns），旧行 NULL，不需要回填：没有「用上」
+   * 记录就是 NULL，不能用 recall 样本反推。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
-    if (from === '7') {
-      this.#db
-        .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
-        .run(SCHEMA_VERSION);
-      return;
-    }
-    if (from === '6') {
+    if (from === '8' || from === '7' || from === '6') {
       this.#db
         .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
         .run(SCHEMA_VERSION);
@@ -1304,19 +1319,26 @@ export class Store {
   }
 
   /**
-   * 把一条事实的首次样本升级为「用上」（v8 / S-M1）。
+   * 记录「首次被用上」（v9 / S2-M1）。
    *
-   * 注入时已经写过 `recall`（first_reneed_at 已就位），下一轮 assistant 复述
-   * 命中（重叠 ≥0.6）时只把 `reneed_kind` 改成 `used`，保留首次注入的时间与
-   * 档位——样本时间仍是「第一次被需要」，分类则变成 S0 标定的主样本。
+   * 与 recall 样本（first_reneed_*）分账：注入时写的那组列保持不动，作对照；
+   * 这里只写用上那一刻的事实——`first_used_at`=当前时刻、`first_used_tier`=
+   * 当前档位、`used_same_context`=当场按 observed_at 重算的同会话判定
+   * （调用方负责判定，store 只落库）。
    *
-   * 只升级 `recall` / 尚未写入的样本；`dedupe`/`correction` 是更早的“漏”
-   * 样本，不能被后来的使用覆盖。已有 `used` 时不重复写（返回 false）。
+   * 覆盖语义（首次「非 same_context 的用上」）：
+   * - 尚无 first_used_*：写入；
+   * - 已有 used_same_context=1、本次为 0：允许覆盖一次（把「刚写完就被注入
+   *   过」的伪样本换成真正的跨会话用上）；
+   * - 已有 used_same_context=0：不再覆盖，保持真正的首次。
+   *
+   * 只处理 `recall` / `used` / 尚未写入的样本；`dedupe`/`correction` 是更早的
+   * “漏”样本，不能被后来的使用覆盖，返回 false。
    *
    * @param {string} id
    * @param {{at?: number|Date, tier: 'clear'|'ambiguous'|'miss',
    *          sameContext?: boolean}} options
-   * @returns {boolean} 是否本次发生升级/写入
+   * @returns {boolean} 是否本次写入/覆盖
    */
   markReneedUsed(id, options = {}) {
     const factId = requireString(id, 'first_reneed.id');
@@ -1329,16 +1351,17 @@ export class Store {
     const info = this.#db
       .prepare(
         `UPDATE facts
-            SET first_reneed_at = COALESCE(first_reneed_at, ?),
-                first_reneed_tier = CASE WHEN first_reneed_at IS NULL
-                                         THEN ? ELSE first_reneed_tier END,
+            SET first_used_at = ?,
+                first_used_tier = ?,
+                used_same_context = ?,
                 reneed_kind = 'used',
-                same_context = ?,
                 updated_at = unixepoch()
           WHERE id = ?
-            AND (first_reneed_at IS NULL OR reneed_kind = 'recall')`,
+            AND (reneed_kind IS NULL OR reneed_kind IN ('recall', 'used'))
+            AND (used_same_context IS NULL
+                 OR (used_same_context = 1 AND ? = 0))`,
       )
-      .run(at, tier, sameContext, factId);
+      .run(at, tier, sameContext, factId, sameContext);
     return Number(info.changes) > 0;
   }
 

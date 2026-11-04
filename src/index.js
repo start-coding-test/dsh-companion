@@ -39,6 +39,7 @@ import { buildConsolidationPrompt, consolidate, planConsolidation } from './memo
 import {
   episodeSourceInSurface,
   isSameContextSample,
+  resolveObservedAt,
 } from './memory/reneed.js';
 import {
   appendEventWithAction,
@@ -377,7 +378,10 @@ function createWiringState({ host, platform, store, config, metrics, embedder = 
     /** 注入时转录里最近一条 assistant 文本 / assistant 条数，用于判断是否出现新回复。 */
     lastRecallAssistant: '',
     assistantCountAtRecall: 0,
-    /** v8/S-M1：本批注入样本（id → {at, tier, sameContext}），供「用上」升级。 */
+    /**
+     * v8/S-M1：本批注入样本（id → {at, tier, sameContext}）。v9 起 sameContext
+     * 只描述本次注入的对照口径；「用上」时另按用上时刻重算 used_same_context。
+     */
     lastRecallSamples: new Map(),
     /** 最近一段转录（用于巩固模型草稿）；当前激活 scope 的视图。 */
     transcript: [],
@@ -1018,7 +1022,7 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
         continue;
       }
       state.metrics.inc('reinforcements');
-      // v8/S-M1：复述命中即「用上」，把首次样本从 recall 升级为 used。
+      // v8/S-M1：复述命中即「用上」；v9 起按用上那一刻记录 used 样本。
       markUsedReneed(state, id, fact, at, samples.get(id));
       state.platform.log('debug', '[dsh-companion] reinforced recalled fact', {
         id,
@@ -1066,8 +1070,32 @@ function sourceStillInSurface(state, scope, fact) {
 }
 
 /**
- * v8/S-M1：把「用上」写进首次再需要样本。首次注入时已经写过 recall；这里
- * 只升级分类并保留首次时间/档位/同会话标记。值缺失时用当前 fact 兜底。
+ * 事实的原话时间（L2-1）：same_context 判定与 Δt 统一用 observed_at。
+ *
+ * 先取来源 episode 兜底（旧库/导入行可能缺 observed_at），再交给
+ * resolveObservedAt 按口径顺序取值。取不到时返回 null，由调用方保守处理。
+ *
+ * @param {object} state
+ * @param {object|null} fact
+ * @returns {number|null}
+ */
+function factOriginTime(state, fact) {
+  let episode = null;
+  const episodeId = fact?.source_episode_id;
+  if (typeof episodeId === 'string' && episodeId !== '') {
+    try {
+      episode = state.store?.getEpisode?.(episodeId) ?? null;
+    } catch {
+      episode = null;
+    }
+  }
+  return resolveObservedAt({ fact, episode });
+}
+
+/**
+ * v9/S2-M1：把「用上」写进 used 样本。first_reneed_* 保持 recall 样本不动；
+ * 时间/档位/同会话都以「用上那一刻」为准，same_context 用 observed_at 当场
+ * 重算（L2-1），不再沿用首次注入时的旧值。
  *
  * @param {object} state
  * @param {string} id
@@ -1082,17 +1110,13 @@ function markUsedReneed(state, id, fact, atSeconds, sample) {
   if (tier !== 'clear' && tier !== 'ambiguous' && tier !== 'miss') {
     tier = fact?.fidelity === 'gist' ? 'ambiguous' : 'clear';
   }
-  let sameContext = sample?.sameContext;
-  if (typeof sameContext !== 'boolean') {
-    sameContext = isSameContextSample({
-      at: atSeconds,
-      createdAt: fact?.created_at,
-      sourceInSurface: sourceStillInSurface(state, state.lastRecallScope ?? SCOPE, fact),
-    });
-  }
-  const at = Number.isFinite(Number(sample?.at)) ? Number(sample.at) : atSeconds;
+  const sameContext = isSameContextSample({
+    at: atSeconds,
+    createdAt: factOriginTime(state, fact),
+    sourceInSurface: sourceStillInSurface(state, state.lastRecallScope ?? SCOPE, fact),
+  });
   try {
-    store.markReneedUsed(id, { at, tier, sameContext });
+    store.markReneedUsed(id, { at: atSeconds, tier, sameContext });
   } catch (error) {
     // 埋点失败不影响强化结果。
     state.platform.log('warn', '[dsh-companion] mark used reneed failed', {
@@ -1990,9 +2014,10 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
  * 同时把 full/gist 档的首次再需要写进 facts.first_reneed_*（W5）；写失败
  * 只告警，不影响本轮召回注入。
  *
- * v8/S-M1：首次样本会标记 `same_context`（Δcreated_at < 6h 或来源 episode 仍在
- * 当前 surface），统计口径排除；样本同时放进 state.lastRecallSamples，等下一轮
- * 复述命中时由 markUsedReneed 升级为 `used`。
+ * v8/S-M1：首次样本会标记 `same_context`（observed_at 距注入 < 6h 或来源
+ * episode 仍在当前 surface），统计口径排除；样本同时放进 state.lastRecallSamples。
+ * v9/S2-M1：样本里的 at/tier 不再被后续注入沿用；「用上」时由 markUsedReneed
+ * 按用上那一刻重算，recall 样本保持首次注入时的值作对照。
  *
  * @param {object} state
  * @param {{items: object[]}} recalled
@@ -2024,23 +2049,18 @@ function recordRecalledFacts(state, recalled, assembled, scope = SCOPE, at = Dat
     } catch {
       fact = null;
     }
-    // 首次样本已存在时沿用原时间/档位/同会话标记，避免第二次注入改写口径。
-    const hasFirst = fact?.first_reneed_at !== null && fact?.first_reneed_at !== undefined;
-    const sample = hasFirst
-      ? {
-        at: Number(fact.first_reneed_at),
-        tier: fact.first_reneed_tier ?? tier,
-        sameContext: Number(fact.same_context) === 1,
-      }
-      : {
+    // 每次注入都按本次时刻记录对照样本；是否同会话用 observed_at 口径
+    // （L2-1）。第二次注入不改写 first_reneed_*（markFirstReneed 只在首次
+    // 写入），但样本表里保留本次的 at/tier，供「用上」时取当前档位。
+    const sample = {
+      at: atSeconds,
+      tier,
+      sameContext: isSameContextSample({
         at: atSeconds,
-        tier,
-        sameContext: isSameContextSample({
-          at: atSeconds,
-          createdAt: fact?.created_at,
-          sourceInSurface: sourceStillInSurface(state, scope, fact),
-        }),
-      };
+        createdAt: factOriginTime(state, fact),
+        sourceInSurface: sourceStillInSurface(state, scope, fact),
+      }),
+    };
     samples.set(item.id, sample);
     try {
       state.store?.markFirstReneed?.(item.id, {

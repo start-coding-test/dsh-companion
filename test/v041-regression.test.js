@@ -7,7 +7,7 @@
  *   2) E-M1 错误分类：缺依赖 → fatal 停用；首次网络错 → transient 退避后可恢复；
  *   3) S-M1：注入后复述升级 reneed_kind='used'、同会话「来源 episode 仍在 surface」
  *      标 same_context 并被 S0 统计排除、L-2 长确认句不触发 α=4；
- *   4) 迁移：真实 v7 旧库 fixture 打开后升到 v8，重复打开幂等且数据不丢。
+ *   4) 迁移：真实 v7 旧库 fixture 打开后升到当前版本（v9），重复打开幂等且数据不丢。
  *
  * 全部使用临时库与注入 loader，不联网、不读真实时间。
  */
@@ -437,7 +437,7 @@ test('L-2 集成：长确认句 + 复述 → α=2（而不是 α=4）', async (t
   assert.equal(events[0].detail.alpha, 2);
 });
 
-/** v7 facts DDL（当前 v8 去掉 same_context 列）：用于构造真实旧库 fixture。 */
+/** v7 facts DDL（v8 起补 same_context，v9 起再补 first_used_*）：用于构造真实旧库 fixture。 */
 const V7_FACTS_SQL = `
 CREATE TABLE facts (
   id                  TEXT PRIMARY KEY,
@@ -474,12 +474,12 @@ CREATE TABLE facts (
 );
 `;
 
-test('migrate：真实 v7 旧库 fixture 升 v8，幂等且数据不丢', (t) => {
+test('migrate：真实 v7 旧库 fixture 升 v9，幂等且数据不丢', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-v041-v7-'));
   const path = join(dir, 'companion.db');
   t.after(() => rmSync(dir, { recursive: true, force: true }));
 
-  // 1) 用裸 SQLite 造一个「v7 形状」的旧库（无 same_context、无 W5 触发器）。
+  // 1) 用裸 SQLite 造一个「v7 形状」的旧库（无 same_context、无 first_used_*、无 W5 触发器）。
   const raw = new DatabaseSync(path);
   try {
     raw.exec('PRAGMA foreign_keys = OFF');
@@ -513,11 +513,11 @@ test('migrate：真实 v7 旧库 fixture 升 v8，幂等且数据不丢', (t) =>
     raw.close();
   }
 
-  // 2) 打开两次：每次都必须升到 v8，且旧行/首次样本原样保留。
+  // 2) 打开两次：每次都必须升到 v9，且旧行/首次样本原样保留（first_used_* 为 NULL）。
   for (let round = 0; round < 2; round += 1) {
     const store = Store.open(path);
     try {
-      assert.equal(store.getMeta('schema_version'), '8', `第 ${round + 1} 次打开应升到 v8`);
+      assert.equal(store.getMeta('schema_version'), '9', `第 ${round + 1} 次打开应升到 v9`);
       const columns = store.db
         .prepare("PRAGMA table_info('facts')")
         .all()
