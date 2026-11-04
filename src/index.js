@@ -83,7 +83,7 @@ import {
   isCredentialError,
   retryDelayMs,
 } from './runtime/retry.js';
-import { handleCommand } from './runtime/commands.js';
+import { COMMAND_HINT_SOURCE_KIND, commandHintMessage, handleCommand } from './runtime/commands.js';
 import { createMetrics } from './runtime/metrics.js';
 import { createProactive } from './runtime/proactive.js';
 import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
@@ -146,6 +146,20 @@ const RECALL_BUDGET_TOKENS = 2050;
  * 的标记：转录快照与巩固选区文本据此排除注入块。
  */
 const RECALL_SOURCE_KIND = 'companion-recall';
+
+/**
+ * H3②：线程/任务类工具。宿主没有 sessionController（capabilities.threadTools
+ * 为 false）时这些工具既无法创建会话也无法取消，注册了只会让模型调到必失败
+ * 的工具，因此整组不注册。
+ */
+const THREAD_TOOL_NAMES = new Set(['thread_list', 'thread_run', 'task_run']);
+
+/**
+ * V3-L3：中文命令提示注入正文的固定前缀。
+ * surface 记录只有 `{role, text, tokens}`（没有 source），排除巩固窗口时按
+ * 这个前缀兜底识别；文案与 runtime/commands.js 的 commandHintMessage 一致。
+ */
+const COMMAND_HINT_TEXT_PREFIX = '宿主只注册 ASCII 命令名';
 
 /** 召回块文本标记（assemble 渲染）；surface 记录只有 role/text，没有 source。 */
 const RECALL_MARKER = '[相关记忆]';
@@ -647,6 +661,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             metrics,
             timeZone: config.timezone,
             budget: typeof budgetInfo === 'function' ? budgetInfo() : undefined,
+            // V3-H3②：宿主无 sessionController 时明确显示「线程：宿主不支持」。
+            threadsSupported: platform.capabilities.threadTools,
             // V3-M2：/状态 展示当前主会话与绑定模式。
             mainSession: {
               id: currentMainSessionId(state),
@@ -706,6 +722,8 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
+    // V3-H3②：没有 sessionController 时线程/任务工具不可用，整组不注册。
+    if (platform.capabilities.threadTools === false && THREAD_TOOL_NAMES.has(tool.name)) continue;
     track(platform.registerTool({
       name: tool.name,
       description: tool.description,
@@ -763,6 +781,8 @@ function hasRealUserInput(messages) {
     if (message.role !== 'user') continue;
     const sourceKind = message.source?.kind;
     if (sourceKind === 'runtime-context' || sourceKind === RECALL_SOURCE_KIND) continue;
+    // V3-L3：中文命令提示也是插件注入，不算用户真实输入（不会抢占主会话绑定）。
+    if (sourceKind === COMMAND_HINT_SOURCE_KIND) continue;
     const blocks = Array.isArray(message.content)
       ? message.content
       : (message.type === 'text' ? [message] : []);
@@ -1123,7 +1143,35 @@ async function runPreStep(state, payload) {
     scheduleConsolidation(state, payload, scope);
   }
 
-  return injectRecall(state, payload, messages, turnKey, scope);
+  const hint = injectCommandHint(state, payload, messages, turnKey);
+  const injection = await injectRecall(state, payload, messages, turnKey, scope);
+  if (hint === null) return injection;
+  if (injection === null) return { inject: [hint] };
+  return { inject: [hint, ...injection.inject] };
+}
+
+/**
+ * V3-L3：识别用户把中文命令（`/记忆`、`/状态`…）当命令输入的情况，注入一句
+ * 提示让模型改用 ASCII 命令名。宿主命令名只允许 ASCII，这类文本会当普通发言
+ * 发给模型；不提示的话模型只能猜。
+ *
+ * 同一 turn 只注入一次（平台会把注入消息回灌到后续 step 的 messages，否则每
+ * step 都会重复注入）。提示消息是完整平台消息（V3-H1 形状），source.kind 为
+ * `companion-command-hint`，下游转录/巩固按 kind 或固定前缀排除。
+ *
+ * @param {object} state
+ * @param {object} payload
+ * @param {unknown[]} messages
+ * @param {string|null} turnKey
+ * @returns {{id: string, role: 'user', content: object[], source: object}|null}
+ */
+function injectCommandHint(state, payload, messages, turnKey) {
+  const key = `hint:${sessionIdOf(payload) ?? SCOPE}:${turnKey ?? `step:${String(payload?.step ?? 'unknown')}`}`;
+  if (state.turnSeen.has(key)) return null;
+  const message = commandHintMessage(lastUserText(messages));
+  if (message === null) return null;
+  state.turnSeen.add(key);
+  return message;
 }
 
 /**
@@ -2408,16 +2456,15 @@ function extractRecallBlock(messages) {
 }
 
 /**
- * 这条 payload 消息是否是本插件的召回注入（V3-H1）。
- * 平台把注入块作为普通 user/message 回灌到后续 pre-step 的 messages，
- * 下游必须按 `source.kind` 识别，不能当用户发言。
+ * 这条 payload 消息是否是插件注入（召回块 / 中文命令提示，V3-H1 + V3-L3）。
+ * 平台会把注入消息作为普通 user/message 回灌，下游不得当用户发言处理。
  * @param {unknown} message
  * @returns {boolean}
  */
-function isRecallMessage(message) {
-  return message !== null
-    && typeof message === 'object'
-    && message.source?.kind === RECALL_SOURCE_KIND;
+function isInjectedMessage(message) {
+  if (message === null || typeof message !== 'object') return false;
+  const kind = message.source?.kind;
+  return kind === RECALL_SOURCE_KIND || kind === COMMAND_HINT_SOURCE_KIND;
 }
 
 /**
@@ -2428,9 +2475,9 @@ function isRecallMessage(message) {
  * @returns {boolean}
  */
 function isRecallRecord(record) {
-  return record?.role === 'user'
-    && typeof record.text === 'string'
-    && record.text.trimStart().startsWith(RECALL_MARKER);
+  if (record?.role !== 'user' || typeof record.text !== 'string') return false;
+  const text = record.text.trimStart();
+  return text.startsWith(RECALL_MARKER) || text.startsWith(COMMAND_HINT_TEXT_PREFIX);
 }
 
 /**
@@ -3353,8 +3400,8 @@ function textRows(messages) {
   const rows = [];
   for (const message of messages) {
     if (message === null || typeof message !== 'object') continue;
-    // 召回注入块回灌后也是 user/message，但不是用户发言（V3-H1）。
-    if (isRecallMessage(message)) continue;
+    // 召回/命令提示注入块回灌后也是 user/message，但不是用户发言（V3-H1 + V3-L3）。
+    if (isInjectedMessage(message)) continue;
     if (Array.isArray(message.content)) {
       for (const block of message.content) {
         if (block?.type !== 'text' || typeof block.text !== 'string') continue;
