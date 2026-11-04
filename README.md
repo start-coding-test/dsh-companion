@@ -67,11 +67,14 @@ dsh-companion/
 | `timezone` | `"Asia/Shanghai"` | 墙上时间所用 IANA 时区（安静时段、每日任务、日界线、备份文件名） | 合法 IANA 时区名 |
 | `purgeAfterDays` | `7` | 遗忘冷静期，到期物理删除 | `1`–`30` |
 | `dbPath` | `"./.data/companion.db"` | SQLite 数据库路径 | 非空字符串 |
+| `rssWarnGiB` | `2.95` | RSS warn 阈值（GiB），只记指标 | `> 0` 且 `< rssStopGiB` |
+| `rssStopGiB` | `3` | RSS 停 `task_run`/主动消息的阈值（GiB） | `> rssWarnGiB` 且 `< rssMainOnlyGiB` |
+| `rssMainOnlyGiB` | `3.15` | RSS 仅主会话的阈值（GiB） | `> rssStopGiB` |
 | `vector.enabled` | `false` | 是否启用可选向量召回 | 布尔；默认关闭 |
 | `vector.dim` | `256` | 向量维度（`hashEmbed` 桶数） | 整数 `8`–`4096` |
 | `vector.embedder` | `"hash"` | 向量化实现 | `hash`（字符 bigram 哈希，非生产质量）/ `none`（退化） |
 
-token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`。未知配置键只记警告，不阻断启动。v0.3.0 新增可选的 `vector.*`（默认关闭；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 13 个键输出）；治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
+token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 新增可选的 `vector.*`（默认关闭；`DEFAULTS.vector` 不可枚举，首次安装自检按 16 个键输出，含 RSS 三档）；治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
@@ -83,7 +86,7 @@ token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryToke
 
 **每日 token 熔断**：按 `timezone` 的本地日界累计每日 token 用量，达到 `3,000,000` 后进入熔断：拒绝新的 `task_run`、暂停主动消息，`/成本` 与 `/状态` 会显示「已熔断」；本地日界翻篇自动复位。该上限固定为 3M，v0.3.2 不提供配置键。
 
-**RSS 三档降级**：每 60 秒检查一次进程 RSS，`≥2.95GiB` 记 warn 指标（不降级）、`≥3.0GiB` 停 `task_run` 与主动消息、`≥3.15GiB` 再停线程创建；恢复后自动解除。阈值固定，v0.3.2 不提供配置键。
+**RSS 三档降级**：每 60 秒检查一次进程 RSS；三档阈值可配置（`rssWarnGiB` / `rssStopGiB` / `rssMainOnlyGiB`，默认 `2.95` / `3.0` / `3.15`GiB，须满足 `0 < warn < stop < mainOnly`）。`≥warn` 只记指标（不降级）、`≥stop` 停 `task_run` 与主动消息、`≥mainOnly` 再停线程创建；恢复后自动解除。4G 云端按自检公式 `min(userLimit, totalmem×0.75−512MiB)` 预算只有 2.5GiB，默认 3.0GiB 的 stop 可能晚于 OOM，建议把三档降到 `2.2` / `2.4` / `2.6`；不要超过总内存 75%（4GiB 即 3.0GiB）。`/状态` 会显示当前生效的三档值。
 
 ## 首次安装自检
 
@@ -98,7 +101,7 @@ node scripts/calibrate/run.mjs
 
 - `.data/calibration.json`：node/electron/dsh 版本、SQLite、CPU、内存、RSS 中位、
   `tokenMeter` 节点数、contextWindow 来源与建议值；
-- `.data/config.suggested.yml`：13 个基础配置键的建议值（不含默认关闭的 `vector.*`），头部带 `generated_at` 与
+- `.data/config.suggested.yml`：16 个基础配置键的建议值（含按内存预算缩放的 RSS 三档；不含默认关闭的 `vector.*`），头部带 `generated_at` 与
   `source`（node/electron/dsh/rss_median）。
 
 自检**不会**自动合并配置、不会写人格卡或记忆库；核对后把需要的键复制到
@@ -169,7 +172,7 @@ node scripts/calibrate/run.mjs
 - 平台管理的会话 JSONL 不在插件控制范围内，插件无法删除。
 - **单人模型**：主会话与线程按 `scope` 隔离（线程为 `thread:<key>`），但仍是单人使用，不是多人协作。
 - **task_run 串行**：worker 全局单槽、忙时排队至多 2 个；软超时 600s 只告警，硬超时 900s 两段式取消（先中止当前轮、再清空排队）。熔断或 RSS 降级时 `task_run` 会在入队前被拒绝（`daily_budget_exceeded` / `memory_pressure`）。
-- **预算/内存保护固定阈值**：每日 3M token 与 RSS 2.95/3.0/3.15GiB 三档不可配置；RSS warn 只记 metric，stop_dispatch 起才停派发；保护读数读取失败时按 `ok` 放行，不会因此中断会话。
+- **预算/内存保护**：每日 3M token 上限固定；RSS 三档可配置（`rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`，默认 2.95/3.0/3.15GiB，4G 机器建议 2.2/2.4/2.6）。RSS warn 只记 metric，stop 起才停派发；保护读数读取失败时按 `ok` 放行，不会因此中断会话。
 - **自愈重试受调度 tick 约束**：巩固重试与轻闲聊都挂在 idle-probe（60s）上；熔断或 RSS ≥ stop_dispatch 期间重试会被顺延（事件与失败态保留，只是延后），恢复后继续推进。
 - **subagent 仍见全局人格段**：平台的 system prompt 段没有 per-session 文本；插件只能让 subagent 跳过召回、巩固与写库，无法移除人格 / 记忆提示段。
 - **schema v4 迁移清空 consolidations**：seq 语义切换为 surface 位置序时，开发期迁移会清空 `consolidations` 并重置 `episodes.consolidation_id`；事实、提醒与状态板不受影响。

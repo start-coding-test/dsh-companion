@@ -183,3 +183,56 @@ test('RSS main_only：停 task_run/线程创建，恢复后自动解除', async 
   const unblocked = await threadRun.execute({ key: 'new', name: '恢复后的线程' });
   assert.notEqual(unblocked.reason, 'memory_main_only');
 });
+
+test('RSS 三档可配置：2.2/2.4/2.6 驱动 warn→stop_dispatch→main_only', async (t) => {
+  const temp = makeTempStore();
+  const ctx = makeApplyCtx();
+  let rss = 2.25 * GIB;
+  ctx.rssReader = () => rss;
+
+  const handle = apply(ctx, {
+    dbPath: temp.dbPath,
+    threadIdleDays: 14,
+    rssWarnGiB: 2.2,
+    rssStopGiB: 2.4,
+    rssMainOnlyGiB: 2.6,
+  });
+  t.after(() => {
+    handle.dispose();
+    temp.cleanup();
+  });
+
+  ctx.advance(MINUTE_MS);
+  await ctx.fireTimers(1);
+  await settle(50);
+  const warned = command(ctx, 'status').text;
+  assert.match(warned, /RSS warn 2304MB/u);
+  assert.match(warned, /RSS 阈值：warn 2\.2GiB \/ stop 2\.4GiB \/ main_only 2\.6GiB/u);
+
+  // 2.45GiB 在默认阈值下还是 ok；配置后已是 stop_dispatch，task_run 被拒。
+  rss = 2.45 * GIB;
+  ctx.advance(MINUTE_MS);
+  await ctx.fireTimers(1);
+  await settle(50);
+  assert.match(command(ctx, 'status').text, /RSS stop_dispatch 2508\.8MB/u);
+  assert.deepEqual(await tool(ctx, 'task_run').execute({ goal: '云端 stop 档任务' }), {
+    ok: false,
+    reason: 'memory_pressure',
+  });
+
+  rss = 2.65 * GIB;
+  ctx.advance(MINUTE_MS);
+  await ctx.fireTimers(1);
+  await settle(50);
+  assert.match(command(ctx, 'status').text, /RSS main_only 2713\.6MB/u);
+  const blocked = await tool(ctx, 'thread_run').execute({ key: 'new', name: '云端小内存线程' });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.reason, 'memory_main_only');
+
+  // 回落到 warn 以下自动恢复 ok。
+  rss = 2.1 * GIB;
+  ctx.advance(MINUTE_MS);
+  await ctx.fireTimers(1);
+  await settle(50);
+  assert.match(command(ctx, 'status').text, /RSS ok 2150\.4MB/u);
+});

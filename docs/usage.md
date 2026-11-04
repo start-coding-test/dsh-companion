@@ -127,11 +127,12 @@ health | archived | 体检 | 2026-10-20
 ```text
 /状态
 状态：entities 8 / episodes 120 / facts 96 / reminders 4 / state_board 2 / state_board_rev 9 / threads 3 / consolidations 21 / memory_events 310 / fts facts 96/episodes 120 / tokens 本轮 入 8000 出 1200（超预算 0 次）｜今日 0/3000000｜RSS ok 128MB｜向量：关
+RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 水位 main：120
 最近 job：s2-purge ok upto_seq=0（2026-11-03 03:30）
 ```
 
-最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·最近命中 N」。
+最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·最近命中 N」。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。
 
 `/状态` 末尾还会给出自愈观测（无事件时显示「无」）：
 
@@ -359,6 +360,7 @@ health | archived | 体检 | 2026-10-20
 - 宿主没有 `sessionController` 时返回 `{ "ok": false, "reason": "session-unavailable" }`。
 - 每日 token 达到 3M 时返回 `{ "ok": false, "reason": "daily_budget_exceeded" }`；
   RSS 达到降级线时返回 `{ "ok": false, "reason": "memory_pressure" }`（入队前拒绝）。
+  降级线由 `rssStopGiB`/`rssMainOnlyGiB` 配置（默认 3.0/3.15GiB；4G 机器建议 2.4/2.6）。
 
 审计：收尾写两条 `memory_events`（append-only）：`USED` + `kind:"task_receipt"`
 （回执正文）与 `USED` + `kind:"task_run"`（任务生命周期）。`action` 词表里没有
@@ -459,6 +461,15 @@ vector:
   enabled: true
   dim: 256
   embedder: hash
+```
+
+2C4G 云端把 RSS 三档下调到预算 2.5GiB 以内（公式 `min(userLimit, totalmem×0.75−512MiB)`；
+三档须递增且不超过总内存 75%，4GiB 即 3.0GiB）：
+
+```yaml
+rssWarnGiB: 2.2
+rssStopGiB: 2.4
+rssMainOnlyGiB: 2.6
 ```
 
 完整配置项与默认值见 [README](../README.md#配置)。

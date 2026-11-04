@@ -14,6 +14,7 @@ import {
   RETAIN_TOKENS,
   renderSuggestedYaml,
   suggestConfig,
+  suggestRssLimits,
 } from '../src/calibrate/formula.js';
 import { DEFAULTS } from '../src/config.js';
 import { DEFAULT_CARD } from '../src/persona/card.js';
@@ -112,7 +113,7 @@ test('suggestConfig：总内存小值与 userLimit 下限', () => {
   assert.equal(zeroLimit.memoryBudget, 0);
 });
 
-test('suggestConfig：13 个配置键齐全、类型正确、时区可覆盖', () => {
+test('suggestConfig：16 个配置键齐全、类型正确、时区可覆盖', () => {
   const suggested = suggestConfig({
     totalmemBytes: 16 * GIB,
     contextWindowTokens: 128000,
@@ -130,6 +131,27 @@ test('suggestConfig：13 个配置键齐全、类型正确、时区可覆盖', (
   assert.equal(suggested.quietStart, '23:00');
   assert.equal(suggested.quietEnd, '08:00');
   assert.ok(Number.isInteger(suggested.memoryBudget));
+});
+
+test('suggestRssLimits：按 memoryBudget 缩放，4GiB 内存给出 2.2/2.4/2.6', () => {
+  const cloud = suggestConfig({ totalmemBytes: 4 * GIB, contextWindowTokens: 128000 });
+  assert.equal(cloud.memoryBudget, 2.5 * GIB, '自检公式：4GiB×0.75−512MiB = 2.5GiB');
+  assert.equal(cloud.rssWarnGiB, 2.2);
+  assert.equal(cloud.rssStopGiB, 2.4);
+  assert.equal(cloud.rssMainOnlyGiB, 2.6);
+  assert.ok(cloud.rssMainOnlyGiB <= 4 * 0.75, 'mainOnly 不超过总内存 75%');
+
+  const large = suggestConfig({ totalmemBytes: 64 * GIB, contextWindowTokens: 128000 });
+  assert.equal(large.rssWarnGiB, 2.95);
+  assert.equal(large.rssStopGiB, 3);
+  assert.equal(large.rssMainOnlyGiB, 3.15);
+
+  const tiny = suggestRssLimits(0.2 * GIB);
+  assert.ok(tiny.rssWarnGiB > 0);
+  assert.ok(tiny.rssWarnGiB < tiny.rssStopGiB);
+  assert.ok(tiny.rssStopGiB < tiny.rssMainOnlyGiB);
+
+  assert.deepEqual(suggestRssLimits(0), { rssWarnGiB: 2.95, rssStopGiB: 3, rssMainOnlyGiB: 3.15 });
 });
 
 test('renderSuggestedYaml：含 provenance 且是合法简单 YAML', () => {
@@ -159,13 +181,16 @@ test('renderSuggestedYaml：含 provenance 且是合法简单 YAML', () => {
   assert.doesNotMatch(yaml, /^memoryBudget:/m, 'memoryBudget 不是配置键');
 
   const parsed = parseSimpleYaml(yaml);
-  assert.equal(Object.keys(parsed).length, 13);
+  assert.equal(Object.keys(parsed).length, 16);
   assert.equal(parsed.workingMemoryTokens, 32000);
   assert.equal(parsed.compactAtTokens, 24000);
   assert.equal(parsed.retainTokens, 6144);
   assert.equal(parsed.timezone, 'Asia/Shanghai');
   assert.equal(parsed.quietStart, '23:00');
   assert.equal(parsed.dbPath, './.data/companion.db');
+  assert.equal(parsed.rssWarnGiB, 2.95);
+  assert.equal(parsed.rssStopGiB, 3);
+  assert.equal(parsed.rssMainOnlyGiB, 3.15);
 });
 
 test('renderSuggestedYaml：provenance 含换行也不会破坏注释结构', () => {
@@ -182,10 +207,10 @@ test('renderSuggestedYaml：provenance 含换行也不会破坏注释结构', ()
   assert.match(lines[0], /node v24 injected: true/);
   assert.doesNotMatch(yaml, /^injected:/m);
   const parsed = parseSimpleYaml(yaml);
-  assert.equal(Object.keys(parsed).length, 13);
+  assert.equal(Object.keys(parsed).length, 16);
 });
 
-test('config.example.yml：13 个键齐全且与 DEFAULTS 一致', () => {
+test('config.example.yml：16 个键齐全且与 DEFAULTS 一致', () => {
   const text = readFileSync(resolve(REPO_ROOT, 'config.example.yml'), 'utf8');
   const parsed = parseExampleConfig(text);
   assert.deepEqual(Object.keys(parsed).sort(), Object.keys(DEFAULTS).sort());

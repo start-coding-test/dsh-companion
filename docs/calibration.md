@@ -67,6 +67,15 @@ dsh --profile headless --patch "<repo>/dsh-companion/scripts/calibrate/calibrate
 | `timezone` | 传入值，否则用进程默认 IANA 时区 |
 | `purgeAfterDays` | `7` |
 | `dbPath` | `./.data/companion.db` |
+| `rssWarnGiB` | `max(0.01, round2(min(2.95, 0.88 × B)))` |
+| `rssStopGiB` | `max(round2(rssWarnGiB + 0.01), round2(min(3.0, 0.96 × B)))` |
+| `rssMainOnlyGiB` | `max(round2(rssStopGiB + 0.01), round2(min(3.15, 1.04 × B)))` |
+
+其中 `B = memoryBudget / 1GiB`（即上面的内存预算换算成 GiB）；三档随内存预算缩放、在
+`2.95/3.0/3.15` 封顶，并强制满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。
+例如 2C4G：`M = 4GiB` → `B = max(0, 4×0.75−0.5) = 2.5GiB`，自检直接建议
+`rssWarnGiB: 2.2`、`rssStopGiB: 2.4`、`rssMainOnlyGiB: 2.6`。三档都不要超过总内存
+75%（4GiB 即 3.0GiB）：超过时进程可能在降级逻辑生效前就被 OOM kill。
 
 `memoryBudget` 只是内存预算提示（字节），不会写进 YAML 键，避免被配置层当作未知键。
 `userLimitBytes` 对应你对 DSH/本插件内存占用的硬上限；未设置时只看机器总内存。
@@ -75,7 +84,8 @@ dsh --profile headless --patch "<repo>/dsh-companion/scripts/calibrate/calibrate
 
 - 内存告警线就是 `min(user_limit, totalmem × 0.75 − 512MiB)`：RSS 中位数接近或超过
   该值时，建议降低 `workingMemoryTokens`、缩短保留尾部，或把 `dbPath` 移到更轻的
-  运行环境。
+  运行环境。自检会用这条预算线推算 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`
+  三个建议值；手工调整时保持三者严格递增，且 `rssMainOnlyGiB` 不超过总内存 75%。
 - `contextWindowTokens` 小于约 `33K` 时，公式可能给出
   `compactAtTokens < retainTokens`，属于「模型窗口太小、MVP 不推荐」的情况。此时
   不要直接抄建议文件；升级模型窗口，或手工把四档 token 调成满足
@@ -124,6 +134,7 @@ tokenMeter 节点数、contextWindow 来源）与 `merged: false`，方便复审
   Windows 略有差异。
 - `contextWindowTokens` 若平台未上报，只能用 patch 配置兜底；请按实际模型修改，
   不要假设所有模型都是 128K。
-- 自检不测试模型质量、网络延迟或磁盘 I/O；这些不影响本文件的 13 个配置键建议。
+- 自检不测试模型质量、网络延迟或磁盘 I/O；这些不影响本文件的 16 个配置键建议
+  （含 RSS 三档）。
 - `node:sqlite` 不可用时 `measurement.sqlite.ok=false`，插件本身仍可运行，但数据库
   相关功能会降级；这属于环境问题，不是自检失败。

@@ -6,6 +6,9 @@
  * - 日界按配置 IANA 时区（与 M1 的日键语义一致），不读 process.env.TZ；
  * - RSS 只做保护性降级，不主动 GC、不杀进程；读不到内存读数时按 ok 处理，
  *   绝不让保护逻辑自己变成故障源；
+ * - RSS 三档阈值默认 2.95/3.0/3.15GiB，可由 config 的
+ *   rssWarnGiB/rssStopGiB/rssMainOnlyGiB 覆盖（N-M3/W4-10：4G 云端按
+ *   `min(userLimit, totalmem×0.75−512MiB)` 预算下调到约 2.2/2.4/2.6）；
  * - 阈值单位按二进制 GiB（源码注释写作 GB，节点里常用 1024^3 口径）。
  */
 
@@ -19,10 +22,40 @@ const MIB = 1024 ** 2;
 /** 每日 token 熔断线：3M。 */
 export const DAILY_TOKEN_LIMIT = 3_000_000;
 
-/** RSS 三档阈值：2.95GiB / 3.0GiB / 3.15GiB。 */
-export const RSS_WARN_BYTES = Math.round(2.95 * GIB);
-export const RSS_STOP_DISPATCH_BYTES = 3 * GIB;
-export const RSS_MAIN_ONLY_BYTES = Math.round(3.15 * GIB);
+/** RSS 三档默认阈值（GiB）：2.95 / 3.0 / 3.15。 */
+export const DEFAULT_RSS_GIB = Object.freeze({ warn: 2.95, stop_dispatch: 3, main_only: 3.15 });
+
+/** RSS 三档默认阈值（字节）；N-M3/W4-10 起可被 config 的 rss*GiB 覆盖。 */
+export const RSS_WARN_BYTES = Math.round(DEFAULT_RSS_GIB.warn * GIB);
+export const RSS_STOP_DISPATCH_BYTES = Math.round(DEFAULT_RSS_GIB.stop_dispatch * GIB);
+export const RSS_MAIN_ONLY_BYTES = Math.round(DEFAULT_RSS_GIB.main_only * GIB);
+
+/**
+ * 从配置读取 RSS 三档阈值，换算成 `checkMemory` 需要的字节口径。
+ *
+ * 配置层 `normalizeConfig` 已校验 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`；
+ * 这里对缺失/非法/乱序的值退回默认阈值——保护逻辑不能自己变成故障源。
+ * @param {{rssWarnGiB?: unknown, rssStopGiB?: unknown, rssMainOnlyGiB?: unknown}} [config]
+ * @returns {{bytes: {warn: number, stop_dispatch: number, main_only: number},
+ *            gib: {warn: number, stop_dispatch: number, main_only: number}}}
+ */
+export function rssLimitsFromConfig(config = {}) {
+  const source = config !== null && typeof config === 'object' ? config : {};
+  const warn = toPositive(source.rssWarnGiB);
+  const stop = toPositive(source.rssStopGiB);
+  const mainOnly = toPositive(source.rssMainOnlyGiB);
+  const ordered = warn !== null && stop !== null && mainOnly !== null
+    && warn < stop && stop < mainOnly;
+  const gib = ordered ? Object.freeze({ warn, stop_dispatch: stop, main_only: mainOnly }) : DEFAULT_RSS_GIB;
+  return Object.freeze({
+    gib,
+    bytes: Object.freeze({
+      warn: Math.round(gib.warn * GIB),
+      stop_dispatch: Math.round(gib.stop_dispatch * GIB),
+      main_only: Math.round(gib.main_only * GIB),
+    }),
+  });
+}
 
 /** 数值化档位，便于写进 metrics（0=ok ... 3=main_only）。 */
 export const RSS_LEVELS = Object.freeze({

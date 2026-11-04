@@ -1,4 +1,4 @@
-# dsh-companion 配置示例（13 个配置键）
+# dsh-companion 配置示例（16 个配置键）
 #
 # 用法：
 #   1. 复制本文件为 config.yml（或把需要的键并入你的 profile patch）。
@@ -51,3 +51,11 @@ purgeAfterDays: 7
 
 # SQLite 数据库路径（默认 ./.data/companion.db；必须是可写目录下的非空路径）
 dbPath: "./.data/companion.db"
+
+# RSS 三档阈值（GiB，默认 2.95/3.0/3.15；必须 0 < warn < stop < mainOnly）
+# 自检公式：memoryBudget = min(userLimit, totalmem×0.75 − 512MiB)；
+# 4GiB 云端示例：totalmem 4GiB → budget 2.5GiB → warn 2.2 / stop 2.4 / mainOnly 2.6。
+# 不要超过总内存 75%（4GiB 机器即 3.0GiB）；小内存机器务必下调，否则保护可能晚于 OOM。
+rssWarnGiB: 2.95
+rssStopGiB: 3
+rssMainOnlyGiB: 3.15

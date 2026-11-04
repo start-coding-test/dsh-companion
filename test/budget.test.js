@@ -20,6 +20,7 @@ import {
   overDailyBudget,
   recordTurnUsage,
   rssLevelCode,
+  rssLimitsFromConfig,
 } from '../src/runtime/budget.js';
 
 const GIB = 1024 ** 3;
@@ -111,6 +112,46 @@ test('checkMemory：limits 逐项覆盖', () => {
   assert.equal(checkMemory({ rss: 150, totalmem: 1000, limits }).level, 'warn');
   assert.equal(checkMemory({ rss: 250, totalmem: 1000, limits }).level, 'stop_dispatch');
   assert.equal(checkMemory({ rss: 350, totalmem: 1000, limits }).level, 'main_only');
+});
+
+test('rssLimitsFromConfig：默认三档与 4G 云端覆盖', () => {
+  const defaults = rssLimitsFromConfig();
+  assert.equal(defaults.gib.warn, 2.95);
+  assert.equal(defaults.gib.stop_dispatch, 3);
+  assert.equal(defaults.gib.main_only, 3.15);
+  assert.equal(defaults.bytes.warn, RSS_WARN_BYTES);
+  assert.equal(defaults.bytes.stop_dispatch, RSS_STOP_DISPATCH_BYTES);
+  assert.equal(defaults.bytes.main_only, RSS_MAIN_ONLY_BYTES);
+
+  const cloud = rssLimitsFromConfig({ rssWarnGiB: 2.2, rssStopGiB: 2.4, rssMainOnlyGiB: 2.6 });
+  assert.deepEqual(cloud.gib, { warn: 2.2, stop_dispatch: 2.4, main_only: 2.6 });
+  assert.equal(cloud.bytes.warn, Math.round(2.2 * GIB));
+  assert.equal(cloud.bytes.stop_dispatch, Math.round(2.4 * GIB));
+  assert.equal(cloud.bytes.main_only, Math.round(2.6 * GIB));
+
+  // 缺失/非法/乱序一律退回默认阈值，保护逻辑不能因配置坏掉而失效。
+  const badInputs = [
+    null,
+    {},
+    { rssWarnGiB: -1, rssStopGiB: 2.4, rssMainOnlyGiB: 2.6 },
+    { rssWarnGiB: 2.2, rssStopGiB: 2.6, rssMainOnlyGiB: 2.4 },
+    { rssWarnGiB: 3, rssStopGiB: 2.4, rssMainOnlyGiB: 2.6 },
+  ];
+  for (const bad of badInputs) {
+    assert.deepEqual(rssLimitsFromConfig(bad).gib, { warn: 2.95, stop_dispatch: 3, main_only: 3.15 });
+  }
+});
+
+test('checkMemory：注入 2.2/2.4/2.6 的云端阈值逐档命中', () => {
+  const { bytes } = rssLimitsFromConfig({ rssWarnGiB: 2.2, rssStopGiB: 2.4, rssMainOnlyGiB: 2.6 });
+  assert.equal(checkMemory({ rss: bytes.warn - 1, totalmem: 4 * GIB, limits: bytes }).level, 'ok');
+  assert.equal(checkMemory({ rss: bytes.warn, totalmem: 4 * GIB, limits: bytes }).level, 'warn');
+  assert.equal(checkMemory({ rss: bytes.stop_dispatch, totalmem: 4 * GIB, limits: bytes }).level, 'stop_dispatch');
+  assert.equal(checkMemory({ rss: bytes.main_only, totalmem: 4 * GIB, limits: bytes }).level, 'main_only');
+
+  // 2.45GiB：默认阈值还是 ok，云端配置已到 stop_dispatch——保护更早生效。
+  assert.equal(checkMemory({ rss: 2.45 * GIB, totalmem: 4 * GIB }).level, 'ok');
+  assert.equal(checkMemory({ rss: 2.45 * GIB, totalmem: 4 * GIB, limits: bytes }).level, 'stop_dispatch');
 });
 
 test('checkMemory：rssReader 注入与异常安全', () => {

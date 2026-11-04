@@ -44,6 +44,9 @@ describe('DEFAULTS', () => {
     assert.equal(DEFAULTS.idleMs, 30 * 60 * 1000);
     assert.equal(DEFAULTS.purgeAfterDays, 7);
     assert.equal(DEFAULTS.dbPath, './.data/companion.db');
+    assert.equal(DEFAULTS.rssWarnGiB, 2.95);
+    assert.equal(DEFAULTS.rssStopGiB, 3);
+    assert.equal(DEFAULTS.rssMainOnlyGiB, 3.15);
   });
 });
 
@@ -113,6 +116,14 @@ describe('normalizeConfig', () => {
     assert.equal(cfg.quietStart, '12:00');
     assert.equal(cfg.quietEnd, '12:00');
   });
+
+  test('RSS 三档允许小内存机器的 2.2/2.4/2.6 配置', () => {
+    const cfg = normalizeConfig({ rssWarnGiB: 2.2, rssStopGiB: 2.4, rssMainOnlyGiB: 2.6 });
+    assert.equal(cfg.rssWarnGiB, 2.2);
+    assert.equal(cfg.rssStopGiB, 2.4);
+    assert.equal(cfg.rssMainOnlyGiB, 2.6);
+    assert.deepEqual(cfg.warnings, []);
+  });
 });
 
 describe('normalizeConfig 非法输入', () => {
@@ -140,6 +151,15 @@ describe('normalizeConfig 非法输入', () => {
     ['workingMemoryTokens 不小于 compactHardTokens', 'workingMemoryTokens', { workingMemoryTokens: 40000 }],
     ['raw 不是对象', 'config', 'not-an-object'],
     ['raw 是数组', 'config', []],
+    ['rssWarnGiB 非数字', 'rssWarnGiB', { rssWarnGiB: '2.95' }],
+    ['rssWarnGiB 为 null', 'rssWarnGiB', { rssWarnGiB: null }],
+    ['rssWarnGiB 为 NaN', 'rssWarnGiB', { rssWarnGiB: NaN }],
+    ['rssStopGiB 为 0', 'rssStopGiB', { rssStopGiB: 0 }],
+    ['rssStopGiB 为布尔', 'rssStopGiB', { rssStopGiB: true }],
+    ['rssMainOnlyGiB 为负', 'rssMainOnlyGiB', { rssMainOnlyGiB: -0.1 }],
+    ['rssMainOnlyGiB 为 Infinity', 'rssMainOnlyGiB', { rssMainOnlyGiB: Infinity }],
+    ['rssWarnGiB 不小于 rssStopGiB', 'rssWarnGiB', { rssWarnGiB: 3 }],
+    ['rssStopGiB 不小于 rssMainOnlyGiB', 'rssStopGiB', { rssStopGiB: 3.15 }],
   ];
 
   for (const [label, field, raw] of invalidCases) {

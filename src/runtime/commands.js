@@ -36,7 +36,8 @@ const RSS_LEVEL_NAMES = Object.freeze(['ok', 'warn', 'stop_dispatch', 'main_only
  * @param {object} [options.metrics] createMetrics() 句柄；/状态 用它显示本轮 token
  * @param {string} [options.timeZone=DEFAULT_TIMEZONE] 日期/日界线所用 IANA 时区
  * @param {{dailyTokens?: number, dailyLimit?: number, tripped?: boolean,
- *   rssLevel?: string, rssMB?: number}} [options.budget] M4 预算/RSS 快照
+ *   rssLevel?: string, rssLevelCode?: number, rssMB?: number,
+ *   rssLimits?: {warnGiB?: number, stopGiB?: number, mainOnlyGiB?: number}}} [options.budget] M4 预算/RSS 快照
  * @returns {{handled: boolean, reply: string}}
  */
 export function handleCommand({
@@ -402,6 +403,29 @@ function formatThreads(rows, timeZone) {
   return lines.join('\n');
 }
 
+/**
+ * RSS 三档阈值行（N-M3/W4-10）。接线层未传 rssLimits 时返回 null，
+ * 保持旧快照格式不变（命令层可被单测直接调用）。
+ * @param {object} [budget]
+ * @returns {string|null}
+ */
+function formatRssLimits(budget) {
+  const limits = budget?.rssLimits;
+  if (limits === null || limits === undefined || typeof limits !== 'object') return null;
+  const warn = formatGiB(limits.warnGiB);
+  const stop = formatGiB(limits.stopGiB);
+  const mainOnly = formatGiB(limits.mainOnlyGiB);
+  if (warn === null || stop === null || mainOnly === null) return null;
+  return `RSS 阈值：warn ${warn}GiB / stop ${stop}GiB / main_only ${mainOnly}GiB`;
+}
+
+/** @param {unknown} value @returns {string|null} */
+function formatGiB(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return String(Math.round(n * 100) / 100);
+}
+
 /** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] */
 function formatStatus(store, scope, metrics, timeZone, budget) {
   const stats = store.stats();
@@ -418,7 +442,11 @@ function formatStatus(store, scope, metrics, timeZone, budget) {
   const fts = `fts ${stats.fts_facts ?? 0}/${stats.fts_episodes ?? 0}`;
   const tokenText = formatTokenSnapshot(metrics, budget);
   const failureText = formatFailureStatus(store, timeZone);
-  return `状态：${counts} / ${fts}${tokenText}\n水位 ${scope}：${watermark}\n最近 job：${jobText}\n${failureText}`;
+  const limitsText = formatRssLimits(budget);
+  const lines = [`状态：${counts} / ${fts}${tokenText}`];
+  if (limitsText !== null) lines.push(limitsText);
+  lines.push(`水位 ${scope}：${watermark}`, `最近 job：${jobText}`, failureText);
+  return lines.join('\n');
 }
 
 /**

@@ -31,11 +31,15 @@ const DEFAULT_VALUES = {
   timezone: DEFAULT_TIMEZONE,
   purgeAfterDays: 7,
   dbPath: './.data/companion.db',
+  // N-M3/W4-10：RSS 三档阈值（GiB）；4G 云端可下调到 2.2/2.4/2.6。
+  rssWarnGiB: 2.95,
+  rssStopGiB: 3,
+  rssMainOnlyGiB: 3.15,
 };
 
 // P2-b：可选向量召回；默认关闭，关闭时检索与 v0.2.0 完全一致。
-// 不参与 Object.keys(DEFAULTS) 的 13 键安装自检/示例配置输出（仍是可访问的默认值），
-// 避免改变既有 13 键配置面的语义；用户显式配置 vector 时照常校验。
+// 不参与 Object.keys(DEFAULTS) 的 16 键安装自检/示例配置输出（仍是可访问的默认值），
+// 避免改变既有配置面的语义；用户显式配置 vector 时照常校验。
 Object.defineProperty(DEFAULT_VALUES, 'vector', {
   value: Object.freeze({ enabled: false, dim: 256, embedder: 'hash' }),
   enumerable: false,
@@ -46,6 +50,7 @@ Object.defineProperty(DEFAULT_VALUES, 'vector', {
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
+const RSS_ORDERING_RULE = '0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB';
 
 /**
  * 把 "HH:MM" 解析为当天分钟数（0..1439），非法值抛 ConfigError。
@@ -92,6 +97,21 @@ function requireInteger(cfg, field, min, max) {
   }
   if (value < min || value > max) {
     throw new ConfigError(field, `must be within ${min}..${max}, got ${value}`);
+  }
+}
+
+/**
+ * 校验 GiB 正数字段（RSS 三档阈值）：必须是 > 0 的有限数，不接受字符串/NaN/Infinity。
+ * @param {Record<string, unknown>} cfg
+ * @param {string} field
+ */
+function requirePositiveNumber(cfg, field) {
+  const value = cfg[field];
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new ConfigError(field, `must be a finite number (GiB), got ${JSON.stringify(value)}`);
+  }
+  if (!(value > 0)) {
+    throw new ConfigError(field, `must be greater than 0, got ${value}`);
   }
 }
 
@@ -169,6 +189,16 @@ export function normalizeConfig(raw = {}) {
   }
   if (!(cfg.workingMemoryTokens < cfg.compactHardTokens)) {
     throw new ConfigError('workingMemoryTokens', `must be less than compactHardTokens (expected ${ORDERING_RULE})`);
+  }
+
+  requirePositiveNumber(cfg, 'rssWarnGiB');
+  requirePositiveNumber(cfg, 'rssStopGiB');
+  requirePositiveNumber(cfg, 'rssMainOnlyGiB');
+  if (!(cfg.rssWarnGiB < cfg.rssStopGiB)) {
+    throw new ConfigError('rssWarnGiB', `must be less than rssStopGiB (expected ${RSS_ORDERING_RULE})`);
+  }
+  if (!(cfg.rssStopGiB < cfg.rssMainOnlyGiB)) {
+    throw new ConfigError('rssStopGiB', `must be less than rssMainOnlyGiB (expected ${RSS_ORDERING_RULE})`);
   }
 
   parseClockField(cfg.quietStart, 'quietStart');

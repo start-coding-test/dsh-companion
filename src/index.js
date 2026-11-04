@@ -67,6 +67,7 @@ import {
   levelAtLeast,
   overDailyBudget,
   recordTurnUsage,
+  rssLimitsFromConfig,
 } from './runtime/budget.js';
 import {
   MAX_CONSOLIDATION_RETRIES,
@@ -1090,6 +1091,7 @@ function refreshBudget(state, at = state.platform.now()) {
  */
 function budgetInfo(state) {
   refreshBudget(state);
+  const rssLimits = rssLimitsFromConfig(state.config).gib;
   return {
     dailyTokens: state.budget.dailyTokens,
     dailyLimit: DAILY_TOKEN_LIMIT,
@@ -1097,6 +1099,11 @@ function budgetInfo(state) {
     rssLevel: state.rss.level,
     rssLevelCode: state.rss.code,
     rssMB: state.rss.rssMB,
+    rssLimits: {
+      warnGiB: rssLimits.warn,
+      stopGiB: rssLimits.stop_dispatch,
+      mainOnlyGiB: rssLimits.main_only,
+    },
     vector: {
       enabled: state.config.vector.enabled && state.config.vector.embedder !== 'none',
       dim: state.config.vector.dim,
@@ -1129,9 +1136,11 @@ function toolBudgetGate(state) {
  */
 function runRssCheck(state) {
   const previous = state.rss?.level ?? 'ok';
+  const limits = rssLimitsFromConfig(state.config).bytes;
   let result;
   try {
-    result = checkMemory(state.rssReader === null ? {} : { rssReader: state.rssReader });
+    const source = state.rssReader === null ? { limits } : { rssReader: state.rssReader, limits };
+    result = checkMemory(source);
   } catch (error) {
     state.platform.log('debug', '[dsh-companion] rss check failed', {
       message: error instanceof Error ? error.message : String(error),
