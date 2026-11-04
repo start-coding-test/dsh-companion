@@ -2,6 +2,21 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.4] - 2026-11-04
+
+V3-H1 修复：召回注入改为完整平台消息。仍为零第三方运行时依赖，无 schema 变更。
+
+### Fixed
+
+- **V3-H1 召回注入让真机回合崩溃**：v0.4.3 的 `injectRecall` 返回裸内容块 `{ type: 'text', text }`，平台在 `dsh-agent-loop/lib/index.js:1067` 读取 `message.source.kind` 时抛 `Cannot read properties of undefined (reading 'kind')`。现在注入完整平台消息（`id` / `role: 'user'` / `content` / `source.kind = 'companion-recall'`），与 `dsh-time-context/lib/index.js:215-246` 的 `createUserMessage` 形状一致；`mergeDecision` 对每个 inject 元素做形状校验（`role` 非空字符串、`content` 数组或字符串），不合法直接 `TypeError`。
+- **召回块不再被当用户发言巩固**：巩固窗口与转录按 `source.kind = 'companion-recall'` 排除召回消息（surface 记录正文置空），避免「注入 → 巩固」自我强化；token / surface 计量口径不变（注入消息按普通 `user/message` 计价，召回内容预算仍由 `RECALL_BUDGET_TOKENS` 约束）。
+
+### Changed
+
+- **召回块的可见期**：召回块随会话保留到下一次压缩，压缩后旧块才被替换。`/记忆 忘掉` 只影响之后的召回；压缩前模型仍可能看到旧块，回执不要承诺「立刻不可见」。
+- **测试**：新增 `test/e2e/recall-injection.test.js`（fake loop 按 `dsh-agent-loop:1067` 逐条消费、JSONL 冷读复验 id/role/source/content、巩固层排除）；`test/platform.test.js` 增加 inject 形状校验；`test/e2e/plugin-smoke.test.js` 改为按 `source.kind` 识别召回消息。
+- **发布门**：`scripts/probe/run-headless.mjs --plugin` 增加 round B —— 预置 1 条 fact 后发命中消息，断言无 `reading 'kind'` 崩溃且该 fact 的 `facts.first_reneed_at` 非空（召回真的注入过）；无模型凭据时明确标注 SKIP 并保留日志。
+
 ## [0.4.3] - 2026-11-04
 
 C-H1 / C-M1 修复：插件首次在真实 cordis 宿主上完成激活；本地加载文档改为指向入口文件。仍为零第三方运行时依赖，无 schema 变更。

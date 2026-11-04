@@ -3,11 +3,13 @@
  * Gate 0 headless 采集器：用临时 DSH_HOME + 独立 profile 跑一次 headless 会话，
  * 把探针写出的 probe.json 拷回仓库 `.data/probe.json`。
  *
- * `--plugin` 是发布门（C-H1）：不再挂 Gate 0 探针，而是用 `--patch` 把本仓库的
- * 真插件 `src/index.js` 插进 headless profile，跑一次并断言
- *   `[dsh-companion] scheduler started`
- * 出现、且输出里没有 `did not activate`。没有 DSH 的机器上该模式退出码 2，
- * 可在 CI 里用 `--plugin` 的退出码区分「跳过」（2）与「失败」（1）。
+ * `--plugin` 是发布门（C-H1 + V3-H1）：不再挂 Gate 0 探针，而是用 `--patch` 把本仓库的
+ * 真插件 `src/index.js` 插进 headless profile，跑两轮：
+ *   A) 冒烟：断言 `[dsh-companion] scheduler started` 出现、且没有 `did not activate`；
+ *   B) 召回：预置 1 条 fact 后发命中消息，断言没有 `reading 'kind'` 崩溃、且该 fact 的
+ *      `first_reneed_at` 非空（召回注入真的走通）。
+ * 没有 DSH 的机器上该模式退出码 2，可在 CI 里用 `--plugin` 的退出码区分
+ * 「跳过」（2）与「失败」（1）。
  *
  * 特点：
  * - 不读、不写用户 `~/.dsh`：DSH_HOME 指向仓库内 `.data/probe-home`；
@@ -27,6 +29,8 @@ import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+import { Store } from '../../src/memory/store.js';
+
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(SCRIPT_DIR, '..', '..');
 const PATCH_FILE = join(SCRIPT_DIR, 'probe.patch.yml');
@@ -42,6 +46,11 @@ const PLUGIN_DB = join(REPO_ROOT, '.data', 'plugin-gate', 'companion.db');
 const PLUGIN_MARKER = '[dsh-companion] scheduler started';
 const PLUGIN_FAILURE_MARKER = 'did not activate';
 const PLUGIN_LOG = join(REPO_ROOT, '.data', 'plugin-gate.log');
+/** V3-H1 召回门：预置事实 + 命中消息；命中的 query 长度必须过 M3 查询门。 */
+const PLUGIN_RECALL_TASK = '周五要交的周报是什么时候';
+const PLUGIN_RECALL_STATEMENT = '每周五要交周报。';
+/** 真机崩溃原文（v0.4.3：裸内容块没有 source）。 */
+const PLUGIN_CRASH_RE = /reading ['"]kind['"]|Cannot read properties of undefined/u;
 
 const HELP = `Gate 0 headless 探针采集器
 
@@ -55,9 +64,15 @@ const HELP = `Gate 0 headless 探针采集器
   --two-turn         首轮之后用 --session-id 续跑同一会话，采集第 2 个 turn 的
                      pre-step/surface（模型凭据缺失时也能拿到第 2 个 pre-step）
   --plugin           C-H1 发布门：用 --patch 把本仓库真插件（src/index.js）挂到
-                     headless，跑一次并断言出现 "[dsh-companion] scheduler started"、
-                     且没有 "did not activate"。退出码 0=通过，1=未通过，2=找不到 DSH；
-                     完整 stdout/stderr 落盘到 .data/plugin-gate.log
+                     headless，跑两轮：
+                       A) 冒烟：出现 "[dsh-companion] scheduler started"、且没有
+                          "did not activate"；
+                       B) 召回（V3-H1）：在门专用库里预置 1 条 fact 后发命中消息，
+                          断言输出里没有 reading 'kind' 崩溃，且该 fact 的
+                          first_reneed_at 非空（证明召回真的注入过）。
+                     无模型凭据时 agent loop 到不了 pre-step，round B 标注 SKIP。
+                     退出码 0=通过，1=未通过，2=找不到 DSH；完整 stdout/stderr
+                     落盘到 .data/plugin-gate.log
   --dsh <path>       DSH CLI 路径（默认依次尝试 DSH_CLI 环境变量、PATH、常见安装目录）
   --timeout <ms>     子进程超时，默认 120000
   --keep-home        保留临时 DSH_HOME（默认也会保留，便于查看日志；目录在 .data/ 下）
@@ -475,43 +490,171 @@ async function runPluginGate(options) {
   process.stdout.write(`plugin-gate: overlay ${patch}\n`);
   process.stdout.write(`plugin-gate: temp DSH_HOME ${PLUGIN_HOME}\n`);
 
-  const run = await runHeadless(launch, env, args, options.timeoutMs);
-  const combined = `${run.stdout}\n${run.stderr}`;
-  const started = combined.includes(PLUGIN_MARKER);
-  const inactive = combined.includes(PLUGIN_FAILURE_MARKER);
+  // ---------------- round A：冒烟（插件激活） ----------------
+  const firstRun = await runHeadless(launch, env, args, options.timeoutMs);
+  const first = summarizePluginRun(firstRun);
   process.stdout.write(
-    `plugin-gate: exit=${run.exitCode}${run.timedOut ? ' (timeout)' : ''} schedulerStarted=${started} didNotActivate=${inactive}\n`,
+    `plugin-gate: round A (smoke) exit=${firstRun.exitCode}${firstRun.timedOut ? ' (timeout)' : ''} schedulerStarted=${first.started} didNotActivate=${first.inactive}\n`,
   );
 
-  // 完整输出落盘，作为发布门证据（含 marker 原文；失败时也保留现场）。
-  mkdirSync(dirname(PLUGIN_LOG), { recursive: true });
-  writeFileSync(PLUGIN_LOG, [
+  const logLines = [
     `plugin-gate: ${new Date().toISOString()}`,
     `plugin: ${PLUGIN_ENTRY}`,
     `overlay: ${patch}`,
     `dsh: ${located.path}`,
     `args: ${args.map((arg) => JSON.stringify(arg)).join(' ')}`,
-    `exit: ${run.exitCode}${run.timedOut ? ' (timeout)' : ''}`,
-    '--- stdout ---',
-    redact(run.stdout),
-    '--- stderr ---',
-    redact(run.stderr),
-    '',
-  ].join('\n'));
+    `round A: exit=${firstRun.exitCode}${firstRun.timedOut ? ' (timeout)' : ''} schedulerStarted=${first.started} didNotActivate=${first.inactive}`,
+    '--- round A stdout ---',
+    redact(firstRun.stdout),
+    '--- round A stderr ---',
+    redact(firstRun.stderr),
+  ];
 
-  if (started && !inactive) {
-    const markerLine = combined.split(/\r?\n/).find((line) => line.includes(PLUGIN_MARKER)) ?? PLUGIN_MARKER;
-    process.stdout.write(`plugin-gate: PASS (${markerLine.trim()})\n`);
-    process.stdout.write(`plugin-gate: full log ${PLUGIN_LOG}\n`);
-    return 0;
+  if (!first.started || first.inactive) {
+    return failPluginGate(
+      first.started ? 'round A: plugin logged did not activate' : 'round A: missing scheduler started marker',
+      [firstRun],
+      logLines,
+    );
   }
 
-  process.stderr.write(
-    `plugin-gate: FAIL (${started ? 'plugin logged did not activate' : 'missing scheduler started marker'})\n`,
+  // ---------------- round B：预置 1 条 fact + 命中消息（V3-H1 真机形态） ----------------
+  const second = await runRecallRound(launch, env, patch, options);
+  process.stdout.write(
+    `plugin-gate: round B (recall) exit=${second.exitCode}${second.timedOut ? ' (timeout)' : ''} schedulerStarted=${second.started} didNotActivate=${second.inactive} recallCrash=${second.crash} firstReneedAt=${second.firstReneedAt ?? 'null'}${second.error ? ` error=${second.error}` : ''}\n`,
   );
-  for (const [label, text] of [['stdout', run.stdout], ['stderr', run.stderr]]) {
-    const tail = redact(text.trim()).split(/\r?\n/).slice(-20).join('\n');
-    if (tail) process.stderr.write(`plugin-gate: ${label} (tail):\n${tail}\n`);
+  logLines.push(
+    `round B task: ${PLUGIN_RECALL_TASK}`,
+    `round B: exit=${second.exitCode}${second.timedOut ? ' (timeout)' : ''} schedulerStarted=${second.started} didNotActivate=${second.inactive} recallCrash=${second.crash} seededFact=${second.seededId ?? 'null'} firstReneedAt=${second.firstReneedAt ?? 'null'}${second.error ? ` error=${second.error}` : ''}`,
+    '--- round B stdout ---',
+    redact(second.stdout ?? ''),
+    '--- round B stderr ---',
+    redact(second.stderr ?? ''),
+  );
+  mkdirSync(dirname(PLUGIN_LOG), { recursive: true });
+  writeFileSync(PLUGIN_LOG, logLines.join('\n'));
+
+  if (second.error) {
+    process.stderr.write(`plugin-gate: FAIL (round B: ${second.error})\n`);
+    return 1;
+  }
+  if (second.crash) {
+    process.stderr.write('plugin-gate: FAIL (round B: platform crashed reading message.source.kind)\n');
+    return 1;
+  }
+  if (!second.started || second.inactive) {
+    process.stderr.write('plugin-gate: FAIL (round B: plugin did not activate)\n');
+    return 1;
+  }
+  // 没有模型凭据时 agent loop 到不了 pre-step，first_reneed_at 保持 null：
+  // 此时只能证明「没有崩」，如实标注 SKIP 而不是假 PASS。
+  if (second.firstReneedAt === null && /MISSING_CREDENTIAL|no API key/u.test(`${second.stdout}\n${second.stderr}`)) {
+    process.stdout.write('plugin-gate: round B SKIPPED (no model credentials; agent loop never reached pre-step)\n');
+  } else if (second.firstReneedAt === null) {
+    process.stderr.write('plugin-gate: FAIL (round B: seeded fact never recalled; first_reneed_at is null)\n');
+    return 1;
+  }
+
+  process.stdout.write('plugin-gate: PASS (round A + round B)\n');
+  process.stdout.write(`plugin-gate: full log ${PLUGIN_LOG}\n`);
+  return 0;
+}
+
+/**
+ * 判定一次 headless 输出：插件是否激活、是否崩在 platform 消息形状上。
+ * @param {{stdout:string, stderr:string}} run
+ * @returns {{started:boolean, inactive:boolean, crash:boolean, combined:string}}
+ */
+function summarizePluginRun(run) {
+  const combined = `${run.stdout}\n${run.stderr}`;
+  return {
+    started: combined.includes(PLUGIN_MARKER),
+    inactive: combined.includes(PLUGIN_FAILURE_MARKER),
+    crash: PLUGIN_CRASH_RE.test(combined),
+    combined,
+  };
+}
+
+/**
+ * round B：预置 1 条 fact → 发命中消息 → 断言召回真的注入过。
+ *
+ * 证据链：pre-step 的 injectRecall 命中后调用 recordRecalledFacts →
+ * Store.markFirstReneed；first_reneed_at 非空即证明召回路径真的走通。
+ * 同时断言输出里没有 `reading 'kind'`：v0.4.3 的裸内容块就在这里崩。
+ *
+ * @param {object} launch
+ * @param {NodeJS.ProcessEnv} env
+ * @param {string} patch
+ * @param {object} options
+ * @returns {Promise<object>}
+ */
+async function runRecallRound(launch, env, patch, options) {
+  const result = {
+    exitCode: null,
+    timedOut: false,
+    stdout: '',
+    stderr: '',
+    started: false,
+    inactive: false,
+    crash: false,
+    seededId: null,
+    firstReneedAt: null,
+    error: null,
+  };
+  try {
+    const seedStore = Store.open(PLUGIN_DB);
+    try {
+      const fact = seedStore.insertFact({
+        kind: 'project',
+        subject_text: '周报',
+        predicate: '提交时间',
+        object_text: '周五',
+        statement: PLUGIN_RECALL_STATEMENT,
+        source_kind: 'turn',
+      });
+      result.seededId = fact?.id ?? null;
+    } finally {
+      seedStore.close();
+    }
+
+    const args = [...launch.prefixArgs, '--profile', 'headless', '--patch', patch, PLUGIN_RECALL_TASK];
+    const run = await runHeadless(launch, env, args, options.timeoutMs);
+    Object.assign(result, summarizePluginRun(run), {
+      exitCode: run.exitCode,
+      timedOut: run.timedOut,
+      stdout: run.stdout,
+      stderr: run.stderr,
+    });
+
+    const readStore = Store.open(PLUGIN_DB);
+    try {
+      const row = result.seededId === null ? null : readStore.getFact(result.seededId);
+      result.firstReneedAt = Number.isInteger(row?.first_reneed_at) ? row.first_reneed_at : null;
+    } finally {
+      readStore.close();
+    }
+  } catch (error) {
+    result.error = error instanceof Error ? error.message : String(error);
+  }
+  return result;
+}
+
+/**
+ * 发布门失败路径：落盘完整证据并打印每轮输出尾部。
+ * @param {string} reason
+ * @param {Array<{stdout:string, stderr:string}>} runs
+ * @param {string[]} logLines
+ * @returns {number} 1
+ */
+function failPluginGate(reason, runs, logLines) {
+  mkdirSync(dirname(PLUGIN_LOG), { recursive: true });
+  writeFileSync(PLUGIN_LOG, logLines.concat('').join('\n'));
+  process.stderr.write(`plugin-gate: FAIL (${reason})\n`);
+  for (const run of runs) {
+    for (const [label, text] of [['stdout', run.stdout], ['stderr', run.stderr]]) {
+      const tail = redact(text.trim()).split(/\r?\n/).slice(-20).join('\n');
+      if (tail) process.stderr.write(`plugin-gate: ${label} (tail):\n${tail}\n`);
+    }
   }
   return 1;
 }

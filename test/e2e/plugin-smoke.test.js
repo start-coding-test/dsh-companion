@@ -119,19 +119,21 @@ test('注册的命令与工具真的连到 Store', async () => {
   assert.ok(written.id);
 
   const searchTool = ctx.tools.registrations.find((definition) => definition.name === 'memory_search');
-  const found = await searchTool.execute({ query: '周报' });
+  const found = await searchTool.execute({ query: '周五交周报' });
   assert.ok(found.items.some((item) => String(item.id) === String(written.id)));
 
-  // pre-step 把召回拼进本批进入消息。
+  // pre-step 把召回作为完整平台消息拼进本批进入消息（V3-H1）。
   const decision = await ctx.dispatch(
     'agent/pre-step',
-    { messages: [{ type: 'text', text: '周报' }] },
+    { messages: [{ type: 'text', text: '周五交周报' }] },
     { kind: 'enter', messages: [] },
   );
   assert.equal(decision.kind, 'enter');
-  assert.ok(decision.messages.some(
-    (block) => block.type === 'text' && block.text.includes('[相关记忆]'),
-  ));
+  const recall = decision.messages.find((message) => message?.source?.kind === 'companion-recall');
+  assert.ok(recall, '召回注入必须带 source.kind=companion-recall');
+  assert.equal(typeof recall.id, 'string');
+  assert.ok(recall.id.length > 0);
+  assert.ok(recall.content.some((block) => block.type === 'text' && block.text.includes('[相关记忆]')));
 });
 
 test('严格 ctx：未声明属性像 cordis 一样抛错，声明面读法不改', () => {

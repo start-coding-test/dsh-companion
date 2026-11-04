@@ -15,11 +15,41 @@ function unavailable(code, what) {
 }
 
 /**
+ * 校验注入项是完整平台消息（V3-H1）。
+ *
+ * 平台把 `decision.messages` 的每一项当消息 append 到会话
+ * （`dsh-agent-loop/lib/index.js:1067`），`dsh-session` 随后校验
+ * id/role/source/content（`dsh-session/lib/index.js:1186-1219`）。这里先检查
+ * 插件可控的最小形状：role 必须是非空字符串，content 必须是数组或字符串。
+ * （id/source 由注入方负责；召回注入见 src/index.js 的 recallMessage。）
+ *
+ * @param {unknown} message
+ * @param {number} index
+ * @returns {void}
+ */
+function assertInjectedMessage(message, index) {
+  if (message === null || typeof message !== 'object' || Array.isArray(message)) {
+    throw new TypeError(`onPreStep "inject"[${index}] must be a platform message object`);
+  }
+  if (typeof message.role !== 'string' || message.role === '') {
+    throw new TypeError(`onPreStep "inject"[${index}] must have a string "role"`);
+  }
+  if (!Array.isArray(message.content) && typeof message.content !== 'string') {
+    throw new TypeError(`onPreStep "inject"[${index}] must have "content" as an array or string`);
+  }
+}
+
+/**
  * 把 agent/pre-step 监听器的返回值合并进 waterfall 决策。
  *
  * handler 支持四种写法：
  * - undefined / null：不修改决策；
- * - { inject: ContentBlock[] }：追加到本批进入消息（模型可见的上下文注入）；
+ * - { inject: PlatformMessage[] }：追加到本批进入消息。**必须是完整平台
+ *   消息**（`{ id, role, content, source }`），不能是裸内容块：平台会逐条
+ *   把 `decision.messages` 当消息 append 到会话
+ *   （`dsh-agent-loop/lib/index.js:1067` 读 `message.source.kind`），裸块会在
+ *   真机上崩 `Cannot read properties of undefined (reading 'kind')`（V3-H1）。
+ *   形状不对时这里直接抛 TypeError，把问题留在插件侧；
  * - { messages: ContentBlock[] }：整体替换本批进入消息；
  * - { reject: true } 或 { kind: 'reject' }：拒绝本步。
  *
@@ -54,6 +84,12 @@ function mergeDecision(decision, patch) {
     if (!Array.isArray(patch.inject)) {
       throw new TypeError('onPreStep "inject" must be an array');
     }
+    // V3-H1：平台逐条把注入项当**消息**消费，裸 ContentBlock 会在
+    // dsh-agent-loop:1067 的 `message.source.kind` 处崩。形状校验前移到
+    // 适配层，错误信息指向插件而不是让平台抛 undefined。
+    patch.inject.forEach((message, index) => {
+      assertInjectedMessage(message, index);
+    });
     const entered = Array.isArray(base.messages) ? base.messages : [];
     return { ...base, kind: 'enter', messages: [...entered, ...patch.inject] };
   }

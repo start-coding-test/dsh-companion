@@ -44,8 +44,9 @@
 2. **平台 `inject` 与 pre-step 注入不是同一层。** `agent.inject(input)`
    （`dsh-agent-loop/lib/index.js:812`）把内容放进 next-step inbox 且不唤醒 driver；
    适配层的 `onPreStep` 补丁 `{ inject: [...] }` 则是在本轮 step 已获准入、平台 fallback
-   之后，把内容追加到本批 `decision.messages`。后者不会唤醒任何东西，是检索注入使用的路径，
-   语义等价于「模型可见的下一批上下文」，但**不写回 inbox**。
+   之后，把**完整平台消息**追加到本批 `decision.messages`（裸内容块会崩，见 §2.1.1）。
+   后者不会唤醒任何东西，是检索注入使用的路径，语义等价于「模型可见的下一批上下文」，
+   但**不写回 inbox**。
 
 ### 1.2 为什么不用 `compactNow`
 
@@ -99,14 +100,51 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 | 返回值 | 效果 |
 | --- | --- |
 | `undefined` / `null` | 不修改平台决策 |
-| `{ inject: ContentBlock[] }` | 追加到 `decision.messages` 尾部（检索注入） |
-| `{ messages: ContentBlock[] }` | 整体替换本批进入消息 |
+| `{ inject: PlatformMessage[] }` | 追加到 `decision.messages` 尾部（检索注入；元素必须是完整平台消息） |
+| `{ messages: PlatformMessage[] }` | 整体替换本批进入消息 |
 | `{ reject: true }` / `{ kind: 'reject' }` | 拒绝本步 |
 | `{ kind: 'enter', messages }` | 同 `messages` 替换 |
 
 上游已经 `reject` 时适配层直接透传，不再调用 handler；返回时展开原决策以保留
 `startsRequestSeries` 等字段。同时返回 `messages` 与 `inject`、或字段类型错误，
 会抛 `TypeError`（编程错误，不做降级）。
+
+#### 2.1.1 `inject` 的元素是完整平台消息，不是内容块
+
+平台把 `decision.messages` 的每个元素都当**消息**处理：
+`dsh-agent-loop/lib/index.js:1067-1073` 遍历本批消息，`source.kind === 'runtime-context'`
+的条目只触发平台自己的 context，其余每条都执行 `session.append('user/message', message)`。
+`dsh-session/lib/index.js:1186-1219` 随后校验：`id` 为非空字符串（缺失报
+`lacks an identified message`）、`role` 与事件类型匹配（user/message → `"user"`）、
+`source` 是带非空 `kind` 的对象、`content` 是数组。
+
+因此裸内容块 `{ type: 'text', text }` 会在 `:1067` 读 `message.source.kind` 时崩溃
+（v0.4.3 真机：`Cannot read properties of undefined (reading 'kind')`）。正确写法照抄
+`dsh-time-context/lib/index.js:215-246` 的 `createUserMessage` 形状（手工构造即可，
+`id` 用 `crypto.randomUUID()`）：
+
+```js
+{
+  id: randomUUID(),
+  role: 'user',
+  content: [{ type: 'text', text }],
+  source: { kind: 'companion-recall', form: 'snapshot', sections: [{ name: 'recall', text }] },
+}
+```
+
+适配层对每个 inject 元素做最小形状校验（`role` 非空字符串、`content` 数组或字符串），
+不合法直接 `TypeError`；`id` / `source` 由注入方负责（召回注入见 `src/index.js`
+的 `recallMessage`）。
+
+**下游排除与计量口径**：
+
+- 召回消息带 `source.kind = 'companion-recall'`。巩固层在选窗口时把这类 surface 记录
+  的正文清空（`withoutRecallRecords`），转录（`textRows`/`captureTranscript`）也按
+  `source.kind` 跳过，所以召回块**不会**被当作用户发言再巩固一遍；它仍留在会话
+  surface 上，直到下一次压缩把它替换掉。
+- token / surface 计量沿用既有口径：注入消息就是一条普通 `user/message`，
+  `tokenMeter.estimateMessage` / `measure` 照常计价；召回自身的内容预算仍由
+  `assemble()` 的 `recallTokens`（`RECALL_BUDGET_TOKENS`）约束。
 
 ### 2.2 能力探测与 `PlatformError`
 

@@ -379,3 +379,75 @@ test('createAdapter 拒绝非对象 ctx', () => {
   assert.throws(() => createAdapter(null), TypeError);
   assert.throws(() => createAdapter('ctx'), TypeError);
 });
+
+// ------------------------------------------------- V3-H1：inject 必须是平台消息
+
+test('onPreStep 注入裸内容块：TypeError，不再把 undefined source 留给平台', async () => {
+  const ctx = new FakeCtx();
+  const adapter = createAdapter(ctx);
+  adapter.onPreStep(() => ({ inject: [{ type: 'text', text: '[相关记忆]\n- 旧块' }] }));
+
+  await assert.rejects(
+    () =>
+      ctx.dispatch(
+        'agent/pre-step',
+        { agent, messages: [{ role: 'user', content: 'hi' }], turn: 1, step: 0 },
+        () => ({ kind: 'enter', messages: [] }),
+      ),
+    (error) => error instanceof TypeError && /"role"/u.test(error.message),
+  );
+});
+
+test('onPreStep 注入形状校验：role 与 content 非法都抛 TypeError', async () => {
+  const cases = [
+    [{ id: 'm1', content: [] }, /"role"/u],
+    [{ id: 'm1', role: 42, content: [] }, /"role"/u],
+    [{ id: 'm1', role: 'user' }, /"content"/u],
+    [{ id: 'm1', role: 'user', content: 42 }, /"content"/u],
+    [null, /platform message object/u],
+    [[], /platform message object/u],
+  ];
+
+  for (const [inject, pattern] of cases) {
+    const ctx = new FakeCtx();
+    const adapter = createAdapter(ctx);
+    adapter.onPreStep(() => ({ inject: [inject] }));
+    await assert.rejects(
+      () =>
+        ctx.dispatch(
+          'agent/pre-step',
+          { agent, messages: [], turn: 1, step: 0 },
+          () => ({ kind: 'enter', messages: [] }),
+        ),
+      (error) => error instanceof TypeError && pattern.test(error.message),
+      `inject=${JSON.stringify(inject)} 应被拒绝`,
+    );
+  }
+});
+
+test('onPreStep 注入完整平台消息：原样追加，不被改写', async () => {
+  const message = {
+    id: 'recall-1',
+    role: 'user',
+    content: [{ type: 'text', text: '[相关记忆]\n- 预算 8000' }],
+    source: {
+      kind: 'companion-recall',
+      form: 'snapshot',
+      sections: [{ name: 'recall', text: '...' }],
+    },
+  };
+  const ctx = new FakeCtx();
+  const adapter = createAdapter(ctx);
+  adapter.onPreStep(() => ({ inject: [message] }));
+
+  const base = { role: 'user', content: 'hi' };
+  const decision = await ctx.dispatch(
+    'agent/pre-step',
+    { agent, messages: [base], turn: 1, step: 0 },
+    () => ({ kind: 'enter', messages: [base] }),
+  );
+
+  assert.equal(decision.messages.length, 2);
+  assert.equal(decision.messages[0], base);
+  assert.equal(decision.messages[1], message, '必须原样交给平台，不做拷贝/改写');
+});

@@ -19,6 +19,7 @@
  *     → 召回经 assemble 预算裁切，同一 turn 只注入一次
  *   deep-sleep 03:00 不再空转：遗忘降级 + 状态板重渲染（staged）+ 审计。
  */
+import { randomUUID } from 'node:crypto';
 import { copyFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
@@ -130,6 +131,24 @@ const SCOPE = MAIN_SCOPE;
 
 /** 召回预算（R-SES-07：注入 ≤2050 tokens；总量由 config.workingMemoryTokens 控制）。 */
 const RECALL_BUDGET_TOKENS = 2050;
+
+/**
+ * 召回注入消息的 `source.kind`（v0.4.4 / V3-H1）。
+ *
+ * 平台把 `decision.messages` 的每一项都当**完整消息**处理：
+ * `dsh-agent-loop/lib/index.js:1067` 逐条读 `message.source.kind`，
+ * 非 `runtime-context` 的消息直接 `session.append('user/message', message)`，
+ * 而 `dsh-session/lib/index.js:1186-1219` 要求消息带非空 `id`、`role`、
+ * `source`（对象 + 非空字符串 kind）与数组 `content`。所以召回注入必须是
+ * 完整平台消息，不能是裸内容块（裸块会崩在 `reading 'kind'`）。
+ *
+ * 该 kind 同时是本插件识别「这条 user/message 是召回注入、不是用户发言」
+ * 的标记：转录快照与巩固选区文本据此排除注入块。
+ */
+const RECALL_SOURCE_KIND = 'companion-recall';
+
+/** 召回块文本标记（assemble 渲染）；surface 记录只有 role/text，没有 source。 */
+const RECALL_MARKER = '[相关记忆]';
 
 /** 转录快照：只保留最近 N 条 / N 字符，供巩固模型使用。 */
 const TRANSCRIPT_MAX_MESSAGES = 40;
@@ -1638,7 +1657,9 @@ function scheduleConsolidation(state, payload, scope = SCOPE) {
   if (!plan.trigger) return;
   if (state.transcript.length === 0) return;
 
-  const snapshot = state.surfaceSnapshotByScope.get(scope) ?? state.surfaceSnapshot;
+  // V3-H1：召回注入块也会作为 user/message 出现在 surface 上；选区文本里
+  // 清掉它，避免把注入块当用户发言巩固（seqs/nodes 不动，token 口径不变）。
+  const snapshot = withoutRecallRecords(state.surfaceSnapshotByScope.get(scope) ?? state.surfaceSnapshot);
   // N1：登记时就把当前选区的文本与边界固定下来，后台任务执行时仍会按
   // 最新水位重算；只有边界完全一致才复用这份文本，避免选区漂移。
   const { region } = planRegion(snapshot, {
@@ -1733,7 +1754,8 @@ async function executeConsolidationJob(state, job) {
       endSeq,
     });
   } else {
-    const snapshot = job.snapshot;
+    // V3-H1：登记时已过滤；重试/旧快照再兜一次（幂等）。
+    const snapshot = withoutRecallRecords(job.snapshot);
     if (snapshot === null || snapshot === undefined) return;
     const watermark = ensureWatermark(state, job.scope, snapshot);
     const { region, reason } = planRegion(snapshot, {
@@ -2148,7 +2170,36 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
   const injection = extractRecallBlock(assembled?.messages);
   if (injection === '') return null;
   recordRecalledFacts(state, recalled, assembled, scope, platform.now());
-  return { inject: [{ type: 'text', text: injection }] };
+  return { inject: [recallMessage(injection)] };
+}
+
+/**
+ * 构造召回注入消息：**完整平台消息**，不是裸 ContentBlock（V3-H1）。
+ *
+ * 形状对齐平台自己的注入实现（`dsh-time-context/lib/index.js:215-246` 用
+ * `createUserMessage({content, source:{kind, form:'snapshot', sections}})`）：
+ * - `id`：平台消息必须带 id，缺了冷读会话会报 `lacks an identified message`
+ *   （`dsh-session/lib/index.js:1200`）；这里用 `randomUUID()`，与
+ *   `dsh-llm` 的 `createMessage` 同口径，不引入平台包（零新增依赖）。
+ * - `role:'user'`：user/message 的类型↔角色映射固定，`dsh-session` 会校验。
+ * - `content`：文本块数组（与平台内容块契约一致）。
+ * - `source`：`kind=companion-recall` 供插件下游（转录/巩固）排除；
+ *   `form`/`sections` 与 time-context 的 snapshot 注入同构，便于宿主识别。
+ *
+ * @param {string} text 渲染好的 `[相关记忆]` 块（含标题）
+ * @returns {{id: string, role: 'user', content: object[], source: object}}
+ */
+function recallMessage(text) {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: {
+      kind: RECALL_SOURCE_KIND,
+      form: 'snapshot',
+      sections: [{ name: 'recall', text }],
+    },
+  };
 }
 
 /**
@@ -2249,11 +2300,57 @@ function extractRecallBlock(messages) {
     const blocks = Array.isArray(message.content) ? message.content : [];
     for (const block of blocks) {
       if (block?.type !== 'text' || typeof block.text !== 'string') continue;
-      const marker = block.text.indexOf('[相关记忆]');
+      const marker = block.text.indexOf(RECALL_MARKER);
       if (marker >= 0) return block.text.slice(marker).trim();
     }
   }
   return '';
+}
+
+/**
+ * 这条 payload 消息是否是本插件的召回注入（V3-H1）。
+ * 平台把注入块作为普通 user/message 回灌到后续 pre-step 的 messages，
+ * 下游必须按 `source.kind` 识别，不能当用户发言。
+ * @param {unknown} message
+ * @returns {boolean}
+ */
+function isRecallMessage(message) {
+  return message !== null
+    && typeof message === 'object'
+    && message.source?.kind === RECALL_SOURCE_KIND;
+}
+
+/**
+ * 一条 surface 记录是否是召回注入。
+ * surface 记录只有 `{role, text, tokens}`（见 src/session/surface.js），
+ * 没有 source，因此按 role+文本前缀兜底识别。
+ * @param {{role?: string, text?: string}|null|undefined} record
+ * @returns {boolean}
+ */
+function isRecallRecord(record) {
+  return record?.role === 'user'
+    && typeof record.text === 'string'
+    && record.text.trimStart().startsWith(RECALL_MARKER);
+}
+
+/**
+ * 返回把召回注入记录文本清空的 surface 快照副本。
+ *
+ * 只清文本、不动 `seqs`/`nodes`：选区边界与 token 计量口径保持不变
+ * （surface 仍按平台 `estimateMessage` 把注入消息计入 tokens/预算），
+ * 只保证交给巩固模型的选区文本里不出现召回块，注入块不会被当成
+ * 用户发言巩固进记忆。
+ *
+ * @param {{seqs: number[], nodes: object[], records: object[]}|null|undefined} snapshot
+ * @returns {object|null|undefined}
+ */
+function withoutRecallRecords(snapshot) {
+  const records = Array.isArray(snapshot?.records) ? snapshot.records : null;
+  if (records === null || !records.some((record) => isRecallRecord(record))) return snapshot;
+  return {
+    ...snapshot,
+    records: records.map((record) => (isRecallRecord(record) ? { ...record, text: '' } : record)),
+  };
 }
 
 // ---------------------------------------------------------- 巩固模型接入
@@ -3137,6 +3234,8 @@ function textRows(messages) {
   const rows = [];
   for (const message of messages) {
     if (message === null || typeof message !== 'object') continue;
+    // 召回注入块回灌后也是 user/message，但不是用户发言（V3-H1）。
+    if (isRecallMessage(message)) continue;
     if (Array.isArray(message.content)) {
       for (const block of message.content) {
         if (block?.type !== 'text' || typeof block.text !== 'string') continue;
@@ -3162,7 +3261,7 @@ function lastUserText(messages) {
     const row = rows[index];
     if (row.role !== 'user') continue;
     const text = row.text.trim();
-    if (text === '' || text.startsWith('[相关记忆]')) continue;
+    if (text === '' || text.startsWith(RECALL_MARKER)) continue;
     return text;
   }
   return '';
@@ -3236,7 +3335,7 @@ function captureTranscript(state, messages) {
   for (const row of textRows(messages)) {
     if (row.role !== 'user' && row.role !== 'assistant') continue;
     const text = row.text.trim();
-    if (text === '' || text.startsWith('[相关记忆]')) continue;
+    if (text === '' || text.startsWith(RECALL_MARKER)) continue;
     rows.push({ role: row.role, text });
   }
   const tail = rows.slice(-TRANSCRIPT_MAX_MESSAGES);
