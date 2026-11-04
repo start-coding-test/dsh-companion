@@ -129,7 +129,8 @@ test('apply：注入 → assistant 复述 → 下一轮强化 α=2，recall_coun
   assert.equal(after.last_reinforced_at, Math.floor(ctx.now() / 1000));
   assert.equal(after.first_reneed_at, before.first_reneed_at, '二次注入不覆盖首次样本');
   assert.equal(after.first_reneed_tier, 'clear');
-  assert.equal(after.reneed_kind, 'recall');
+  assert.equal(after.reneed_kind, 'used', '复述命中后首次样本升级为 used');
+  assert.equal(after.same_context, 0, '隔天召回不是同会话样本');
 
   const events = reinforcementEvents(temp.store, seeded.factId);
   assert.equal(events.length, 1, '应写一条 REINFORCE 审计');
@@ -303,5 +304,62 @@ test('apply：gist 档召回记 ambiguous（R 0.2–0.5）', async (t) => {
   assert.equal(row.first_reneed_at, at);
   assert.equal(row.first_reneed_tier, 'ambiguous', 'gist 档命中记 ambiguous');
   assert.equal(row.reneed_kind, 'recall');
+});
+
+test('apply：同会话立即召回标 same_context，统计排除；复述升级 used 仍保留标记', async (t) => {
+  const temp = makeTempStore();
+  const seeded = seedMemory(temp.store, { now: TEST_NOW, statement: FACT_STATEMENT });
+  const ctx = makeApplyCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14 });
+  t.after(() => {
+    handle.dispose();
+    temp.cleanup();
+  });
+
+  // 模拟事实刚刚写入（created_at 与注入同一时刻）。
+  const at = Math.floor(TEST_NOW / 1000);
+  temp.store.db
+    .prepare('UPDATE facts SET created_at = ? WHERE id = ?')
+    .run(at, seeded.factId);
+
+  const first = await ctx.dispatch(
+    'agent/pre-step',
+    turnPayload(1, messages(['user', '青柠计划的代号是什么？'])),
+    { kind: 'enter', messages: [] },
+  );
+  assert.match(decisionText(first), /蓝鲸/u, '应注入召回块');
+
+  const recalled = temp.store.getFact(seeded.factId);
+  assert.equal(recalled.reneed_kind, 'recall', '仅注入先记 recall');
+  assert.equal(recalled.same_context, 1, '几分钟内立刻召回标同会话');
+  const counted = temp.store.db
+    .prepare('SELECT COUNT(*) AS n FROM facts WHERE reneed_kind IS NOT NULL AND same_context = 0')
+    .get();
+  assert.equal(counted.n, 0, '同会话样本不得进入 S0 统计口径');
+
+  // 下一轮复述升级 used，但同会话标记保留，仍然排除。
+  ctx.advance(60_000);
+  await ctx.dispatch(
+    'agent/pre-step',
+    turnPayload(
+      2,
+      messages(
+        ['user', '青柠计划的代号是什么？'],
+        ['assistant', '青柠计划的代号是蓝鲸。'],
+        ['user', '谢谢。'],
+      ),
+    ),
+    { kind: 'enter', messages: [] },
+  );
+  const used = temp.store.getFact(seeded.factId);
+  assert.equal(used.reneed_kind, 'used');
+  assert.equal(used.first_reneed_at, at, '升级不改变首次时间');
+  assert.equal(used.same_context, 1);
+  assert.equal(
+    temp.store.db
+      .prepare('SELECT COUNT(*) AS n FROM facts WHERE reneed_kind IS NOT NULL AND same_context = 0')
+      .get().n,
+    0,
+  );
 });
 

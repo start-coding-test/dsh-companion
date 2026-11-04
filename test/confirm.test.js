@@ -47,3 +47,18 @@ test('N-L1：空值与无确认词文本 → 不确认', () => {
     assert.equal(isConfirmation(text), false, String(text));
   }
 });
+
+test('L-2：确认词后跟新的内容事实（去标点 >10 字）→ 不确认', () => {
+  for (const text of [
+    '对，我明天要去北京开会，顺便……',
+    '没错，明天上午十点在北京南站集合再出发去会场。',
+    '是的，我已经把方案发给客户了，等他们回复。',
+    '对，记得把上次说的那三个问题一起带过去。',
+  ]) {
+    assert.equal(isConfirmation(text), false, text);
+  }
+  // 短确认语仍然成立。
+  for (const text of ['对', '没错', '对。', '是的！', '嗯，对。', '确实，我记住了。']) {
+    assert.equal(isConfirmation(text), true, text);
+  }
+});

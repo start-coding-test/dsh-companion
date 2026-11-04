@@ -30,6 +30,13 @@ export const USE_OVERLAP_THRESHOLD = 0.6;
  */
 export const CONFIRMATION_WORDS = Object.freeze(['对', '是的', '没错', '记住了', '确实', '就是']);
 
+/**
+ * L-2：确认语长度上限。整条消息去掉标点/符号/空白后超过 10 个字，就不算
+ * 确认——「对，我明天要去北京开会，顺便……」是带新内容的一整句，不能因为
+ * 句首有个「对」就把 α 从 2 抬到 4。
+ */
+export const CONFIRM_MAX_CHARS = 10;
+
 /** 确认词后允许的语气短尾：「对呀」「没错吧」「记住了啊」。 */
 const CONFIRM_TAIL_PARTICLES = new Set(['啊', '呀', '呢', '吧', '哦', '嘛', '哈', '嗯', '啦', '的']);
 
@@ -58,6 +65,8 @@ function isBoundaryChar(ch) {
  *    b. 确认词独立成小句：前后都是边界（「嗯，对，就这样」）；
  *    c. 以确认词开头且紧接边界或 ≤2 个语气短尾（「对，就是这样」「没错吧？」）。
  * 3. 命中片段附近出现 不/没/别/错/未必 → 不算确认（「好像不太对」「对，但是不对」）。
+ * 4. L-2：整条消息去掉标点/空白后超过 {@link CONFIRM_MAX_CHARS} 字 → 不算确认；
+ *    长句里的「对」多半是引子，后面跟的是新的内容事实。
  *
  * 纯函数：不改状态、不读时钟，便于单测与复用。
  *
@@ -73,6 +82,9 @@ export function isConfirmation(text) {
   if (stripped === '') return false;
   const chars = [...stripped];
   if (chars.length === 0) return false;
+  // L-2：先卡长度。去标点/符号/空白后仍超过上限的，是带内容的长句。
+  const contentChars = [...trimmed].filter((ch) => !isBoundaryChar(ch)).length;
+  if (contentChars > CONFIRM_MAX_CHARS) return false;
 
   for (const word of CONFIRMATION_WORDS) {
     const wordChars = [...word];

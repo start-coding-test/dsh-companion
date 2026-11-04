@@ -37,6 +37,10 @@ import {
 } from './memory/reinforce.js';
 import { buildConsolidationPrompt, consolidate, planConsolidation } from './memory/consolidate.js';
 import {
+  episodeSourceInSurface,
+  isSameContextSample,
+} from './memory/reneed.js';
+import {
   appendEventWithAction,
   apply as applyGovernance,
   exportMirror,
@@ -373,6 +377,8 @@ function createWiringState({ host, platform, store, config, metrics, embedder = 
     /** 注入时转录里最近一条 assistant 文本 / assistant 条数，用于判断是否出现新回复。 */
     lastRecallAssistant: '',
     assistantCountAtRecall: 0,
+    /** v8/S-M1：本批注入样本（id → {at, tier, sameContext}），供「用上」升级。 */
+    lastRecallSamples: new Map(),
     /** 最近一段转录（用于巩固模型草稿）；当前激活 scope 的视图。 */
     transcript: [],
     /** H3：每个 scope 各自的转录，切换会话时恢复，避免跨会话串味。 */
@@ -963,6 +969,7 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
     // 上轮注入属于另一个会话作用域：不跨 scope 强化；换轮时丢弃。
     if (isNewTurn) {
       state.lastRecalledIds = [];
+      state.lastRecallSamples = new Map();
       state.lastRecallScope = scope;
     }
     return;
@@ -976,12 +983,15 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
   if (!hasNewReply) {
     if (isNewTurn) {
       state.lastRecalledIds = [];
+      state.lastRecallSamples = new Map();
       state.lastRecallScope = scope;
     }
     return;
   }
 
   state.lastRecalledIds = [];
+  const samples = state.lastRecallSamples instanceof Map ? state.lastRecallSamples : new Map();
+  state.lastRecallSamples = new Map();
   const userText = lastUserText(messages);
   const confirmed = isConfirmation(userText);
   const alpha = confirmed ? CONFIRM_ALPHA : DEFAULT_ALPHA;
@@ -1008,6 +1018,8 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
         continue;
       }
       state.metrics.inc('reinforcements');
+      // v8/S-M1：复述命中即「用上」，把首次样本从 recall 升级为 used。
+      markUsedReneed(state, id, fact, at, samples.get(id));
       state.platform.log('debug', '[dsh-companion] reinforced recalled fact', {
         id,
         alpha,
@@ -1021,6 +1033,72 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
         message: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+}
+
+/**
+ * 来源 episode 是否仍在当前 surface（S-M1）。
+ *
+ * 巩固时 episode 记录 consolidations.upto_seq。该 seq 还在当前 surface 里，
+ * 说明原文尚未被压缩替换，召回属于「来源还在上下文里」。
+ *
+ * @param {object} state
+ * @param {string} scope
+ * @param {object|null} fact
+ * @returns {boolean}
+ */
+function sourceStillInSurface(state, scope, fact) {
+  const episodeId = fact?.source_episode_id;
+  if (typeof episodeId !== 'string' || episodeId === '') return false;
+  try {
+    const episode = state.store?.getEpisode?.(episodeId);
+    if (episode === null || episode === undefined || !episode.consolidation_id) return false;
+    const consolidation = state.store?.getConsolidation?.(episode.consolidation_id);
+    const snapshot = state.surfaceSnapshotByScope?.get?.(scope) ?? state.surfaceSnapshot;
+    return episodeSourceInSurface({
+      seqs: Array.isArray(snapshot?.seqs) ? snapshot.seqs : null,
+      episode,
+      consolidation,
+    });
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * v8/S-M1：把「用上」写进首次再需要样本。首次注入时已经写过 recall；这里
+ * 只升级分类并保留首次时间/档位/同会话标记。值缺失时用当前 fact 兜底。
+ *
+ * @param {object} state
+ * @param {string} id
+ * @param {object|null} fact
+ * @param {number} atSeconds 本轮强化时刻（Unix 秒）
+ * @param {{at?: number, tier?: string, sameContext?: boolean}|undefined} sample
+ */
+function markUsedReneed(state, id, fact, atSeconds, sample) {
+  const store = state.store;
+  if (store === null || store === undefined || typeof store.markReneedUsed !== 'function') return;
+  let tier = sample?.tier;
+  if (tier !== 'clear' && tier !== 'ambiguous' && tier !== 'miss') {
+    tier = fact?.fidelity === 'gist' ? 'ambiguous' : 'clear';
+  }
+  let sameContext = sample?.sameContext;
+  if (typeof sameContext !== 'boolean') {
+    sameContext = isSameContextSample({
+      at: atSeconds,
+      createdAt: fact?.created_at,
+      sourceInSurface: sourceStillInSurface(state, state.lastRecallScope ?? SCOPE, fact),
+    });
+  }
+  const at = Number.isFinite(Number(sample?.at)) ? Number(sample.at) : atSeconds;
+  try {
+    store.markReneedUsed(id, { at, tier, sameContext });
+  } catch (error) {
+    // 埋点失败不影响强化结果。
+    state.platform.log('warn', '[dsh-companion] mark used reneed failed', {
+      id,
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 
@@ -1910,6 +1988,11 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
  * 以及注入时刻的 assistant 快照，供下一轮「用上」判定。
  * 同时把 full/gist 档的首次再需要写进 facts.first_reneed_*（W5）；写失败
  * 只告警，不影响本轮召回注入。
+ *
+ * v8/S-M1：首次样本会标记 `same_context`（Δcreated_at < 6h 或来源 episode 仍在
+ * 当前 surface），统计口径排除；样本同时放进 state.lastRecallSamples，等下一轮
+ * 复述命中时由 markUsedReneed 升级为 `used`。
+ *
  * @param {object} state
  * @param {{items: object[]}} recalled
  * @param {object} assembled
@@ -1925,6 +2008,7 @@ function recordRecalledFacts(state, recalled, assembled, scope = SCOPE, at = Dat
   );
   const atSeconds = Math.floor(Number(at) / 1000);
   const ids = [];
+  const samples = new Map();
   for (const item of recalled.items) {
     if (item === null || typeof item !== 'object') continue;
     if (item.kind !== 'fact' || typeof item.id !== 'string') continue;
@@ -1932,11 +2016,37 @@ function recordRecalledFacts(state, recalled, assembled, scope = SCOPE, at = Dat
     if (ids.includes(item.id)) continue;
     ids.push(item.id);
     if (item.fidelity !== 'full' && item.fidelity !== 'gist') continue;
+    const tier = item.fidelity === 'full' ? 'clear' : 'ambiguous';
+    let fact = null;
+    try {
+      fact = state.store?.getFact?.(item.id) ?? null;
+    } catch {
+      fact = null;
+    }
+    // 首次样本已存在时沿用原时间/档位/同会话标记，避免第二次注入改写口径。
+    const hasFirst = fact?.first_reneed_at !== null && fact?.first_reneed_at !== undefined;
+    const sample = hasFirst
+      ? {
+        at: Number(fact.first_reneed_at),
+        tier: fact.first_reneed_tier ?? tier,
+        sameContext: Number(fact.same_context) === 1,
+      }
+      : {
+        at: atSeconds,
+        tier,
+        sameContext: isSameContextSample({
+          at: atSeconds,
+          createdAt: fact?.created_at,
+          sourceInSurface: sourceStillInSurface(state, scope, fact),
+        }),
+      };
+    samples.set(item.id, sample);
     try {
       state.store?.markFirstReneed?.(item.id, {
-        at: atSeconds,
-        tier: item.fidelity === 'full' ? 'clear' : 'ambiguous',
+        at: sample.at,
+        tier: sample.tier,
         kind: 'recall',
+        sameContext: sample.sameContext,
       });
     } catch (error) {
       state.platform?.log?.('warn', '[dsh-companion] mark first reneed failed', {
@@ -1946,6 +2056,7 @@ function recordRecalledFacts(state, recalled, assembled, scope = SCOPE, at = Dat
     }
   }
   state.lastRecalledIds = ids;
+  state.lastRecallSamples = samples;
   state.lastRecallScope = scope;
   state.lastRecallAssistant = lastAssistantText(state.transcript);
   state.assistantCountAtRecall = countAssistantRows(state.transcript);
