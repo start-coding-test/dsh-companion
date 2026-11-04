@@ -1295,6 +1295,7 @@ async function retrieveVectors(state, input) {
 
 /**
  * W4：空闲回填本批（≤backfillBatchSize）缺失/不匹配的向量。
+ * E-M1：local 尚未预热完成时不占用 idle-probe，只触发/续接预热。
  * 失败只记 metric 与 warn，不抛出，不阻塞 idle-probe。
  * @param {object} state
  * @returns {Promise<number>} 本批写入条数
