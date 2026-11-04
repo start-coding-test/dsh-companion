@@ -553,14 +553,20 @@ function formatTokenSnapshot(metrics, budget) {
 }
 
 /**
- * 向量召回状态片段（P2-b）：关闭时只显示「关」，开启时显示维度与最近命中。
+ * 向量召回状态片段（P2-b / W4）：关闭时只显示「关」，开启时显示 dim、embedder
+ * 与本进程已回填条数、最近命中。旧 budget 形状（无 embedder）保持原格式。
  * @param {object} [budget]
  * @returns {string}
  */
 function formatVectorText(budget) {
   const vector = budget?.vector;
   if (vector === undefined || vector === null || vector.enabled !== true) return '｜向量：关';
-  return `｜向量：开·dim ${Number(vector.dim) || 0}·最近命中 ${Number(vector.lastHits) || 0}`;
+  const dim = Number(vector.dim) || 0;
+  const lastHits = Number(vector.lastHits) || 0;
+  if (typeof vector.embedder !== 'string' || vector.embedder === '') {
+    return `｜向量：开·dim ${dim}·最近命中 ${lastHits}`;
+  }
+  return `｜向量：开·dim ${dim}·${vector.embedder}·已回填 ${Number(vector.backfilled) || 0}·最近命中 ${lastHits}`;
 }
 
 /** @param {object} store @param {string} scope */

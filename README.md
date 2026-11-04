@@ -72,7 +72,10 @@ dsh-companion/
 | `rssMainOnlyGiB` | `3.15` | RSS 仅主会话的阈值（GiB） | `> rssStopGiB` |
 | `vector.enabled` | `false` | 是否启用可选向量召回 | 布尔；默认关闭 |
 | `vector.dim` | `256` | 向量维度（`hashEmbed` 桶数） | 整数 `8`–`4096` |
-| `vector.embedder` | `"hash"` | 向量化实现 | `hash`（字符 bigram 哈希，非生产质量）/ `none`（退化） |
+| `vector.embedder` | `"hash"` | 向量化实现 | `hash` / `local` / `remote` / `none`；详见 [docs/embedding.md](docs/embedding.md) |
+| `vector.localModel` | `"Xenova/bge-small-zh-v1.5"` | local 模型 id（需可选安装 `@huggingface/transformers`） | 非空字符串 |
+| `vector.remote.enabled` | `false` | remote 必须显式开启；开启后原文会发到第三方 | 布尔 |
+| `vector.backfillBatchSize` | `50` | idle-probe 每批回填条数 | 整数 `1`–`50` |
 
 token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 新增可选的 `vector.*`（默认关闭；`DEFAULTS.vector` 不可枚举，首次安装自检按 16 个键输出，含 RSS 三档）；治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
 
@@ -151,14 +154,15 @@ node scripts/calibrate/run.mjs
 
 - 默认关闭（`vector.enabled: false`），检索走 v0.2.0 的 bigram FTS 路径，结果与旧版逐字节一致，且不读向量表。
 - 开启后 `hybridSearch` 用 RRF（`1/(60+rank)`）融合 FTS 与向量两路并去重；向量路只召回 active、normal、未删除、非 `sensitive/secret` 且 R ≥ 0.05 的事实。
-- `vector.embedder` 目前只有 `hash`（字符 bigram → FNV-1a → 桶 → L2 归一）与 `none`（退化）。**`hash` 是语义近似，不是真实 embedding**，中文同义改写召回有限；真实 embedding 留待 P3。
-- 开启后 `/状态` 显示「向量：开·dim 256·最近命中 N」；离线对比可跑 `node scripts/bench-vector.mjs`。
-- 旧库升级到 schema v5 不会自动补向量：旧事实在下一次写入 / 编辑 / 强化时重建投影，期间开启向量只是召回不到它们，不会报错。
+- `vector.embedder` 支持 `hash`（默认，字符 bigram 哈希，零依赖但非语义）、`local`（可选依赖 `@huggingface/transformers`，默认 `Xenova/bge-small-zh-v1.5` 512 维 int8）与 `remote`（默认关闭，显式 `vector.remote.enabled: true` 才启用；会把原文发到第三方，见 [docs/embedding.md](docs/embedding.md#remote)）。
+- 向量按 `embedder_id` 隔离：换模型后旧向量不再参与召回；local/remote 的缺失向量由 idle-probe 分批回填（≤ `vector.backfillBatchSize`，默认 50）。
+- 开启后 `/状态` 显示「向量：开·dim 256·hash:256·已回填 N·最近命中 N」；embedding 超时/未安装时退回 FTS 并记 `vectorEmbedFailures`。
+- 旧库升级到 schema v6 会把旧向量行标成 `hash:<dim>`；hash 在下次写入/编辑/强化时重建，local/remote 由空闲回填补齐。
 
 ## 记忆与遗忘
 
 - 工作记忆按 32K 装配；连续两轮超过 24K 触发巩固，40K 为安全阀，压缩保留最近 6,144 token。
-- 检索使用 bigram FTS 与遗忘曲线四档（full / gist / index / dormant）；开启 `vector.enabled` 时再融合可选的哈希向量召回（见上节）；同一轮只注入一次召回，且末条是工具结果时不注入。
+- 检索使用 bigram FTS 与遗忘曲线四档（full / gist / index / dormant）；开启 `vector.enabled` 时再融合可选向量召回（见上节）；同一轮只注入一次召回，且末条是工具结果时不注入。
 - `/记忆 忘掉` 只做标记（S1）；7 天冷静期内仍可恢复，到期由每日 03:30 的清理任务物理删除。
 - 被遗忘、被取代或标记为 secret 的内容不会被召回；此时珞然会直接说「不记得了」，不编造。
 - 每日 03:00 的 deep-sleep 执行睡眠期巩固（有模型时）、遗忘降级、FTS 孤儿 GC 与状态板 staged 重渲染，并写审计。
@@ -166,7 +170,7 @@ node scripts/calibrate/run.mjs
 ## 已知限制
 
 - **FTS 为 bigram 近似**：没有分词器或同义词，召回依赖字面 bigram 与时间衰减；同义改写可能召回不到（可选向量召回可缓解，但见下条）。
-- **向量召回非生产质量（默认关闭）**：`hashEmbed` 是字符 bigram 哈希投影，不是真实 embedding，中文语义召回有限；仓库 bench 的 100%/100%/100% 属合成数据自评口径。离线环境无真实 embedding，`vector.embedder` 仅支持 `hash`/`none`，接入真实 provider 留待 P3。
+- **向量召回默认关闭且效果取决于 embedder**：`hash` 只是字符 bigram 哈希投影，不是语义 embedding；`local` 需要可选安装 `@huggingface/transformers` 并首次联网下载模型；`remote` 会把原文发到第三方（隐私例外见 [docs/embedding.md](docs/embedding.md)）。`vector.embedder` 已支持 `hash`/`local`/`remote`/`none`，任一实现失败都会退回 FTS。
 - **旧加密文件（v1）不认证 header**：v0.3.0 及更早版本导出的密文没有 AAD 绑定，`id`/`created_at` 等 header 字段仍可被伪造；新文件（`format: "v2"`）已认证。需要时可解密后用同一口令重新导出。
 - **无跨设备备份**：数据库只在本机；backup 任务只在本机按日期滚动保留 7 份。需要搬移时用 `/记忆 导出` 与 `importAll`（见「导出、恢复与加密」）。
 - 平台管理的会话 JSONL 不在插件控制范围内，插件无法删除。
@@ -176,12 +180,12 @@ node scripts/calibrate/run.mjs
 - **自愈重试受调度 tick 约束**：巩固重试与轻闲聊都挂在 idle-probe（60s）上；熔断或 RSS ≥ stop_dispatch 期间重试会被顺延（事件与失败态保留，只是延后），恢复后继续推进。
 - **subagent 仍见全局人格段**：平台的 system prompt 段没有 per-session 文本；插件只能让 subagent 跳过召回、巩固与写库，无法移除人格 / 记忆提示段。
 - **schema v4 迁移清空 consolidations**：seq 语义切换为 surface 位置序时，开发期迁移会清空 `consolidations` 并重置 `episodes.consolidation_id`；事实、提醒与状态板不受影响。
-- **schema v5 不补旧向量**：v4→v5 只推进版本并建 `fact_vectors`，不动数据；旧事实在下次写入 / 编辑 / 强化前不会被向量召回（不报错）。
+- **schema v5→v6 不丢向量**：v5→v6 只给 `fact_vectors` 增加 `embedder_id` 并把旧行标成 `hash:<dim>`，不删数据；换 embedder 后旧向量按 id 隔离，由写入或空闲回填重建。
 - deep-sleep 的「情景→语义」模型抽取尚未实现，MVP 只做规则子步。
 
 ## 隐私
 
-所有记忆存在本机 SQLite，不上传到第三方；主动消息受安静时段、每日上限、同类去重与积压上限约束。导出默认剔除 `secret`/`sensitive` 与墓碑；加密导出用 AES-256-GCM，口令只在本机从 stdin 读取、不落盘。平台侧会话记录由 DSH 管理。
+所有记忆存在本机 SQLite，不上传到第三方；主动消息受安静时段、每日上限、同类去重与积压上限约束。导出默认剔除 `secret`/`sensitive` 与墓碑；加密导出用 AES-256-GCM，口令只在本机从 stdin 读取、不落盘。平台侧会话记录由 DSH 管理。**例外**：显式开启 `vector.embedder: remote` 后，回填的事实原文与召回查询会发往配置的第三方 embedding 端点；敏感/secret/墓碑事实不会进入回填批次，但第三方侧的留存不受本插件 7 天删除约束。
 
 ## 开发与测试
 

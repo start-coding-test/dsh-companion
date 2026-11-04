@@ -171,6 +171,7 @@ export function searchVector({
   scope = 'main',
   query = '',
   embed = hashEmbed,
+  embedderId = null,
   limit = 20,
   now = Date.now(),
 } = {}) {
@@ -198,7 +199,12 @@ export function searchVector({
   const sensitiveFilter = hasSensitive
     ? " AND (f.sensitive IS NULL OR f.sensitive = 0)"
     : '';
+  // W4：只有当前 embedder 写入的向量参与召回；旧库/迁移前行为（不传 id）保持全量。
+  const embedderFilter = typeof embedderId === 'string' && embedderId !== ''
+    ? ' AND fv.embedder_id = ?'
+    : '';
 
+  const params = embedderFilter === '' ? [scope, queryVec.length] : [scope, embedderId, queryVec.length];
   const rows = store.db
     .prepare(
       `SELECT fv.fact_id, fv.vec, fv.dim, f.strength_days,
@@ -210,9 +216,10 @@ export function searchVector({
           AND f.deleted_at IS NULL
           AND f.privacy = 'normal'
           ${sensitiveFilter}
+          ${embedderFilter}
           AND fv.dim = ?`,
     )
-    .all(scope, queryVec.length);
+    .all(...params);
 
   const scored = [];
   for (const row of rows) {
@@ -261,6 +268,7 @@ export function hybridSearch({
   scope = 'main',
   query = '',
   embed = hashEmbed,
+  embedderId = null,
   limit = 20,
   k = DEFAULT_RRF_K,
   now = Date.now(),
@@ -282,6 +290,7 @@ export function hybridSearch({
     scope,
     query,
     embed,
+    embedderId,
     limit: searchLimit,
     now,
   });

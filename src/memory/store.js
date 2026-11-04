@@ -39,8 +39,10 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  * schema 版本。
  * v4：consolidations 改 surface seq 口径（见 docs/h1-h3-probe.md）。
  * v5：新增 fact_vectors（P2-b 可选向量召回），只建表、不动既有数据。
+ * v6：fact_vectors 增加 embedder_id（W4 可插拔 embedding），旧行回填
+ *     `hash:<dim>`，避免换模型后新旧向量混用。
  */
-const SCHEMA_VERSION = '5';
+const SCHEMA_VERSION = '6';
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
 
@@ -225,10 +227,11 @@ CREATE INDEX IF NOT EXISTS ix_facts_purge ON facts(deleted_at) WHERE deleted_at 
 -- P2-b：可选向量召回。hashEmbed 的离线向量投影；只随 facts 生命周期维护，
 -- 关闭向量时表为空也不会影响检索。FK 级联保证物理删除后不留孤儿。
 CREATE TABLE IF NOT EXISTS fact_vectors (
-  fact_id    TEXT PRIMARY KEY REFERENCES facts(id) ON DELETE CASCADE,
-  dim        INTEGER NOT NULL,
-  vec        BLOB NOT NULL,
-  updated_at INTEGER NOT NULL
+  fact_id     TEXT PRIMARY KEY REFERENCES facts(id) ON DELETE CASCADE,
+  dim         INTEGER NOT NULL,
+  vec         BLOB NOT NULL,
+  embedder_id TEXT NOT NULL DEFAULT '',
+  updated_at  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_fact_vectors_dim ON fact_vectors(dim);
 
@@ -485,6 +488,14 @@ export class Store {
   #inTransaction = false;
   /** P2-b：向量投影维度；关闭向量时不会写入 fact_vectors。 */
   #vectorDim = DEFAULT_VECTOR_DIM;
+  /** W4：当前向量写入者 id；检索只召回同 id 的向量。 */
+  #vectorEmbedderId = `hash:${DEFAULT_VECTOR_DIM}`;
+  /**
+   * 同步向量函数；async embedder（local/remote）没有同步版本时为 null，
+   * 其向量由空闲回填（upsertFactVector）补齐。
+   * @type {((text: string, dim: number) => Float32Array)|null}
+   */
+  #vectorEmbed = hashEmbed;
 
   /**
    * 请用 Store.open(path) 创建实例。
@@ -525,9 +536,15 @@ export class Store {
     return this.#vectorDim;
   }
 
+  /** W4：当前向量写入者 id（如 hash:256 / local:bge-small-zh-v1.5:512）。 @returns {string} */
+  get vectorEmbedderId() {
+    return this.#vectorEmbedderId;
+  }
+
   /**
    * 设置向量投影维度。维度变化时清掉旧维度投影（下次写入会按新维度重建），
    * 避免 searchVector 按 dim 过滤后静默丢召回。
+   * 兼容入口：仅用于 hash embedder，相当于 configureVectors({id:`hash:${dim}`, dim, embed:hashEmbed})。
    * @param {number} dim
    * @returns {number}
    */
@@ -535,11 +552,139 @@ export class Store {
     if (!Number.isInteger(dim) || dim < 8 || dim > 4096) {
       throw new TypeError(`[store] invalid vector dim: ${String(dim)}`);
     }
-    if (dim !== this.#vectorDim) {
-      this.#db.prepare('DELETE FROM fact_vectors WHERE dim <> ?').run(dim);
+    this.configureVectors({ id: `hash:${dim}`, dim, embed: hashEmbed });
+    return dim;
+  }
+
+  /**
+   * W4：配置当前 embedder 的 id/维度/同步向量函数。
+   *
+   * id 或维度变化会删除不匹配的旧投影（换模型后旧向量不可比），随后由
+   * 写入路径或空闲回填按新 id 重建。`embed` 为 null 表示只能用异步
+   * embedder（local/remote），此时写入路径不生成向量，等回填补齐。
+   * @param {{id: string, dim: number, embed?: ((text: string, dim: number) => Float32Array)|null}} input
+   * @returns {{id: string, dim: number}}
+   */
+  configureVectors(input = {}) {
+    const id = requireString(input.id, 'fact_vectors.embedder_id');
+    const dim = input.dim === undefined ? this.#vectorDim : input.dim;
+    if (!Number.isInteger(dim) || dim < 0 || dim > 4096) {
+      throw new TypeError(`[store] invalid vector dim: ${String(dim)}`);
+    }
+    const embed = input.embed === undefined ? null : input.embed;
+    if (embed !== null && typeof embed !== 'function') {
+      throw new TypeError('[store] vector embed must be a function or null');
+    }
+    if (id !== this.#vectorEmbedderId || dim !== this.#vectorDim) {
+      this.#db
+        .prepare('DELETE FROM fact_vectors WHERE embedder_id <> ? OR (dim <> ? AND ? > 0)')
+        .run(id, dim > 0 ? dim : this.#vectorDim, dim);
+      this.#vectorEmbedderId = id;
       this.#vectorDim = dim;
     }
-    return this.#vectorDim;
+    this.#vectorEmbed = embed;
+    return { id, dim };
+  }
+
+  /**
+   * W4：写入一条事实向量（回填/异步 embedder 用）。
+   *
+   * 写入前复核事实仍可向量化（active + normal + 未删除 + 非 sensitive），
+   * 避免回填批次与治理/删除并发时留下可召回残影。
+   * @param {{factId: string, vec: Float32Array, embedderId?: string}} input
+   * @returns {{factId: string, embedderId: string, dim: number}|null}
+   */
+  upsertFactVector(input = {}) {
+    const factId = requireString(input.factId, 'fact_vectors.fact_id');
+    const embedderId = requireString(
+      input.embedderId === undefined ? this.#vectorEmbedderId : input.embedderId,
+      'fact_vectors.embedder_id',
+    );
+    const vec = input.vec;
+    if (!(vec instanceof Float32Array)) {
+      throw new TypeError('[store] fact vector must be a Float32Array');
+    }
+    if (vec.length < 8 || vec.length > 4096) {
+      throw new TypeError(`[store] invalid vector dim: ${vec.length}`);
+    }
+    for (const value of vec) {
+      if (!Number.isFinite(value)) throw new TypeError('[store] fact vector contains non-finite values');
+    }
+    const hasSensitive = this.#db
+      .prepare("SELECT 1 AS present FROM pragma_table_info('facts') WHERE name = 'sensitive'")
+      .get() !== undefined;
+    const row = this.#db
+      .prepare(
+        `SELECT status, deleted_at, privacy${hasSensitive ? ', sensitive' : ''}
+           FROM facts WHERE id = ?`,
+      )
+      .get(factId);
+    const keep = row !== undefined
+      && row.deleted_at === null
+      && row.status === 'active'
+      && row.privacy === 'normal'
+      && (!hasSensitive || Number(row.sensitive) === 0);
+    if (!keep) {
+      this.#db.prepare('DELETE FROM fact_vectors WHERE fact_id = ?').run(factId);
+      return null;
+    }
+    const bytes = new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength);
+    this.#db
+      .prepare(
+        `INSERT INTO fact_vectors (fact_id, dim, vec, embedder_id, updated_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(fact_id) DO UPDATE SET
+           dim = excluded.dim,
+           vec = excluded.vec,
+           embedder_id = excluded.embedder_id,
+           updated_at = excluded.updated_at`,
+      )
+      .run(factId, vec.length, bytes, embedderId, nowSeconds());
+    return { factId, embedderId, dim: vec.length };
+  }
+
+  /**
+   * W4：列出需要回填的活跃事实（向量缺失 / embedder_id 不一致 / 维度不一致）。
+   *
+   * 只取 active + normal + 未删除 + 非 sensitive（若治理加了该列），
+   * 墓碑/superseded/secret 不会进入 embedder（remote 隐私前提）。
+   * @param {{embedderId?: string, dim?: number, limit?: number}} [input]
+   * @returns {{id: string, text: string}[]}
+   */
+  listVectorBackfill(input = {}) {
+    const embedderId = requireString(
+      input.embedderId === undefined ? this.#vectorEmbedderId : input.embedderId,
+      'fact_vectors.embedder_id',
+    );
+    const dim = input.dim === undefined ? this.#vectorDim : input.dim;
+    const limit = Number.isInteger(input.limit) && input.limit > 0 ? input.limit : 50;
+    const hasSensitive = this.#db
+      .prepare("SELECT 1 AS present FROM pragma_table_info('facts') WHERE name = 'sensitive'")
+      .get() !== undefined;
+    const dimFilter = Number.isInteger(dim) && dim > 0 ? ' OR fv.dim <> ?' : '';
+    const params = [embedderId];
+    if (dimFilter !== '') params.push(dim);
+    params.push(limit);
+    const rows = this.#db
+      .prepare(
+        `SELECT f.id, f.statement, f.subject_text, f.predicate, f.object_text
+           FROM facts f
+           LEFT JOIN fact_vectors fv ON fv.fact_id = f.id
+          WHERE f.status = 'active'
+            AND f.deleted_at IS NULL
+            AND f.privacy = 'normal'
+            ${hasSensitive ? 'AND COALESCE(f.sensitive, 0) = 0' : ''}
+            AND (fv.fact_id IS NULL OR fv.embedder_id <> ?${dimFilter})
+          ORDER BY f.last_reinforced_at DESC, f.id ASC
+          LIMIT ?`,
+      )
+      .all(...params);
+    return rows.map((row) => ({
+      id: row.id,
+      text: [row.statement, row.subject_text, row.predicate, row.object_text]
+        .filter((part) => typeof part === 'string' && part !== '')
+        .join(' '),
+    }));
   }
 
   /** 数据库文件路径。 */
@@ -572,6 +717,10 @@ export class Store {
       .get();
     const from = row ? String(row.value) : 'missing';
     if (from !== SCHEMA_VERSION) this.#migrateFrom(from);
+    // v6 的 embedder 索引放在迁移之后建：v5 旧表此时才补上 embedder_id 列。
+    this.#db.exec(
+      'CREATE INDEX IF NOT EXISTS ix_fact_vectors_embedder ON fact_vectors(embedder_id)',
+    );
     this.#ensureScopeRow('main');
   }
 
@@ -604,7 +753,7 @@ export class Store {
   }
 
   /**
-   * 升级旧库；支持 v3 → v4 → v5。
+   * 升级旧库；支持 v3 → v4 → v5 → v6。
    *
    * v3 的 `consolidations.upto_seq` 是插件自增 turn 计数，与平台 surface seq
    * 不可比（H1）。开发期尚无用户数据，直接清空巩固行（facts/episodes 保留），
@@ -612,9 +761,39 @@ export class Store {
    *
    * v4 → v5 只新增 fact_vectors，DDL 已由 migrate() 的 SCHEMA_SQL 幂等建好；
    * 这里只推进版本号，不改任何既有数据。旧事实的向量由后续写入/编辑补齐。
+   *
+   * v5 → v6 给 fact_vectors 补 embedder_id：v5 旧行都是 hashEmbed 产物，
+   * 回填为 `hash:<dim>`；其余新旧不匹配行留空，由空闲回填重建。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
+    if (from === '5') {
+      this.#db.exec('BEGIN IMMEDIATE');
+      try {
+        const columns = this.#db
+          .prepare("PRAGMA table_info('fact_vectors')")
+          .all()
+          .map((column) => column.name);
+        if (!columns.includes('embedder_id')) {
+          this.#db.exec("ALTER TABLE fact_vectors ADD COLUMN embedder_id TEXT NOT NULL DEFAULT ''");
+        }
+        this.#db.exec(
+          "UPDATE fact_vectors SET embedder_id = 'hash:' || dim WHERE embedder_id = ''",
+        );
+        this.#db
+          .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
+          .run(SCHEMA_VERSION);
+        this.#db.exec('COMMIT');
+      } catch (error) {
+        try {
+          this.#db.exec('ROLLBACK');
+        } catch {
+          // 回滚失败时保留原始错误
+        }
+        throw error;
+      }
+      return;
+    }
     if (from === '4') {
       this.#db
         .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
@@ -775,18 +954,28 @@ export class Store {
     const text = [row.statement, row.subject_text, row.predicate, row.object_text]
       .filter((part) => typeof part === 'string' && part !== '')
       .join(' ');
-    const vec = hashEmbed(text, this.#vectorDim);
+    // 异步 embedder（local/remote）没有同步向量函数：先清掉旧 id 的投影，
+    // 等 idle-probe 的回填用新 id 补写，避免检索命中过期向量。
+    if (this.#vectorEmbed === null) {
+      this.#db.prepare('DELETE FROM fact_vectors WHERE fact_id = ?').run(id);
+      return;
+    }
+    const vec = this.#vectorEmbed(text, this.#vectorDim);
+    if (!(vec instanceof Float32Array) || vec.length !== this.#vectorDim) {
+      throw new StoreError('[store] vector embed returned an unexpected dimension');
+    }
     const bytes = new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength);
     this.#db
       .prepare(
-        `INSERT INTO fact_vectors (fact_id, dim, vec, updated_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO fact_vectors (fact_id, dim, vec, embedder_id, updated_at)
+         VALUES (?, ?, ?, ?, ?)
          ON CONFLICT(fact_id) DO UPDATE SET
            dim = excluded.dim,
            vec = excluded.vec,
+           embedder_id = excluded.embedder_id,
            updated_at = excluded.updated_at`,
       )
-      .run(id, this.#vectorDim, bytes, nowSeconds());
+      .run(id, this.#vectorDim, bytes, this.#vectorEmbedderId, nowSeconds());
   }
 
   /** @param {string} id */

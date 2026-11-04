@@ -25,6 +25,7 @@ import { basename, dirname, join } from 'node:path';
 import { isQuietAt, normalizeConfig } from './config.js';
 import { Store } from './memory/store.js';
 import { retrieve } from './memory/retrieve.js';
+import { createEmbedder } from './memory/embedders/index.js';
 import { assemble } from './memory/assemble.js';
 import {
   CONFIRM_ALPHA,
@@ -195,10 +196,23 @@ export function apply(ctx, rawConfig) {
 
   const platform = createAdapter(host, { now: () => host.now?.() ?? Date.now() });
   const store = Store.open(config.dbPath);
-  // P2-b：向量维度在校验后固定；关闭向量时只是不写投影，不改变检索路径。
-  store.setVectorDim(config.vector.dim);
+  // W4：向量关闭时保持 v0.3.2 的 hash 投影路径；开启时按 embedder 配置 id/dim。
+  // local/remote 没有同步向量函数，写入路径先不投影，由 idle-probe 回填。
+  const embedder = config.vector.enabled ? createEmbedder(config.vector) : null;
+  if (embedder === null || embedder.kind === 'hash') {
+    store.setVectorDim(config.vector.dim);
+  } else {
+    store.configureVectors({ id: embedder.id, dim: embedder.dim || 0, embed: null });
+  }
   const metrics = createMetrics({ clock: platform.now });
-  const state = createWiringState({ host, platform, store, config, metrics });
+  const state = createWiringState({ host, platform, store, config, metrics, embedder });
+  if (embedder !== null && embedder.kind === 'remote') {
+    // W4：remote 会把原文发到第三方，启动时必须显式告警（隐私例外见 docs/embedding.md）。
+    platform.log('warn', '[dsh-companion] vector.embedder=remote enabled; memory text will be sent to a third party', {
+      host: embedder.host ?? '',
+      timeoutMs: embedder.timeoutMs,
+    });
+  }
 
   const disposers = [];
   const track = (disposer) => {
@@ -238,7 +252,17 @@ export function apply(ctx, rawConfig) {
       }));
     }
     registerCommands(platform, store, config, metrics, track, () => state.currentScope, () => budgetInfo(state), state);
-    registerTools(platform, store, config, track, () => state.currentScope, () => toolBudgetGate(state), metrics);
+    registerTools(
+      platform,
+      store,
+      config,
+      track,
+      () => state.currentScope,
+      () => toolBudgetGate(state),
+      metrics,
+      (input) => retrieveVectors(state, input),
+      vectorConfig(state),
+    );
     track(startScheduler(state));
   } catch (error) {
     for (const disposer of disposers.splice(0).reverse()) {
@@ -292,13 +316,17 @@ export function apply(ctx, rawConfig) {
  * @param {object} input
  * @returns {object}
  */
-function createWiringState({ host, platform, store, config, metrics }) {
+function createWiringState({ host, platform, store, config, metrics, embedder = null }) {
   return {
     host,
     platform,
     store,
     config,
     metrics,
+    /** W4：当前 embedder（关闭向量时为 null）；local/remote 由注入 loader/fetch 构造。 */
+    embedder,
+    /** W4：本进程已回填的向量条数（/状态 展示）。 */
+    vectorBackfilled: 0,
     scheduler: null,
     proactive: null,
     /** M4：每日 token 累计（按配置时区的日键复位）。 */
@@ -511,12 +539,14 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
  * @param {() => (string|null)} [currentScope]
  * @param {() => object|undefined} [budgetGate] M4：task_run/thread_run 的预算/内存闸门
  * @param {{inc:Function}} [metrics] 计数器（thread_run 槽位日志/兜底）
+ * @param {(input: object) => Promise<object>} [retrieveFn] 带 embedder 的召回入口（缺省用 retrieve）
+ * @param {object} [vectorCfg] 召回用的 vector 配置（embedder 不可用时 enabled=false）
  */
-function registerTools(platform, store, config, track, currentScope, budgetGate, metrics) {
+function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg) {
   if (!platform.capabilities.tools) return;
   const tools = createTools({
     store,
-    retrieve,
+    retrieve: typeof retrieveFn === 'function' ? retrieveFn : retrieve,
     registry: threadRegistry,
     platform,
     clock: platform.now,
@@ -525,7 +555,7 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     currentScope,
     budgetGate,
     metrics,
-    vector: config.vector,
+    vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
     track(platform.registerTool({
@@ -1099,6 +1129,80 @@ function refreshBudget(state, at = state.platform.now()) {
 }
 
 /**
+ * W4：召回用的 vector 配置。embedder 未装配（关闭、none、remote 未启用、
+ * local 未安装）时强制 enabled=false，走纯 FTS，避免拿错维度/旧向量。
+ * @param {object} state
+ * @returns {object}
+ */
+function vectorConfig(state) {
+  if (state.embedder !== null && state.embedder !== undefined) return state.config.vector;
+  return { ...state.config.vector, enabled: false };
+}
+
+/**
+ * W4：带 embedder 的召回入口。embedding 失败（未安装/超时/网络）只记 metric
+ * 并退回纯 FTS，绝不阻塞当前 turn。
+ * @param {object} state
+ * @param {object} input retrieve() 参数
+ * @returns {Promise<object>}
+ */
+async function retrieveVectors(state, input) {
+  const result = await retrieve({ ...input, embedder: state.embedder });
+  if (result !== null && typeof result === 'object' && result.vectorError) {
+    state.metrics.inc('vectorEmbedFailures');
+    state.platform.log('warn', '[dsh-companion] embedding failed; falling back to FTS', result.vectorError);
+  }
+  return result;
+}
+
+/**
+ * W4：空闲回填本批（≤backfillBatchSize）缺失/不匹配的向量。
+ * 失败只记 metric 与 warn，不抛出，不阻塞 idle-probe。
+ * @param {object} state
+ * @returns {Promise<number>} 本批写入条数
+ */
+export async function backfillVectors(state) {
+  const { store, embedder, config, metrics, platform } = state;
+  if (config.vector.enabled !== true || embedder === null || embedder.kind === 'hash') return 0;
+  let written = 0;
+  try {
+    const rows = store.listVectorBackfill({
+      embedderId: embedder.id,
+      dim: embedder.dim || 0,
+      limit: config.vector.backfillBatchSize,
+    });
+    if (rows.length === 0) return 0;
+    const vectors = await embedder.embed(rows.map((row) => row.text));
+    if (!Array.isArray(vectors) || vectors.length !== rows.length) {
+      throw new Error(
+        `[dsh-companion] embedder returned ${Array.isArray(vectors) ? vectors.length : 'non-array'} vectors for ${rows.length} texts`,
+      );
+    }
+    for (let i = 0; i < rows.length; i += 1) {
+      const vec = vectors[i];
+      if (!(vec instanceof Float32Array) || vec.length === 0) continue;
+      const saved = store.upsertFactVector({
+        factId: rows[i].id,
+        vec,
+        embedderId: embedder.id,
+      });
+      if (saved !== null) written += 1;
+    }
+    if (written > 0) {
+      state.vectorBackfilled += written;
+      metrics.inc('vectorBackfilled', written);
+    }
+  } catch (error) {
+    metrics.inc('vectorEmbedFailures');
+    platform.log('warn', '[dsh-companion] vector backfill failed', {
+      code: error?.code ?? null,
+      reason: error?.message ?? String(error),
+    });
+  }
+  return written;
+}
+
+/**
  * 命令层预算快照（/成本、/状态用）。
  * @param {object} state
  * @returns {object}
@@ -1119,8 +1223,10 @@ function budgetInfo(state) {
       mainOnlyGiB: rssLimits.main_only,
     },
     vector: {
-      enabled: state.config.vector.enabled && state.config.vector.embedder !== 'none',
-      dim: state.config.vector.dim,
+      enabled: state.embedder !== null && state.embedder !== undefined,
+      dim: state.embedder === null ? state.config.vector.dim : state.embedder.dim,
+      embedder: state.embedder?.id ?? null,
+      backfilled: state.vectorBackfilled,
       lastHits: state.lastVectorHits,
     },
   };
@@ -1688,13 +1794,13 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
 
   let recalled;
   try {
-    recalled = await retrieve({
+    recalled = await retrieveVectors(state, {
       store,
       query,
       scope,
       now: platform.now(),
       budgetTokens: RECALL_BUDGET_TOKENS,
-      vector: config.vector,
+      vector: vectorConfig(state),
     });
   } catch (error) {
     platform.log('warn', '[dsh-companion] recall injection failed', {
@@ -2069,6 +2175,8 @@ function startScheduler(state) {
       maybeRetryConsolidation(state);
       // M4：每 60s 读一次 RSS；warn 只记 metric，stop_dispatch/main_only 降级。
       runRssCheck(state);
+      // W4：空闲时回填一批缺失/不匹配的向量；失败不阻塞后续闲聊。
+      await backfillVectors(state);
       if (proactiveBlocked(state)) return;
       await runLightChat(state);
       const report = await proactive.flush();
@@ -2384,14 +2492,14 @@ async function runLightChat(state) {
 
     let recallSummary = '';
     try {
-      const recalled = await retrieve({
+      const recalled = await retrieveVectors(state, {
         store,
         query: recentTopics[0]?.title ?? '',
         scope: SCOPE,
         now,
         budgetTokens: 600,
         limit: 3,
-        vector: config.vector,
+        vector: vectorConfig(state),
       });
       recallSummary = recalled.items
         .map((item) => item.text)

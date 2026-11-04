@@ -132,7 +132,7 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 最近 job：s2-purge ok upto_seq=0（2026-11-03 03:30）
 ```
 
-最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·最近命中 N」。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。
+最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。
 
 `/状态` 末尾还会给出自愈观测（无事件时显示「无」）：
 
@@ -422,13 +422,13 @@ node scripts/decrypt-encrypted.mjs secret.enc --out fact.json
 
 ### 向量召回（可选）
 
-默认 `vector.enabled=false`：检索与 v0.2.0 逐字节一致，不读 `fact_vectors`。开启后 `hybridSearch` 用 RRF（`1/(60+rank)`）融合 FTS 与向量，同一 fact 去重；向量路只召回 active、normal、未删除、非 `sensitive`/`secret` 且 R ≥ 0.05 的事实。`hash` 是字符 bigram 哈希投影（非生产质量），离线对比可跑：
+默认 `vector.enabled=false`：检索与 v0.2.0 逐字节一致，不读 `fact_vectors`。开启后 `hybridSearch` 用 RRF（`1/(60+rank)`）融合 FTS 与向量，同一 fact 去重；向量路只召回 active、normal、未删除、非 `sensitive`/`secret` 且 R ≥ 0.05 的事实。`vector.embedder` 支持 `hash`（默认，字符 bigram 哈希投影）、`local`（可选安装 `@huggingface/transformers`，默认 bge-small-zh-v1.5 512 维）与 `remote`（默认关闭，显式 `vector.remote.enabled: true` 才启用；隐私例外见 [embedding.md](embedding.md)）。离线对比可跑：
 
 ```bash
 node scripts/bench-vector.mjs --dim 256 --json
 ```
 
-旧库升级到 schema v5 不会自动补向量：旧事实在下一次写入 / 编辑 / 强化时重建投影，期间开启向量只是召回不到它们，不会报错。
+旧库升级到 schema v6 会给 `fact_vectors` 增加 `embedder_id` 并把旧行标成 `hash:<dim>`；hash 在下次写入 / 编辑 / 强化时重建，local/remote 的缺失向量由 idle-probe 每批 ≤ `vector.backfillBatchSize`（默认 50）回填，期间开启向量只是暂时召回不到它们，不会报错。
 
 ## 配置示例
 
@@ -454,13 +454,40 @@ proactiveDailyCap: 0
 dbPath: "D:/dsh-data/companion.db"
 ```
 
-开启可选向量召回（默认关闭；`hash` 为非生产质量的字符哈希投影）：
+开启可选向量召回（默认关闭；`hash` 为零依赖字符哈希投影）：
 
 ```yaml
 vector:
   enabled: true
   dim: 256
   embedder: hash
+```
+
+用本地真实 embedding（可选依赖，不装则自动退回 FTS）：
+
+```bash
+npm i @huggingface/transformers
+```
+
+```yaml
+vector:
+  enabled: true
+  embedder: local
+  localModel: Xenova/bge-small-zh-v1.5
+  prefixQuery: true
+```
+
+接入远程 embedding（默认关闭；会把事实原文与查询发到第三方，敏感/secret/墓碑不回填）：
+
+```yaml
+vector:
+  enabled: true
+  embedder: remote
+  embedTimeoutMs: 300
+  remote:
+    enabled: true
+    endpoint: https://embed.example.com/v1/embeddings
+    apiKeyEnv: DSH_EMBED_API_KEY
 ```
 
 2C4G 云端把 RSS 三档下调到预算 2.5GiB 以内（公式 `min(userLimit, totalmem×0.75−512MiB)`；
@@ -496,7 +523,7 @@ rssMainOnlyGiB: 2.6
 - 无模型（`ctx.companion.consolidationLlm` 与 `ctx.llm` 都不可用）：巩固跳过并记 debug 日志，不阻塞对话，已有记忆照常检索。
 - 无 `unarchiveSession`：复用归档线程返回 `unarchive-unavailable`。
 - 无 `sessionController`：`task_run` 返回 `session-unavailable`；`/记忆 导出` 仍可用（只读库）。
-- `vector.embedder: none` 或 `enabled: false`：检索退化为 bigram FTS，与旧版一致；`/状态` 显示「向量：关」。
+- `vector.embedder: none`、`enabled: false` 或 remote 未显式 `remote.enabled: true`：检索退化为 bigram FTS，与旧版一致；`/状态` 显示「向量：关」。
 
 ### 工具错误
 
@@ -538,11 +565,11 @@ rssMainOnlyGiB: 2.6
 
 1. 旧机器：`/记忆 导出 json`（或 `md` 仅作阅读），把 `.data/export/memory-*.json` 拷走；
 2. 新机器：`importAll({ store, file, mode: 'fresh' })` 导入空库（已有数据时用 `merge`，按主键跳过已存在行）；
-3. 导入是单事务，失败零落库；恢复后 FTS 自动重建。旧事实不会自动补向量：开启 `vector.enabled` 后，它们在下一次写入 / 编辑 / 强化时才有投影。
+3. 导入是单事务，失败零落库；恢复后 FTS 自动重建。旧事实不会立刻有向量：hash 在下一次写入 / 编辑 / 强化时重建，local/remote 由 idle-probe 分批回填。
 
 ### 向量召回为什么没效果？
 
-先确认 `vector.enabled: true`（默认关闭）且 `/状态` 显示「向量：开·dim X·最近命中 N」。当前只有 `hash` 实现——字符 bigram 哈希投影，不是真实 embedding，中文同义改写召回有限；旧库升级到 schema v5 后旧事实没有向量，需要一次写入或编辑触发重建。真实 embedding 接入留待 P3。
+先确认 `vector.enabled: true`（默认关闭）且 `/状态` 显示「向量：开·dim X·<embedder id>·已回填 N·最近命中 N」。`hash` 只是字符 bigram 哈希投影，不是语义 embedding，中文同义改写召回有限；`local` 需要可选安装 `@huggingface/transformers` 并首次联网下载模型；`remote` 需要显式 `remote.enabled: true` 且 endpoint 可达。旧库升级到 schema v6 后旧向量按 `embedder_id` 隔离，等待写入或 idle-probe 回填；embedding 失败会在日志里出现 `embedding failed; falling back to FTS`。
 
 ### 主动消息为什么没来？
 
@@ -566,6 +593,7 @@ rssMainOnlyGiB: 2.6
 历史行只作审计。升级到 v0.1.1 时旧库会迁移到 `schema_version=4`：清空 `consolidations`
 （开发期约定，旧值语义不可比）、把 `episodes.consolidation_id` 置空；facts/episodes 不受影响。
 v0.3.0 起 `schema_version=5`：只新增 `fact_vectors`（向量投影）表，既有数据不动。
+v0.4.0 起 `schema_version=6`：`fact_vectors` 增加 `embedder_id`，旧向量行回填为 `hash:<dim>`（v4→v6 会在建表后直接推进版本）。
 
 ### 数据存在哪里？
 

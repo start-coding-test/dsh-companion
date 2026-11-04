@@ -238,6 +238,7 @@ export async function retrieve({
   budgetTokens = DEFAULT_BUDGET_TOKENS,
   limit = DEFAULT_LIMIT,
   vector = null,
+  embedder = null,
 } = {}) {
   if (!store || typeof store.searchBigram !== 'function'
     || typeof store.getFact !== 'function' || typeof store.getEpisode !== 'function') {
@@ -262,19 +263,47 @@ export async function retrieve({
   const vectorDim = Number.isInteger(vector?.dim) && vector.dim > 0
     ? vector.dim
     : DEFAULT_VECTOR_DIM;
+  // W4：有 embedder 时先异步算查询向量；失败（未安装/超时/网络）不阻塞 turn，
+  // 本轮退化为纯 FTS，并把错误带回给调用方计数。embedder=null 保留 v0.3.2 的
+  // hashEmbed 路径（单测/关闭向量时的兼容行为）。
+  let queryVec = null;
+  let embeddingError = null;
+  if (vectorEnabled && embedder !== null && typeof embedder.embed === 'function') {
+    try {
+      const embedded = typeof embedder.embedQuery === 'function'
+        ? await embedder.embedQuery([textQuery])
+        : await embedder.embed([textQuery]);
+      const candidate = Array.isArray(embedded) ? embedded[0] : null;
+      if (!(candidate instanceof Float32Array) || candidate.length === 0) {
+        throw new Error('[retrieve] embedder returned no query vector');
+      }
+      queryVec = candidate;
+    } catch (error) {
+      embeddingError = error;
+    }
+  }
+  const useVector = vectorEnabled && (embedder === null || queryVec !== null);
+  const embedderId = embedder !== null
+    && typeof embedder.id === 'string' && embedder.id !== ''
+    ? embedder.id
+    : null;
+  const embed = queryVec !== null
+    ? () => queryVec
+    : (text) => hashEmbed(text, vectorDim);
 
   /** @type {Map<string, {type:'fact'|'episode', id:string}>} */
   const candidates = new Map();
   const searchLimit = Math.max(1, maxItems * 2);
   let vectorScores = new Map();
-  if (vectorEnabled) {
+  if (useVector) {
     // 单独取一次向量命中，用于 /状态 的「最近命中」统计；融合本身走 hybridSearch。
     vectorScores = new Map(
       searchVector({
         store,
         scope,
         query: textQuery,
-        embed: (text) => hashEmbed(text, vectorDim),
+        embed,
+        embedderId,
         limit: searchLimit,
         now: nowMs,
       }).map((hit) => [hit.factId, hit.score]),
@@ -283,7 +312,8 @@ export async function retrieve({
       store,
       scope,
       query: textQuery,
-      embed: (text) => hashEmbed(text, vectorDim),
+      embed,
+      embedderId,
       limit: searchLimit,
       now: nowMs,
     })) {
@@ -329,7 +359,7 @@ export async function retrieve({
 
   /** @type {Array<{kind:'fact'|'episode', id:string, text:string,
    *   fidelity:'full'|'gist'|'index', score:number, R:number}>} */
-  const maxRrf = vectorEnabled
+  const maxRrf = useVector
     ? Math.max(0, ...[...candidates.values()].map((candidate) => Number(candidate.rrf) || 0))
     : 0;
   const scored = [];
@@ -396,8 +426,15 @@ export async function retrieve({
   }
 
   const result = { items, tokens, usedIds, truncated };
-  if (vectorEnabled) {
+  if (useVector) {
     result.vectorHits = usedIds.filter((id) => vectorScores.has(id)).length;
+  }
+  if (embeddingError !== null) {
+    result.vectorError = {
+      name: embeddingError?.name ?? 'Error',
+      code: embeddingError?.code ?? null,
+      message: embeddingError?.message ?? String(embeddingError),
+    };
   }
   return result;
 }

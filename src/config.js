@@ -40,8 +40,29 @@ const DEFAULT_VALUES = {
 // P2-b：可选向量召回；默认关闭，关闭时检索与 v0.2.0 完全一致。
 // 不参与 Object.keys(DEFAULTS) 的 16 键安装自检/示例配置输出（仍是可访问的默认值），
 // 避免改变既有配置面的语义；用户显式配置 vector 时照常校验。
+const VECTOR_DEFAULTS = Object.freeze({
+  enabled: false,
+  dim: 256,
+  // W4：hash（零依赖）/ local（可选动态加载 @huggingface/transformers）/ remote（显式开启）。
+  embedder: 'hash',
+  localModel: 'Xenova/bge-small-zh-v1.5',
+  prefixQuery: true,
+  // remote 的 id 由用户指定；空字符串时回退 remote:<host>。
+  embedderId: '',
+  // 全局默认超时；vector.remote.timeoutMs 可单独覆盖。
+  embedTimeoutMs: 300,
+  // 空闲回填每批条数，硬上限 50。
+  backfillBatchSize: 50,
+  remote: Object.freeze({
+    enabled: false,
+    endpoint: '',
+    apiKeyEnv: '',
+    timeoutMs: 300,
+  }),
+});
+
 Object.defineProperty(DEFAULT_VALUES, 'vector', {
-  value: Object.freeze({ enabled: false, dim: 256, embedder: 'hash' }),
+  value: VECTOR_DEFAULTS,
   enumerable: false,
   writable: false,
   configurable: false,
@@ -119,15 +140,25 @@ function requirePositiveNumber(cfg, field) {
  * 校验 vector 配置。未知子键只 warning；非法值 fail-fast。
  * @param {unknown} raw
  * @param {string[]} warnings
- * @returns {Readonly<{enabled: boolean, dim: number, embedder: 'hash'|'none'}>}
+ * @returns {Readonly<{
+ *   enabled: boolean, dim: number, embedder: 'hash'|'local'|'remote'|'none',
+ *   localModel: string, prefixQuery: boolean, embedderId: string,
+ *   embedTimeoutMs: number, backfillBatchSize: number,
+ *   remote: Readonly<{enabled: boolean, endpoint: string, apiKeyEnv: string, timeoutMs: number}>,
+ * }>}
  */
 function normalizeVector(raw, warnings) {
   const defaults = DEFAULTS.vector;
-  if (raw === undefined) return Object.freeze({ ...defaults });
+  if (raw === undefined) {
+    return Object.freeze({ ...defaults, remote: Object.freeze({ ...defaults.remote }) });
+  }
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ConfigError('vector', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
   }
-  const allowed = new Set(['enabled', 'dim', 'embedder']);
+  const allowed = new Set([
+    'enabled', 'dim', 'embedder', 'localModel', 'prefixQuery', 'embedderId',
+    'embedTimeoutMs', 'backfillBatchSize', 'remote',
+  ]);
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) warnings.push(`unknown config field "vector.${key}" ignored`);
   }
@@ -140,10 +171,104 @@ function normalizeVector(raw, warnings) {
     throw new ConfigError('vector.dim', `must be an integer within 8..4096, got ${JSON.stringify(dim)}`);
   }
   const embedder = raw.embedder === undefined ? defaults.embedder : raw.embedder;
-  if (embedder !== 'hash' && embedder !== 'none') {
-    throw new ConfigError('vector.embedder', `must be "hash" or "none", got ${JSON.stringify(embedder)}`);
+  if (embedder !== 'hash' && embedder !== 'local' && embedder !== 'remote' && embedder !== 'none') {
+    throw new ConfigError(
+      'vector.embedder',
+      `must be "hash", "local", "remote" or "none", got ${JSON.stringify(embedder)}`,
+    );
   }
-  return Object.freeze({ enabled, dim, embedder });
+  const localModel = raw.localModel === undefined ? defaults.localModel : raw.localModel;
+  if (typeof localModel !== 'string' || localModel.trim() === '') {
+    throw new ConfigError('vector.localModel', `must be a non-empty string, got ${JSON.stringify(localModel)}`);
+  }
+  const prefixQuery = raw.prefixQuery === undefined ? defaults.prefixQuery : raw.prefixQuery;
+  if (typeof prefixQuery !== 'boolean') {
+    throw new ConfigError('vector.prefixQuery', `must be a boolean, got ${JSON.stringify(prefixQuery)}`);
+  }
+  const embedderId = raw.embedderId === undefined ? defaults.embedderId : raw.embedderId;
+  if (typeof embedderId !== 'string') {
+    throw new ConfigError('vector.embedderId', `must be a string, got ${JSON.stringify(embedderId)}`);
+  }
+  const embedTimeoutMs = raw.embedTimeoutMs === undefined ? defaults.embedTimeoutMs : raw.embedTimeoutMs;
+  if (typeof embedTimeoutMs !== 'number' || !Number.isInteger(embedTimeoutMs)
+    || embedTimeoutMs < 1 || embedTimeoutMs > 60_000) {
+    throw new ConfigError(
+      'vector.embedTimeoutMs',
+      `must be an integer within 1..60000, got ${JSON.stringify(embedTimeoutMs)}`,
+    );
+  }
+  const backfillBatchSize = raw.backfillBatchSize === undefined
+    ? defaults.backfillBatchSize
+    : raw.backfillBatchSize;
+  if (typeof backfillBatchSize !== 'number' || !Number.isInteger(backfillBatchSize)
+    || backfillBatchSize < 1 || backfillBatchSize > 50) {
+    throw new ConfigError(
+      'vector.backfillBatchSize',
+      `must be an integer within 1..50, got ${JSON.stringify(backfillBatchSize)}`,
+    );
+  }
+  const remoteRaw = raw.remote === undefined ? defaults.remote : raw.remote;
+  if (remoteRaw === null || typeof remoteRaw !== 'object' || Array.isArray(remoteRaw)) {
+    throw new ConfigError(
+      'vector.remote',
+      `must be a plain object, got ${remoteRaw === null ? 'null' : typeof remoteRaw}`,
+    );
+  }
+  const remoteAllowed = new Set(['enabled', 'endpoint', 'apiKeyEnv', 'timeoutMs']);
+  for (const key of Object.keys(remoteRaw)) {
+    if (!remoteAllowed.has(key)) warnings.push(`unknown config field "vector.remote.${key}" ignored`);
+  }
+  const remoteEnabled = remoteRaw.enabled === undefined ? defaults.remote.enabled : remoteRaw.enabled;
+  if (typeof remoteEnabled !== 'boolean') {
+    throw new ConfigError('vector.remote.enabled', `must be a boolean, got ${JSON.stringify(remoteEnabled)}`);
+  }
+  const endpoint = remoteRaw.endpoint === undefined ? defaults.remote.endpoint : remoteRaw.endpoint;
+  if (typeof endpoint !== 'string') {
+    throw new ConfigError('vector.remote.endpoint', `must be a string, got ${JSON.stringify(endpoint)}`);
+  }
+  if (remoteEnabled) {
+    let validUrl = false;
+    try {
+      const parsed = new URL(endpoint);
+      validUrl = parsed.protocol === 'http:' || parsed.protocol === 'https:';
+    } catch {
+      validUrl = false;
+    }
+    if (!validUrl) {
+      throw new ConfigError(
+        'vector.remote.endpoint',
+        `must be an http(s) URL when vector.remote.enabled=true, got ${JSON.stringify(endpoint)}`,
+      );
+    }
+  }
+  const apiKeyEnv = remoteRaw.apiKeyEnv === undefined ? defaults.remote.apiKeyEnv : remoteRaw.apiKeyEnv;
+  if (typeof apiKeyEnv !== 'string') {
+    throw new ConfigError('vector.remote.apiKeyEnv', `must be a string, got ${JSON.stringify(apiKeyEnv)}`);
+  }
+  const remoteTimeout = remoteRaw.timeoutMs === undefined ? embedTimeoutMs : remoteRaw.timeoutMs;
+  if (typeof remoteTimeout !== 'number' || !Number.isInteger(remoteTimeout)
+    || remoteTimeout < 1 || remoteTimeout > 60_000) {
+    throw new ConfigError(
+      'vector.remote.timeoutMs',
+      `must be an integer within 1..60000, got ${JSON.stringify(remoteTimeout)}`,
+    );
+  }
+  return Object.freeze({
+    enabled,
+    dim,
+    embedder,
+    localModel,
+    prefixQuery,
+    embedderId,
+    embedTimeoutMs,
+    backfillBatchSize,
+    remote: Object.freeze({
+      enabled: remoteEnabled,
+      endpoint,
+      apiKeyEnv,
+      timeoutMs: remoteTimeout,
+    }),
+  });
 }
 
 /**
