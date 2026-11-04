@@ -106,10 +106,10 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 
 ### D-5 Linux 2C4G 内存复测（Gate 0-4 的目标环境）
 
-- **现状**：Gate 0 的预算数据来自 Windows 开发机；RSS 默认三档 2.95/3.0/3.15GiB，4G 机器按自检公式只有 2.5GiB 预算，需手动降到 2.2/2.4/2.6，swap 与 `threadMaxActive` 均未在 Linux 2C4G 上实测。
+- **现状**：Gate 0 的预算数据来自 Windows 开发机；RSS 默认三档 2.95/3.0/3.15GiB，4G 机器按自检公式只有 2.5GiB 预算，需按自检值下调（例如 3.64GiB 对应 1.96/2.14/2.32），swap 与 `threadMaxActive` 均未在 Linux 2C4G 上实测。
 - **影响**：默认 3.0GiB 的 stop 可能晚于 OOM；不配 swap 时峰值 2.92GiB 已贴近 4G 上限；线程并发高时更容易触发 OOM 而非优雅降级。
 - **建议排期**：云端发布前必须；与 D-4 同批做。
-- **验收方式**：Linux 2C4G、swap 1–2GB、DSH headless；按 [calibration.md](calibration.md) 配 RSS 2.2/2.4/2.6（`threadMaxActive` 先设 2–3）；跑 24h 混合负载，记录常驻/峰值 RSS、warn/stop/main_only 触发与恢复、无 OOM；再把结果回填 Gate 0-4。
+- **验收方式**：Linux 2C4G、swap 1–2GB、DSH headless；按 [calibration.md](calibration.md) 的自检值配 RSS（例如 3.64GiB 对应 1.96/2.14/2.32；`threadMaxActive` 先设 2–3）；跑 24h 混合负载，记录常驻/峰值 RSS、warn/stop/main_only 触发与恢复、无 OOM；再把结果回填 Gate 0-4。
 
 ### D-8 L-4：RSS 默认值与 3.2GB 红线的单位待 07 明确（P1 / 真机）
 

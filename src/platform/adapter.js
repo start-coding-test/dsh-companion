@@ -149,6 +149,37 @@ export function createAdapter(ctx, opts = {}) {
     }
   };
 
+  /**
+   * V3-M1：读**已声明 inject** 的 service，走正常属性访问。
+   *
+   * 声明过的 service 由 cordis fiber store 在 apply 前就绪（缺 service 时
+   * entry 停在 waiting、根本不会执行到这里），属性读不会触发
+   * `cannot get property "x" without inject`；这才是平台推荐写法，也能让
+   * cordis 的 service 生命周期（reload/替换）生效。
+   *
+   * 仍保留 `get()` 回落：测试替身可能只在 `get()` 上暴露同名 service。
+   * @param {string} name
+   * @returns {any}
+   */
+  const declaredService = (name) => {
+    let value;
+    try {
+      value = ctx[name];
+    } catch {
+      value = undefined;
+    }
+    return value === undefined ? service(name) : value;
+  };
+
+  /**
+   * V3-M1：`timer` 是声明过的 inject，cordis 把它投影成 Context mixin
+   * `ctx.interval(callback, delay) → Disposer`（docs/platform-api.md §1 #6，
+   * `cordis-plugin-timer/lib/index.js:48,53`）。直接读 mixin，不再绕
+   * `ctx.get('timer').interval`。
+   * @returns {Function|undefined}
+   */
+  const intervalSeat = () => (typeof ctx.interval === 'function' ? ctx.interval : undefined);
+
   /** Context 自有属性（不在 inject 约束内）；cordis 根上下文一定持有 logger。 */
   const logger = ctx.logger;
 
@@ -207,7 +238,7 @@ export function createAdapter(ctx, opts = {}) {
 
   const capabilities = Object.freeze({
     get systemPrompt() {
-      return typeof service('systemPrompt')?.section === 'function';
+      return typeof declaredService('systemPrompt')?.section === 'function';
     },
     get preStep() {
       return typeof ctx.on === 'function';
@@ -217,7 +248,7 @@ export function createAdapter(ctx, opts = {}) {
       return typeof ctx.on === 'function';
     },
     get timer() {
-      return typeof service('timer')?.interval === 'function';
+      return typeof intervalSeat() === 'function';
     },
     get compaction() {
       return typeof service('compaction')?.compactRegion === 'function';
@@ -257,10 +288,10 @@ export function createAdapter(ctx, opts = {}) {
       return logger !== undefined && logger !== null && typeof logger.info === 'function';
     },
     get commands() {
-      return typeof service('commands')?.register === 'function';
+      return typeof declaredService('commands')?.register === 'function';
     },
     get tools() {
-      return typeof service('tools')?.register === 'function';
+      return typeof declaredService('tools')?.register === 'function';
     },
     get unarchive() {
       return typeof service('workspaceRegistry')?.unarchiveSession === 'function';
@@ -303,7 +334,7 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Function}
    */
   function section(section) {
-    const impl = service('systemPrompt');
+    const impl = declaredService('systemPrompt');
     if (typeof impl?.section !== 'function') {
       throw unavailable('no-system-prompt', 'ctx.systemPrompt.section()');
     }
@@ -364,8 +395,8 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Function}
    */
   function every(ms, callback) {
-    const timer = service('timer');
-    if (typeof timer?.interval !== 'function') {
+    const interval = intervalSeat();
+    if (typeof interval !== 'function') {
       throw unavailable('no-timer', 'ctx.interval()');
     }
     if (typeof callback !== 'function') {
@@ -374,7 +405,7 @@ export function createAdapter(ctx, opts = {}) {
     if (!Number.isFinite(ms) || ms <= 0) {
       throw new TypeError('every(ms, callback): ms must be a positive finite number');
     }
-    return timer.interval(callback, ms);
+    return interval.call(ctx, callback, ms);
   }
 
   /**
@@ -588,7 +619,7 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Function} 平台 disposer
    */
   function registerCommand(definition) {
-    const impl = service('commands');
+    const impl = declaredService('commands');
     if (typeof impl?.register !== 'function') {
       throw unavailable('no-commands', 'ctx.commands.register()');
     }
@@ -607,7 +638,7 @@ export function createAdapter(ctx, opts = {}) {
    * @returns {Function} 平台 disposer
    */
   function registerTool(definition) {
-    const impl = service('tools');
+    const impl = declaredService('tools');
     if (typeof impl?.register !== 'function') {
       throw unavailable('no-tools', 'ctx.tools.register()');
     }
@@ -615,6 +646,31 @@ export function createAdapter(ctx, opts = {}) {
       throw new TypeError('registerTool(definition): definition must be an object');
     }
     return impl.register(definition);
+  }
+
+  /**
+   * V3-M1：宿主销毁 context 时的兜底回收钩子。
+   *
+   * cordis 4 在 fiber dispose 时广播 `dispose` 事件；宿主未必调用 apply 返回的
+   * `handle.dispose()`（例如直接 `ctx.dispose()` 或插件热重载），注册的
+   * section/command/tool/listener 就会残留。把清理挂到该事件上，保证
+   * 「apply → ctx dispose → apply」不会让注册数翻倍。
+   *
+   * @param {() => void} handler 清理回调（必须幂等）
+   * @returns {Function|null} 注册成功返回 disposer；宿主没有 on() 时返回 null
+   */
+  function onDispose(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('onDispose(handler): handler must be a function');
+    }
+    if (typeof ctx.on !== 'function') return null;
+    return ctx.on('dispose', () => {
+      try {
+        handler();
+      } catch {
+        // 卸载钩子里的异常不能打断宿主自己的 dispose 流程。
+      }
+    });
   }
 
   /**
@@ -741,6 +797,7 @@ export function createAdapter(ctx, opts = {}) {
     readSurface,
     registerCommand,
     registerTool,
+    onDispose,
     unarchiveSession,
     listProviders,
     listModels,

@@ -402,7 +402,10 @@ test('/记忆 改：旧条 superseded、新条 active，写 EDIT 事件', () => 
     assert.equal(updated.statement, '我改喝无糖美式');
 
     const event = temp.store.listEvents({ action: 'EDIT', limit: 1 })[0];
-    assert.deepEqual(JSON.parse(event.detail_json), { from: old.id, to: updated.id });
+    const detail = JSON.parse(event.detail_json);
+    assert.equal(detail.from, old.id);
+    assert.equal(detail.to, updated.id);
+    assert.equal(detail.edited, true, 'V3-M4：EDIT 审计标出这是编辑');
   } finally {
     handle.dispose();
     temp.cleanup();

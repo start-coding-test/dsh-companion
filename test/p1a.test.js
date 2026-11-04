@@ -102,7 +102,11 @@ test('/记忆 改：旧条 superseded_by 新条，新条 active，写 EDIT 事�
   assert.equal(updated.id === old.id, false);
 
   const event = store.listEvents({ action: 'EDIT', limit: 1 })[0];
-  assert.deepEqual(JSON.parse(event.detail_json), { from: old.id, to: updated.id });
+  const detail = JSON.parse(event.detail_json);
+  assert.equal(detail.from, old.id);
+  assert.equal(detail.to, updated.id);
+  assert.equal(detail.edited, true, 'V3-M4：EDIT 审计标出这是编辑');
+  assert.equal(detail.reextracted, true);
 
   const missing = run(store, '/记忆 改 fact_missing 新内容');
   assert.match(missing, /修改失败/);

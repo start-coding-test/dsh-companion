@@ -430,6 +430,12 @@ export function apply(ctx, rawConfig, hooks = {}) {
     },
   });
 
+  // V3-M1：宿主直接销毁 context（cordis `dispose` 事件）时也回收注册，
+  // 不依赖调用方是否记得调用 handle.dispose()。
+  platform.onDispose(() => {
+    handle.dispose();
+  });
+
   INSTALLS.set(host, { handle, store });
   return handle;
 }
@@ -1529,8 +1535,13 @@ export async function retrieveVectors(state, input) {
       ...input,
       embedder: null,
       vector: { ...(input.vector ?? state.config.vector), enabled: false },
+      recall: input.recall ?? state.config?.recall ?? null,
     })
-    : await retrieve({ ...input, embedder: state.embedder });
+    : await retrieve({
+      ...input,
+      embedder: state.embedder,
+      recall: input.recall ?? state.config?.recall ?? null,
+    });
   if (result !== null && typeof result === 'object' && result.vectorError) {
     if (result.vectorError.code === 'EMBEDDING_BUSY') {
       // L-1：占用不是失败（回填推理仍在跑，下一轮会好），只记 busy；与
@@ -3626,6 +3637,89 @@ function formatGovernance({ store, scope, now, dryRun }) {
 }
 
 /**
+ * 去掉抽取文本两端的空白与标点；只用于「值」的边界收敛。
+ * @param {unknown} text
+ * @returns {string}
+ */
+function trimExtractionEdges(text) {
+  return String(text ?? '')
+    .replace(/^[\s\p{P}\p{S}]+|[\s\p{P}\p{S}]+$/gu, '')
+    .trim();
+}
+
+/**
+ * V3-M4：按编辑后的 statement 重抽事实字段（保守规则，不做 NLP）。
+ *
+ * 旧实现只替换 `statement`，`subject_text`/`predicate`/`object_text` 沿用旧行，
+ * 于是治理去重、冲突分组与 FTS/向量索引都还停在旧值（真机实测：改
+ * 「下周四去杭州」后 object_text 仍是「杭州出差」，旧值还能被搜到）。
+ *
+ * 保守规则：
+ * - `subject_text` 沿用旧值：用户改的是内容，不推断主体变化；
+ * - `predicate` 沿用旧值：自由文本里没有可靠的关系词，凭空猜会把治理分组打散；
+ * - `object_text` 取「新 statement 去掉可复用前缀」后的剩余部分。前缀优先用
+ *   「旧 statement 中旧 object_text 之前的部分」（旧值由抽取产生，它的位置正好
+ *   划出主体+关系与值的边界），例如「下周四去杭州出差」的 object_text 是
+ *   「杭州出差」，边界为「下周四去」，故改成「下周四去杭州」得到「杭州」；
+ *   旧 object 缺失时依次回退到 `subject_text`、旧 `predicate`（memory_write 的
+ *   模板词，如「记住」），取能匹配上的最长前缀；
+ * - 句子没变时保留旧 object_text（纯审计场景不该把值清空）；
+ * - 去前缀后为空、或整句与旧句子没有任何可复用前缀（换成了完全无关的说法），
+ *   视为抽不出：`object_text = null`，由调用方在 EDIT 审计里标 `reextracted: false`。
+ *
+ * @param {object} oldFact 旧 facts 行（需含 statement/subject_text/predicate/object_text）
+ * @param {string} statement 编辑后的新内容
+ * @returns {{subject_text: string, predicate: string, object_text: string|null,
+ *            extracted: boolean, unchanged: boolean}}
+ */
+export function reextractFactFields(oldFact, statement) {
+  const subject = String(oldFact?.subject_text ?? '');
+  const predicate = String(oldFact?.predicate ?? '');
+  const oldStatement = String(oldFact?.statement ?? '').trim();
+  const nextStatement = String(statement ?? '').trim();
+  if (nextStatement !== '' && nextStatement === oldStatement) {
+    return {
+      subject_text: subject,
+      predicate,
+      object_text: oldFact?.object_text ?? null,
+      extracted: true,
+      unchanged: true,
+    };
+  }
+  const miss = {
+    subject_text: subject,
+    predicate,
+    object_text: null,
+    extracted: false,
+    unchanged: false,
+  };
+  if (nextStatement === '') return miss;
+
+  // 前缀边界优先取「旧 statement 中旧 object_text 之前的部分」：旧值是抽取出来的，
+  // 它出现的位置正好划出「主体 + 关系」与「值」的边界（「下周四去杭州出差」的
+  // object_text 是「杭州出差」，边界就是「下周四去」）。旧 object 缺失时依次
+  // 回退到 subject 与 predicate（memory_write 模板词，如「记住」）。
+  const oldObject = trimExtractionEdges(oldFact?.object_text ?? '');
+  const boundaries = [];
+  if (oldObject !== '') {
+    const at = oldStatement.indexOf(oldObject);
+    if (at > 0) boundaries.push(trimExtractionEdges(oldStatement.slice(0, at)));
+  }
+  if (subject !== '') boundaries.push(trimExtractionEdges(subject));
+  if (predicate !== '') boundaries.push(trimExtractionEdges(predicate));
+  const usable = boundaries
+    .filter((prefix) => prefix !== ''
+      && prefix.length < nextStatement.length
+      && nextStatement.startsWith(prefix))
+    .sort((left, right) => right.length - left.length);
+  // 没有任何可复用前缀（换成了完全无关的说法），说明抽不出值。
+  if (usable.length === 0) return miss;
+  const objectText = trimExtractionEdges(nextStatement.slice(usable[0].length));
+  if (objectText === '') return miss;
+  return { subject_text: subject, predicate, object_text: objectText, extracted: true, unchanged: false };
+}
+
+/**
  * 编辑一条长期记忆：新内容以新 id 生效，旧条 superseded_by 指向新条。
  *
  * @param {{store: Store, scope?: string, id: string, statement: string,
@@ -3653,6 +3747,8 @@ export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date
   const nowMs = toMillis(now);
   const atSeconds = Math.floor(nowMs / 1000);
   const nextStatement = statement.trim();
+  // V3-M4：按新 statement 重抽内容字段，避免旧 object_text 继续参与检索与治理。
+  const fields = reextractFactFields(confidence, nextStatement);
   const markSensitive = confidence.sensitive === 1 || isSensitiveText(nextStatement);
   let newId = null;
   try {
@@ -3661,9 +3757,9 @@ export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date
         scope,
         kind: confidence.kind,
         subject_id: confidence.subject_id,
-        subject_text: confidence.subject_text,
-        predicate: confidence.predicate,
-        object_text: confidence.object_text,
+        subject_text: fields.subject_text,
+        predicate: fields.predicate,
+        object_text: fields.object_text,
         statement: nextStatement,
         source_kind: confidence.source_kind,
         source_episode_id: confidence.source_episode_id,
@@ -3686,6 +3782,8 @@ export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date
       if (markSensitive) {
         ensureSensitiveColumn(store);
         store.db.prepare('UPDATE facts SET sensitive = 1 WHERE id = ?').run(newId);
+        // 重建（而不是只删 FTS）：sensitive 列出现后向量投影也必须按新值重算并清掉。
+        store.updateFact(newId, {});
         deleteFactFtsRow(store, newId);
       }
       appendEventWithAction(store, {
@@ -3695,7 +3793,13 @@ export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date
         actor: 'user',
         reason: 'memory_update',
         at: nowMs,
-        detail: { from: id, to: newId },
+        // V3-M4：审计里标出这是编辑，以及内容字段是否抽得出来（抽不出即 object_text=NULL）。
+        detail: {
+          from: id,
+          to: newId,
+          edited: true,
+          reextracted: fields.extracted,
+        },
       });
     });
   } catch (error) {
@@ -3705,7 +3809,13 @@ export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date
       message: error instanceof Error ? error.message : String(error),
     };
   }
-  return { ok: true, id: newId, supersededId: id };
+  return {
+    ok: true,
+    id: newId,
+    supersededId: id,
+    reextracted: fields.extracted,
+    objectText: fields.object_text,
+  };
 }
 
 /**
