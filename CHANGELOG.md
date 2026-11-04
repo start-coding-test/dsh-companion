@@ -2,6 +2,21 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.3.2] - 2026-11-04
+
+v0.3.1 评审的 N-H1 / N-M1 / N-M2 修复。无配置键变更、无 schema 变更（仍为 v5），升级不需要迁移。
+
+### Fixed
+
+- **N-H1 水位重锚**：外部压缩（平台自动压缩、用户 `/compact`、pending 过期后再次压缩）会让原水位 seq 从 surface 消失，此前 `stale-watermark` 只记 debug 日志后永久跳过巩固。现在 pre-step / 调度 / 深睡在选区前调用 `ensureWatermark`：优先取「不在上一版 surface 里的最小 seq」（替换节点之后），seq 重映射时取当前首节点，无历史时锚点 0 整段重来；锚点写入 `schema_meta` 的 `watermark_anchor:<scope>`，巩固或压缩成功后清除；`/状态` 增加「水位重锚」计数，warn 日志带 scope/anchor/mode。
+- **N-M1 按 scope 的待压缩槽**：`pendingCompact` 由单槽改为 `Map<scope, pending>`，主会话与线程互不覆盖；apply 启动时按 scope 恢复各自最新的 `written` nap 行。
+- **N-M2 共用执行槽**：`thread_run`（带 `goal` 时）与 `task_run` 共用 `createTaskRunner` 的同一个执行槽；槽忙时立即返回 `{ok:false, reason:"busy"}`，不再绕过串行槽并发创建第二个执行态。不带 `goal` 的线程创建/复用不占槽。
+
+### Changed
+
+- **测试**：546 → 551 个用例（新增 `test/pending-compact.test.js` 3 个、`test/tools.test.js` 共享槽 1 个、`test/e2e/external-compaction.test.js` 1 个），三种时区全绿。
+- **文档**：README 增补外部压缩重锚、按 scope 待压缩槽、单执行槽三条行为说明；版本与用例数更新为 0.3.2 / 551。
+
 ## [0.3.1] - 2026-11-04
 
 P2 复审遗留 L1–L3 修复（复审见 `docs/review-v4.md`）。无配置键变更、无 schema 变更（仍为 v5），升级不需要迁移。

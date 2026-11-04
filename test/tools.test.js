@@ -238,6 +238,37 @@ test('thread_run：复用归档线程会调用 unarchiveSession 并继续投递'
   }
 });
 
+test('thread_run 与 task_run 共用执行槽（N-M2）', async () => {
+  const harness = makeHarness();
+  let releaseIdle;
+  const idle = new Promise((resolve) => {
+    releaseIdle = resolve;
+  });
+  harness.platform.whenIdle = () => idle;
+  let first;
+
+  try {
+    first = await harness.byName.thread_run.execute({
+      key: 'new', name: '占槽线程', goal: '查一下预算',
+    });
+    assert.equal(first.ok, true);
+
+    const second = await harness.byName.thread_run.execute({
+      key: 'new', name: '第二个线程', goal: '查一下预算',
+    });
+    assert.deepEqual([second.ok, second.reason], [false, 'busy'], '执行槽被占时应立即 busy');
+    assert.equal(harness.platform.sessions.length, 1, 'busy 时不应创建会话');
+  } finally {
+    releaseIdle();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
+  const third = await harness.byName.thread_run.execute({
+    key: first.key, goal: '继续查预算',
+  });
+  assert.equal(third.ok, true, 'whenIdle 之后槽应释放');
+});
+
 test('thread_run：活跃线程达上限时拒绝新建', async () => {
   const harness = makeHarness();
   try {

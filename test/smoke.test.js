@@ -4,8 +4,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-// 本卡只校验仓库骨架本身；插件入口 src/index.js 由后续卡片（T3）创建，
-// 因此这里直接读取 package.json，不 import src/index.js。
+// 本卡只校验仓库骨架本身；这里直接读取 package.json，不 import 插件入口。
 const here = dirname(fileURLToPath(import.meta.url));
 const pkg = JSON.parse(readFileSync(join(here, '..', 'package.json'), 'utf8'));
 
@@ -13,8 +12,8 @@ test('package.json name 为 dsh-companion', () => {
   assert.equal(pkg.name, 'dsh-companion');
 });
 
-test('package.json version 为 0.3.1', () => {
-  assert.equal(pkg.version, '0.3.1');
+test('package.json version 为 0.3.2', () => {
+  assert.equal(pkg.version, '0.3.2');
 });
 
 test('package.json 定义了 node --test 脚本', () => {

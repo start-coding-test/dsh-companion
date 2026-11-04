@@ -80,6 +80,13 @@ import { createProactive } from './runtime/proactive.js';
 import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
 import { createTools } from './runtime/tools.js';
 import {
+  createPendingCompacts,
+  peekPendingCompact,
+  recoverPendingCompacts,
+  setPendingCompact,
+  takePendingCompact,
+} from './state/pending-compact.js';
+import {
   createSurfaceIndex,
   planRegion,
   surfaceSeqs,
@@ -205,8 +212,8 @@ export function apply(ctx, rawConfig) {
     if (restarted !== null) {
       platform.log('info', '[dsh-companion] state board published on restart', { revision: restarted });
     }
-    state.pendingCompact = recoverPendingCompact(store, SCOPE);
-    state.watermarkSeq = Number(store.getWatermark(SCOPE)) || 0;
+    state.pendingCompact = recoverPendingCompacts(store);
+    state.watermarkSeq = initialWatermark(store, SCOPE);
     state.watermarkByScope.set(SCOPE, state.watermarkSeq);
     // H1：surface 索引。优先用 session/event 增量维护；宿主没有该事件时靠
     // readSurface 冷启动回填（每次 O(整段 log)，只在缺失时触发）。
@@ -315,6 +322,8 @@ function createWiringState({ host, platform, store, config, metrics }) {
     surfaceSnapshot: null,
     /** H3：每个 scope 最近一次 surface 快照；deep-sleep 用 main 的。 */
     surfaceSnapshotByScope: new Map(),
+    /** N-H1：每个 scope 上一版（外部压缩前）的 surface seq，用于识别替换节点。 */
+    prevSurfaceSeqsByScope: new Map(),
     /** 巩固水位：最近一次成功巩固的 surface seq；0 = 尚未巩固任何节点。 */
     watermarkSeq: 0,
     /** H3：每个 scope 各自的水位（切换 main/thread 时恢复）。 */
@@ -340,7 +349,8 @@ function createWiringState({ host, platform, store, config, metrics }) {
     lastHumanAt: null,
     tokens: 0,
     overCount: 0,
-    pendingCompact: null,
+    /** N-M1：每个 scope 一个待压缩槽，跨 scope 不再互相覆盖。 */
+    pendingCompact: createPendingCompacts(),
     /** M3：待执行的巩固任务（pre-step 只登记，不 await）。 */
     pendingConsolidation: null,
     /** M3：同一时刻只跑一个巩固任务。 */
@@ -477,8 +487,10 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
         if (!result.handled) {
           return { kind: 'error', text: `未识别的命令参数；用法：${alias.prefix} [参数]` };
         }
+        const reanchors = Number(metrics.snapshot?.().watermarkReanchors) || 0;
         const text = alias.name === 'status'
           ? `${result.reply}\n${formatChatStatus(state, platform.now())}`
+            + (reanchors > 0 ? `\n水位重锚：${reanchors} 次` : '')
           : result.reply;
         return { kind: 'success', text };
       },
@@ -588,6 +600,105 @@ function routeSession(state, payload) {
   return identity;
 }
 
+
+/** 水位重锚的持久化键前缀：外部压缩后旧 upto_seq 已失效，重启时要能恢复新锚点。 */
+const WATERMARK_ANCHOR_PREFIX = 'watermark_anchor:';
+
+/**
+ * 读持久化的水位锚点（N-H1）。
+ * @param {{getMeta: Function}} store
+ * @param {string} scope
+ * @returns {number|null}
+ */
+function readWatermarkAnchor(store, scope) {
+  try {
+    const raw = Number(store.getMeta(`${WATERMARK_ANCHOR_PREFIX}${scope}`));
+    return Number.isSafeInteger(raw) && raw > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 写/清水位锚点。写 0 表示清空（Store 没有 deleteMeta）。
+ * @param {{setMeta: Function}} store
+ * @param {string} scope
+ * @param {number|null} seq
+ */
+function writeWatermarkAnchor(store, scope, seq) {
+  try {
+    store.setMeta(`${WATERMARK_ANCHOR_PREFIX}${scope}`, String(seq ?? 0));
+  } catch {
+    // 锚点只是恢复优化；写失败最多重启后重锚一次。
+  }
+}
+
+/** 清掉锚点，回到「最新一条巩固行的 upto_seq」口径。 */
+function clearWatermarkAnchor(store, scope) {
+  writeWatermarkAnchor(store, scope, null);
+}
+
+/**
+ * 初始化水位：优先用外部压缩后的重锚值，否则用最新巩固行的 upto_seq。
+ * @param {{getWatermark: Function, getMeta: Function}} store
+ * @param {string} scope
+ * @returns {number}
+ */
+function initialWatermark(store, scope) {
+  const anchor = readWatermarkAnchor(store, scope);
+  if (anchor !== null) return anchor;
+  return Number(store.getWatermark(scope)) || 0;
+}
+
+/**
+ * N-H1：水位不在当前 surface 时重锚，避免巩固永久停摆。
+ *
+ * 平台压缩会把一段节点换成一个**追加在日志末尾的摘要节点**（seq 不在压缩前的
+ * surface 里）。因此：
+ * 1. 有上一版 surface seq 时，取「第一个不在旧集合里」的 seq 作为锚点——它是替换
+ *    节点，摘要是平台写的，不重复巩固，从它之后开始；
+ * 2. 旧集合里一个新 seq 都没有（seq 被重映射）→ 从当前 surface 第一个节点重来；
+ * 3. 没有上一版快照（冷启动即失效）→ 锚点归零，整段重来（宁可重抽一次，也不能静默断档）。
+ *
+ * @param {object} state
+ * @param {string} scope
+ * @param {{seqs?: number[]}|null|undefined} snapshot
+ * @returns {number} 可用的水位
+ */
+function ensureWatermark(state, scope, snapshot) {
+  const current = watermarkOf(state, scope);
+  if (!(current > 0)) return current;
+  const seqs = Array.isArray(snapshot?.seqs) ? snapshot.seqs : [];
+  if (seqs.length === 0 || seqs.includes(current)) return current;
+
+  const previous = state.prevSurfaceSeqsByScope?.get?.(scope) ?? null;
+  let anchor = 0;
+  let mode = 'no-history';
+  if (Array.isArray(previous) && previous.length > 0) {
+    const known = new Set(previous);
+    const fresh = seqs.filter((seq) => !known.has(seq));
+    if (fresh.length > 0) {
+      anchor = Math.min(...fresh);
+      mode = 'replacement';
+    } else {
+      anchor = seqs[0];
+      mode = 'remapped';
+    }
+  }
+
+  setWatermark(state, scope, anchor);
+  writeWatermarkAnchor(state.store, scope, anchor);
+  state.metrics.inc('watermarkReanchors');
+  state.platform.log('warn', '[dsh-companion] stale watermark re-anchored after external compaction', {
+    scope,
+    watermark: current,
+    anchor,
+    mode,
+    nodes: seqs.length,
+  });
+  return anchor;
+}
+
 /**
  * 读取/初始化某个 scope 的水位。
  * @param {object} state
@@ -597,7 +708,7 @@ function routeSession(state, payload) {
 function watermarkOf(state, scope) {
   if (!(state.watermarkByScope instanceof Map)) state.watermarkByScope = new Map();
   if (!state.watermarkByScope.has(scope)) {
-    state.watermarkByScope.set(scope, Number(state.store.getWatermark(scope)) || 0);
+    state.watermarkByScope.set(scope, initialWatermark(state.store, scope));
   }
   return Number(state.watermarkByScope.get(scope)) || 0;
 }
@@ -673,6 +784,9 @@ async function runPreStep(state, payload) {
 
   // H1：每步刷新 surface 快照（seq 列表 + 对齐的 token/文本索引）。
   await refreshSurface(state, payload, usage?.nodes ?? null);
+  // N-H1：平台自动压缩 / 用户 /compact 会让旧水位从 surface 消失；先重锚再谈巩固，
+  // 否则 planRegion 永远返回 stale-watermark，该 scope 静默停摆。
+  ensureWatermark(state, scope, state.surfaceSnapshotByScope.get(scope) ?? state.surfaceSnapshot);
 
   if (isNewTurn) {
     // 先补上一轮写库后未完成的两段式压缩（平台只允许 turn 内压缩）。
@@ -702,6 +816,11 @@ async function refreshSurface(state, payload, measuredNodes = null, options = {}
     });
     state.surfaceSnapshot = snapshot;
     if (typeof state.currentScope === 'string' && state.currentScope !== '') {
+      const previous = state.surfaceSnapshotByScope.get(state.currentScope);
+      if (previous !== null && previous !== undefined && Array.isArray(previous.seqs)
+        && previous.seqs.length > 0) {
+        state.prevSurfaceSeqsByScope.set(state.currentScope, previous.seqs.slice());
+      }
       state.surfaceSnapshotByScope.set(state.currentScope, snapshot);
     }
     return snapshot;
@@ -1029,7 +1148,7 @@ function scheduleConsolidation(state, payload, scope = SCOPE) {
   // N1：登记时就把当前选区的文本与边界固定下来，后台任务执行时仍会按
   // 最新水位重算；只有边界完全一致才复用这份文本，避免选区漂移。
   const { region } = planRegion(snapshot, {
-    afterSeq: watermarkOf(state, scope),
+    afterSeq: ensureWatermark(state, scope, snapshot),
     budgetTokens: config.retainTokens,
   });
   state.pendingConsolidation = {
@@ -1122,7 +1241,7 @@ async function executeConsolidationJob(state, job) {
   } else {
     const snapshot = job.snapshot;
     if (snapshot === null || snapshot === undefined) return;
-    const watermark = watermarkOf(state, job.scope);
+    const watermark = ensureWatermark(state, job.scope, snapshot);
     const { region, reason } = planRegion(snapshot, {
       afterSeq: watermark,
       budgetTokens: config.retainTokens,
@@ -1191,13 +1310,14 @@ async function executeConsolidationJob(state, job) {
     }
 
     const consolidation = findConsolidation(store, job.scope, Number(result.upto_seq));
-    state.pendingCompact = {
+    setPendingCompact(state.pendingCompact, {
       id: consolidation?.id ?? null,
       startSeq,
       endSeq,
       scope: job.scope,
-    };
+    });
     setWatermark(state, job.scope, endSeq);
+    clearWatermarkAnchor(state.store, job.scope);
     state.consolidationRetry = null;
     metrics.inc('consolidations');
     state.lastConsolidationResult = {
@@ -1406,17 +1526,13 @@ function maybeRetryConsolidation(state) {
  */
 async function maybeCompact(state, payload, scope = SCOPE) {
   const { platform, store } = state;
-  if (state.pendingCompact === null) return;
+  const pending = peekPendingCompact(state.pendingCompact, scope);
+  if (pending === null) return;
   if (!platform.capabilities.compaction) {
     platform.log('debug', '[dsh-companion] compaction unavailable; keeping pending_compact');
     return;
   }
 
-  const pending = state.pendingCompact;
-  if (pending.scope !== undefined && pending.scope !== scope) {
-    // 另一个作用域登记的待压缩区间：留给对应会话的 turn 头处理。
-    return;
-  }
   const snapshot = await refreshSurface(state, payload);
   if (snapshot === null) return;
   const seqs = snapshot.seqs;
@@ -1429,7 +1545,7 @@ async function maybeCompact(state, payload, scope = SCOPE) {
       endSeq: pending.endSeq,
       nodes: seqs.length,
     });
-    state.pendingCompact = null;
+    takePendingCompact(state.pendingCompact, scope);
     state.metrics.inc('compactionDrops');
     return;
   }
@@ -1453,7 +1569,8 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     });
     setWatermark(state, scope, watermark);
     if (pending.id) store.retargetConsolidation(pending.id, { uptoSeq: watermark });
-    state.pendingCompact = null;
+    takePendingCompact(state.pendingCompact, scope);
+    clearWatermarkAnchor(state.store, scope);
     const revision = publishBoard(store, scope, 'compact');
     platform.log('info', '[dsh-companion] compacted and published state board', {
       start,
@@ -1745,7 +1862,7 @@ async function deepConsolidate(state) {
     return { written: false, reason: 'no-surface' };
   }
   const { region, reason } = planRegion(snapshot, {
-    afterSeq: watermarkOf(state, SCOPE),
+    afterSeq: ensureWatermark(state, SCOPE, snapshot),
     budgetTokens: state.config.retainTokens,
   });
   if (region === null) return { written: false, reason };
@@ -1766,13 +1883,14 @@ async function deepConsolidate(state) {
     });
     if (result?.skipped) return { written: false, reason: 'skipped' };
     const row = findConsolidation(store, SCOPE, Number(result.upto_seq));
-    state.pendingCompact = {
+    setPendingCompact(state.pendingCompact, {
       id: row?.id ?? null,
       startSeq: region.startSeq,
       endSeq: region.endSeq,
       scope: SCOPE,
-    };
+    });
     setWatermark(state, SCOPE, region.endSeq);
+    clearWatermarkAnchor(state.store, SCOPE);
     state.metrics.inc('consolidations');
     return { written: true, upto_seq: result.upto_seq, facts: result.facts ?? 0 };
   } catch (error) {
@@ -2420,24 +2538,6 @@ async function freezeThreads(store, platform, config) {
 }
 
 // ---------------------------------------------------------------- 小工具
-
-/**
- * 重启后恢复未完成的两段式压缩（只认 nap：deep 行的 upto_seq 是审计水位）。
- * @param {Store} store
- * @param {string} scope
- * @returns {{id: string, startSeq: number, endSeq: number, scope: string}|null}
- */
-function recoverPendingCompact(store, scope) {
-  const row = store.db.prepare(
-    `SELECT id, upto_seq, turn_from, compaction_start_seq FROM consolidations
-      WHERE scope = ? AND status = 'written' AND kind = 'nap'
-      ORDER BY started_at DESC, rowid DESC LIMIT 1`,
-  ).get(scope);
-  if (!row) return null;
-  const endSeq = Number(row.upto_seq);
-  const startSeq = Number(row.compaction_start_seq ?? row.turn_from ?? endSeq);
-  return { id: row.id, startSeq, endSeq, scope };
-}
 
 /**
  * @param {Store} store

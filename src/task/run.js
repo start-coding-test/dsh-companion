@@ -225,12 +225,25 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
     }
   }
 
+  /**
+   * 非阻塞取槽（N-M2：thread_run 与 task_run 共用）。
+   * 槽忙时立即返回 false，不排队——thread_run 交给主会话回「排队中」。
+   * @returns {boolean}
+   */
+  function tryAcquire() {
+    if (active < maxExec) {
+      active += 1;
+      return true;
+    }
+    return false;
+  }
+
   /** 只读槽位统计（测试与诊断用）。 */
   function stats() {
     return { active, queued: waiting.length, finished, maxExec, maxQueue };
   }
 
-  return { runTask, stats };
+  return { runTask, stats, tryAcquire, release };
 }
 
 const defaultRunner = createTaskRunner();
@@ -246,6 +259,19 @@ export function runTask(options) {
 /** 单例槽位统计。 */
 export function taskRunnerStats() {
   return defaultRunner.stats();
+}
+
+/**
+ * N-M2：非阻塞取执行槽（thread_run 用）。
+ * @returns {boolean}
+ */
+export function tryAcquireExecSlot() {
+  return defaultRunner.tryAcquire();
+}
+
+/** N-M2：释放执行槽（thread_run 结束时调用）。 */
+export function releaseExecSlot() {
+  defaultRunner.release();
 }
 
 /**

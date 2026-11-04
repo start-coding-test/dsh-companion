@@ -12,7 +12,11 @@
  */
 
 import { forgetMemory } from '../memory/forget.js';
-import { runTask as runBackgroundTask } from '../task/run.js';
+import {
+  releaseExecSlot,
+  runTask as runBackgroundTask,
+  tryAcquireExecSlot,
+} from '../task/run.js';
 import { summarizeCost } from './commands.js';
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
 
@@ -24,6 +28,46 @@ const THREAD_STATUSES = new Set(['active', 'archived', 'retired']);
 
 /** 投递给线程/worker 的目标长度上限（按 Unicode 码点计，L 级）。 */
 const GOAL_MAX_CODEPOINTS = 2000;
+
+/**
+ * N-M2：thread_run 占槽后等线程空闲的上限；超时强制释放，避免槽位泄漏。
+ * 与 worker 硬超时 900s 对齐。
+ */
+const THREAD_SLOT_HOLD_MAX_MS = 900_000;
+
+/**
+ * 槽位保持到线程空闲：thread_run 已经把目标投递进去，真正的执行是线程会话；
+ * 只有等它 whenIdle 才算这次执行结束，否则 task_run 会与它并行成第二个执行态。
+ * whenIdle 不可用/抛错时立即释放（宁可弱保证，也不泄漏槽位）。
+ *
+ * @param {object} platform
+ * @param {string} sessionId
+ */
+function holdExecSlotUntilIdle(platform, sessionId) {
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    releaseExecSlot();
+  };
+  if (typeof platform?.whenIdle !== 'function') {
+    release();
+    return;
+  }
+  let timer = null;
+  try {
+    const idle = Promise.resolve(platform.whenIdle(sessionId));
+    timer = setTimeout(release, THREAD_SLOT_HOLD_MAX_MS);
+    if (typeof timer?.unref === 'function') timer.unref();
+    idle.then(
+      () => { if (timer) clearTimeout(timer); release(); },
+      () => { if (timer) clearTimeout(timer); release(); },
+    );
+  } catch {
+    if (timer) clearTimeout(timer);
+    release();
+  }
+}
 
 const SCOPE_SCHEMA = Object.freeze({ type: 'string', description: '作用域，默认 main' });
 const LIMIT_SCHEMA = Object.freeze({
@@ -350,101 +394,122 @@ export function createTools({
           return { ok: false, action: 'reject', key: plan.key ?? key, reason: plan.reason };
         }
 
-        const nowSec = Math.floor(nowMs() / 1000);
-        if (plan.action === 'reuse') {
-          let thread = store.getThread(plan.key);
-          if (!thread) {
-            return { ok: false, action: 'reuse', key: plan.key, reason: 'thread-row-missing' };
-          }
-          let reactivated = false;
-          if (thread.status !== 'active') {
-            if (typeof platform?.unarchiveSession !== 'function') {
-              return {
-                ok: false,
-                action: 'reuse',
-                key: plan.key,
-                reason: 'unarchive-unavailable',
-              };
+        const run = async () => {
+          const nowSec = Math.floor(nowMs() / 1000);
+          if (plan.action === 'reuse') {
+            let thread = store.getThread(plan.key);
+            if (!thread) {
+              return { ok: false, action: 'reuse', key: plan.key, reason: 'thread-row-missing' };
             }
-            await platform.unarchiveSession(thread.session_id);
-            thread = store.upsertThread({
-              ...thread,
-              status: 'active',
-              last_progress: goal ?? thread.last_progress,
-              last_active_at: nowSec,
-            });
-            reactivated = true;
+            let reactivated = false;
+            if (thread.status !== 'active') {
+              if (typeof platform?.unarchiveSession !== 'function') {
+                return {
+                  ok: false,
+                  action: 'reuse',
+                  key: plan.key,
+                  reason: 'unarchive-unavailable',
+                };
+              }
+              await platform.unarchiveSession(thread.session_id);
+              thread = store.upsertThread({
+                ...thread,
+                status: 'active',
+                last_progress: goal ?? thread.last_progress,
+                last_active_at: nowSec,
+              });
+              reactivated = true;
+            }
+            let prompted = false;
+            if (goal !== undefined) {
+              if (typeof platform?.prompt !== 'function') {
+                return {
+                  ok: false,
+                  action: 'reuse',
+                  key: plan.key,
+                  reason: 'prompt-unavailable',
+                };
+              }
+              await platform.prompt({
+                sessionId: thread.session_id,
+                content: [{ type: 'text', text: goal }],
+              });
+              store.upsertThread({ ...thread, last_progress: goal, last_active_at: nowSec });
+              prompted = true;
+            }
+            return {
+              ok: true,
+              action: 'reuse',
+              key: plan.key,
+              sessionId: thread.session_id,
+              reactivated,
+              prompted,
+            };
           }
+  
+          if (typeof platform?.createSession !== 'function') {
+            return { ok: false, action: 'create', key: plan.key, reason: 'session-unavailable' };
+          }
+          const targetCwd = optionalString(args.cwd, 'thread_run', 'cwd') ?? defaultCwd;
+          if (targetCwd === undefined) {
+            // cwd 必须由接线层从宿主注入；不读 process.cwd()（L3）。
+            return { ok: false, action: 'create', key: plan.key, reason: 'cwd-unavailable' };
+          }
+          const created = await platform.createSession({
+            cwd: targetCwd,
+            agentPreset: 'companion-thread',
+          });
+          const sessionId = sessionIdOf(created);
+          if (sessionId === null) {
+            throw new Error('[tools] thread_run: createSession() returned no session id');
+          }
+  
+          const thread = store.upsertThread({
+            key: plan.key,
+            name: name ?? plan.key,
+            session_id: sessionId,
+            description: goal ?? `线程：${plan.key}`,
+            last_progress: goal ?? null,
+            last_active_at: nowSec,
+            status: 'active',
+          });
+  
           let prompted = false;
           if (goal !== undefined) {
-            if (typeof platform?.prompt !== 'function') {
-              return {
-                ok: false,
-                action: 'reuse',
-                key: plan.key,
-                reason: 'prompt-unavailable',
-              };
-            }
             await platform.prompt({
-              sessionId: thread.session_id,
+              sessionId,
               content: [{ type: 'text', text: goal }],
             });
-            store.upsertThread({ ...thread, last_progress: goal, last_active_at: nowSec });
             prompted = true;
           }
           return {
             ok: true,
-            action: 'reuse',
+            action: 'create',
             key: plan.key,
-            sessionId: thread.session_id,
-            reactivated,
-            prompted,
-          };
-        }
-
-        if (typeof platform?.createSession !== 'function') {
-          return { ok: false, action: 'create', key: plan.key, reason: 'session-unavailable' };
-        }
-        const targetCwd = optionalString(args.cwd, 'thread_run', 'cwd') ?? defaultCwd;
-        if (targetCwd === undefined) {
-          // cwd 必须由接线层从宿主注入；不读 process.cwd()（L3）。
-          return { ok: false, action: 'create', key: plan.key, reason: 'cwd-unavailable' };
-        }
-        const created = await platform.createSession({
-          cwd: targetCwd,
-          agentPreset: 'companion-thread',
-        });
-        const sessionId = sessionIdOf(created);
-        if (sessionId === null) {
-          throw new Error('[tools] thread_run: createSession() returned no session id');
-        }
-
-        const thread = store.upsertThread({
-          key: plan.key,
-          name: name ?? plan.key,
-          session_id: sessionId,
-          description: goal ?? `线程：${plan.key}`,
-          last_progress: goal ?? null,
-          last_active_at: nowSec,
-          status: 'active',
-        });
-
-        let prompted = false;
-        if (goal !== undefined) {
-          await platform.prompt({
             sessionId,
-            content: [{ type: 'text', text: goal }],
-          });
-          prompted = true;
-        }
-        return {
-          ok: true,
-          action: 'create',
-          key: plan.key,
-          sessionId,
-          prompted,
-          thread,
+            prompted,
+            thread,
+          };
         };
+
+        // N-M2：thread_run 会真正驱动一个会话执行，必须与 task_run 共用执行槽；
+        // 没有 goal 只是复用/新建线程行，不占槽。
+        if (goal === undefined) return run();
+        if (!tryAcquireExecSlot()) {
+          return { ok: false, action: plan.action, key: plan.key, reason: 'busy' };
+        }
+        let handedOff = false;
+        try {
+          const result = await run();
+          if (result?.ok === true && result.prompted === true
+            && typeof result.sessionId === 'string' && result.sessionId !== '') {
+            handedOff = true;
+            holdExecSlotUntilIdle(platform, result.sessionId);
+          }
+          return result;
+        } finally {
+          if (!handedOff) releaseExecSlot();
+        }
       },
     },
 
