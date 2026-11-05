@@ -136,6 +136,17 @@ DSH 会把 `name` 转成 `file://` URL 再动态 import：绝对路径按 `pathT
 
 token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置，v0.4.2 新增 `vector.backfillTimeoutMs` 并把 `backfillBatchSize` 默认降到 8；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。v0.4.4 起新增非枚举的 `recall.*` 与 `session.mainBinding`，同样不参与 16 键安装自检。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
 
+**宿主压缩能力（compaction-basic）**：插件通过宿主的 `compaction.compactRegion` 服务压缩上下文，压缩后由水位重锚接管。DSH web-app 默认把 `compaction-basic` 设为 `disabled: true`，插件拿不到该能力，`/状态` 会显示「压缩：宿主未开启（compaction-basic 未启用）」：巩固照常写库，但 `pending_compact` 只保留区间，surface 不会真正缩小。云端已验证的开启写法（写进 `cordis.patch.yml`，不是本插件的 config）：
+
+```yaml
+- id: compaction-basic
+  disabled: false
+  config:
+    auto: false
+```
+
+`auto: false` 表示宿主不再每轮自动压缩，只由插件在空闲边界（`idleMs`，默认 30 分钟）调用 `compactRegion`，避免与巩固抢时机。开启后 `/状态` 显示「压缩：宿主已开启（compaction-basic 已启用）」，有待压缩区间时附「，待压缩 N 个区间」。
+
 **主会话绑定（v0.4.4）**：默认 `session.mainBinding: 'latest-user'`——只有当**线程外**会话出现真实用户输入时才把 `main_session_id` 重绑到该会话，并记一条 info 日志（旧/新 id）；runtime-context、召回注入与中文命令提示都不算用户输入，不会触发重绑。`'first'` 保持原主会话不变。提醒投递到当前主会话，`/状态` 会显示「主会话：<id>（绑定 <mode>）」。
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。

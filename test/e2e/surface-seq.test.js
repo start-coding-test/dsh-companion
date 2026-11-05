@@ -211,15 +211,15 @@ test('正文不可得时降级跳过，不写半截 episode', async () => {
   const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
   try {
     await preStep(ctx, session, 1, '新的一轮。');
-    const debug = await waitFor(
+    const warn = await waitFor(
       () => ctx.logs.find((entry) => /surface text incomplete/u.test(entry.message)),
       { label: 'surface text incomplete log' },
     );
     assert.equal(streams.length, 0, '正文缺失时不应调用巩固模型');
     const count = temp.store.db.prepare("SELECT COUNT(*) AS n FROM consolidations WHERE kind = 'nap'").get();
     assert.equal(Number(count.n), 0);
-    assert.ok(debug, '应 debug 说明跳过原因');
-    assert.equal(debug.level, 'debug');
+    assert.ok(warn, '应 warn 说明跳过原因');
+    assert.equal(warn.level, 'warn', 'web 宿主只看 info+，跳过原因必须是 warn');
   } finally {
     handle.dispose();
     temp.cleanup();

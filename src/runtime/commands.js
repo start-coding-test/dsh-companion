@@ -32,6 +32,13 @@ const MEMORY_COMMANDS = new Set(['记忆', '成本', '线程', '状态']);
 const MAX_FORGET = 5;
 const RSS_LEVEL_NAMES = Object.freeze(['ok', 'warn', 'stop_dispatch', 'main_only']);
 
+/** C5-L1：/线程 与 /状态 共用的「宿主没有线程能力」提示。 */
+const THREADS_UNSUPPORTED_TEXT = '线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）';
+
+/** C5-M1：/状态 的压缩开关文案；undefined 表示调用方未提供能力位（不显示）。 */
+const COMPACTION_DISABLED_TEXT = '压缩：宿主未开启（compaction-basic 未启用）';
+const COMPACTION_ENABLED_TEXT = '压缩：宿主已开启（compaction-basic 已启用）';
+
 /** V3-L3：宿主只注册 ASCII 命令名，给误输入中文命令的用户一句固定提示。 */
 export const CHINESE_COMMAND_HINT = '请用 /memory、/status、/cost、/threads';
 
@@ -102,6 +109,9 @@ export function commandHintMessage(text) {
  *   （即线程/任务工具是否已注册）；false 时 /状态 明确显示「线程：宿主不支持」
  * @param {{id?: string|null, binding?: string}} [options.mainSession] V3-M2：
  *   当前主会话 id 与绑定模式（latest-user / first），/状态 展示用
+ * @param {boolean} [options.compactionSupported] C5-M1：宿主是否提供
+ *   compaction.compactRegion（compaction-basic）；false 时 /状态 明确提示
+ * @param {number} [options.pendingCompactions] C5-M1：待压缩区间数（仅展示用）
  * @returns {{handled: boolean, reply: string}}
  */
 export function handleCommand({
@@ -114,6 +124,8 @@ export function handleCommand({
   budget,
   threadsSupported,
   mainSession,
+  compactionSupported,
+  pendingCompactions,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -140,11 +152,18 @@ export function handleCommand({
     return { handled: true, reply: formatCost(summary, budget) };
   }
   if (command === '线程') {
+    // C5-L1：宿主没有线程能力时与 /状态 用同一句提示，不返回空目录、不抛错。
+    if (threadsSupported === false) return { handled: true, reply: THREADS_UNSUPPORTED_TEXT };
     return { handled: true, reply: formatThreads(store.listThreads({ limit: 100 }), timeZone) };
   }
   return {
     handled: true,
-    reply: formatStatus(store, scope, metrics, timeZone, budget, { threadsSupported, mainSession }),
+    reply: formatStatus(store, scope, metrics, timeZone, budget, {
+      threadsSupported,
+      mainSession,
+      compactionSupported,
+      pendingCompactions,
+    }),
   };
 }
 
@@ -517,7 +536,16 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // H3②：宿主没有 sessionController 时不注册线程/任务工具，状态里说清楚，
   // 免得用户以为 /线程 为空是数据问题。
   if (options.threadsSupported === false) {
-    lines.push('线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）');
+    lines.push(THREADS_UNSUPPORTED_TEXT);
+  }
+  // C5-M1：web-app 默认不启用 compaction-basic（disabled:true），插件只能靠
+  // 宿主 compactRegion 压缩；能力位为 false 时说明原因与开关，避免「占内存」误判。
+  if (options.compactionSupported === false) {
+    lines.push(COMPACTION_DISABLED_TEXT);
+  } else if (options.compactionSupported === true) {
+    const pending = Number(options.pendingCompactions);
+    const suffix = Number.isFinite(pending) && pending > 0 ? `，待压缩 ${pending} 个区间` : '';
+    lines.push(`${COMPACTION_ENABLED_TEXT}${suffix}`);
   }
   // V3-M2：主会话绑定对排障关键（提醒投错会话时先看这里）。
   const mainSession = options.mainSession;

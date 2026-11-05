@@ -59,3 +59,20 @@ dbPath: "./.data/companion.db"
 rssWarnGiB: 2.95
 rssStopGiB: 3
 rssMainOnlyGiB: 3.15
+
+# ── 宿主压缩服务（compaction-basic）────────────────────────────────
+# 下面不是本插件的配置键，而是 cordis.patch.yml 里 compaction-basic 的写法；
+# 不要写进 config.yml。
+#
+# DSH web-app 默认 disabled: true，插件拿不到 compactRegion 能力，/状态 会显示
+# 「压缩：宿主未开启（compaction-basic 未启用）」。云端已验证的开启写法：
+#
+#   - id: compaction-basic
+#     disabled: false
+#     config:
+#       auto: false
+#
+# auto: false 表示宿主不每轮自动压缩，只在插件空闲边界（idleMs，默认 30 分钟）
+# 由插件调用 compactRegion，避免与巩固/水位重锚抢时机。开启后 /状态 显示
+# 「压缩：宿主已开启（compaction-basic 已启用）」，有待压缩区间时附数量。
+

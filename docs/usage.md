@@ -118,7 +118,7 @@ rent | active | 租房 | 2026-11-03
 health | archived | 体检 | 2026-10-20
 ```
 
-没有线程时返回 `线程目录：暂无。`。
+没有线程时返回 `线程目录：暂无。`；宿主没有 `sessionController` 时不返回空目录，而是与 `/状态` 一致返回 `线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）`。
 
 ### `/状态`
 
@@ -443,6 +443,25 @@ node scripts/bench-vector.mjs --dim 256 --json
 ```
 
 schema v9 对向量表本身没有新改动：v0.3.0（schema 5）新建 `fact_vectors`；v0.4.0 的 v6 迁移给 `fact_vectors` 增加 `embedder_id` 并把旧行标成 `hash:<dim>`，hash 在下次写入 / 编辑 / 强化时重建，local/remote 的缺失向量由 idle-probe 每批 ≤ `vector.backfillBatchSize`（默认 8）回填、回填推理用 `vector.backfillTimeoutMs`（默认 30s），期间开启向量只是暂时召回不到它们，不会报错。v6→v7 给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind` 三列（旧行 NULL）；v7→v8 增加 `same_context`；v8→v9 增加 `first_used_at` / `first_used_tier` / `used_same_context`，用于 S0 标定（见 [s0-calibration.md](s0-calibration.md)）。
+
+### 宿主压缩开关（compaction-basic，v0.4.6）
+
+插件通过宿主的 `compaction.compactRegion` 服务真正压缩 surface，压缩后按[外部压缩与水位重锚](#外部压缩与水位重锚v040)重锚水位。DSH web-app 默认把 `compaction-basic` 设为 `disabled: true`，此时 `/状态` 显示：
+
+```text
+压缩：宿主未开启（compaction-basic 未启用）
+```
+
+巩固与写库照常进行，`pending_compact` 只保留待压缩区间，不会真的缩小上下文。云端已验证的开启写法（写在 `cordis.patch.yml` 的插件列表里，不是本插件的 `config.yml`）：
+
+```yaml
+- id: compaction-basic
+  disabled: false
+  config:
+    auto: false
+```
+
+`auto: false` 表示宿主不在每轮自动压缩，只让插件在空闲边界（`idleMs`，默认 30 分钟）调用 `compactRegion`，避免与巩固抢时机。开启后 `/状态` 显示「压缩：宿主已开启（compaction-basic 已启用）」，有待压缩区间时附「，待压缩 N 个区间」。
 
 ### 外部压缩与水位重锚（v0.4.0）
 

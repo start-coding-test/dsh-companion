@@ -586,7 +586,10 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     llmRoutePromise: null,
     llmRouteLastAttemptAt: null,
     lastNoModelFailureAt: null,
-    warnedNoLlm: false,
+    /** C5-M2：同一 skip 原因只 warn 一次；巩固真正继续时清空。 */
+    skipWarnReason: null,
+    /** C5-M2：同一投递失败原因只 warn 一次；恢复成功后清空。 */
+    deliveryWarnReason: null,
     /** P1-b：闲聊模型单独解析/缓存，不复用巩固模型（提示词与输出都不同）。 */
     chatLlm: null,
     chatLlmRoute: null,
@@ -701,6 +704,10 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
               id: currentMainSessionId(state),
               binding: mainBindingOf(config),
             },
+            // C5-M1：web-app 默认 compaction-basic disabled:true；能力位 false 时
+            // /状态 直接说明原因，并展示待压缩区间数（真开时）。
+            compactionSupported: platform.capabilities.compaction,
+            pendingCompactions: state.pendingCompact.size,
           });
         } catch (error) {
           return {
@@ -1908,6 +1915,13 @@ async function runConsolidationJob(state) {
   }
 }
 
+/** C5-M2：跳过原因只在变化时告警，避免每 tick 刷屏。 */
+function warnSkipOnce(state, reason, message, meta) {
+  if (state.skipWarnReason === reason) return;
+  state.skipWarnReason = reason;
+  state.platform.log('warn', message, { reason, ...meta });
+}
+
 /**
  * 真正执行一次巩固：水位判断 → 模型草稿 → 单事务写库，成功才登记 pending_compact。
  * @param {object} state
@@ -1955,7 +1969,8 @@ async function executeConsolidationJob(state, job) {
       return;
     }
     if (region.missing > 0) {
-      platform.log('debug', '[dsh-companion] consolidation skipped: surface text incomplete', {
+      // C5-M2：web 宿主只显示 info+，跳过原因用 warn；同一原因只在状态变化时打一次。
+      warnSkipOnce(state, 'surface-incomplete', '[dsh-companion] consolidation skipped: surface text incomplete', {
         missing: region.missing,
         count: region.count,
       });
@@ -1974,12 +1989,14 @@ async function executeConsolidationJob(state, job) {
 
   const llm = await resolveConsolidationLlm(state);
   if (typeof llm !== 'function') {
-    if (!state.warnedNoLlm) {
-      state.warnedNoLlm = true;
-      platform.log('debug', '[dsh-companion] consolidation model unavailable; skipping consolidation');
-    }
+    // C5-M2：跳过原因升到 warn，并按原因去重；/状态 的「无可用模型」不受影响。
+    warnSkipOnce(state, 'no-llm', '[dsh-companion] consolidation skipped: no model available', {
+      scope: job.scope,
+    });
     return;
   }
+  // 真正继续巩固即状态变化，下一次跳过可以再告警。
+  state.skipWarnReason = null;
 
   const at = Math.floor(platform.now() / 1000);
   try {
@@ -3052,6 +3069,7 @@ function startScheduler(state) {
       await runLightChat(state);
       const report = await proactive.flush();
       recordChatDelivery(state, report);
+      logDeliveryReport(state, report);
     },
     reminders: async () => {
       // 降级/熔断期间不把提醒标记 fired，恢复后仍可补投。
@@ -3061,6 +3079,7 @@ function startScheduler(state) {
       fireDueReminders(state);
       const report = await proactive.flush();
       recordChatDelivery(state, report);
+      logDeliveryReport(state, report);
     },
     'deep-sleep': async () => {
       await runDeepSleep(state);
@@ -3608,6 +3627,39 @@ function recordChatDelivery(state, report) {
     return 1;
   } catch {
     return 0;
+  }
+}
+
+/** 从 proactive.flush 的 report 里取可用于去重的失败原因。 */
+function describeDeliveryFailure(report) {
+  const error = report?.error;
+  if (error instanceof Error) return `${error.name}: ${error.message}`;
+  if (error !== null && error !== undefined) return String(error);
+  const failed = Number(report?.failed);
+  return Number.isFinite(failed) && failed > 0 ? `failed=${failed}` : null;
+}
+
+/**
+ * C5-M2：投递失败原因用 warn（web 宿主只显示 info+），同一原因只打一次；
+ * 一次成功 flush 视为状态恢复，清空去重键。/状态 的「最近失败」仍由事件表驱动。
+ */
+function logDeliveryReport(state, report) {
+  try {
+    const reason = describeDeliveryFailure(report);
+    if (reason === null) {
+      // 只有真正投出过消息才算恢复；另一条队列的空 flush 不能清掉去重键。
+      if (Number(report?.sent) > 0) state.deliveryWarnReason = null;
+      return;
+    }
+    if (state.deliveryWarnReason === reason) return;
+    state.deliveryWarnReason = reason;
+    state.platform.log('warn', '[dsh-companion] proactive delivery failed', {
+      reason,
+      failed: Number(report?.failed) || 0,
+      deferred: Number(report?.deferred) || 0,
+    });
+  } catch {
+    // 日志失败绝不能影响调度。
   }
 }
 
