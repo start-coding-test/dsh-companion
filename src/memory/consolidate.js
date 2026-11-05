@@ -161,6 +161,31 @@ function epochMs(value) {
   return num === null ? null : num;
 }
 
+/**
+ * 读取 memory_events detail 里的 duration_ms（V7-L2）。
+ *
+ * 兼容三种入参：detail 对象、detail_json 字符串、store.listEvents 返回的整行；
+ * 字段缺失、非数字或负数一律返回 null——旧行（v0.4.8 及更早）没有 duration_ms，
+ * 读取方不会因此报错。
+ * @param {unknown} value
+ * @returns {number|null} 非负整数毫秒；不可读返回 null
+ */
+export function eventDurationMs(value) {
+  let detail = value;
+  if (isPlainObject(detail) && 'detail_json' in detail) detail = detail.detail_json;
+  if (typeof detail === 'string') {
+    try {
+      detail = JSON.parse(detail);
+    } catch {
+      return null;
+    }
+  }
+  if (!isPlainObject(detail)) return null;
+  const duration = finiteNumber(detail.duration_ms);
+  if (duration === null || duration < 0) return null;
+  return Math.round(duration);
+}
+
 /** 草稿内时间字段 → Unix 秒；非法直接按 bad-draft 处理。 */
 function draftEpoch(value, field) {
   if (value === null || value === undefined) return null;
@@ -481,6 +506,8 @@ export function buildConsolidationPrompt(input = {}) {
  *   非空时优先于 transcript；调用方保证与 seqFrom/seqTo 对齐
  * @param {{role:string,text:string}[]} [input.transcript] 最近转录；选区缺失时兜底
  * @param {number|Date} [input.now] 巩固时刻（Unix 秒）；默认当前时间
+ * @param {() => number|Date} [input.clock] 毫秒时钟（V7-L2 duration_ms 计时）；
+ *   默认 Date.now；测试可注入假时钟，同一秒内也能区分耗时
  * @param {string} [input.trigger='idle'] 归因，写入 consolidations.trigger
  * @param {string} [input.sessionId] 归属会话；默认同 scope（main 即 'main'）
  * @param {string} [input.kind='nap'] 巩固类型（nap/deep/forget_flush）
@@ -490,7 +517,8 @@ export function buildConsolidationPrompt(input = {}) {
  *   index.js 已在 surface 层面选好窗口，传 false 以允许水位从射线外推进
  * @returns {Promise<{skipped: boolean, upto_seq: number, textSource: string,
  *                    episodeId?: string, facts?: number, kind?: string,
- *                    excluded?: number, sensitive?: number, notice?: string|null}>}
+ *                    excluded?: number, sensitive?: number, notice?: string|null,
+ *                    duration_ms?: number}>}
  */
 export async function consolidate(input = {}) {
   const { store, seqFrom, seqTo, llm } = input;
@@ -524,6 +552,17 @@ export async function consolidate(input = {}) {
   const at = requireNow(input.now ?? Math.floor(Date.now() / 1000));
   const trigger = nonEmptyString(input.trigger) ?? 'idle';
   const sessionId = nonEmptyString(input.sessionId) ?? scope;
+  // V7-L2：duration_ms 用注入的毫秒时钟计时，补足 started_at/finished_at 只到
+  // 秒、同一秒内多次巩固无法区分耗时的缺口。默认 Date.now，测试可注入假时钟。
+  const clock = input.clock === undefined ? Date.now : input.clock;
+  if (typeof clock !== 'function') {
+    throw new TypeError('[consolidate] clock must be a function returning epoch milliseconds');
+  }
+  const startedMs = epochMs(clock());
+  if (startedMs === null) {
+    throw new TypeError('[consolidate] clock must return epoch milliseconds');
+  }
+  let durationMs = 0;
 
   // 定向巩固（遗忘闭环）：先把目标事实的 statement 归一化成排除集，
   // 草稿里相同/包含/被包含的事实不写回。目标已 tombstone，getFact 仍可读。
@@ -689,6 +728,11 @@ export async function consolidate(input = {}) {
     }));
     stageBoard(store, scope, boardText);
 
+    // V7-L2：完成时刻用同一注入时钟；夹到非负整数毫秒。detail.kind 让
+    // consolidation 与 compaction 两类事件在 memory_events 里可区分。
+    const finishedMs = epochMs(clock());
+    durationMs = Math.max(0, Math.round((finishedMs ?? startedMs) - startedMs));
+
     store.appendEvent({
       at,
       action: 'ADD',
@@ -696,7 +740,13 @@ export async function consolidate(input = {}) {
       row_id: episodeRow.id,
       actor: 'consolidator',
       reason: trigger,
-      detail_json: { upto_seq: to, facts: insertedFacts, reminders: reminders.length },
+      detail_json: {
+        kind: 'consolidation',
+        upto_seq: to,
+        facts: insertedFacts,
+        reminders: reminders.length,
+        duration_ms: durationMs,
+      },
     });
 
     return { episodeId: episodeRow.id, facts: insertedFacts, sensitive: sensitiveCount };
@@ -713,5 +763,6 @@ export async function consolidate(input = {}) {
     excluded: excludedFacts,
     sensitive: written.sensitive,
     notice: written.sensitive > 0 ? CREDENTIAL_HINT : null,
+    duration_ms: durationMs,
   };
 }

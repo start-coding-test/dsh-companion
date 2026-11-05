@@ -336,7 +336,10 @@ test('memory_events：ADD/USED/PURGED 只留元数据，不落正文', async (t)
   assert.equal(add.actor, 'consolidator');
   assert.equal(add.row_id, written.episodeId);
   const addDetail = parseDetail(add.detail_json);
-  assert.deepEqual(Object.keys(addDetail).sort(), ['facts', 'reminders', 'upto_seq']);
+  // V7-L2：detail 额外带 kind 与毫秒 duration_ms，两者都只是元数据。
+  assert.deepEqual(Object.keys(addDetail).sort(), ['duration_ms', 'facts', 'kind', 'reminders', 'upto_seq']);
+  assert.equal(addDetail.kind, 'consolidation');
+  assert.ok(Number.isInteger(addDetail.duration_ms) && addDetail.duration_ms >= 0);
   assert.equal(addDetail.upto_seq, 9);
 
   // USED：真实调度器触发 job，审计只写 job 元数据。

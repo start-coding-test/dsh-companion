@@ -169,16 +169,17 @@ test('V15 正常路径：写库成功、水位推进、状态板只 staged 不�
   assert.match(board.staged_rendered, /V15 事务演练/);
   assert.equal(store.getBoard('main'), '');
 
-  // 审计事件：ADD episodes，detail 记录本次 upto_seq 与 facts 数。
+  // 审计事件：ADD episodes，detail 记录本次 upto_seq 与 facts 数（V7-L2 另有 kind/duration_ms）。
   const events = store.listEvents({ table_name: 'episodes', action: 'ADD' });
   assert.equal(events.length, 1);
   assert.equal(events[0].actor, 'consolidator');
   assert.equal(events[0].row_id, result.episodeId);
-  assert.deepEqual(JSON.parse(events[0].detail_json), {
-    upto_seq: SEQ_TO,
-    facts: 2,
-    reminders: 1,
-  });
+  const detail = JSON.parse(events[0].detail_json);
+  assert.equal(detail.upto_seq, SEQ_TO);
+  assert.equal(detail.facts, 2);
+  assert.equal(detail.reminders, 1);
+  assert.equal(detail.kind, 'consolidation');
+  assert.ok(Number.isInteger(detail.duration_ms) && detail.duration_ms >= 0);
 });
 
 // ------------------------------------------------------------ 失败路径

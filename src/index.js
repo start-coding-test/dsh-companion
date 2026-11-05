@@ -2102,6 +2102,8 @@ async function executeConsolidationJob(state, job) {
       transcript,
       llm,
       now: at,
+      // V7-L2：duration_ms 用平台毫秒时钟（测试注入的假时钟也可控）。
+      clock: platform.now,
       trigger: job.trigger,
       sessionId: job.sessionId,
       // 窗口已在 surface 层选好；水位推进允许跨过旧值。
@@ -2390,6 +2392,8 @@ async function maybeCompact(state, payload, scope = SCOPE) {
 
   const start = seqs[startIdx];
   const end = seqs[endIdx];
+  // V7-L2：压缩耗时用平台毫秒时钟单独计时；事件时间戳仍是秒级。
+  const startedMs = platform.now();
   try {
     await platform.compactRegion(start, end, payload?.agent);
     if (pending.id) {
@@ -2410,11 +2414,38 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     takePendingCompact(state.pendingCompact, scope);
     clearWatermarkAnchor(state.store, scope);
     const revision = publishBoard(store, scope, 'compact');
+
+    // V7-L2：压缩完成事件带毫秒耗时（detail.kind='compaction' 与巩固事件区分）。
+    // 审计写失败不影响已成功的压缩。
+    const durationMs = Math.max(0, Math.round(platform.now() - startedMs));
+    try {
+      store.appendEvent({
+        at: Math.floor(platform.now() / 1000),
+        action: 'UPDATE',
+        table_name: 'compactions',
+        row_id: pending.id ?? null,
+        actor: 'consolidator',
+        reason: 'compaction',
+        detail_json: {
+          kind: 'compaction',
+          start,
+          end,
+          watermark,
+          duration_ms: durationMs,
+        },
+      });
+    } catch (error) {
+      platform.log('warn', '[dsh-companion] compaction event write failed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+
     platform.log('info', '[dsh-companion] compacted and published state board', {
       start,
       end,
       watermark,
       revision,
+      durationMs,
     });
   } catch (error) {
     state.metrics.inc('compactionFailures');
@@ -3115,6 +3146,8 @@ async function deepConsolidate(state) {
       seqTo: region.endSeq,
       llm,
       now: Math.floor(platform.now() / 1000),
+      // V7-L2：同一平台毫秒时钟计 duration_ms。
+      clock: platform.now,
       trigger: 'deep-sleep',
       sessionId: SCOPE,
       guardWatermark: false,

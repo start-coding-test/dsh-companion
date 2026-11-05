@@ -66,6 +66,11 @@ const PLUGIN_CONSOLIDATION_TASK = [
   '这些数字在配置里都有默认值，安装自检要求顶层恰好十六个键。',
   '如果后续要调整巩固模型，只需要改 consolidation.model，不用动其他开关。',
 ].join('');
+/**
+ * V7-L1：round C 第二轮。同一会话续跑，让 pre-step 能计量到含首轮历史的 token；
+ * 单轮时 state.tokens 从 0 起算，巩固阈值永远触发不了。
+ */
+const PLUGIN_CONSOLIDATION_TASK2 = '继续：请复述上面记录里周三、周四各做了什么，再补一句周五要发布什么。回答尽量简短。';
 /** 真机崩溃原文（v0.4.3：裸内容块没有 source）。 */
 const PLUGIN_CRASH_RE = /reading ['"]kind['"]|Cannot read properties of undefined/u;
 
@@ -87,8 +92,10 @@ const HELP = `Gate 0 headless 探针采集器
                        B) 召回（V3-H1）：在门专用库里预置 1 条 fact 后发命中消息，
                           断言输出里没有 reading 'kind' 崩溃，且该 fact 的
                           first_reneed_at 非空（证明召回真的注入过）。
-                       C) 巩固（C5-H2）：换独立库与低阈值，灌入超过阈值的文本，
-                          断言 consolidations 至少 1 行；无模型凭据时标注 SKIP。
+                       C) 巩固（C5-H2）：换独立库与低阈值，用 --json 跑两轮
+                          同一会话（第二轮 --session-id 续跑），断言 scheduler
+                          已启动、tokenMeter 观测到非零 token、consolidations
+                          至少 1 行；无模型凭据时标注 SKIP（不算 PASS）。
                       无模型凭据时 agent loop 到不了 pre-step，round B 也标注 SKIP。
                       退出码 0=通过，1=未通过，2=找不到 DSH；完整 stdout/stderr
                       落盘到 .data/plugin-gate.log
@@ -483,7 +490,7 @@ function writeConsolidationPatch() {
     '        retainTokens: 1',
     '        compactAtTokens: 50',
     '        workingMemoryTokens: 100',
-    '        compactHardTokens: 200',
+    '        compactHardTokens: 120',
     '',
   ];
   writeFileSync(PLUGIN_CONSOLIDATION_PATCH, lines.join('\n'), 'utf8');
@@ -597,14 +604,15 @@ async function runPluginGate(options) {
     return 1;
   }
 
-  // ---------------- round C：灌入超过阈值的文本（C5-H2 巩固真机门） ----------------
+  // ---------------- round C：两轮同会话（V7-L1 巩固 / tokenMeter 真机门） ----------------
   const third = await runConsolidationRound(launch, env, options);
   process.stdout.write(
-    `plugin-gate: round C (consolidation) exit=${third.exitCode}${third.timedOut ? ' (timeout)' : ''} schedulerStarted=${third.started} didNotActivate=${third.inactive} consolidations=${third.count}${third.credentialsMissing ? ' credentials=missing' : ''}${third.error ? ` error=${third.error}` : ''}\n`,
+    `plugin-gate: round C (consolidation) turns=${third.turns} exit=${third.exitCode}${third.timedOut ? ' (timeout)' : ''} schedulerStarted=${third.started} didNotActivate=${third.inactive} consolidations=${third.count} tokenEvents=${third.tokenEvents} maxTokensIn=${third.maxTokensIn}${third.credentialsMissing ? ' credentials=missing' : ''}${third.sessionId ? ` session=${third.sessionId}` : ''}${third.error ? ` error=${third.error}` : ''} verdict=${third.verdict ?? 'n/a'}\n`,
   );
   logLines.push(
-    `round C task: ${PLUGIN_CONSOLIDATION_TASK}`,
-    `round C: exit=${third.exitCode}${third.timedOut ? ' (timeout)' : ''} schedulerStarted=${third.started} didNotActivate=${third.inactive} consolidations=${third.count} credentialsMissing=${third.credentialsMissing}${third.error ? ` error=${third.error}` : ''}`,
+    `round C task 1: ${PLUGIN_CONSOLIDATION_TASK}`,
+    `round C task 2: ${PLUGIN_CONSOLIDATION_TASK2}`,
+    `round C: turns=${third.turns} exit=${third.exitCode}${third.timedOut ? ' (timeout)' : ''} schedulerStarted=${third.started} didNotActivate=${third.inactive} consolidations=${third.count} tokenEvents=${third.tokenEvents} maxTokensIn=${third.maxTokensIn} credentialsMissing=${third.credentialsMissing}${third.sessionId ? ` session=${third.sessionId}` : ''} verdict=${third.verdict ?? 'n/a'} reason=${third.reason ?? ''}${third.error ? ` error=${third.error}` : ''}`,
     '--- round C stdout ---',
     redact(third.stdout ?? ''),
     '--- round C stderr ---',
@@ -613,24 +621,14 @@ async function runPluginGate(options) {
   mkdirSync(dirname(PLUGIN_LOG), { recursive: true });
   writeFileSync(PLUGIN_LOG, logLines.join('\n'));
 
-  if (third.error) {
-    process.stderr.write(`plugin-gate: FAIL (round C: ${third.error})\n`);
-    return 1;
-  }
-  if (third.inactive) {
-    process.stderr.write('plugin-gate: FAIL (round C: plugin did not activate)\n');
-    return 1;
-  }
-  if (third.count >= 1) {
-    process.stdout.write(`plugin-gate: round C PASS (consolidations=${third.count})\n`);
-  } else if (third.credentialsMissing) {
+  if (third.verdict === 'pass') {
+    process.stdout.write(`plugin-gate: round C PASS (${third.reason})\n`);
+  } else if (third.verdict === 'skip') {
     process.stdout.write(
-      'plugin-gate: round C SKIPPED (no model credentials; consolidation cannot run without a model)\n',
+      'plugin-gate: round C SKIPPED (no model credentials; two-turn consolidation cannot be asserted)\n',
     );
   } else {
-    process.stderr.write(
-      'plugin-gate: FAIL (round C: no consolidation row written despite over-threshold input)\n',
-    );
+    process.stderr.write(`plugin-gate: FAIL (round C: ${third.reason ?? third.error ?? 'unknown'})\n`);
     return 1;
   }
 
@@ -719,17 +717,127 @@ async function runRecallRound(launch, env, patch, options) {
 }
 
 /**
- * round C：灌入超过阈值的文本 → 断言 consolidations 至少一行（C5-H2）。
+ * 从 `dsh --json` 的 NDJSON stdout 里取 sessionId（type=session / final 都带）。
+ * @param {string} stdout
+ * @returns {string|null}
+ */
+export function parseSessionId(stdout) {
+  for (const line of String(stdout ?? '').split(/\r?\n/u)) {
+    const text = line.trim();
+    if (text === '' || text[0] !== '{') continue;
+    let event;
+    try {
+      event = JSON.parse(text);
+    } catch {
+      continue;
+    }
+    const id = typeof event?.sessionId === 'string'
+      ? event.sessionId
+      : (typeof event?.session?.id === 'string' ? event.session.id : null);
+    if (typeof id === 'string' && id !== '') return id;
+  }
+  return null;
+}
+
+/**
+ * 读 round C 门专用库的巩固证据：
+ * - count：status ∈ {written, compacted} 的巩固行数；
+ * - tokenEvents：memory_events 里 table_name='tokens' 的行数；
+ * - maxTokensIn：这些行 detail.tokensIn 的最大值（>0 即 tokenMeter 真的计量过）。
+ * @param {string} [dbPath]
+ * @returns {{count:number, tokenEvents:number, maxTokensIn:number}}
+ */
+export function readConsolidationEvidence(dbPath = PLUGIN_CONSOLIDATION_DB) {
+  const evidence = { count: 0, tokenEvents: 0, maxTokensIn: 0 };
+  if (!existsSync(dbPath)) return evidence;
+  const db = new DatabaseSync(dbPath, { readOnly: true });
+  try {
+    const row = db
+      .prepare("SELECT COUNT(*) AS n FROM consolidations WHERE status IN ('written', 'compacted')")
+      .get();
+    evidence.count = Number(row?.n ?? 0);
+    const rows = db.prepare("SELECT detail_json FROM memory_events WHERE table_name = 'tokens'").all();
+    for (const event of rows) {
+      evidence.tokenEvents += 1;
+      let detail = null;
+      try {
+        detail = JSON.parse(event?.detail_json ?? 'null');
+      } catch {
+        detail = null;
+      }
+      const tokensIn = Number(detail?.tokensIn) || 0;
+      if (tokensIn > evidence.maxTokensIn) evidence.maxTokensIn = tokensIn;
+    }
+  } finally {
+    db.close();
+  }
+  return evidence;
+}
+
+/**
+ * round C 判定（纯函数，便于用 fake 覆盖两条分支）：
+ * - 插件未激活 / 缺 scheduler 标记 / 崩溃 / error → fail（与凭据无关，必须报错）；
+ * - 无模型凭据 → skip（环境缺失，明确不算 PASS）；
+ * - 有凭据：tokenMeter 必须观测到非零 token、且 consolidations 至少一行 → pass，
+ *   否则 fail（有凭据时的真回归必须让发布门退出非 0）。
+ * @param {{error?: string|null, inactive?: boolean, started?: boolean, crash?: boolean,
+ *          credentialsMissing?: boolean, count?: number, maxTokensIn?: number,
+ *          tokenEvents?: number}} input
+ * @returns {{verdict: 'pass'|'skip'|'fail', reason: string}}
+ */
+export function evaluateConsolidationRound(input = {}) {
+  const {
+    error = null,
+    inactive = false,
+    started = false,
+    crash = false,
+    credentialsMissing = false,
+    count = 0,
+    maxTokensIn = 0,
+    tokenEvents = 0,
+  } = input ?? {};
+  if (error) return { verdict: 'fail', reason: `error: ${error}` };
+  if (inactive) return { verdict: 'fail', reason: 'plugin did not activate' };
+  if (!started) return { verdict: 'fail', reason: 'missing scheduler started marker' };
+  if (crash) return { verdict: 'fail', reason: "platform crashed reading message.source.kind" };
+  if (credentialsMissing) return { verdict: 'skip', reason: 'no model credentials' };
+  if (!(Number(maxTokensIn) > 0)) {
+    return { verdict: 'fail', reason: `tokenMeter reported no non-zero tokens (token events=${tokenEvents})` };
+  }
+  if (!(Number(count) >= 1)) {
+    return {
+      verdict: 'fail',
+      reason: 'no consolidation row written despite over-threshold two-turn input',
+    };
+  }
+  return { verdict: 'pass', reason: `consolidations=${count} maxTokensIn=${maxTokensIn}` };
+}
+
+/**
+ * round C（V7-L1）：同一会话跑两轮 → 断言 tokenMeter 有非零计量 + 巩固至少一行。
  *
- * 无模型凭据时 agent loop 不产生对话，巩固自然不会运行；此时只标注 SKIP，
- * 不把「环境缺失」误判成「功能失败」。有凭据而 0 行才是真失败。
+ * 第一轮 `--json` 拿 sessionId；第二轮 `--session-id` 续跑，pre-step 才能计量到
+ * 含首轮历史的 token（单轮时 state.tokens 从 0 起算，巩固阈值永不触发）。
+ * 无模型凭据时 agent loop 不产生对话，巩固自然不运行：此时只标注 SKIP，
+ * 不把「环境缺失」误判成「功能失败」；有凭据而断言失败必须返回非 0。
  *
  * @param {object} launch
  * @param {NodeJS.ProcessEnv} env
  * @param {object} options
+ * @param {{runHeadless?: Function, readEvidence?: Function, prepare?: Function}} [deps]
+ *   测试注入点；prepare 默认清库并写 overlay
  * @returns {Promise<object>}
  */
-async function runConsolidationRound(launch, env, options) {
+export async function runConsolidationRound(launch, env, options, deps = {}) {
+  const runHeadlessFn = deps.runHeadless ?? runHeadless;
+  const readEvidence = deps.readEvidence ?? readConsolidationEvidence;
+  const prepare = deps.prepare ?? (() => {
+    for (const suffix of ['', '-wal', '-shm']) {
+      const file = `${PLUGIN_CONSOLIDATION_DB}${suffix}`;
+      if (existsSync(file)) rmSync(file, { force: true });
+    }
+    return writeConsolidationPatch();
+  });
   const result = {
     exitCode: null,
     timedOut: false,
@@ -739,33 +847,66 @@ async function runConsolidationRound(launch, env, options) {
     inactive: false,
     crash: false,
     count: 0,
+    tokenEvents: 0,
+    maxTokensIn: 0,
+    turns: 0,
+    sessionId: null,
     credentialsMissing: false,
     error: null,
+    verdict: null,
+    reason: null,
+  };
+  /** 把一轮输出并入门级结果（started/inactive/crash 为 OR，日志按轮拼接）。 */
+  const accumulate = (run) => {
+    const summary = summarizePluginRun(run);
+    result.started = result.started || summary.started;
+    result.inactive = result.inactive || summary.inactive;
+    result.crash = result.crash || summary.crash;
+    result.exitCode = run.exitCode;
+    result.timedOut = result.timedOut || run.timedOut;
+    const turn = result.turns;
+    const out = String(run.stdout ?? '');
+    const err = String(run.stderr ?? '');
+    result.stdout = result.stdout === '' ? out : `${result.stdout}\n--- turn ${turn} stdout ---\n${out}`;
+    result.stderr = result.stderr === '' ? err : `${result.stderr}\n--- turn ${turn} stderr ---\n${err}`;
+    result.credentialsMissing = result.credentialsMissing
+      || /MISSING_CREDENTIAL|no API key/u.test(`${out}\n${err}`);
+  };
+  const applyEvidence = (evidence) => {
+    result.count = evidence?.count ?? 0;
+    result.tokenEvents = evidence?.tokenEvents ?? 0;
+    result.maxTokensIn = evidence?.maxTokensIn ?? 0;
   };
   try {
-    for (const suffix of ['', '-wal', '-shm']) {
-      const file = `${PLUGIN_CONSOLIDATION_DB}${suffix}`;
-      if (existsSync(file)) rmSync(file, { force: true });
-    }
-    const patch = writeConsolidationPatch();
-    const args = [...launch.prefixArgs, '--profile', 'headless', '--patch', patch, PLUGIN_CONSOLIDATION_TASK];
-    const run = await runHeadless(launch, env, args, options.timeoutMs);
-    Object.assign(result, summarizePluginRun(run), {
-      exitCode: run.exitCode,
-      timedOut: run.timedOut,
-      stdout: run.stdout,
-      stderr: run.stderr,
-    });
-    result.credentialsMissing = /MISSING_CREDENTIAL|no API key/u.test(`${run.stdout}\n${run.stderr}`);
-    if (existsSync(PLUGIN_CONSOLIDATION_DB)) {
-      const db = new DatabaseSync(PLUGIN_CONSOLIDATION_DB, { readOnly: true });
-      try {
-        const row = db.prepare("SELECT COUNT(*) AS n FROM consolidations WHERE status IN ('written', 'compacted')").get();
-        result.count = Number(row?.n ?? 0);
-      } finally {
-        db.close();
+    const patch = prepare();
+    // DSH CLI 解析顺序有要求：--patch 必须在 --json 之前，否则 JSON 运行模式的
+    // 参数解析器不认识 overlay 选项（实测 `unknown option '--patch'`）。
+    const baseArgs = [...launch.prefixArgs, '--profile', 'headless', '--patch', patch, '--json'];
+
+    result.turns = 1;
+    const first = await runHeadlessFn(launch, env, [...baseArgs, PLUGIN_CONSOLIDATION_TASK], options.timeoutMs);
+    accumulate(first);
+    result.sessionId = parseSessionId(first.stdout);
+    applyEvidence(readEvidence());
+
+    if (!result.credentialsMissing) {
+      if (result.sessionId === null) {
+        throw new Error('round C: first turn reported no session id to resume');
       }
+      result.turns = 2;
+      const second = await runHeadlessFn(
+        launch,
+        env,
+        [...baseArgs, '--session-id', result.sessionId, PLUGIN_CONSOLIDATION_TASK2],
+        options.timeoutMs,
+      );
+      accumulate(second);
+      applyEvidence(readEvidence());
     }
+
+    const verdict = evaluateConsolidationRound(result);
+    result.verdict = verdict.verdict;
+    result.reason = verdict.reason;
   } catch (error) {
     result.error = error instanceof Error ? error.message : String(error);
   }
@@ -893,11 +1034,16 @@ async function main() {
   return captured ? 0 : 1;
 }
 
-main()
-  .then((code) => {
-    process.exitCode = code;
-  })
-  .catch((error) => {
-    process.stderr.write(`probe: ${redact(error?.stack ?? error)}\n`);
-    process.exitCode = 2;
-  });
+const IS_MAIN = process.argv[1] !== undefined
+  && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (IS_MAIN) {
+  main()
+    .then((code) => {
+      process.exitCode = code;
+    })
+    .catch((error) => {
+      process.stderr.write(`probe: ${redact(error?.stack ?? error)}\n`);
+      process.exitCode = 2;
+    });
+}

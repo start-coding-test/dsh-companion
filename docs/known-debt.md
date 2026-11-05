@@ -127,6 +127,9 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 
 ## 5. 已关闭（本轮修复）
 
+- **V7-L1 发布门 round C 只跑单轮、tokenMeter=0**：v0.4.9 修复（与 V7-L2 同提交）。round C 改为同一会话两轮：第一轮 `--json` 取 `sessionId`，第二轮 `--session-id` 续跑（overlay 的 `compactHardTokens` 降到 120，两轮输入才过阈值）。判定要求 scheduler started 标记、tokenMeter 观测到非零 token（`tokens` 事件 `maxTokensIn > 0`）、`consolidations` 至少一行；无模型凭据时 SKIP（明确不算 PASS），有凭据而断言失败时发布门 exit 1。为可测试性导出 `parseSessionId` / `readConsolidationEvidence` / `evaluateConsolidationRound`，`runConsolidationRound` 接受 runner 与证据读取注入。
+- **V7-L2 巩固/压缩事件只有秒级 started_at/finished_at**：v0.4.9 修复（与 V7-L1 同提交）。巩固在 `consolidate({ clock })` 事务收尾用注入毫秒时钟算 `duration_ms`（生产传 `platform.now`），写进 episodes 事件 detail（`kind: 'consolidation'`）；压缩在 `compactRegion` 前后用 `platform.now()` 计时，成功后写 `memory_events`（`table_name: 'compactions'`、`action: 'UPDATE'`、`detail.kind: 'compaction'`）；新增 `eventDurationMs` 读取 helper，旧行没有该字段时返回 null（不影响读取）。
+
 - **S2-M1 `used` 升级锁死首次注入时间/档位/same_context**：v0.4.2 修复，commit `890f028`。新增 `first_used_at` / `first_used_tier` / `used_same_context`（schema v9），用上那一刻写入并按 `observed_at` 重新判定 same_context；「首次」指首次非 same_context 用上，same_context 的 used 可被后续非 same_context used 覆盖一次，reverse 不覆盖；`first_reneed_*` 保留为 recall 对照样本。SQL 与口径见 [s0-calibration.md](s0-calibration.md)。
 - **E2-M1 回填共用 300ms 超时且推理/加载叠加**：v0.4.2 修复，commit `a99de84`。回填独立 `vector.backfillTimeoutMs`（默认 30s）、`backfillBatchSize` 默认 8；推理单飞，超时批次未结束前不再起新批；查询遇忙立即回退 FTS；加载单飞复用同一 promise。真机参数校准仍见 D-4（未关闭）。
 - **L2-1 same_context / Δt 以 `created_at` 计时**：v0.4.2 修复，commit `890f028`。same_context 判定与 Δt 统一从 `observed_at`（原话时间）起算，取不到时按 episode 时间回退，代码注释与 SQL 同步说明。
