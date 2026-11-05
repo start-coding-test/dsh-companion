@@ -45,33 +45,33 @@ export const CREDENTIAL_HINT = '这类信息建议放环境变量或文件里，
  *
  * V9-L1（v0.4.10）收窄误报：
  * - 去掉裸 `\btoken\b`：「用户这个月 token 额度约 10B」不再判敏感；token 仍由
- *   「字段名 + 值」形式兜底（`token 是 abc123`、`API token：sk-xxxxxx` 仍命中）；
+ *   「字段名 + 值」形式兜底（`token 是 abc***`、`API token：sk-******` 仍命中）；
  * - 去掉裸 `银行卡|信用卡`：「用户的银行卡在招行」这类纯提及不再判敏感；
  *   卡号本身改由 CARD_NUMBER_PATTERN 按「12 位以上数字（允许空格/连字符分隔）」
  *   拦，卡号字段名（`卡号`/`card number`）只在后面跟数字时命中。
  *
- * V9-L2（v0.4.10）补漏：新增 `口令` 强词（「路由器口令是蓝鲸-7788」），
+ * V9-L2（v0.4.10）补漏：新增 `口令` 强词（「路由器口令是蓝鲸-****」），
  * 设备/网络的「名词 + 是/为/:/= + 含数字或符号的值」形态见 DEVICE_VALUE_PATTERN
- * （「WiFi 是 蓝鲸-7788」）。
+ * （「WiFi 是 蓝鲸-****」）。
  */
 const SENSITIVE_PATTERN = /身份证|住址|密码(?!学)|口令|passw(?:or)?d|验证码|verification\s*code|\bCVC\b|\bCVV\b|私钥|密钥|卡号\s*(?:是|为|:|：|=)?\s*\d|card\s*number\s*(?:is|是|:|：|=)?\s*\d|api[\s_-]?key|\baccess[\s_-]?token\b|令牌|\bsk-[A-Za-z0-9]{6,}/iu;
 
 /**
- * V7-M3：「字段名 + 值」形式（`key 是 abc123`、`secret: hunter2`、`pwd=1234`）。
+ * V7-M3：「字段名 + 值」形式（`key 是 abc***`、`secret: hun***`、`pwd=12**`）。
  * 字段名后必须有分隔符/判断词，再跟至少 4 个非空白字符的值。
  */
 const CREDENTIAL_FIELD_PATTERN = /(?:^|[^A-Za-z0-9_])(?:key|secret|token|pwd|pass|passwd)\s*(?:是|为|:|：|=|is)\s*([^\s，。；,;]{4,})/iu;
 
 /**
  * V9-L1：卡号形态——12 位以上数字，允许空格/连字符按 4 位分组
- * （`6222 0202 0000 1234`、`6222-0202-0000-1234`、`6222020200001234`）。
+ * （`6222 **** **** ****`、`6222-****-****-****`、`6222************`）。
  * 只拦号码本身，不因为出现「银行卡/信用卡」字样就判敏感。
  */
 const CARD_NUMBER_PATTERN = /\d{12,}|\d{4}(?:[\s-]\d{4}){2}(?:[\s-]\d{1,4})?/u;
 
 /**
  * V9-L2：设备/网络名词 + 判断词 + 值，且值里含数字或符号
- * （`WiFi 是 蓝鲸-7788`、`门禁口令：8848`）。纯名词或纯文字值不命中。
+ * （`WiFi 是 蓝鲸-****`、`门禁口令：88**`）。纯名词或纯文字值不命中。
  */
 const DEVICE_VALUE_PATTERN = /(?:wi-?fi|路由器|路由|门禁|门锁|热点)\s*(?:是|为|:|：|=)\s*([^\s，。；,;]{2,})/iu;
 
@@ -114,14 +114,14 @@ const CREDENTIAL_VALUE_SHAPE = /[\d\p{P}\p{S}]/u;
  *
  * - `PASSWORD_CONNECTIVE`：密码/口令/password + 是/为/:/：/=/is + 值。有显式
  *   连接词时值一定是凭据，纯文字密码（`密码是 bluewhale`）也抹；值被空格+
- *   连字符拆开（`密码 是 蓝鲸 - 7788`）时连同数字尾段一起抹——V9-M1b 去掉
+ *   连字符拆开（`密码 是 蓝鲸 - ****`）时连同数字尾段一起抹——V9-M1b 去掉
  *   整段兜底后，拼接形态由值级脱敏负责，避免残片落库；
- * - `PASSWORD_BARE`：密码/口令 + 空白 + 值（「路由器密码 蓝鲸-7788」），
+ * - `PASSWORD_BARE`：密码/口令 + 空白 + 值（「路由器密码 蓝鲸-****」），
  *   要求值含数字或符号，避免「密码 忘了」这类叙述被误伤；
  * - `CREDENTIAL_FIELD_REDACT`：api key / access token / secret / token / key
- *   等字段名 + 连接词 + 值（「token 是 abc123」「API token：sk-xxxxxx」）；
+ *   等字段名 + 连接词 + 值（「token 是 abc***」「API token：sk-******」）；
  * - `DEVICE_VALUE_REDACT`：设备/网络名词 + 判断词 + 含数字或符号的值
- *   （「WiFi 是 蓝鲸-7788」），与 DEVICE_VALUE_PATTERN 同口径；
+ *   （「WiFi 是 蓝鲸-****」），与 DEVICE_VALUE_PATTERN 同口径；
  * - `CARD_NUMBER_REDACT` / `SK_KEY_REDACT`：卡号形态与 `sk-` 字面值，
  *   没有上下文也能认出来，直接整段值替换。
  */
