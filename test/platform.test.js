@@ -257,7 +257,7 @@ test('createSession/whenIdle 转发，支持 agent 与 createSession 返回值',
   );
 });
 
-test('prompt 构造幂等 source：kind=user、rpcId=requestId', async () => {
+test('prompt 第二个参数是 AbortSignal，requestId 稳定可去重', async () => {
   const ctx = new FakeCtx();
   const adapter = createAdapter(ctx);
   const request = {
@@ -268,18 +268,19 @@ test('prompt 构造幂等 source：kind=user、rpcId=requestId', async () => {
 
   await adapter.prompt(request);
   const call = ctx.callsOf('sessionController.prompt')[0];
-  assert.equal(call.args[0], request);
-  assert.deepEqual(call.args[1], { kind: 'user', rpcId: 'req-1' });
+  assert.deepEqual(call.args[0], request);
+  const signal = call.args[1];
+  assert.ok(signal instanceof AbortSignal);
+  assert.equal(typeof signal.throwIfAborted, 'function');
+  // 旧宿主兼容：signal 上尽量附加 kind/rpcId。
+  assert.equal(signal.kind, 'user');
+  assert.equal(signal.rpcId, 'req-1');
 
   await adapter.prompt({ sessionId: 's-2', content: [] });
-  const generated = ctx.callsOf('sessionController.prompt')[1].args[1];
-  assert.equal(generated.kind, 'user');
-  assert.match(generated.rpcId, /^companion-/);
-
-  const source = { kind: 'user', rpcId: 'custom' };
-  await adapter.prompt({ sessionId: 's-3', requestId: 'req-3', content: [] }, source);
-  assert.equal(ctx.callsOf('sessionController.prompt')[2].args[1], source);
-  assert.deepEqual(source, { kind: 'user', rpcId: 'custom' });
+  const fallback = ctx.callsOf('sessionController.prompt')[1];
+  assert.ok(fallback.args[1] instanceof AbortSignal);
+  assert.match(fallback.args[0].requestId, /^companion-/);
+  assert.equal(fallback.args[1].rpcId, fallback.args[0].requestId);
 });
 
 test('cancel 接受 sessionId 字符串或 request 对象', async () => {

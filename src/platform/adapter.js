@@ -118,19 +118,33 @@ function mergeDecision(decision, patch) {
   return base;
 }
 
+/** prompt 的默认超时：宿主 prompt(request, signal) 的第二个参数是 AbortSignal。 */
+const PROMPT_TIMEOUT_MS = 30_000;
+
 /**
- * 默认 prompt source：与 sessionController 客户端包装保持一致
- * （{ kind: 'user', rpcId }），让平台按 rpcId 对重试做幂等去重。
+ * 构造 prompt 的 AbortSignal（C5-H1a）。
+ *
+ * DSH 0.2.1-rc.5 的 `ApiSessionList.prompt(request, signal)` 把第二个参数
+ * 当 AbortSignal 用（内部会调 `signal.throwIfAborted()`），消息 source 由
+ * 宿主自己生成成 `{ kind: 'user', rpcId: request.requestId }`。旧宿主则把
+ * 第二个参数当 source 对象。为了同时兼容两种宿主，这里返回真正的
+ * AbortSignal，并尽量在它上面附加 `kind` / `rpcId`（附加失败就忽略，
+ * 不影响新宿主）。
+ *
  * @param {{ requestId?: string }} request
- * @param {object} [source] 调用方显式指定的 source
- * @returns {object}
+ * @returns {AbortSignal}
  */
-function promptSource(request, source) {
-  if (source !== undefined) return source;
-  const rpcId = typeof request?.requestId === 'string' && request.requestId.length > 0
-    ? request.requestId
-    : `companion-${randomUUID()}`;
-  return { kind: 'user', rpcId };
+function deliverySignal(request) {
+  const signal = AbortSignal.timeout(PROMPT_TIMEOUT_MS);
+  try {
+    Object.defineProperty(signal, 'kind', { value: 'user', configurable: true });
+    if (typeof request?.requestId === 'string' && request.requestId.length > 0) {
+      Object.defineProperty(signal, 'rpcId', { value: request.requestId, configurable: true });
+    }
+  } catch {
+    // 兼容旧宿主的 best-effort 附加：失败时仍按新宿主语义工作。
+  }
+  return signal;
 }
 
 /**
@@ -458,17 +472,30 @@ export function createAdapter(ctx, opts = {}) {
   }
 
   /**
-   * 向会话投递一条用户消息。
+   * 向会话投递一条用户消息（C5-H1a）。
+   *
+   * 宿主签名是 `prompt(request, signal)`：第二个参数必须是 AbortSignal。
+   * 消息的 source 由宿主按 `request.requestId` 构造，所以这里保证每次调用
+   * 都带 requestId（调用方没给时退化为一次性 `companion-<uuid>`），不去重
+   * 就会在宿主侧失去幂等。
+   *
    * @param {{ sessionId: string, content: unknown[], requestId?: string, mode?: 'queue'|'steer' }} request
-   * @param {object} [source] 缺省按 requestId 构造 { kind: 'user', rpcId }
    * @returns {Promise<unknown>}
    */
-  function prompt(request, source) {
+  function prompt(request) {
     const impl = service('sessionController');
     if (typeof impl?.prompt !== 'function') {
       throw unavailable('no-session', 'ctx.sessionController.prompt()');
     }
-    return impl.prompt(request, promptSource(request, source));
+    const normalized = request !== null && typeof request === 'object' ? { ...request } : request;
+    if (
+      normalized !== null
+      && typeof normalized === 'object'
+      && !(typeof normalized.requestId === 'string' && normalized.requestId.length > 0)
+    ) {
+      normalized.requestId = `companion-${randomUUID()}`;
+    }
+    return impl.prompt(normalized, deliverySignal(normalized));
   }
 
   /**

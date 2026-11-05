@@ -22,7 +22,7 @@
 | 8 | `compaction.compactRegion` | `ctx.compaction.compactRegion(start, end, agent, signal)`；`start`/`end` 为 surface 节点 seq 闭区间，边界必须存在且 tool call/result 配对均衡 | 两段式压缩的阶段 2 | `dsh-compaction-basic/lib/index.js:971`；参数校验 `:554-558`；必须存在 open turn `:460` |
 | 9 | `compaction.compactNow`（不用） | `ctx.compaction.compactNow(agent, signal, sourceCommandId)`；要求 idle agent，无区间参数 | 用户手动 `/compact` 语义，不满足保留尾部与先写库要求 | `dsh-compaction-basic/lib/index.js:985-1009`；range 选择 `:992` |
 | 10 | `sessionController.createSession` | `ctx.sessionController.createSession(request) → { agent, agentPreset }`；request 可带 `{ sessionId, cwd, agentPreset, reusable }` | 线程 worker 会话语义 | `dsh-api-session-controller/lib/index.js:264`、`:502-507`；服务名 `:2952` |
-| 11 | `sessionController.prompt` | `ctx.sessionController.prompt(request, source)`；request = `{ sessionId, content, requestId, mode?: 'queue'\|'steer' }`；source 形如 `{ kind: 'user', rpcId }`，`rpcId === requestId` 时平台按请求去重 | 向 worker 投递消息、重试幂等 | `dsh-api-session-controller/lib/index.js:925`；source `:3225-3233`；去重 `:1124-1136` |
+| 11 | `sessionController.prompt` | `ctx.sessionController.prompt(request, signal)`；request = `{ sessionId, content, requestId, mode?: 'queue'\|'steer' }`，第二参是 AbortSignal（宿主内部会 `signal.throwIfAborted()`）；消息 source 由宿主按 `request.requestId` 构造为 `{ kind: 'user', rpcId }` | 向 worker 投递消息、重试幂等 | `dsh-api-session-controller/lib/index.js:925`；source `:3218-3233`；去重 `:1124-1136` |
 | 12 | `sessionController.cancel` | `ctx.sessionController.cancel({ sessionId })` | 线程取消/回收 | `dsh-api-session-controller/lib/index.js:1061` |
 | 13 | `agent.whenIdle` | `agent.whenIdle() → Promise`；属于 agent 句柄，不在 sessionController 上 | 回执前等待线程静默 | `dsh-agent-loop/lib/index.js:870`；`dsh-agent/README.md:47` |
 | 14 | `workspaceRegistry.archiveSession` | `ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity })`；不带 `stopActivity` 时若有活动会抛 `WorkspaceActiveSessionError`；`stopActivity: true` 先写归档集再停活动 | 空闲 14 天的线程冻结 | `dsh-workspace/lib/index.js:526,540`；`stopSessionActivity` `:621-623`；错误类 `:303-305` |
@@ -119,7 +119,7 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 | `every(ms, callback)` | `ctx.interval(callback, ms)` | 返回 disposer；`ms` 必须为正有限数 |
 | `compactRegion(start, end, agent, signal?)` | `ctx.compaction.compactRegion(...)` | 闭区间，调用方负责 open turn 时序 |
 | `createSession(request)` | `ctx.sessionController.createSession(request)` | 返回 `{ agent, agentPreset }` |
-| `prompt(request, source?)` | `ctx.sessionController.prompt(request, source)` | source 缺省为 `{ kind: 'user', rpcId: request.requestId }`；无 `requestId` 时生成 `companion-<uuid>` |
+| `prompt(request)` | `ctx.sessionController.prompt(request, AbortSignal.timeout(30000))` | 第二参必须是 AbortSignal；无 `requestId` 时补 `companion-<uuid>`；兼容旧宿主时在 signal 上附加 `kind`/`rpcId` |
 | `cancel(sessionIdOrRequest)` | `ctx.sessionController.cancel(request)` | 字符串自动包成 `{ sessionId }` |
 | `whenIdle(agentOrCreated)` | `agent.whenIdle()` | 接受 agent 句柄或 `createSession` 返回值 `{ agent }` |
 | `archiveSession(sessionId, options?)` | `ctx.workspaceRegistry.archiveSession(...)` | 归档线程；冻结场景应传 `{ stopActivity: true }` |

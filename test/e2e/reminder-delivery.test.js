@@ -370,7 +370,7 @@ test('V4-H1：prompt 首次抛错后下一次 tick 只送达一条，文本不�
     // FakeCtx 会保留失败那次调用记录，所以共 2 次；第二次必须是单条、正文只出现一次标题。
     const texts = promptTexts(ctx).filter((text) => text.includes('交房租'));
     assert.equal(texts.length, 2);
-    assert.equal(texts[1], '提醒：交房租');
+    assert.equal(texts[1], '[提醒] 交房租');
     assert.equal((texts[1].match(/交房租/gu) ?? []).length, 1);
 
     const delivered = temp.store.getReminder(reminder.id);

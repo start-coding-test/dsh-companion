@@ -170,6 +170,21 @@ const RECALL_MARKER = '[相关记忆]';
  */
 const RECALL_END_MARKER = '[/相关记忆]';
 
+/**
+ * C5-H1a：本插件主动投递消息的 requestId 前缀。
+ *
+ * 宿主会把 `sessionController.prompt` 的消息记成 `source.kind='user'`、
+ * `source.rpcId=request.requestId`。插件自己发出的提醒/主动消息因此必须能被
+ * 认出来，否则会被当成用户发言参与巩固、主会话重绑与召回查询。
+ */
+const COMPANION_RPC_PREFIX = 'companion-';
+
+/** C5-H1a：提醒正文前缀（surface 记录没有 source，按正文兜底识别）。 */
+const REMINDER_TEXT_PREFIX = '[提醒] ';
+
+/** C5-H1a：投递失败事件 kind（memory_events.detail_json.kind）。 */
+const DELIVERY_ERROR_KIND = 'delivery_error';
+
 /** 转录快照：只保留最近 N 条 / N 字符，供巩固模型使用。 */
 const TRANSCRIPT_MAX_MESSAGES = 40;
 const TRANSCRIPT_MAX_CHARS = 6000;
@@ -689,7 +704,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
         // R-M1：外部压缩吞掉未巩固节点时，把丢失量也放进 /状态，便于观测。
         const lostUnconsolidated = Number(metricSnapshot.compactionLostUnconsolidated) || 0;
         const text = alias.name === 'status'
-          ? `${result.reply}\n${formatChatStatus(state, platform.now())}`
+          ? `${withDeliveryFailure(store, result.reply)}\n${formatChatStatus(state, platform.now())}`
             + (reanchors > 0 ? `\n水位重锚：${reanchors} 次` : '')
             + (lostUnconsolidated > 0 ? `\n未巩固被压缩：${lostUnconsolidated} 个节点` : '')
           : result.reply;
@@ -789,6 +804,8 @@ function hasRealUserInput(messages) {
     if (sourceKind === 'runtime-context' || sourceKind === RECALL_SOURCE_KIND) continue;
     // V3-L3：中文命令提示也是插件注入，不算用户真实输入（不会抢占主会话绑定）。
     if (sourceKind === COMMAND_HINT_SOURCE_KIND) continue;
+    // C5-H1a：插件主动投递（提醒/任务/线程）被宿主记成 user，不重绑主会话。
+    if (isCompanionMessage(message)) continue;
     const blocks = Array.isArray(message.content)
       ? message.content
       : (message.type === 'text' ? [message] : []);
@@ -2470,7 +2487,43 @@ function extractRecallBlock(messages) {
 function isInjectedMessage(message) {
   if (message === null || typeof message !== 'object') return false;
   const kind = message.source?.kind;
-  return kind === RECALL_SOURCE_KIND || kind === COMMAND_HINT_SOURCE_KIND;
+  return kind === RECALL_SOURCE_KIND
+    || kind === COMMAND_HINT_SOURCE_KIND
+    || isCompanionMessage(message);
+}
+
+/**
+ * C5-H1a：这条 payload 消息是否是本插件主动投递（提醒/任务/线程/主动消息）。
+ *
+ * 宿主把它们记成普通 `user/message`，source 是 `{kind:'user', rpcId}`。优先按
+ * `source.rpcId` 的 `companion-` 前缀识别；拿不到 rpcId（或旧宿主/回放）时按
+ * 正文的 `[提醒] ` 前缀兜底。
+ *
+ * @param {unknown} message
+ * @returns {boolean}
+ */
+function isCompanionMessage(message) {
+  if (message === null || typeof message !== 'object') return false;
+  const rpcId = message.source?.rpcId;
+  if (typeof rpcId === 'string' && rpcId.startsWith(COMPANION_RPC_PREFIX)) return true;
+  const blocks = Array.isArray(message.content) ? message.content : [];
+  for (const block of blocks) {
+    const text = typeof block === 'string' ? block : block?.type === 'text' ? block.text : null;
+    if (typeof text === 'string' && text.trimStart().startsWith(REMINDER_TEXT_PREFIX)) return true;
+  }
+  return false;
+}
+
+/**
+ * C5-H1a：一条 surface 记录是否是本插件主动投递。
+ * surface 记录只有 `{role, text, tokens}`（没有 source），按 role+正文前缀兜底。
+ * @param {{role?: string, text?: string}|null|undefined} record
+ * @returns {boolean}
+ */
+function isCompanionRecord(record) {
+  return record?.role === 'user'
+    && typeof record.text === 'string'
+    && record.text.trimStart().startsWith(REMINDER_TEXT_PREFIX);
 }
 
 /**
@@ -2538,13 +2591,15 @@ function withoutRecallRecords(snapshot) {
   const records = Array.isArray(snapshot?.records) ? snapshot.records : null;
   if (records === null) return snapshot;
   // V4-L2：摘要节点可能把召回块夹在正文中（不是以标记开头），这类记录也要剔除。
+  // C5-H1a：插件主动投递（提醒）会以 user 文本留在 surface 里，同样清空。
   const needsScrub = records.some((record) => isRecallRecord(record)
+    || isCompanionRecord(record)
     || (typeof record?.text === 'string' && record.text.includes(RECALL_MARKER)));
   if (!needsScrub) return snapshot;
   return {
     ...snapshot,
     records: records.map((record) => {
-      if (isRecallRecord(record)) return { ...record, text: '' };
+      if (isRecallRecord(record) || isCompanionRecord(record)) return { ...record, text: '' };
       if (typeof record?.text !== 'string') return record;
       const text = scrubRecallBlocks(record.text);
       return text === record.text ? record : { ...record, text };
@@ -2822,9 +2877,13 @@ function startScheduler(state) {
   const proactive = createProactive({
     store,
     platform: {
-      prompt: (sessionId, text) => platform.prompt({
+      // C5-H1a：requestId 由 proactive 按「份」算出并透传，宿主按 rpcId 去重。
+      prompt: (sessionId, text, options = {}) => platform.prompt({
         sessionId,
         content: [{ type: 'text', text }],
+        ...(typeof options?.requestId === 'string' && options.requestId.length > 0
+          ? { requestId: options.requestId }
+          : {}),
       }),
     },
     // V3-H2：投递目标是 identity 解析出的当前主会话 id，不再是字面量 'main'。
@@ -2935,8 +2994,12 @@ function fireDueReminders(state) {
     }
     const result = proactive?.enqueue({
       kind: 'reminder',
-      text: `提醒：${row.title}`,
+      // C5-H1a：正文前缀供 surface/回放侧兜底识别「这不是用户发言」。
+      text: `${REMINDER_TEXT_PREFIX}${row.title}`,
       dedupeKey: `reminder:${row.id}`,
+      // requestId 与 claim 的 fireKey 同源：同一次到点/同一次 claim 内重试保持一致，
+      // 宿主才能按 rpcId 去重（否则重试会被当成新的用户消息重复投递）。
+      requestId: `companion-reminder:${row.id}:${String(row.next_fire_at)}`,
       at: now,
       onAttempt: () => {
         const fresh = store.getReminder(row.id);
@@ -3092,6 +3155,61 @@ function formatChatStatus(state, now) {
 }
 
 /**
+ * C5-H1a：投递失败优先显示在 /状态 的「最近失败」行。
+ *
+ * `src/runtime/commands.js` 的 formatFailureStatus 只认巩固/job 失败；主动消息
+ * 投递失败（FakeCtx/真实宿主 prompt 抛 TypeError 等）写在 memory_events 的
+ * `reason='delivery_error'`。这里只在投递失败比巩固失败更新时替换那一行，
+ * 不改写其它状态行，也不改动命令层（本卡范围外）。
+ *
+ * @param {object} store
+ * @param {string} reply 命令层已生成的回复
+ * @returns {string}
+ */
+function withDeliveryFailure(store, reply) {
+  if (typeof reply !== 'string' || typeof store?.listEvents !== 'function') return reply;
+  let rows = [];
+  try {
+    rows = store.listEvents({ limit: 200 });
+  } catch {
+    return reply;
+  }
+  let latestDelivery = null;
+  let latestConsolidationFailure = null;
+  for (const row of Array.isArray(rows) ? rows : []) {
+    if (latestDelivery === null && String(row?.reason ?? '') === DELIVERY_ERROR_KIND) {
+      latestDelivery = row;
+    }
+    if (latestConsolidationFailure === null
+      && (row?.reason === 'consolidation_failed' || row?.reason === 'consolidation_failed_final')) {
+      latestConsolidationFailure = row;
+    }
+    if (latestDelivery !== null && latestConsolidationFailure !== null) break;
+  }
+  if (latestDelivery === null) return reply;
+  if (latestConsolidationFailure !== null
+    && Number(latestConsolidationFailure.id) > Number(latestDelivery.id)) {
+    return reply;
+  }
+  let detail = latestDelivery.detail_json;
+  if (typeof detail === 'string') {
+    try {
+      detail = JSON.parse(detail);
+    } catch {
+      detail = null;
+    }
+  }
+  const name = typeof detail?.errorName === 'string' && detail.errorName !== ''
+    ? detail.errorName
+    : 'Error';
+  const message = typeof detail?.errorMessage === 'string' ? detail.errorMessage : '';
+  const line = message === ''
+    ? `最近失败：投递失败：${name}`
+    : `最近失败：投递失败：${name}：${message}`;
+  return reply.replace(/^最近失败：.*$/mu, () => line);
+}
+
+/**
  * 扫描到期承诺并入队：每条每天最多一次，逾期久的先入队。
  * @param {object} state
  * @returns {number} 本次入队条数
@@ -3130,8 +3248,10 @@ function runCommitmentFollowups(state) {
     const overdueDays = commitmentOverdueDays(row, { now });
     proactive?.enqueue({
       kind: 'reminder',
-      text: followUpText({ card: DEFAULT_CARD, reminder: row, overdueDays }),
+      // C5-H1a：承诺跟进同样是插件主动投递，正文带提醒前缀，requestId 按天稳定。
+      text: `${REMINDER_TEXT_PREFIX}${followUpText({ card: DEFAULT_CARD, reminder: row, overdueDays })}`,
       dedupeKey: `commitment:${row.id}:${dayKey}`,
+      requestId: `companion-commitment:${row.id}:${dayKey}`,
       at: now,
     });
     mark.run(dayKey, row.id);
@@ -3251,6 +3371,8 @@ async function runLightChat(state) {
       kind: 'chat',
       text: normalized.text,
       dedupeKey: `chat:${dayKey}`,
+      // C5-H1a：主动闲聊也必须有稳定 requestId（同一天只投一次）。
+      requestId: `companion-chat:${dayKey}:daily`,
       at: now,
     });
     writeMeta(store, CHAT_META.lastTryDay, dayKey);
@@ -3502,7 +3624,9 @@ function lastUserText(messages) {
     const row = rows[index];
     if (row.role !== 'user') continue;
     const text = row.text.trim();
-    if (text === '' || text.startsWith(RECALL_MARKER)) continue;
+    // C5-H1a：主动投递的提醒正文没有 source 可查，按正文前缀兜底排除，
+    // 避免它被当成召回查询（lastUserText）或交互日记录的唯一输入。
+    if (text === '' || text.startsWith(RECALL_MARKER) || text.startsWith(REMINDER_TEXT_PREFIX)) continue;
     return text;
   }
   return '';

@@ -196,7 +196,7 @@ test('V4-H1 集成：提醒失败一次后下一 tick 只送达一条，无重�
 
     const texts = promptTexts(ctx).filter((text) => text.includes('交房租'));
     assert.equal(texts.length, 2, '一次失败 + 一次成功，共两次 prompt');
-    assert.equal(texts[1], '提醒：交房租', '重试必须是单条提醒原文');
+    assert.equal(texts[1], '[提醒] 交房租', '重试必须是单条提醒原文');
     assert.equal((texts[1].match(/交房租/gu) ?? []).length, 1, '同一提醒不得重复拼接');
     assert.equal(texts[1].includes('\n\n'), false, '单条提醒不得与其它提醒合并');
 
@@ -262,7 +262,7 @@ test('V4-H1 集成：连续 3 个 tick 失败重试不会把提醒提前耗成 e
     await settle(50);
     const texts = promptTexts(ctx).filter((text) => text.includes('吃药'));
     assert.equal(texts.length, 3, '两次失败 + 一次成功');
-    assert.equal(texts[2], '提醒：吃药');
+    assert.equal(texts[2], '[提醒] 吃药');
     assert.equal((texts[2].match(/吃药/gu) ?? []).length, 1);
     row = temp.store.getReminder(reminder.id);
     assert.equal(row.status, 'fired');

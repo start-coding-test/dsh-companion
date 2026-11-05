@@ -11,7 +11,9 @@
  *    不同提醒绝不拼成一条，避免一条被取消/失败时拖累其余；
  * 6. backlog 超过 5 条时丢弃最旧（enqueue 时执行）。
  *
- * 唯一投递通道是 `platform.prompt(target(), text)`（10 §2.3：唤醒 main 一轮）。
+ * 唯一投递通道是 `platform.prompt(target(), text, { requestId })`（10 §2.3：唤醒
+ * main 一轮）。requestId 供宿主去重（C5-H1a）：同一份消息在同一次 claim 内重试必须
+ * 保持一致，否则宿主会把重试当成新请求重复投递。
  * target 由接线层按 identity 解析出的「当前主会话 id」提供，不得传字面量 'main'；
  * 取不到主会话与投递失败同路径处理（保留 backlog 等待重试）。
  * 投递前后可选钩子（onAttempt/onSent/onFailed，如提醒的两阶段状态机）由 enqueue 携带：
@@ -50,6 +52,9 @@ export const MAX_BACKLOG = 5;
 
 /** memory_events 里主动消息事件的 table_name。 */
 export const PROACTIVE_EVENT_TABLE = 'proactive';
+
+/** 投递失败事件的 kind（C5-H1a：写入 memory_events 供 /status 展示）。 */
+export const DELIVERY_ERROR_KIND = 'delivery_error';
 
 const KINDS = Object.freeze(Object.keys(KIND_CAPS));
 
@@ -182,6 +187,50 @@ export function createProactive({ store, platform, config, target, clock = Date.
     state.byKind = { task_report: 0, reminder: 0, chat: 0 };
   }
 
+  /**
+   * 计算一条待投递消息的 requestId（C5-H1a）。
+   *
+   * 单份消息优先用它自己的 requestId；合并条只有全部份共享同一 requestId 时才
+   * 复用，否则用 `companion-<kind>:merged:<seq>`——seq 在队列里稳定，同一次
+   * claim 重试时不变，宿主可据此去重。
+   * @param {{kind: string, seq: number, parts: object[]}} item
+   * @returns {string}
+   */
+  function deliveryRequestId(item) {
+    const ids = new Set();
+    for (const part of item.parts) {
+      if (typeof part.requestId === 'string' && part.requestId.length > 0) ids.add(part.requestId);
+    }
+    if (ids.size === 1) return [...ids][0];
+    return `companion-${item.kind}:merged:${item.seq}`;
+  }
+
+  /** 投递失败落库（C5-H1a）：写 error.name / error.message，供 /status「最近失败」。 */
+  function recordDeliveryError(item, error, at) {
+    try {
+      store.appendEvent({
+        at: Math.floor(at / 1000),
+        action: 'USED',
+        table_name: PROACTIVE_EVENT_TABLE,
+        row_id: null,
+        actor: 'scheduler',
+        reason: DELIVERY_ERROR_KIND,
+        detail_json: {
+          kind: DELIVERY_ERROR_KIND,
+          msgKind: item.kind,
+          requestId: item.requestId ?? null,
+          dedupeKey: item.dedupeKey ?? null,
+          errorName: error instanceof Error ? error.name : typeof error,
+          errorMessage: error instanceof Error ? error.message : String(error),
+          text: item.text,
+        },
+      });
+    } catch (recordError) {
+      // 写库失败不影响投递失败本身的处理（保留 backlog、释放 claim）。
+      console.warn('[proactive] failed to record delivery error:', recordError);
+    }
+  }
+
   /** 写发送记账事件；写库失败不影响投递结果（只记入报告）。 */
   function recordSent(item, at) {
     const seconds = Math.floor(at / 1000);
@@ -209,8 +258,8 @@ export function createProactive({ store, platform, config, target, clock = Date.
    * 提醒的 dedupeKey 稳定为 `reminder:<id>`，安静时段/日上限/退避期间每个 tick
    * 重新入队也不会堆出多份副本（V4-H1）。backlog 超过 MAX_BACKLOG 时丢弃最旧的一条。
    *
-   * @param {{kind?: string, text: string, dedupeKey?: string, at?: number|Date,
-   *   onAttempt?: Function, onSent?: Function, onFailed?: Function}} msg
+   * @param {{kind?: string, text: string, dedupeKey?: string, requestId?: string,
+   *   at?: number|Date, onAttempt?: Function, onSent?: Function, onFailed?: Function}} msg
    * @returns {{queued: number, dropped: number, duplicate: boolean}}
    */
   function enqueue(msg) {
@@ -228,6 +277,9 @@ export function createProactive({ store, platform, config, target, clock = Date.
     const dedupeKey = typeof msg.dedupeKey === 'string' && msg.dedupeKey.trim() !== ''
       ? msg.dedupeKey.trim()
       : null;
+    const requestId = typeof msg.requestId === 'string' && msg.requestId.trim() !== ''
+      ? msg.requestId.trim()
+      : null;
     const at = msg.at === undefined ? nowMs() : normalizeNow(msg.at);
     const hooks = [];
     if (typeof msg.onAttempt === 'function' || typeof msg.onSent === 'function'
@@ -240,8 +292,10 @@ export function createProactive({ store, platform, config, target, clock = Date.
     }
 
     // 每一份是独立的投递/钩子单元；单条消息的 parts 只有一项，合并时才追加。
-    const part = { text, dedupeKey, hooks };
-    queue.push({ kind, text, at, seq: seq++, dedupeKey, hooks, parts: [part] });
+    // requestId 随份保存：合并条只有在全部份共享同一 requestId 时才复用它，
+    // 否则退化为按 item.seq 生成的稳定 id（retry 时 seq 不变，仍可去重）。
+    const part = { text, dedupeKey, requestId, hooks };
+    queue.push({ kind, text, at, seq: seq++, dedupeKey, requestId, hooks, parts: [part] });
     while (queue.length > MAX_BACKLOG) {
       const droppedItem = queue.shift();
       dropped += 1;
@@ -395,10 +449,12 @@ export function createProactive({ store, platform, config, target, clock = Date.
         parts: allowed,
         text: allowed.map((part) => part.text).join('\n\n'),
       };
+      delivered.requestId = deliveryRequestId(delivered);
       try {
-        await platform.prompt(sessionId, delivered.text);
+        await platform.prompt(sessionId, delivered.text, { requestId: delivered.requestId });
       } catch (error) {
         report.failed += 1;
+        recordDeliveryError(delivered, error, at);
         // 本条已 claim 的份（allowed）必须释放；后面没轮到的候选一并回队等待重试。
         const remaining = [
           delivered,
