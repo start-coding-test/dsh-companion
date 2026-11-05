@@ -5,7 +5,7 @@
  * AbortSignal，消息 source 由宿主按 `request.requestId` 构造为
  * `{ kind: 'user', rpcId }`；因此：
  *   1) adapter 必须传 AbortSignal（旧宿主兼容：在 signal 上挂 kind/rpcId）；
- *   2) 每次投递都必须带 requestId，且同一次 claim 内重试保持一致；
+ *   2) 每次投递都必须带 requestId，且同一次到点（occurrence）内的退避重试保持一致；
  *   3) 宿主会把这条消息记成 kind:'user'，巩固转录 / 主会话重绑 / 召回查询
  *      三处都必须按 rpcId 前缀或 `[提醒] ` 正文前缀排除；
  *   4) 投递失败写 memory_events(kind='delivery_error')，/状态「最近失败」可见。
@@ -214,8 +214,11 @@ test('C5-H1a：提醒投递带 companion-reminder requestId 与 AbortSignal，�
 
     const calls = promptCalls(ctx);
     assert.equal(calls.length, 1, '失败后不应在同一次 flush 里重复投递');
-    const firstRequestId = `companion-reminder:${reminder.id}:${reminder.next_fire_at}`;
-    assert.equal(calls[0].request.requestId, firstRequestId, '提醒 requestId 必须由 claim key 决定');
+    // V6-M1：requestId 由本次到点的 occurrence_key 决定（不再用 next_fire_at）。
+    const failedRow = temp.store.getReminder(reminder.id);
+    const firstRequestId = `companion-reminder:${reminder.id}:${failedRow.occurrence_key}`;
+    assert.ok(failedRow.occurrence_key, '入队前必须生成本次到点的 occurrence_key');
+    assert.equal(calls[0].request.requestId, firstRequestId, '提醒 requestId 必须由 occurrence 决定');
     assert.equal(calls[0].text, REMINDER_TEXT, '正文带 [提醒] 前缀供正文侧排除');
     assert.ok(calls[0].signal instanceof AbortSignal, '第二参必须是 AbortSignal');
     assert.equal(typeof calls[0].signal.throwIfAborted, 'function');
@@ -241,8 +244,7 @@ test('C5-H1a：提醒投递带 companion-reminder requestId 与 AbortSignal，�
     const reply = status.handler({ rawInput: '' });
     assert.match(reply.text, /最近失败：投递失败：TypeError：signal\.throwIfAborted is not a function/u);
 
-    // 下一次 tick 是新 claim：requestId 换用新的 fire key（同一次 claim 内才必须一致）。
-    const failedRow = temp.store.getReminder(reminder.id);
+    // 下一次 tick 是同一 occurrence 的重试：occurrence_key 不变，requestId 必须一致。
     ctx.advance(30_000);
     await ctx.fireTimers();
     await settle(50);
@@ -250,8 +252,8 @@ test('C5-H1a：提醒投递带 companion-reminder requestId 与 AbortSignal，�
     assert.equal(retriedCalls.length, 2, '退避到期后应重试一次');
     assert.equal(
       retriedCalls[1].request.requestId,
-      `companion-reminder:${reminder.id}:${failedRow.next_fire_at}`,
-      '新 claim 使用新的 fire key，上一次 claim 的 requestId 不重复使用',
+      firstRequestId,
+      '同一次到点的退避重试必须复用同一个 requestId，宿主才能去重',
     );
     const stillFailing = temp.store.getReminder(reminder.id);
     assert.equal(stillFailing.status, 'pending', '失败仍回 pending，等待下一次退避重试');

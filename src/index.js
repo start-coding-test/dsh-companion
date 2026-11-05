@@ -3124,11 +3124,16 @@ function startScheduler(state) {
  * 队列语义（V4-H1）：
  * - dedupeKey 稳定为 `reminder:<id>`（不含 tick 秒），配合 proactive.enqueue 的
  *   同键跳过，安静时段/日上限/退避期间每个 tick 重复入队只会保留一份。
+ * - requestId 按 occurrence 稳定（V6-M1）：入队前取 `ensureReminderOccurrence`，
+ *   同一次到点内即使失败退避把 `next_fire_at` 改写（30s→60s），重试仍复用同一个
+ *   occurrence_key，rpcId 不变，宿主才能按 rpcId 去重；投递成功/置 expired 后
+ *   occurrence 清空，下一次到点生成新 key，attempts 也从 0 重新计数。
  * - fireKey 用发生时刻 `next_fire_at`（不是 tick 秒）：同一次到点在多次失败重试中
  *   保持同一个 fireKey，claimReminderDelivery 只在 fireKey 变化时才累加 attempts。
- * - onAttempt 返回 false 表示本轮不投递：行已不是 pending/snoozed、已删除，或
- *   next_fire_at 被推后到未来（失败退避 30s→60s→120s 尚未到期）。proactive 会对
- *   该份回调 onFailed，若已 claim 成功则释放回 pending，不会留下 delivering 残留。
+ * - onAttempt 返回 false 表示本轮不投递：行已不是 pending/snoozed、已删除、
+ *   occurrence 已换代，或 next_fire_at 被推后到未来（失败退避 30s→60s→120s
+ *   尚未到期）。proactive 会对该份回调 onFailed，若已 claim 成功则释放回
+ *   pending，不会留下 delivering 残留。
  * - onFailed 由 store.markReminderDeliveryFailed 按 attempts 写入退避后的
  *   next_fire_at；attempts 达上限（3）才置 expired，因此连续 3 个 30s tick 不会
  *   直接把提醒耗成 expired（30s/60s/120s 退避下第 3 次重试最早在约 3.5 分钟后）。
@@ -3156,19 +3161,24 @@ function fireDueReminders(state) {
       });
       continue;
     }
+    // V6-M1：本次到点的稳定身份。已不是 pending/snoozed（刚被完成/取消/删除）
+    // 时返回 null，直接跳过，避免把旧 occurrence 的 rpcId 带进来。
+    const occurrenceKey = store.ensureReminderOccurrence(row.id, seconds);
+    if (occurrenceKey === null) continue;
     const result = proactive?.enqueue({
       kind: 'reminder',
       // C5-H1a：正文前缀供 surface/回放侧兜底识别「这不是用户发言」。
       text: `${REMINDER_TEXT_PREFIX}${row.title}`,
       dedupeKey: `reminder:${row.id}`,
-      // requestId 与 claim 的 fireKey 同源：同一次到点/同一次 claim 内重试保持一致，
-      // 宿主才能按 rpcId 去重（否则重试会被当成新的用户消息重复投递）。
-      requestId: `companion-reminder:${row.id}:${String(row.next_fire_at)}`,
+      // requestId 与 occurrence_key 同源：同一次到点/同一次 claim 内重试保持一致，
+      // 宿主才能按 rpcId 去重（否则退避重写 next_fire_at 后会被当成新消息重复投递）。
+      requestId: `companion-reminder:${row.id}:${occurrenceKey}`,
       at: now,
       onAttempt: () => {
         const fresh = store.getReminder(row.id);
         if (fresh === null || fresh === undefined) return false;
         if (fresh.status !== 'pending' && fresh.status !== 'snoozed') return false;
+        if (fresh.occurrence_key !== occurrenceKey) return false;
         if (Number(fresh.next_fire_at) > Math.floor(platform.now() / 1000)) return false;
         return store.claimReminderDelivery(
           fresh.id,

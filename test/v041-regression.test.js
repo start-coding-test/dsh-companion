@@ -7,7 +7,7 @@
  *   2) E-M1 错误分类：缺依赖 → fatal 停用；首次网络错 → transient 退避后可恢复；
  *   3) S-M1：注入后复述升级 reneed_kind='used'、同会话「来源 episode 仍在 surface」
  *      标 same_context 并被 S0 统计排除、L-2 长确认句不触发 α=4；
- *   4) 迁移：真实 v7 旧库 fixture 打开后升到当前版本（v10），重复打开幂等且数据不丢。
+ *   4) 迁移：真实 v7 旧库 fixture 打开后升到当前版本（v11），重复打开幂等且数据不丢。
  *
  * 全部使用临时库与注入 loader，不联网、不读真实时间。
  */
@@ -474,7 +474,7 @@ CREATE TABLE facts (
 );
 `;
 
-test('migrate：真实 v7 旧库 fixture 升 v10，幂等且数据不丢', (t) => {
+test('migrate：真实 v7 旧库 fixture 升 v11，幂等且数据不丢', (t) => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-v041-v7-'));
   const path = join(dir, 'companion.db');
   t.after(() => rmSync(dir, { recursive: true, force: true }));
@@ -513,11 +513,11 @@ test('migrate：真实 v7 旧库 fixture 升 v10，幂等且数据不丢', (t) =
     raw.close();
   }
 
-  // 2) 打开两次：每次都必须升到 v10，且旧行/首次样本原样保留（first_used_* 为 NULL）。
+  // 2) 打开两次：每次都必须升到 v11，且旧行/首次样本原样保留（first_used_* 为 NULL）。
   for (let round = 0; round < 2; round += 1) {
     const store = Store.open(path);
     try {
-      assert.equal(store.getMeta('schema_version'), '10', `第 ${round + 1} 次打开应升到 v10`);
+      assert.equal(store.getMeta('schema_version'), '11', `第 ${round + 1} 次打开应升到 v11`);
       const columns = store.db
         .prepare("PRAGMA table_info('facts')")
         .all()

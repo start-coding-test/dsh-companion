@@ -162,7 +162,7 @@ test('exportAll json：计数、文件名与默认过滤 secret/sensitive/墓碑
   assert.equal(payload.version, EXPORT_VERSION);
   assert.equal(payload.scope, 'main');
   assert.equal(payload.exported_at, '2026-11-05T09:00:00.000Z');
-  assert.equal(payload.schema_version, '10');
+  assert.equal(payload.schema_version, '11');
   assert.equal(payload.counts.facts, 1);
   assert.equal(payload.counts.episodes, 0);
   assert.equal(payload.counts.reminders, 1);

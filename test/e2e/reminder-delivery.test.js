@@ -6,7 +6,8 @@
  *   2. 投递成功 → fired，之后 tick 不重复提醒；
  *   3. 崩溃残留 delivering → 启动回收成 pending 后补发；超过重试上限转 expired；
  *   4. 提醒投递到「最近一次真实用户输入」的主会话，探针会话不改绑定；
- *   5. v9 → v10 迁移：reminders 增加 delivering 与 delivery_attempts，幂等可重开。
+ *   5. v9 → v11 迁移：reminders 增加 delivering、delivery_attempts 与 occurrence_key，
+ *      幂等可重开。
  */
 
 import test from 'node:test';
@@ -129,7 +130,8 @@ test('prompt 抛错：行保持 pending，重启后补发成功转 fired', async
     assert.equal(texts.length, 1);
     const delivered = temp.store.getReminder(reminder.id);
     assert.equal(delivered.status, 'fired');
-    assert.equal(delivered.delivery_attempts, 2);
+    // V6-M1：一次 occurrence 成功结束，失败计数归零。
+    assert.equal(delivered.delivery_attempts, 0);
   } finally {
     handle2.dispose();
     temp.cleanup();
@@ -147,7 +149,9 @@ test('投递成功：转 fired，后续 tick 不重复提醒', async () => {
     assert.equal(promptTexts(ctx).filter((text) => text.includes('给妈妈打电话')).length, 1);
     const row = temp.store.getReminder(reminder.id);
     assert.equal(row.status, 'fired');
-    assert.ok(row.last_fire_key);
+    assert.equal(row.last_fire_key, null, '成功投递后 last_fire_key 清空，下一次到点重新计数');
+    assert.equal(row.occurrence_key, null, '成功投递后 occurrence 清空');
+    assert.equal(row.delivery_attempts, 0);
 
     ctx.advance(30_000);
     await ctx.fireTimers();
@@ -181,7 +185,8 @@ test('崩溃残留 delivering：启动回收为 pending 并补发', async () => 
     await firstTick(ctx);
     assert.equal(promptTexts(ctx).filter((text) => text.includes('交水电费')).length, 1);
     assert.equal(temp.store.getReminder(reminder.id).status, 'fired');
-    assert.equal(temp.store.getReminder(reminder.id).delivery_attempts, 2);
+    // V6-M1：补发成功即结束本次 occurrence，计数归零。
+    assert.equal(temp.store.getReminder(reminder.id).delivery_attempts, 0);
   } finally {
     handle.dispose();
     temp.cleanup();
@@ -202,6 +207,9 @@ test('重试耗尽：delivering 且 attempts 已达上限，启动回收为 expi
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     assert.equal(temp.store.getReminder(reminder.id).status, 'expired');
+    // V6-M1：置 expired 时同样清空 occurrence 并把计数归零。
+    assert.equal(temp.store.getReminder(reminder.id).delivery_attempts, 0);
+    assert.equal(temp.store.getReminder(reminder.id).occurrence_key, null);
     await firstTick(ctx);
     assert.equal(promptTexts(ctx).filter((text) => text.includes('过期提醒')).length, 0);
   } finally {
@@ -264,7 +272,7 @@ test('提醒投递到最近一次真实用户输入的主会话，探针会话�
   }
 });
 
-test('v9 → v10 迁移：reminders 支持 delivering 与 delivery_attempts，重开幂等', () => {
+test('v9 → v11 迁移：reminders 支持 delivering、delivery_attempts 与 occurrence_key，重开幂等', () => {
   const dir = mkdtempSync(join(tmpdir(), 'dsh-companion-v9-'));
   const dbPath = join(dir, 'companion.db');
   const OLD_REMINDERS_DDL = `
@@ -311,11 +319,13 @@ test('v9 → v10 迁移：reminders 支持 delivering 与 delivery_attempts，�
       .all()
       .map((column) => column.name);
     assert.ok(columns.includes('delivery_attempts'), 'v10 必须补 delivery_attempts');
-    assert.equal(store.getMeta('schema_version'), '10');
+    assert.ok(columns.includes('occurrence_key'), 'v11 必须补 occurrence_key');
+    assert.equal(store.getMeta('schema_version'), '11');
 
     const migrated = store.getReminder('old-1');
     assert.equal(migrated.title, '旧提醒');
     assert.equal(migrated.delivery_attempts, 0);
+    assert.equal(migrated.occurrence_key, null, '旧行的 occurrence_key 必须为 NULL');
 
     // 旧 CHECK 已放开 delivering：两阶段流程可写占位态。
     assert.equal(store.claimReminderDelivery('old-1', 'k1'), true);
@@ -330,7 +340,7 @@ test('v9 → v10 迁移：reminders 支持 delivering 与 delivery_attempts，�
   // 重开：已是最新版本时不再重建，迁移幂等。
   const reopened = Store.open(dbPath);
   try {
-    assert.equal(reopened.getMeta('schema_version'), '10');
+    assert.equal(reopened.getMeta('schema_version'), '11');
     assert.equal(reopened.getReminder('old-1').status, 'fired');
     const indexes = reopened.db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'reminders'")
@@ -375,7 +385,8 @@ test('V4-H1：prompt 首次抛错后下一次 tick 只送达一条，文本不�
 
     const delivered = temp.store.getReminder(reminder.id);
     assert.equal(delivered.status, 'fired');
-    assert.equal(delivered.delivery_attempts, 2);
+    // V6-M1：一次 occurrence 成功结束，失败计数归零。
+    assert.equal(delivered.delivery_attempts, 0);
     assert.equal(
       temp.store.db.prepare("SELECT COUNT(*) AS n FROM reminders WHERE status = 'delivering'").get().n,
       0,
@@ -415,7 +426,8 @@ test('V4-H1：安静时段跨夜后早上只发一条（同一提醒不重复入
     assert.match(texts[0], /早点休息/);
     const row = temp.store.getReminder(reminder.id);
     assert.equal(row.status, 'fired');
-    assert.equal(row.delivery_attempts, 1);
+    // V6-M1：成功投递即结束本次 occurrence，计数归零。
+    assert.equal(row.delivery_attempts, 0);
   } finally {
     handle.dispose();
     temp.cleanup();
@@ -458,8 +470,10 @@ test('V4-H1：失败退避 30s→60s→120s，3 个 tick 内不会把 attempts �
     await ctx.fireTimers();
     await settle(50);
     row = temp.store.getReminder(reminder.id);
-    assert.equal(row.delivery_attempts, 3);
+    // V6-M1：expired 是本次 occurrence 的终点，计数归零、occurrence 清空。
     assert.equal(row.status, 'expired');
+    assert.equal(row.delivery_attempts, 0);
+    assert.equal(row.occurrence_key, null);
   } finally {
     handle.dispose();
     temp.cleanup();

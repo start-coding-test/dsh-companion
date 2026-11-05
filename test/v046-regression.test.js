@@ -7,8 +7,9 @@
  * 同一条链路里，确认它们没有互相踩踏。
  *
  * 覆盖：
- *   C5-H1a 提醒 prompt 第二参是 AbortSignal、requestId 由 claim 决定且新 claim
- *          换 key、失败写 delivery_error 并进 /状态「最近失败」、warn 去重。
+ *   C5-H1a 提醒 prompt 第二参是 AbortSignal、requestId 按 occurrence 稳定
+ *          （退避重试不换 key）、失败写 delivery_error 并进 /状态「最近失败」、
+ *          warn 去重。
  *   C5-H1a 宿主记成 user 的提醒消息不重绑主会话、不进巩固窗口、不喂召回。
  *   C5-H1b strict 宿主无 createSession，线程走 create/resolveAgent，投递带
  *          companion-thread:/companion-task: requestId。
@@ -196,8 +197,11 @@ test('v0.4.6 C5-H1a：提醒投递带 AbortSignal 与稳定 requestId，失败�
 
   const calls = promptCalls(ctx);
   assert.equal(calls.length, 1, '失败后不应在同一次 flush 里重复投递');
-  const firstRequestId = `companion-reminder:${reminder.id}:${reminder.next_fire_at}`;
-  assert.equal(calls[0].request.requestId, firstRequestId, '提醒 requestId 必须由 claim key 决定');
+  // V6-M1：requestId 按 occurrence 稳定（不再随退避改写后的 next_fire_at 变化）。
+  const occurrenceKey = temp.store.getReminder(reminder.id).occurrence_key;
+  assert.ok(occurrenceKey, '入队前必须生成本次到点的 occurrence_key');
+  const firstRequestId = `companion-reminder:${reminder.id}:${occurrenceKey}`;
+  assert.equal(calls[0].request.requestId, firstRequestId, '提醒 requestId 必须由 occurrence 决定');
   assert.equal(calls[0].text, REMINDER_TEXT, '正文带 [提醒] 前缀供正文侧排除');
   assert.ok(calls[0].signal instanceof AbortSignal, '第二参必须是 AbortSignal');
   assert.equal(typeof calls[0].signal.throwIfAborted, 'function');
@@ -216,7 +220,7 @@ test('v0.4.6 C5-H1a：提醒投递带 AbortSignal 与稳定 requestId，失败�
     /最近失败：投递失败：TypeError：signal\.throwIfAborted is not a function/u,
   );
 
-  // 下一次 tick 是新 claim：requestId 换新的 fire key；失败仍回 pending。
+  // 下一次 tick 是同一 occurrence 的退避重试：requestId 不变；失败仍回 pending。
   const failedRow = temp.store.getReminder(reminder.id);
   assert.equal(failedRow.status, 'pending');
   assert.equal(failedRow.delivery_attempts, 1);
@@ -229,10 +233,10 @@ test('v0.4.6 C5-H1a：提醒投递带 AbortSignal 与稳定 requestId，失败�
   assert.equal(retried.length, 2, '退避到期后应重试一次');
   assert.equal(
     retried[1].request.requestId,
-    `companion-reminder:${reminder.id}:${failedRow.next_fire_at}`,
-    '新 claim 使用新的 fire key',
+    firstRequestId,
+    '同一次到点的退避重试必须复用同一个 requestId',
   );
-  assert.notEqual(retried[1].request.requestId, firstRequestId);
+  assert.equal(temp.store.getReminder(reminder.id).occurrence_key, occurrenceKey);
   assert.equal(warnLogs(ctx, /proactive delivery failed/u).length, 1, '同一失败原因只 warn 一次');
 
   const after = temp.store.getReminder(reminder.id);

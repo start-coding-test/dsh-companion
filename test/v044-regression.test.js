@@ -342,7 +342,8 @@ test('V3-H2：投递成功转 fired，后续 tick 不重复提醒', async () => 
     assert.equal(promptTexts(ctx).filter((text) => text.includes('给妈妈打电话')).length, 1);
     const row = temp.store.getReminder(reminder.id);
     assert.equal(row.status, 'fired');
-    assert.ok(row.last_fire_key);
+    assert.equal(row.last_fire_key, null);
+    assert.equal(row.delivery_attempts, 0);
 
     ctx.advance(30_000);
     await ctx.fireTimers();
@@ -382,7 +383,7 @@ test('V3-H2：prompt 抛错后重启仍 pending，补发成功才 fired', async 
     assert.equal(promptTexts(second.ctx).filter((text) => text.includes('交房租')).length, 1);
     const delivered = temp.store.getReminder(reminder.id);
     assert.equal(delivered.status, 'fired');
-    assert.equal(delivered.delivery_attempts, 2);
+    assert.equal(delivered.delivery_attempts, 0);
   } finally {
     handle2.dispose();
     temp.cleanup();
@@ -408,7 +409,7 @@ test('V3-H2：崩溃残留 delivering 启动回收为 pending 并补发', async 
     await firstTick(ctx);
     assert.equal(promptTexts(ctx).filter((text) => text.includes('交水电费')).length, 1);
     assert.equal(temp.store.getReminder(reminder.id).status, 'fired');
-    assert.equal(temp.store.getReminder(reminder.id).delivery_attempts, 2);
+    assert.equal(temp.store.getReminder(reminder.id).delivery_attempts, 0);
   } finally {
     handle.dispose();
     temp.cleanup();

@@ -202,7 +202,7 @@ test('V4-H1 集成：提醒失败一次后下一 tick 只送达一条，无重�
 
     const delivered = temp.store.getReminder(reminder.id);
     assert.equal(delivered.status, 'fired');
-    assert.equal(delivered.delivery_attempts, 2);
+    assert.equal(delivered.delivery_attempts, 0);
     assert.equal(
       temp.store.db.prepare("SELECT COUNT(*) AS n FROM reminders WHERE status = 'delivering'").get().n,
       0,
@@ -266,7 +266,8 @@ test('V4-H1 集成：连续 3 个 tick 失败重试不会把提醒提前耗成 e
     assert.equal((texts[2].match(/吃药/gu) ?? []).length, 1);
     row = temp.store.getReminder(reminder.id);
     assert.equal(row.status, 'fired');
-    assert.equal(row.delivery_attempts, 3);
+    // V6-M1：成功投递后失败计数归零，下一次到点从 0 重新计。
+    assert.equal(row.delivery_attempts, 0);
   } finally {
     handle.dispose();
     temp.cleanup();

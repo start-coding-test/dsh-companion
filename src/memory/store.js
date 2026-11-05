@@ -54,8 +54,11 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  * v10：reminders.status 合法值增加 `delivering`（两阶段投递：先占位再置 fired），
  *     并新增 delivery_attempts 计数（重启回收与重试上限）。SQLite 不能改 CHECK，
  *     由 #ensureRemindersDeliveryColumns 幂等重建表，旧行 delivery_attempts=0。
+ * v11：reminders 增加 occurrence_key（V6-M1）：requestId 按「本次到点」而非
+ *     next_fire_at 取值，失败退避改写 next_fire_at 后重试仍复用同一 rpcId；
+ *     投递成功/置 expired 时清空，下一次到点重新生成。旧行 NULL，按列检测补列。
  */
-const SCHEMA_VERSION = '10';
+const SCHEMA_VERSION = '11';
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
 
@@ -284,6 +287,7 @@ CREATE TABLE IF NOT EXISTS reminders (
   rrule             TEXT,
   next_fire_at      INTEGER,
   last_fire_key     TEXT,
+  occurrence_key    TEXT,
   status            TEXT NOT NULL DEFAULT 'pending'
                     CHECK (status IN ('pending','delivering','fired','snoozed','done','cancelled','expired')),
   closed_at         INTEGER,
@@ -767,6 +771,8 @@ export class Store {
       // v10：reminders 增加 delivering 状态与 delivery_attempts；SQLite 改不了
       // CHECK，按列检测后重建表（幂等，新库直接命中「列已存在」）。
       this.#ensureRemindersDeliveryColumns();
+      // v11：reminders 增加 occurrence_key（V6-M1），按列检测补列，旧行 NULL。
+      this.#ensureReminderOccurrenceColumn();
       // v6/v7/v8/v9 的列与索引放在迁移之后处理：旧表此时才补上 embedder_id 与
       // first_reneed_*/same_context/first_used_* 列。ALTER 按列检测，重复调用安全。
       this.#ensureFactsReneedColumns();
@@ -907,10 +913,12 @@ export class Store {
    * 记录就是 NULL，不能用 recall 样本反推。
    * v9 → v10 只推进版本号；reminders 的 delivering 状态与 delivery_attempts
    * 由 migrate() 统一重建（#ensureRemindersDeliveryColumns）。
+   * v10 → v11 只推进版本号；reminders.occurrence_key 由 migrate() 统一补列
+   * （#ensureReminderOccurrenceColumn），旧行 NULL，不需要回填。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
-    if (from === '9' || from === '8' || from === '7' || from === '6') {
+    if (from === '10' || from === '9' || from === '8' || from === '7' || from === '6') {
       this.#db
         .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
         .run(SCHEMA_VERSION);
@@ -987,6 +995,7 @@ export class Store {
         rrule             TEXT,
         next_fire_at      INTEGER,
         last_fire_key     TEXT,
+        occurrence_key    TEXT,
         status            TEXT NOT NULL DEFAULT 'pending'
                           CHECK (status IN ('pending','delivering','fired','snoozed','done','cancelled','expired')),
         closed_at         INTEGER,
@@ -1012,6 +1021,22 @@ export class Store {
       CREATE INDEX IF NOT EXISTS ix_rm_done ON reminders(closed_at)
         WHERE status IN ('done','cancelled');
     `);
+  }
+
+  /**
+   * v11（V6-M1）：reminders 增加 occurrence_key。
+   *
+   * 只加可空列，不重建表；旧行保持 NULL，等到下一次真正到点入队时再惰性生成。
+   * 逐列检测因此对新库、v10 旧库、v3..v9 升级路径都幂等；调用方（migrate）已包在
+   * BEGIN IMMEDIATE 里。
+   */
+  #ensureReminderOccurrenceColumn() {
+    const columns = this.#db
+      .prepare("PRAGMA table_info('reminders')")
+      .all()
+      .map((column) => column.name);
+    if (columns.includes('occurrence_key')) return;
+    this.#db.exec('ALTER TABLE reminders ADD COLUMN occurrence_key TEXT');
   }
 
   close() {
@@ -1782,6 +1807,46 @@ export class Store {
   }
 
   /**
+   * V6-M1：取（或惰性创建）本次到点的 occurrence key。
+   *
+   * requestId 必须按「occurrence」稳定：同一次到点因失败退避改写 `next_fire_at`
+   * 之后，重试仍复用同一个 key（宿主按 rpcId 去重）；投递成功或置 `expired` 时
+   * 清空，下一次到点再生成新 key。只有真正到了入队时刻才写库，插入提醒本身不
+   * 产生 key。
+   *
+   * 只对 `pending`/`snoozed` 且未删除的行生效；行不存在、已 fired/done/cancelled
+   * 时返回 null，调用方据此跳过入队。
+   *
+   * @param {string} id
+   * @param {number|Date} [now] 本次到点时间（Unix 秒），用于生成可读的 key
+   * @returns {string|null} 活跃提醒的 occurrence_key
+   */
+  ensureReminderOccurrence(id, now) {
+    const reminderId = requireString(id, 'reminders.id');
+    const at = epochOr(now, nowSeconds());
+    // key 带「本次到点秒」便于排查，再拼唯一后缀保证同秒多次到点也不撞。
+    const key = `${at}-${newId('occ')}`;
+    this.#db
+      .prepare(
+        `UPDATE reminders
+            SET occurrence_key = COALESCE(occurrence_key, ?),
+                updated_at = unixepoch()
+          WHERE id = ?
+            AND status IN ('pending','snoozed')
+            AND deleted_at IS NULL`,
+      )
+      .run(key, reminderId);
+    const row = this.#db
+      .prepare('SELECT occurrence_key, status, deleted_at FROM reminders WHERE id = ?')
+      .get(reminderId);
+    if (row === undefined || row === null) return null;
+    if (row.status !== 'pending' && row.status !== 'snoozed') return null;
+    if (row.deleted_at !== null && row.deleted_at !== undefined) return null;
+    if (row.occurrence_key === null || row.occurrence_key === undefined) return null;
+    return String(row.occurrence_key);
+  }
+
+  /**
    * 两阶段投递第一步：把到点提醒占位为 `delivering` 并记下本次 fire key。
    *
    * 只有 pending/snoozed 且未超重试上限的行能占位成功；占位成功返回 true，
@@ -1818,6 +1883,9 @@ export class Store {
 
   /**
    * 两阶段投递第二步（成功）：delivering → fired。
+   *
+   * V6-M1：一次到点结束，清空 occurrence_key/last_fire_key 并把 attempts 归零，
+   * 下一次到点重新生成 occurrence（新 rpcId），也不会继承上一次的失败计数。
    * @param {string} id
    * @returns {boolean}
    */
@@ -1825,7 +1893,11 @@ export class Store {
     const info = this.#db
       .prepare(
         `UPDATE reminders
-            SET status = 'fired', updated_at = unixepoch()
+            SET status = 'fired',
+                occurrence_key = NULL,
+                last_fire_key = NULL,
+                delivery_attempts = 0,
+                updated_at = unixepoch()
           WHERE id = ? AND status = 'delivering'`,
       )
       .run(requireString(id, 'reminders.id'));
@@ -1855,10 +1927,16 @@ export class Store {
     if (row === null || row.status !== 'delivering') return false;
     const attempts = Number(row.delivery_attempts ?? 0);
     if (attempts >= REMINDER_MAX_DELIVERY_ATTEMPTS) {
+      // V6-M1：本次 occurrence 彻底失败，清掉 occurrence/last_fire_key 并把
+      // 计数归零，与成功投递的「一次 occurrence 结束」语义保持一致。
       const expired = this.#db
         .prepare(
           `UPDATE reminders
-              SET status = 'expired', updated_at = unixepoch()
+              SET status = 'expired',
+                  occurrence_key = NULL,
+                  last_fire_key = NULL,
+                  delivery_attempts = 0,
+                  updated_at = unixepoch()
             WHERE id = ? AND status = 'delivering' AND delivery_attempts = ?`,
         )
         .run(reminderId, attempts);
@@ -1905,7 +1983,11 @@ export class Store {
     const expired = this.#db
       .prepare(
         `UPDATE reminders
-            SET status = 'expired', updated_at = unixepoch()
+            SET status = 'expired',
+                occurrence_key = NULL,
+                last_fire_key = NULL,
+                delivery_attempts = 0,
+                updated_at = unixepoch()
           WHERE status = 'delivering' AND delivery_attempts >= ?`,
       )
       .run(max);
@@ -1917,6 +1999,9 @@ export class Store {
 
   /**
    * 重试次数用尽：提醒置 expired（不再投递）。
+   *
+   * V6-M1：同样结束本次 occurrence——清空 occurrence_key/last_fire_key 并把
+   * attempts 归零，避免同一条提醒将来重新启用时继承旧计数/rpcId。
    * @param {string} id
    * @returns {boolean}
    */
@@ -1924,7 +2009,11 @@ export class Store {
     const info = this.#db
       .prepare(
         `UPDATE reminders
-            SET status = 'expired', updated_at = unixepoch()
+            SET status = 'expired',
+                occurrence_key = NULL,
+                last_fire_key = NULL,
+                delivery_attempts = 0,
+                updated_at = unixepoch()
           WHERE id = ? AND status IN ('pending','snoozed','delivering')
             AND deleted_at IS NULL`,
       )
