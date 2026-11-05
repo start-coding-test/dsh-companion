@@ -2,6 +2,27 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.7] - 2026-11-05
+
+v0.4.6 后的真机反馈修复：提醒 requestId 按 occurrence 稳定并重置 attempts、`/状态` 巩固模型来源标注改为「自动选取」、provider/model 发现失败 warn 去重。仍为零第三方运行时依赖；schema 升至 v11（旧库自动升级）；发布前独立复审 pass（H=0 / M=0 / L=0），见 [docs/review-v12.md](docs/review-v12.md)。
+
+### Fixed
+
+- **V6-M1 提醒 requestId 随退避改写而变化**：`reminders` 新增 `occurrence_key`（schema v11），每次真正到点入队前惰性生成并固定下来，requestId 改为 `companion-reminder:<id>:<occurrence_key>`。失败后按 30s / 60s 退避改写 `next_fire_at` 重试时复用同一个 occurrence_key，因此 rpcId 逐字节不变，宿主能按 rpcId 去重、不会被当成多条提醒；`onAttempt` 若发现库里的 occurrence_key 已被换代（旧队列 part 领取新到点）则拒绝投递。投递成功、达到上限置 `expired`（含 `recoverReminderDeliveries` 回收超限行）与 `expireReminder` 时统一清空 `occurrence_key` / `last_fire_key` 并把 `delivery_attempts` 归零，下一次到点生成新 key、attempts 从 0 重新计数。此前 V5-L2 观察到的口径问题（提醒 requestId 应「按 occurrence 稳定 + attempts 重置」）在本版落地。
+- **V6-L1 `/状态` 巩固模型来源标注**：运行时自动解析出的路由标注由「（运行时）」改为「（自动选取）」，配置来源为「（配置）」、宿主注入为「（宿主注入）」；`/状态` 三态措辞与 README、`docs/usage.md` 同步，不再出现「（运行时）」。
+- **V6-L3 provider/model 发现失败 warn 去重**：`listProviders` 失败由 `debug` 升为 `warn`（reason=`providers`），某 provider 的 `listModels` 失败同样升 `warn`（reason=`models:<providerId>`，meta 带 provider/message）。两类各只 warn 一次，连续重试（5 分钟）不重复刷屏；对应发现成功后清该键、成功解析出 runtime 路由后整体清空，之后再失败可再次 warn。
+
+### Changed
+
+- **迁移**：schema v10 → v11 在 delivery 列补齐后按 `PRAGMA table_info` 幂等 `ALTER TABLE ADD COLUMN` 补 `occurrence_key`（旧行为 NULL，下次到点惰性生成）；`export.js` 的 `CURRENT_SCHEMA_VERSION` 同步为 `'11'`。
+- **文档**：`docs/usage.md` 更新提醒 requestId/attempts 语义、`/状态` 标注与 warn 去重/重置，并补 schema 版本历史。
+- **测试**：新增 `test/v047-occurrence.test.js`、`test/v047-l1-l3.test.js` 与跨项集成回归 `test/v047-regression.test.js`（4 例，经真实 `apply()` 覆盖同 occurrence 退避重试、成功换代、v10→v11 迁移、`/状态` 标注与两类 warn 去重）；更新 `c5-h1a`、`c5-h2`、`v044` / `v045` / `v046` 与 e2e 提醒投递断言；用例总数 789 → 799 / 16 个套件。
+
+### Verified
+
+- 三时区 `node --test`（默认 / `TZ=UTC` / `TZ=America/New_York`）799/799 pass、0 fail、16 个套件；`test/e2e/plugin-smoke.test.js` 4/4。
+- 发布门 `node scripts/probe/run-headless.mjs --plugin` 通过；工作树干净，`git tag -a v0.4.7` 后推送远端。
+
 ## [0.4.6] - 2026-11-05
 
 v0.4.5 后的必修项修复：提醒投递签名与用户消息污染、线程服务公开方法名、巩固模型解析（llm 晚注册）、压缩开关可见性、跳过日志级别与 `/线程` 不支持提示。仍为零第三方运行时依赖，无 schema 变更；发布前独立复审 pass（H=0 / M=0 / L=1，Low 项已随发布修完），见 [docs/review-v11.md](docs/review-v11.md)。

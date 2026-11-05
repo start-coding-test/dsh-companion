@@ -4,7 +4,14 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.6 已发布**（2026-11-05）。`node --test` 全绿：789 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.4.7 已发布**（2026-11-05）。`node --test` 全绿：799 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+
+## v0.4.7 变更摘要
+
+- **提醒 requestId 按 occurrence 稳定（V6-M1）**：`reminders` 新增 `occurrence_key`（schema v11），requestId 固定为 `companion-reminder:<id>:<occurrence_key>`；失败退避改写 `next_fire_at` 重试时 rpcId 不变，成功或 `expired` 后清空 occurrence/last_fire_key 并把 `delivery_attempts` 归零，下一次到点换新 key、attempts 从 0 起。v10 旧库自动幂等迁移。
+- **`/状态` 巩固模型标注（V6-L1）**：运行时解析出的路由标「（自动选取）」，配置来源「（配置）」，宿主注入「（宿主注入）」，不再出现「（运行时）」。
+- **llm 发现失败 warn 去重（V6-L3）**：`listProviders` / 各 provider `listModels` 失败由 `debug` 升为 `warn`，按 `providers` / `models:<providerId>` 各只 warn 一次；发现成功后清键，成功解析出路由后整体清空，之后再失败可再次 warn。
+- **复审**：发布前独立复审 pass（H=0 / M=0 / L=0），见 [docs/review-v12.md](docs/review-v12.md)。完整条目见 [CHANGELOG](CHANGELOG.md)。
 
 ## v0.4.6 变更摘要
 
