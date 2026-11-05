@@ -31,7 +31,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { toBigrams, toMatchQuery } from './bigram.js';
-import { redactSensitiveValues } from './govern.js';
+import { REDACTED_CREDENTIAL, hasUnredactedCredentialValue, redactSensitiveValues } from './govern.js';
 import { RENEED_KINDS } from './reneed.js';
 import { DEFAULT_ALPHA, decayOf, reinforce } from './reinforce.js';
 import { boardFragments, renderBoard, scrubBoardText } from './state-board.js';
@@ -512,6 +512,8 @@ function toJsonArray(value) {
  * 巩固层写库前已按字段脱敏一次，这里再对 title/summary/evidence/
  * mood_evidence/topics/entities 套一遍：`redactSensitiveValues` 对非字符串
  * 原样返回、对无命中文本返回原文、且幂等，所以对已脱敏的值不会叠加占位符。
+ * V9-M1b 起兜底判定用 `hasUnredactedCredentialValue`：只有脱敏后仍残留凭据
+ * 「值」形态才整段替换，避免把「用户提到一个密码」这类叙事二次抹掉。
  * fts_episodes 由 `#refreshEpisodesFts` 从主表投影，自动跟着干净。
  *
  * @param {unknown} value 文本或文本数组（topics/entities）
@@ -529,12 +531,24 @@ function redactEpisodeInput(value) {
       // 坏 JSON 退化为整段文本脱敏（不改变「尽量不落明文」的取向）。
     }
   }
-  return redactSensitiveValues(value);
+  return redactEpisodeText(value);
 }
 
 /** @param {unknown[]} items */
 function redactEpisodeItems(items) {
-  return items.map((item) => (typeof item === 'string' ? redactSensitiveValues(item) : item));
+  return items.map((item) => redactEpisodeText(item));
+}
+
+/**
+ * V9-M1b：单条 episode 文本的防御性脱敏。值级替换后若仍残留凭据「值」才整段
+ * 替换为占位符；非字符串原样返回。
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+function redactEpisodeText(value) {
+  if (typeof value !== 'string' || value === '') return value;
+  const redacted = redactSensitiveValues(value);
+  return hasUnredactedCredentialValue(redacted) ? REDACTED_CREDENTIAL : redacted;
 }
 
 /**

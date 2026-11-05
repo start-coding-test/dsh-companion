@@ -17,7 +17,8 @@
  */
 
 import {
-  CREDENTIAL_HINT, REDACTED_CREDENTIAL, isSensitiveText, redactSensitiveValues,
+  CREDENTIAL_HINT, REDACTED_CREDENTIAL, hasUnredactedCredentialValue, isSensitiveText,
+  redactSensitiveValues,
 } from './govern.js';
 import { decayOf } from './reinforce.js';
 import { renderBoard, stageBoard } from './state-board.js';
@@ -366,19 +367,21 @@ function normalizeDraft(draft) {
 // ------------------------------------------------------- V9-M1 episode 脱敏
 
 /**
- * V9-M1：episode 单字段脱敏。
+ * V9-M1b：episode 单字段脱敏。
  *
- * 先按值脱敏（保留「用户提到一个密码」这类上下文），若整段仍命中
- * isSensitiveText（凭据值被空格/标点拆开而与上下文拼接，正则漏网），再整段
- * 替换为占位符。episode 是「叙事摘要」，宁可丢一句描述也不落明文。
+ * 先按值脱敏（保留「用户提到一个密码」这类上下文），只有脱敏后仍残留可识别的
+ * 凭据「值」（卡号 / `sk-` / 字段值 / 设备值）时才整段替换为占位符。V9-M1 最初
+ * 用 `isSensitiveText` 做兜底，任何提到「密码/口令」的字段都会被整段抹掉，
+ * 叙事摘要不可读；这里改用 `hasUnredactedCredentialValue`，词的提及不再触发。
+ * 导出以便单测直接覆盖字段级行为。
  *
  * @param {unknown} value
  * @returns {unknown}
  */
-function redactEpisodeField(value) {
+export function redactEpisodeField(value) {
   if (typeof value !== 'string' || value === '') return value;
   const redacted = redactSensitiveValues(value);
-  return isSensitiveText(redacted) ? REDACTED_CREDENTIAL : redacted;
+  return hasUnredactedCredentialValue(redacted) ? REDACTED_CREDENTIAL : redacted;
 }
 
 /**

@@ -113,7 +113,9 @@ const CREDENTIAL_VALUE_SHAPE = /[\d\p{P}\p{S}]/u;
  * V9-M1 脱敏面：与 isSensitiveText 的判定面一一对应，但只抹「值」。
  *
  * - `PASSWORD_CONNECTIVE`：密码/口令/password + 是/为/:/：/=/is + 值。有显式
- *   连接词时值一定是凭据，纯文字密码（`密码是 bluewhale`）也抹；
+ *   连接词时值一定是凭据，纯文字密码（`密码是 bluewhale`）也抹；值被空格+
+ *   连字符拆开（`密码 是 蓝鲸 - 7788`）时连同数字尾段一起抹——V9-M1b 去掉
+ *   整段兜底后，拼接形态由值级脱敏负责，避免残片落库；
  * - `PASSWORD_BARE`：密码/口令 + 空白 + 值（「路由器密码 蓝鲸-7788」），
  *   要求值含数字或符号，避免「密码 忘了」这类叙述被误伤；
  * - `CREDENTIAL_FIELD_REDACT`：api key / access token / secret / token / key
@@ -123,7 +125,7 @@ const CREDENTIAL_VALUE_SHAPE = /[\d\p{P}\p{S}]/u;
  * - `CARD_NUMBER_REDACT` / `SK_KEY_REDACT`：卡号形态与 `sk-` 字面值，
  *   没有上下文也能认出来，直接整段值替换。
  */
-const PASSWORD_CONNECTIVE = /(密码(?!学)|口令|passw(?:or)?d|pwd|passwd)(\s*(?:是|为|:|：|=|is)\s*)([^\s，。；,;]+)/giu;
+const PASSWORD_CONNECTIVE = /(密码(?!学)|口令|passw(?:or)?d|pwd|passwd)(\s*(?:是|为|:|：|=|is)\s*)([^\s，。；,;]+(?:\s*[-–—]\s*\d[^\s，。；,;]*)?)/giu;
 const PASSWORD_BARE = /(密码(?!学)|口令|passw(?:or)?d|passwd)(\s+)([^\s，。；,;]+)/giu;
 const CREDENTIAL_FIELD_REDACT = /(api[\s_-]?key|access[\s_-]?token|access[\s_-]?key|secret[\s_-]?key|\bkey\b|\btoken\b|\bsecret\b|\bpwd\b|\bpass\b)(\s*(?:是|为|:|：|=|is)\s*)([^\s，。；,;]+)/giu;
 const DEVICE_VALUE_REDACT = /(wi-?fi|路由器|路由|门禁|门锁|热点)(\s*(?:是|为|:|：|=)\s*)([^\s，。；,;]+)/giu;
@@ -157,6 +159,38 @@ export function redactSensitiveValues(text) {
   out = out.replace(SK_KEY_REDACT, REDACTED_CREDENTIAL);
   out = out.replace(CARD_NUMBER_REDACT, REDACTED_CREDENTIAL);
   return out;
+}
+
+/** V9-M1b：残留值检测的 `sk-` 形态（与 SENSITIVE_PATTERN 的 /i 口径一致）。 */
+const SK_KEY_PATTERN = /\bsk-[A-Za-z0-9]{6,}/iu;
+
+/**
+ * V9-M1b：脱敏后是否仍残留可识别的凭据「值」。
+ *
+ * `isSensitiveText` 只要出现「密码/口令/银行卡」这类词就命中，适合把事实挡在
+ * 库外；但 episode 字段的兜底不能用它，否则「用户提到一个密码」这类正常叙事
+ * 会被整段抹掉。这里只认「值」形态：
+ * - 卡号（CARD_NUMBER_PATTERN）与 `sk-` 字面值；
+ * - 凭据字段名 + 值，且值里含数字或符号（与 isSensitiveText 的弱字段同口径）；
+ * - 设备/网络名词 + 值，且值里含数字或符号。
+ *
+ * 单独出现「密码/口令/银行卡」等词、或已经替换成 `[凭据已省略]` 的文本都不算
+ * 残留；非字符串/空串返回 false。字段级兜底据此决定是否整段替换，避免把叙事
+ * 摘要一并抹掉。
+ *
+ * @param {unknown} text
+ * @returns {boolean}
+ */
+export function hasUnredactedCredentialValue(text) {
+  if (typeof text !== 'string' || text === '') return false;
+  // 占位符本身带方括号/冒号，会被「字段名 + 值」形态误认成值；先剔除再判。
+  const cleaned = text.split(REDACTED_CREDENTIAL).join(' ');
+  if (CARD_NUMBER_PATTERN.test(cleaned)) return true;
+  if (SK_KEY_PATTERN.test(cleaned)) return true;
+  const field = CREDENTIAL_FIELD_PATTERN.exec(cleaned);
+  if (field !== null && CREDENTIAL_VALUE_SHAPE.test(field[1])) return true;
+  const device = DEVICE_VALUE_PATTERN.exec(cleaned);
+  return device !== null && CREDENTIAL_VALUE_SHAPE.test(device[1]);
 }
 
 /**

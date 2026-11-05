@@ -1,5 +1,5 @@
 /**
- * v0.4.10 V9-M1：episode 入库前对凭据值脱敏。
+ * v0.4.10 V9-M1 / V9-M1b：episode 入库前对凭据值脱敏。
  *
  * 背景：V7-M3 只挡住了 facts 与状态板，consolidate 仍把 episode 的
  * title/summary/evidence/mood_evidence 原样写库，store 再投影到 fts_episodes，
@@ -8,19 +8,24 @@
  * 覆盖：
  *   1. govern.redactSensitiveValues：密码/口令、凭据字段名、设备值、`sk-`、
  *      卡号只抹「值」，保留上下文；无命中原文返回、非字符串原样返回、幂等；
- *   2. 巩固提示词新增「不得复述凭据值」约束；
- *   3. consolidate 写库前逐字段脱敏 + 整段兜底，四字段、topics 与
- *      fts_episodes 都不含明文，敏感事实仍按 V7-M3 过滤；
- *   4. store.insertEpisode 防御性脱敏：绕过 consolidate 直接写也不落明文；
- *   5. 纯文本 episode 不被误改（四字段与列表一字不差）。
+ *   2. V9-M1b：hasUnredactedCredentialValue 只认残留「值」形态，单纯出现
+ *      「密码/口令/银行卡」等词不算；redactEpisodeField 据此兜底，提到密码的
+ *      正常叙事不再整段被抹掉；
+ *   3. 巩固提示词新增「不得复述凭据值」约束；
+ *   4. consolidate 写库前逐字段脱敏，四字段、topics 与 fts_episodes 都不含
+ *      明文，敏感事实仍按 V7-M3 过滤；
+ *   5. store.insertEpisode 防御性脱敏：绕过 consolidate 直接写也不落明文；
+ *   6. 纯文本 episode 不被误改（四字段与列表一字不差）。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  REDACTED_CREDENTIAL, isSensitiveText, redactSensitiveValues,
+  REDACTED_CREDENTIAL, hasUnredactedCredentialValue, isSensitiveText, redactSensitiveValues,
 } from '../src/memory/govern.js';
-import { buildConsolidationPrompt, consolidate } from '../src/memory/consolidate.js';
+import {
+  buildConsolidationPrompt, consolidate, redactEpisodeField,
+} from '../src/memory/consolidate.js';
 import { Store } from '../src/memory/store.js';
 
 const PASSWORD_VALUE = '蓝鲸-7788';
@@ -54,6 +59,8 @@ test('V9-M1：redactSensitiveValues 只抹凭据值，保留上下文', () => {
     ['门禁密码为 8848', `门禁密码为 ${REDACTED_CREDENTIAL}`],
     ['口令：bluewhale', `口令：${REDACTED_CREDENTIAL}`],
     ['password is hunter2', `password is ${REDACTED_CREDENTIAL}`],
+    // 值被空格+连字符拆开时连同尾段一起抹（V9-M1b 由值级脱敏负责）。
+    ['密码 是 蓝鲸 - 7788', `密码 是 ${REDACTED_CREDENTIAL}`],
     // 凭据字段名 + 连接词
     ['token 是 abc123', `token 是 ${REDACTED_CREDENTIAL}`],
     ['API token：sk-abc123', `API token：${REDACTED_CREDENTIAL}`],
@@ -96,6 +103,77 @@ test('V9-M1：无命中原文返回、非字符串原样返回、幂等', () => 
   assert.equal(redactSensitiveValues(once), once);
   // 占位符本身不敏感：store 二次脱敏不会把它当凭据再判一次。
   assert.equal(isSensitiveText(REDACTED_CREDENTIAL), false);
+});
+
+// ------------------------------------------------- V9-M1b 字段级兜底口径
+
+test('V9-M1b：hasUnredactedCredentialValue 只认残留「值」形态', () => {
+  // 卡号 / sk- / 凭据字段值 / 设备值：脱敏漏网时仍能被认出来。
+  const residual = [
+    '卡号 6222 0202 0000 1234',
+    '账号 6222020200001234 已绑定',
+    '用 sk-abc12345 调用',
+    'token 是 abc123',
+    'API token：sk-abc123',
+    'pwd=1234',
+    `WiFi 是 ${PASSWORD_VALUE}`,
+    '门禁 是 8848',
+  ];
+  for (const text of residual) {
+    assert.equal(hasUnredactedCredentialValue(text), true, `应判为残留值：${text}`);
+  }
+
+  // 单纯出现「密码/口令/银行卡」等词不是残留值——这正是 V9-M1b 要修的过宽兜底。
+  const wordsOnly = [
+    '用户提到一个密码',
+    '我昨天忘了密码。',
+    '用户问起密码学与 tokenizer。',
+    '银行卡在招行',
+    '信用卡账单已还',
+    'token 额度 10B',
+    PASSWORD_VALUE,
+    REDACTED_CREDENTIAL,
+    `密码 ${REDACTED_CREDENTIAL}`,
+    '',
+  ];
+  for (const text of wordsOnly) {
+    assert.equal(hasUnredactedCredentialValue(text), false, `不应判为残留值：${text}`);
+  }
+  assert.equal(hasUnredactedCredentialValue(null), false);
+  assert.equal(hasUnredactedCredentialValue(undefined), false);
+  assert.equal(hasUnredactedCredentialValue(['密码']), false);
+
+  // 脱敏后的常见形态不再被判残留（兜底不会二次触发）。
+  assert.equal(
+    hasUnredactedCredentialValue(redactSensitiveValues(`路由器密码 ${PASSWORD_VALUE}`)),
+    false,
+  );
+  assert.equal(
+    hasUnredactedCredentialValue(redactSensitiveValues('卡号 6222 0202 0000 1234')),
+    false,
+  );
+});
+
+test('V9-M1b：redactEpisodeField 只在残留值时整段兜底', () => {
+  const kept = [
+    ['用户提到一个密码', '用户提到一个密码'],
+    ['我昨天忘了密码。', '我昨天忘了密码。'],
+    ['用户问起密码学与 tokenizer。', '用户问起密码学与 tokenizer。'],
+    // 值被替换、上下文保留，不再整段抹掉叙事。
+    [`路由器密码 ${PASSWORD_VALUE}`, `路由器密码 ${REDACTED_CREDENTIAL}`],
+    ['卡号 6222 0202 0000 1234', `卡号 ${REDACTED_CREDENTIAL}`],
+    // 已脱敏文本再走字段函数保持原样（幂等）。
+    [`密码 ${REDACTED_CREDENTIAL}`, `密码 ${REDACTED_CREDENTIAL}`],
+  ];
+  for (const [input, expected] of kept) {
+    assert.equal(redactEpisodeField(input), expected, `字段结果不符：${input}`);
+  }
+  assert.equal(redactEpisodeField(''), '');
+  assert.equal(redactEpisodeField(null), null);
+  assert.equal(redactEpisodeField(undefined), undefined);
+
+  // 脱敏面漏网且仍残留值形态时，整段兜底（大写 sk- 不在 redact 的小写面里）。
+  assert.equal(redactEpisodeField('用户用 SK-ABC12345 调接口'), REDACTED_CREDENTIAL);
 });
 
 // ------------------------------------------------------- 提示词约束
@@ -165,12 +243,13 @@ test('V9-M1：consolidate 写库前逐字段脱敏，episodes 与 fts_episodes �
   assert.equal(rows.length, 1);
   const row = rows[0];
 
-  // 四字段：值被抹掉，且整段仍命中 isSensitiveText 时兜底为占位符。
-  for (const field of ['title', 'summary', 'evidence', 'mood_evidence']) {
-    assert.equal(row[field], REDACTED_CREDENTIAL, `${field} 应整段兜底`);
-  }
+  // 四字段：值被替换、上下文保留（V9-M1b 起不再整段抹掉叙事）。
+  assert.equal(row.title, `路由器密码 ${REDACTED_CREDENTIAL}`);
+  assert.equal(row.summary, `用户把家里路由器密码 ${REDACTED_CREDENTIAL} 告诉了我，想让我记住。`);
+  assert.equal(row.evidence, `用户原话：路由器密码 ${REDACTED_CREDENTIAL}`);
+  assert.equal(row.mood_evidence, `提到密码 ${REDACTED_CREDENTIAL} 时语气有点紧张`);
   // topics 逐项脱敏（fts_episodes 会投影 topics）。
-  assert.deepEqual(JSON.parse(row.topics_json), ['网络', REDACTED_CREDENTIAL]);
+  assert.deepEqual(JSON.parse(row.topics_json), ['网络', `路由器密码 ${REDACTED_CREDENTIAL}`]);
   assert.deepEqual(JSON.parse(row.entities_json), ['路由器']);
 
   // episodes 四字段与列表、整行 JSON 都不含明文。
@@ -193,7 +272,7 @@ test('V9-M1：consolidate 写库前逐字段脱敏，episodes 与 fts_episodes �
   assert.deepEqual(facts.map((fact) => fact.statement), ['用户住在朝阳区']);
 });
 
-test('V9-M1：凭据值被拆成拼接形态时整段兜底', async (t) => {
+test('V9-M1b：拼接形态的值被完整替换，字段不整段抹掉', async (t) => {
   const store = Store.open(':memory:');
   t.after(() => store.close());
 
@@ -213,10 +292,44 @@ test('V9-M1：凭据值被拆成拼接形态时整段兜底', async (t) => {
   });
 
   const row = store.listEpisodes({ scope: 'main' })[0];
-  // 值被空格拆开，值级脱敏会漏掉「- 7788」；整段仍敏感 → 整段替换。
-  assert.equal(row.summary, REDACTED_CREDENTIAL);
+  // 值被空格/连字符拆开也整体替换，叙事保留；不因「密码」一词整段抹掉。
+  assert.equal(row.summary, `用户说密码 是 ${REDACTED_CREDENTIAL}，回头再改。`);
   assert.equal(row.title, '网络设置', '纯文本字段不受牵连');
-  assert.doesNotMatch(episodeText(row), /7788/u);
+  assert.doesNotMatch(episodeText(row), /7788|蓝鲸/u);
+});
+
+test('V9-M1b：字段兜底只针对残留值，不因「密码」一词整段抹掉', async (t) => {
+  const store = Store.open(':memory:');
+  t.after(() => store.close());
+
+  await consolidate({
+    store,
+    scope: 'main',
+    seqFrom: 1,
+    seqTo: 4,
+    llm: async () => ({
+      episode: {
+        title: '账号安全',
+        summary: '用户提到一个密码，但没说是哪个，准备改天聊。',
+        evidence: '用户说密码学与 tokenizer。',
+        mood_evidence: '我昨天忘了密码。',
+        topics: ['账号'],
+        mood: 'neutral',
+      },
+      facts: [],
+    }),
+    now: 1_700_000_600,
+  });
+
+  const row = store.listEpisodes({ scope: 'main' })[0];
+  // 只是提到「密码/密码学/忘了密码」，没有值：字段原样保留。
+  assert.equal(row.title, '账号安全');
+  assert.equal(row.summary, '用户提到一个密码，但没说是哪个，准备改天聊。');
+  assert.equal(row.evidence, '用户说密码学与 tokenizer。');
+  assert.equal(row.mood_evidence, '我昨天忘了密码。');
+  assert.deepEqual(JSON.parse(row.topics_json), ['账号']);
+  // 叙事照常进 fts_episodes，正常召回不受影响。
+  assert.ok(store.searchBigram('账号', {}).some((hit) => hit.type === 'episode'));
 });
 
 test('V9-M1：纯文本 episode 不被误改', async (t) => {
@@ -272,7 +385,7 @@ test('V9-M1：store.insertEpisode 防御性脱敏，绕过 consolidate 也不落
     started_at: 1_700_000_000,
   });
 
-  // store 只做值级脱敏（整段兜底在 consolidate 层）：值被替换、上下文保留。
+  // 值被替换、上下文保留（只有脱敏后仍残留值形态才整段兜底）。
   assert.equal(row.title, `路由器密码 ${REDACTED_CREDENTIAL}`);
   assert.equal(row.summary, `明文密码 ${REDACTED_CREDENTIAL}`);
   assert.equal(row.evidence, `API token：${REDACTED_CREDENTIAL}`);
@@ -291,6 +404,16 @@ test('V9-M1：store.insertEpisode 防御性脱敏，绕过 consolidate 也不落
     started_at: 1_700_000_100,
   });
   assert.deepEqual(JSON.parse(jsonTopics.topics_json), [`路由器密码 ${REDACTED_CREDENTIAL}`]);
+
+  // 只提到「密码」、没有值的叙事不会被 store 二次整段覆盖。
+  const narrative = store.insertEpisode({
+    scope: 'main',
+    session_id: 'main',
+    title: '账号安全',
+    summary: '用户提到一个密码，但没说是哪个。',
+    started_at: 1_700_000_250,
+  });
+  assert.equal(narrative.summary, '用户提到一个密码，但没说是哪个。');
 
   // 幂等：已脱敏文本再写一次不会叠加占位符。
   const again = store.insertEpisode({
