@@ -4,7 +4,15 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.10 已发布**（2026-11-05）。`node --test` 全绿：881 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.4.11 已发布**（2026-11-05）。`node --test` 全绿：918 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+
+## v0.4.11 变更摘要
+
+- **thread preset 可配置（V10-H1）**：新增可选配置 `thread.agentPreset`（默认 `null`）；未配置时 `thread_run` 不传 `agentPreset`、走宿主默认，配置后传入该值。宿主报未知 preset 时返回 `{ ok: false, reason: 'preset_unknown', message }`，不抛异常、不写 `threads` 行；`/状态` 显示「线程 preset：宿主默认 / <name>（配置：thread.agentPreset）」。
+- **压缩/巩固耗时阈值（G0-9）**：新增可选配置 `timing.compactWarnMs`（默认 `20000`）与 `timing.consolidateWarnMs`（默认 `60000`）；成功/失败都采样最近耗时，超阈值同类每进程只 warn 一次、**不设硬超时、不中止**；`/状态` 增加「最近压缩耗时」「最近巩固耗时」（无样本 `—`，超阈值标「（超阈值）」）。
+- **存量 episode 脱敏 scrub（V10-L1，schema v13）**：打开 v12 及更早（或无标记）的库时，对存量 episodes 的六个文本/JSON 字段一次性重跑值级脱敏并重建 `fts_episodes`；只改变化行，写 `schema_meta` 标记 `episode_scrub_v13` 与一条 `action=scrub` 审计（仅 `{scanned,changed}`），重复打开幂等。
+- **round C 常驻口径（V10-M1）**：round C 改为**常驻实例 8 次巩固成功**；headless / one-shot turn 结束进程即退出，`setImmediate` 排后的巩固不执行属正常（云端 `tokenMeter` 有值、`consolidations=0`），headless 门只作 A/B 冒烟、SKIP 不计 PASS；三种门改造登记为推迟项 D-10。
+- **复审**：发布前独立复审 [review-v17](docs/review-v17.md)（pass，H=0 / M=0 / L=3，均为不阻塞观察）。完整条目见 [CHANGELOG](CHANGELOG.md)。
 
 ## v0.4.10 变更摘要
 
@@ -171,7 +179,7 @@ DSH 会把 `name` 转成 `file://` URL 再动态 import：绝对路径按 `pathT
 | `recall.skipSmallTalk` | `true` | 长度 <4、纯算术/符号与常见问候跳过召回 | 布尔 |
 | `session.mainBinding` | `"latest-user"` | 主会话绑定策略：`latest-user` 跟随最新真实用户会话，`first` 保持首个主会话 | `latest-user` / `first` |
 
-token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置，v0.4.2 新增 `vector.backfillTimeoutMs` 并把 `backfillBatchSize` 默认降到 8；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。v0.4.4 起新增非枚举的 `recall.*` 与 `session.mainBinding`，同样不参与 16 键安装自检。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
+token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置，v0.4.2 新增 `vector.backfillTimeoutMs` 并把 `backfillBatchSize` 默认降到 8；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。v0.4.4 起新增非枚举的 `recall.*` 与 `session.mainBinding`，同样不参与 16 键安装自检；v0.4.11 起新增非枚举的 `thread.agentPreset`（默认 `null`）与 `timing.compactWarnMs` / `timing.consolidateWarnMs`（默认 `20000` / `60000`），同样不参与 16 键安装自检。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
 
 **宿主压缩能力（compaction-basic）**：插件通过宿主的 `compaction.compactRegion` 服务压缩上下文，压缩后由水位重锚接管。DSH web-app 默认把 `compaction-basic` 设为 `disabled: true`，插件拿不到该能力，`/状态` 会显示「压缩：宿主未开启（compaction-basic 未启用）」：巩固照常写库，但 `pending_compact` 只保留区间，surface 不会真正缩小。云端已验证的开启写法（写进 `cordis.patch.yml`，不是本插件的 config）：
 

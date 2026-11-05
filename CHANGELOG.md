@@ -4,7 +4,7 @@
 
 ## [0.4.11] - 2026-11-05
 
-按用户 v0.4.11 清单修复四项：V10-H1（thread preset 可配置、未知 preset 不抛异常）、G0-9（压缩/巩固耗时阈值与告警，不中止）、V10-L1（存量 episode/FTS 一次性脱敏 scrub，幂等）、V10-M1（round C 口径与 headless 巩固限制写入文档）。仍为零第三方运行时依赖；schema 升至 v13（纯数据迁移，无新列）。
+按用户 v0.4.11 清单修复四项：V10-H1（thread preset 可配置、未知 preset 不抛异常）、G0-9（压缩/巩固耗时阈值与告警，不中止）、V10-L1（存量 episode/FTS 一次性脱敏 scrub，幂等）、V10-M1（round C 口径与 headless 巩固限制写入文档）。仍为零第三方运行时依赖；schema 升至 v13（纯数据迁移，无新列）。本次发布 **918 个用例 / 16 个套件**，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过。
 
 ### Fixed
 
@@ -15,6 +15,8 @@
 ### Changed
 
 - **V10-M1 round C 口径与 headless 巩固限制（文档项）**：round C 的通过口径改为 **常驻实例上 8 次巩固成功**，不再要求 headless 门内完成。headless / one-shot 在 turn 结束后进程即退出，巩固由 `setImmediate` 排到后台，因此**不会发生巩固**；云端实测 `tokenMeter` 有值、`consolidations=0` 属正常。`docs/usage.md` 新增「headless 一次性运行与 round C 口径」一节；`docs/known-debt.md` 记录 `DSH_COMPANION_GATE_SYNC`、常驻版门脚本、dispose 限时等待三种门改造均未实现、属推迟项。`config.example.yml` 补 `thread.agentPreset` 可选注释段。
+
+发布前独立复审：[review-v17](docs/review-v17.md)（pass，H=0 / M=0 / L=3，均为不阻塞观察）。
 
 ## [0.4.10] - 2026-11-05
 
