@@ -237,24 +237,32 @@ test('compactRegion 原样转发参数与返回值', async () => {
   assert.equal(result.end, 20);
 });
 
-test('createSession/whenIdle 转发，支持 agent 与 createSession 返回值', async () => {
-  const ctx = new FakeCtx();
+test('createSession/whenIdle 转发：公开 create + resolveAgent 归一', async () => {
+  const ctx = new FakeCtx({ strict: true });
   const adapter = createAdapter(ctx);
   const request = { cwd: 'D:/work' };
 
   const created = await adapter.createSession(request);
-  assert.equal(ctx.callsOf('sessionController.createSession')[0].args[0], request);
+  // C5-H1b：转发到公开服务 create()（不是内部类 createSession）。
+  assert.equal(ctx.callsOf('sessionController.create')[0].args[0], request);
+  assert.equal(ctx.callsOf('sessionController.createSession').length, 0);
+  // 归一成历史约定 {agent, agentPreset, sessionId}，agent 由 resolveAgent 反查。
   assert.ok(created.agent);
+  assert.equal(created.sessionId, created.agent.id);
+  assert.equal(ctx.callsOf('sessionController.resolveAgent')[0].args[0], created.sessionId);
 
   const first = await adapter.whenIdle(created.agent);
   assert.deepEqual(first, { id: created.agent.id });
   await adapter.whenIdle(created);
   assert.equal(ctx.callsOf('agent.whenIdle').length, 2);
 
-  assert.throws(
+  await assert.rejects(
     () => adapter.whenIdle({}),
     (error) => error instanceof PlatformError && error.code === 'no-when-idle',
   );
+  // 支持直接传会话 id：经 resolveAgent 反查后 whenIdle。
+  await adapter.whenIdle(created.sessionId);
+  assert.equal(ctx.callsOf('agent.whenIdle').length, 3);
 });
 
 test('prompt 第二个参数是 AbortSignal，requestId 稳定可去重', async () => {
@@ -359,7 +367,7 @@ const missingCases = [
   ['on', 'no-pre-step', (adapter) => adapter.onPreStep(() => undefined)],
   ['timer', 'no-timer', (adapter) => adapter.every(1_000, () => {})],
   ['compaction', 'no-compaction', (adapter) => adapter.compactRegion(1, 2, agent)],
-  ['sessionController.createSession', 'no-session', (adapter) => adapter.createSession({ cwd: '.' })],
+  ['sessionController.create', 'no-session', (adapter) => adapter.createSession({ cwd: '.' })],
   ['sessionController.prompt', 'no-session', (adapter) => adapter.prompt({ sessionId: 's', content: [] })],
   ['sessionController.cancel', 'no-session', (adapter) => adapter.cancel('s')],
   ['workspaceRegistry', 'no-archive', (adapter) => adapter.archiveSession('s')],

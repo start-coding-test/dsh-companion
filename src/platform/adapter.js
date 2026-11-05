@@ -259,12 +259,15 @@ export function createAdapter(ctx, opts = {}) {
 
   /**
    * H3②：线程/任务工具的能力探测。只读 `ctx.get('sessionController')`，
-   * **绝不实际 createSession**；三个方法缺一个就视为宿主不支持。
+   * **绝不实际创建会话**；公开服务的 create/prompt/cancel 缺一个就视为不支持。
+   *
+   * C5-H1b：这里探测的是 `ApiSessionList` 的公开方法 `create`，不是内部类
+   * `ApiSessionAgentController` 的 `createSession`（后者不在服务对象上）。
    * @returns {boolean}
    */
   const hasThreadControl = () => {
     const controller = service('sessionController');
-    return typeof controller?.createSession === 'function'
+    return typeof controller?.create === 'function'
       && typeof controller?.prompt === 'function'
       && typeof controller?.cancel === 'function';
   };
@@ -460,15 +463,34 @@ export function createAdapter(ctx, opts = {}) {
   }
 
   /**
+   * 开一个会话（C5-H1b）。
+   *
+   * 宿主服务 `sessionController` 实际是 `ApiSessionList`，公开方法是
+   * `create(request)`；内部类 `ApiSessionAgentController.createSession` 不在
+   * 服务对象上。公开 `create` 返回 `{ sessionId, agentPreset? }`（不是
+   * `{ agent }`），这里归一成历史约定 `{ agent, agentPreset, sessionId }`，
+   * agent 句柄用公开的 `resolveAgent(sessionId)` 反查，调用方无需感知差异。
+   *
+   * 保持同步抛 `PlatformError`（缺能力时），返回值是 Promise。
+   *
    * @param {object} request { sessionId?, cwd, agentPreset?, reusable? }
-   * @returns {Promise<{agent: object, agentPreset: unknown}>}
+   * @returns {Promise<{agent: object|null, agentPreset: unknown, sessionId?: string}>}
    */
   function createSession(request) {
     const impl = service('sessionController');
-    if (typeof impl?.createSession !== 'function') {
-      throw unavailable('no-session', 'ctx.sessionController.createSession()');
+    if (typeof impl?.create !== 'function') {
+      throw unavailable('no-session', 'ctx.sessionController.create()');
     }
-    return impl.createSession(request);
+    return Promise.resolve(impl.create(request)).then(async (created) => {
+      const sessionId = sessionIdOf(created);
+      const agent = created?.agent
+        ?? (sessionId === null ? null : await resolveAgent(sessionId));
+      return {
+        agent,
+        agentPreset: created?.agentPreset,
+        ...(sessionId === null ? {} : { sessionId }),
+      };
+    });
   }
 
   /**
@@ -516,42 +538,89 @@ export function createAdapter(ctx, opts = {}) {
   }
 
   /**
-   * 把 agent 句柄 / createSession 返回值 / 会话 id 归一成 agent 句柄。
-   * @param {unknown} target
-   * @returns {object|null}
+   * 从 createSession 返回值/请求对象里取会话 id（C5-H1b）。
+   * @param {unknown} value
+   * @returns {string|null}
    */
-  function resolveAgent(target) {
-    let candidate = target;
-    if (typeof candidate === 'string') {
-      const agents = service('agents');
-      if (typeof agents?.get === 'function') {
-        candidate = agents.get(candidate);
-      } else if (Array.isArray(agents)) {
-        candidate = agents.find(
-          (agent) => agent?.id === target || agent?.session?.id === target,
-        );
-      } else {
-        candidate = null;
-      }
-      return candidate ?? null;
-    }
-    if (candidate !== null && typeof candidate === 'object' && candidate.agent !== undefined) {
-      candidate = candidate.agent;
-    }
-    return candidate !== null && typeof candidate === 'object' ? candidate : null;
+  function sessionIdOf(value) {
+    if (typeof value === 'string') return value === '' ? null : value;
+    if (value === null || typeof value !== 'object') return null;
+    const candidates = [
+      value.sessionId,
+      value.session?.id,
+      value.agent?.sessionId,
+      value.agent?.id,
+      value.agent?.session?.id,
+    ];
+    return candidates.find((candidate) => typeof candidate === 'string' && candidate !== '') ?? null;
   }
 
   /**
-   * 等待 agent 静默。whenIdle 属于 agent 句柄而非 sessionController。
-   * @param {object|string} target agent 句柄、会话 id，或 createSession 的返回值 { agent }
+   * 用公开服务 `sessionController.resolveAgent(sessionId)` 反查 agent 句柄；
+   * 服务没有该方法时回落到 `ctx.agents`（数组或 Map 风格 get）。
+   * @param {string} sessionId
+   * @returns {Promise<object|null>}
+   */
+  async function agentBySessionId(sessionId) {
+    const controller = service('sessionController');
+    if (typeof controller?.resolveAgent === 'function') {
+      try {
+        const resolved = await controller.resolveAgent(sessionId);
+        if (resolved !== null && typeof resolved === 'object' && resolved.agent) {
+          return resolved.agent;
+        }
+      } catch {
+        // resolveAgent 抛错时继续试 agents 服务；两者都不可用则返回 null。
+      }
+    }
+    const agents = service('agents');
+    if (typeof agents?.get === 'function') {
+      return agents.get(sessionId) ?? null;
+    }
+    if (Array.isArray(agents)) {
+      return agents.find(
+        (agent) => agent?.id === sessionId || agent?.session?.id === sessionId,
+      ) ?? null;
+    }
+    return null;
+  }
+
+  /**
+   * 把 agent 句柄 / createSession 返回值 / 会话 id 归一成 agent 句柄。
+   *
+   * C5-H1b：字符串或 `{ sessionId }` 走公开的
+   * `sessionController.resolveAgent(sessionId)`（宿主内部同样用这个方法），
+   * 不再假设调用方一定拿得到 agent 对象。
+   * @param {unknown} target
+   * @returns {Promise<object|null>}
+   */
+  async function resolveAgent(target) {
+    if (typeof target === 'string') {
+      return agentBySessionId(target);
+    }
+    if (target === null || typeof target !== 'object') return null;
+    if (typeof target.whenIdle === 'function') return target;
+    if (target.agent !== undefined) {
+      return target.agent !== null && typeof target.agent === 'object' ? target.agent : null;
+    }
+    const sessionId = sessionIdOf(target);
+    if (sessionId !== null) return agentBySessionId(sessionId);
+    return target;
+  }
+
+  /**
+   * 等待 agent 静默。whenIdle 属于 agent 句柄而非 sessionController；
+   * 会话 id 或 createSession 返回值先经 resolveAgent 归一。
+   * @param {object|string} target agent 句柄、会话 id，或 createSession 的返回值
    * @returns {Promise<unknown>}
    */
   function whenIdle(target) {
-    const agent = resolveAgent(target);
-    if (agent !== null && typeof agent === 'object' && typeof agent.whenIdle === 'function') {
-      return agent.whenIdle();
-    }
-    throw unavailable('no-when-idle', 'agent.whenIdle()');
+    return Promise.resolve(resolveAgent(target)).then((agent) => {
+      if (agent !== null && typeof agent === 'object' && typeof agent.whenIdle === 'function') {
+        return agent.whenIdle();
+      }
+      throw unavailable('no-when-idle', 'agent.whenIdle()');
+    });
   }
 
   /**
@@ -569,7 +638,7 @@ export function createAdapter(ctx, opts = {}) {
     if (typeof sessionId !== 'string' || sessionId === '') {
       throw new TypeError('cleanInbox(sessionId): sessionId must be a non-empty string');
     }
-    const agent = resolveAgent(sessionId);
+    const agent = await resolveAgent(sessionId);
     if (agent === null || typeof agent !== 'object') return false;
     const inbox = agent.inbox;
     if (inbox === null || typeof inbox !== 'object' || typeof inbox.clear !== 'function') {

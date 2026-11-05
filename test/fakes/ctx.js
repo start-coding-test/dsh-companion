@@ -2,9 +2,10 @@
  * FakeCtx：适配层的测试替身。
  *
  * - 覆盖适配层用到的 11 个平台面：now、logger、systemPrompt.section、on、
- *   interval、compaction.compactRegion、sessionController.createSession、
- *   sessionController.prompt、sessionController.cancel、
- *   workspaceRegistry.archiveSession、tokenMeter.measure。
+ *   interval、compaction.compactRegion、sessionController.create、
+ *   sessionController.resolveAgent、sessionController.prompt、
+ *   sessionController.cancel、workspaceRegistry.archiveSession、
+ *   tokenMeter.measure。
  * - 手动时钟：构造参数 now（毫秒）指定起点，advance(ms) 推进。
  * - 调用记录：calls 数组，元素为 { method, args, at }。
  * - 失败注入：构造参数 fail 或 fail(key, error) 注入，key 使用点号路径，
@@ -12,6 +13,9 @@
  * - 返回值注入：构造参数 returns，按同样的点号 key 覆盖默认返回值。
  * - 缺失能力：构造参数 missing，例如 ["compaction", "sessionController"]；
  *   对应服务切片不会挂到 FakeCtx 上，用于验证 PlatformError。
+ * - strict：构造参数 strict=true 时 sessionController 只暴露真实宿主公开的
+ *   `{ create, resolveAgent, prompt, cancel }`，**没有**内部类方法
+ *   `createSession`（C5-H1b）。
  */
 export class FakeCtx {
   /**
@@ -20,11 +24,13 @@ export class FakeCtx {
    *   missing?: string[],
    *   fail?: Record<string, Error>,
    *   returns?: Record<string, unknown>,
+   *   strict?: boolean,
    * }} [options]
    */
   constructor(options = {}) {
     this._clock = options.now ?? Date.parse('2026-01-01T00:00:00.000Z');
     this._sessionSeq = 0;
+    this.strict = options.strict === true;
     this.calls = [];
     this.logs = [];
     this.listeners = new Map();
@@ -118,38 +124,97 @@ export class FakeCtx {
 
     if (!this.missing.has('sessionController')) {
       this.sessionController = {};
-      if (!this.missing.has('sessionController.createSession')) {
-        this.sessionController.createSession = (request) => {
+
+      /** 造一个 agent 句柄（whenIdle 计入调用，deferIdle 时挂起）。 */
+      const makeAgent = (sessionId) => ({
+        id: sessionId,
+        session: { id: sessionId },
+        inbox: {
+          cleared: 0,
+          clear() {
+            this.cleared += 1;
+            return true;
+          },
+        },
+        whenIdle: async () => {
+          this._record('agent.whenIdle', []);
+          this._failAt('agent.whenIdle');
+          if (this.deferIdle) {
+            return new Promise((resolve) => {
+              this.idleWaiters.set(sessionId, resolve);
+            });
+          }
+          return { id: sessionId };
+        },
+      });
+
+      /**
+       * 公开服务 `create(request)`（C5-H1b）：真实宿主返回
+       * `{ sessionId, agentPreset? }`，agent 由 `resolveAgent` 反查。
+       * 测试仍可用 returns 注入旧形状 `{ agent, agentPreset }`。
+       */
+      const create = (request) => {
+        this._record('sessionController.create', [request]);
+        this._failAt('sessionController.create');
+        // 非 strict：兼容旧测试断言，把同一调用同时记到已废弃的
+        // createSession 名下；strict 不暴露这个内部类方法（C5-H1b）。
+        if (!this.strict) {
           this._record('sessionController.createSession', [request]);
           this._failAt('sessionController.createSession');
-          this._sessionSeq += 1;
-          const sessionId = request?.sessionId ?? `session-fake-${this._sessionSeq}`;
-          const agent = {
-            id: sessionId,
-            session: { id: sessionId },
-            inbox: {
-              cleared: 0,
-              clear() {
-                this.cleared += 1;
-                return true;
-              },
-            },
-            whenIdle: async () => {
-              this._record('agent.whenIdle', []);
-              this._failAt('agent.whenIdle');
-              if (this.deferIdle) {
-                return new Promise((resolve) => {
-                  this.idleWaiters.set(sessionId, resolve);
-                });
-              }
-              return { id: sessionId };
-            },
+        }
+        this._sessionSeq += 1;
+        const fallbackId = request?.sessionId ?? `session-fake-${this._sessionSeq}`;
+        const override = Object.hasOwn(this.returns, 'sessionController.create')
+          ? this.returns['sessionController.create']
+          : (Object.hasOwn(this.returns, 'sessionController.createSession')
+            ? this.returns['sessionController.createSession']
+            : undefined);
+        let agent;
+        let sessionId = fallbackId;
+        let agentPreset = null;
+        if (typeof override === 'string') {
+          sessionId = override;
+        } else if (override !== null && typeof override === 'object') {
+          agent = override.agent ?? undefined;
+          sessionId = override.sessionId
+            ?? agent?.id
+            ?? agent?.session?.id
+            ?? fallbackId;
+          agentPreset = override.agentPreset ?? null;
+        }
+        if (agent === undefined) agent = makeAgent(sessionId);
+        if (agent.id !== sessionId) sessionId = agent.id ?? sessionId;
+        this.agents.push(agent);
+        return { sessionId, agentPreset };
+      };
+      this._fakeCreate = create;
+
+      // strict 模式只模拟真实宿主：没有 createSession（那是内部类方法）。
+      if (!this.strict) {
+        if (!this.missing.has('sessionController.createSession')) {
+          this.sessionController.createSession = (request) => {
+            const created = create(request);
+            const agent = this.agents.find((candidate) => candidate.id === created.sessionId);
+            return this._value('sessionController.createSession', {
+              agent,
+              agentPreset: created.agentPreset,
+            });
           };
-          this.agents.push(agent);
-          return this._value('sessionController.createSession', {
-            agent,
-            agentPreset: null,
-          });
+        }
+      }
+      if (!this.missing.has('sessionController.create')) {
+        this.sessionController.create = create;
+      }
+      if (!this.missing.has('sessionController.resolveAgent')) {
+        this.sessionController.resolveAgent = async (sessionId) => {
+          this._record('sessionController.resolveAgent', [sessionId]);
+          this._failAt('sessionController.resolveAgent');
+          const agent = this.agents.find(
+            (candidate) => candidate.id === sessionId || candidate.session?.id === sessionId,
+          );
+          return this._value('sessionController.resolveAgent', agent === undefined
+            ? { error: new Error(`unknown session ${sessionId}`) }
+            : { agent });
         };
       }
       if (!this.missing.has('sessionController.prompt')) {

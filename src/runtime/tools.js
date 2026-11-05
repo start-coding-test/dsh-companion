@@ -41,6 +41,21 @@ const DEFAULT_TIMERS = Object.freeze({
   clearTimeout: (handle) => clearTimeout(handle),
 });
 
+/** 进程内递增序号：给每次 thread_run/task_run 执行一个稳定、可读的短 id。 */
+let executionSequence = 0;
+
+/**
+ * 生成一次执行的唯一短 id（时间 + 递增序号）。同一次 execute 内只调用一次，
+ * 重试/多次投递共享同一个 id，不会每 tick 变化（C5-H1b）。
+ * @param {string} prefix
+ * @param {number} ms
+ * @returns {string}
+ */
+function makeExecutionId(prefix, ms) {
+  executionSequence += 1;
+  return `${prefix}-${Math.trunc(ms).toString(36)}-${executionSequence.toString(36)}`;
+}
+
 /**
  * 槽位保持到线程空闲：thread_run 已经把目标投递进去，真正的执行是线程会话；
  * 只有等它 whenIdle 才算这次执行结束，否则 task_run 会与它并行成第二个执行态。
@@ -458,6 +473,10 @@ export function createTools({
 
         // 新建分支返回的句柄直接用于 whenIdle，避免线程尚未进入 ctx.agents 时退化。
         let createdHandle = null;
+        // C5-H1b：同一次 thread_run 的所有投递共用一个 requestId；宿主据此把
+        // 「用户输入」与运行时内部消息区分开，重试不会产生新的用户消息。
+        const runId = makeExecutionId('run', nowMs());
+        const requestId = `companion-thread:${plan.key}:${runId}`;
 
         const run = async () => {
           const nowSec = Math.floor(nowMs() / 1000);
@@ -498,6 +517,7 @@ export function createTools({
               await platform.prompt({
                 sessionId: thread.session_id,
                 content: [{ type: 'text', text: goal }],
+                requestId,
               });
               store.upsertThread({ ...thread, last_progress: goal, last_active_at: nowSec });
               prompted = true;
@@ -545,6 +565,7 @@ export function createTools({
             await platform.prompt({
               sessionId,
               content: [{ type: 'text', text: goal }],
+              requestId,
             });
             prompted = true;
           }
@@ -624,6 +645,9 @@ export function createTools({
           return { ok: false, reason: 'session-unavailable' };
         }
         const scope = scopeNow();
+        // C5-H1b：一次 task_run 执行对应一个稳定 claimKey，worker 的 prompt
+        // requestId = companion-task:<taskId>:<claimKey>，重试不换 id。
+        const claimKey = makeExecutionId('claim', nowMs());
         return runBackgroundTask({
           platform,
           store,
@@ -632,6 +656,7 @@ export function createTools({
           at: nowMs(),
           scope: typeof scope === 'string' && scope !== '' ? scope : 'main',
           cwd: defaultCwd,
+          claimKey,
         });
       },
     },

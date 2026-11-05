@@ -47,7 +47,7 @@ test('adapter：now/cwd 经 ctx.get/opts 读取，缺省回落 Date.now()', () =
   assert.equal(bare.cwd(), undefined);
 });
 
-test('apply 的 hooks 席位优先于宿主：cwd 进 thread_run 的 createSession 请求', async () => {
+test('apply 的 hooks 席位优先于宿主：cwd 进 thread_run 的 create 请求', async () => {
   const ctx = makePluginCtx();
   const handle = apply(strictCtx(ctx), { dbPath: ':memory:' }, {
     cwd: '/hooked/cwd',
@@ -60,7 +60,7 @@ test('apply 的 hooks 席位优先于宿主：cwd 进 thread_run 的 createSessi
   const result = await tool.execute({ key: 'new', name: 'C-H1 席位', goal: '把席位读法锁住' });
   assert.equal(result.ok, true, JSON.stringify(result));
 
-  const call = ctx.callsOf('sessionController.createSession')[0];
+  const call = ctx.callsOf('sessionController.create')[0];
   assert.equal(call.args[0].cwd, '/hooked/cwd');
 
   handle.dispose();

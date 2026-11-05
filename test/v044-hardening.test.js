@@ -107,15 +107,15 @@ test('V3-H3②：无 sessionController 时 threadTools=false，且探测不创�
 
   assert.equal(adapter.capabilities.sessionController, false);
   assert.equal(adapter.capabilities.threadTools, false);
-  // 探测只读服务对象：不调用 createSession/prompt/cancel。
-  assert.equal(ctx.callsOf('sessionController.createSession').length, 0);
+  // 探测只读服务对象：不调用 create/prompt/cancel。
+  assert.equal(ctx.callsOf('sessionController.create').length, 0);
   assert.equal(ctx.callsOf('sessionController.prompt').length, 0);
   assert.equal(ctx.callsOf('sessionController.cancel').length, 0);
 });
 
 test('V3-H3②：sessionController 方法不齐时 threadTools 也是 false', () => {
   for (const missing of [
-    'sessionController.createSession',
+    'sessionController.create',
     'sessionController.prompt',
     'sessionController.cancel',
   ]) {
@@ -128,7 +128,7 @@ test('V3-H3②：能力齐全时 threadTools=true 且探测无副作用', () => 
   const ctx = new FakeCtx();
   const adapter = createAdapter(ctx);
   assert.equal(adapter.capabilities.threadTools, true);
-  assert.equal(ctx.callsOf('sessionController.createSession').length, 0);
+  assert.equal(ctx.callsOf('sessionController.create').length, 0);
 });
 
 // ------------------------------------------------- V3-H3② /状态 文案

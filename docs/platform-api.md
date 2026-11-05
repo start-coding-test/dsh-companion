@@ -21,8 +21,8 @@
 | 7 | compaction 服务 | `ctx.compaction`（抽象后端，三操作 `compactIfNeeded` / `compactNow` / `compactRegion`） | 只用 `compactRegion` | `dsh-compaction/lib/index.js:171`；`dsh-compaction/README.md:78` |
 | 8 | `compaction.compactRegion` | `ctx.compaction.compactRegion(start, end, agent, signal)`；`start`/`end` 为 surface 节点 seq 闭区间，边界必须存在且 tool call/result 配对均衡 | 两段式压缩的阶段 2 | `dsh-compaction-basic/lib/index.js:971`；参数校验 `:554-558`；必须存在 open turn `:460` |
 | 9 | `compaction.compactNow`（不用） | `ctx.compaction.compactNow(agent, signal, sourceCommandId)`；要求 idle agent，无区间参数 | 用户手动 `/compact` 语义，不满足保留尾部与先写库要求 | `dsh-compaction-basic/lib/index.js:985-1009`；range 选择 `:992` |
-| 10 | `sessionController.createSession` | `ctx.sessionController.createSession(request) → { agent, agentPreset }`；request 可带 `{ sessionId, cwd, agentPreset, reusable }` | 线程 worker 会话语义 | `dsh-api-session-controller/lib/index.js:264`、`:502-507`；服务名 `:2952` |
-| 11 | `sessionController.prompt` | `ctx.sessionController.prompt(request, signal)`；request = `{ sessionId, content, requestId, mode?: 'queue'\|'steer' }`，第二参是 AbortSignal（宿主内部会 `signal.throwIfAborted()`）；消息 source 由宿主按 `request.requestId` 构造为 `{ kind: 'user', rpcId }` | 向 worker 投递消息、重试幂等 | `dsh-api-session-controller/lib/index.js:925`；source `:3218-3233`；去重 `:1124-1136` |
+| 10 | `sessionController.create` | `ctx.sessionController.create(request) → { sessionId, agentPreset? }`；request 可带 `{ sessionId, cwd, agentPreset, reusable }`；agent 句柄另用 `ctx.sessionController.resolveAgent(sessionId) → { agent } \| { error }` 反查。**服务对象上没有 `createSession`**（那是内部类 `ApiSessionAgentController` 的方法，见 §1.3） | 线程 worker 会话语义 | `dsh-api-session-controller/lib/index.js:745`（命令层返回形状）、`:3090`（服务转发）、`:3037`（resolveAgent）；服务名 `:2952`；内部类 `createSession` `:180`、`:264`、`:502-507` |
+| 11 | `sessionController.prompt` | `ctx.sessionController.prompt(request, signal)`；request = `{ sessionId, content, requestId, mode?: 'queue'\|'steer' }`，第二参是 AbortSignal（宿主内部会 `signal.throwIfAborted()`）；消息 source 由宿主按 `request.requestId` 构造为 `{ kind: 'user', rpcId }`；同一逻辑投递必须复用同一 `requestId`（去重键），不要每 tick 换 | 向 worker 投递消息、重试幂等 | `dsh-api-session-controller/lib/index.js:925`；source `:3218-3233`；去重 `:1124-1136` |
 | 12 | `sessionController.cancel` | `ctx.sessionController.cancel({ sessionId })` | 线程取消/回收 | `dsh-api-session-controller/lib/index.js:1061` |
 | 13 | `agent.whenIdle` | `agent.whenIdle() → Promise`；属于 agent 句柄，不在 sessionController 上 | 回执前等待线程静默 | `dsh-agent-loop/lib/index.js:870`；`dsh-agent/README.md:47` |
 | 14 | `workspaceRegistry.archiveSession` | `ctx.workspaceRegistry.archiveSession(sessionId, { stopActivity })`；不带 `stopActivity` 时若有活动会抛 `WorkspaceActiveSessionError`；`stopActivity: true` 先写归档集再停活动 | 空闲 14 天的线程冻结 | `dsh-workspace/lib/index.js:526,540`；`stopSessionActivity` `:621-623`；错误类 `:303-305` |
@@ -87,8 +87,16 @@
   没有 Host 侧服务，`dsh-api-session-controller/lib/index.js:2917-2930` 的
   `static inject` 需要 agents / sessions / llm / sessionQuery 等一整套，
   **不要在 headless 上补 patch 试图启用**，按「不支持」处理。
-- **结论**：`platform.capabilities.threadTools` 是唯一门槛；缺失时按 §5 降级，
-  无需改平台源码。
+- **服务方法与内部类方法要区分（C5-H1b）**：`sessionController` 服务对象是
+  `ApiSessionList`，公开方法只有 `create` / `prompt` / `cancel` / `fork` /
+  `page` / `follow` / `resolveAgent` 等（`dsh-api-session-controller/lib/index.js:3037`、`:3090`、
+  `:3218`、`:3253`、`:3262`、`:3272`）。`createSession` 属于内部类
+  `ApiSessionAgentController`（`:180`、`:264`），**不在服务对象上**；服务层
+  `create` 返回 `{ sessionId, agentPreset? }`，需要 agent 句柄时再调
+  `resolveAgent(sessionId)`（成功 `{ agent }`，失败 `{ error }` 不抛）。
+  能力探测与适配层都只看公开方法。
+- **结论**：`platform.capabilities.threadTools` 是唯一门槛；默认探测
+  `create` + `prompt` + `cancel` 三者齐全。缺失时按 §5 降级，无需改平台源码。
 
 ### 1.4 宿主只注册 ASCII 命令名（V3-L3）
 
@@ -118,10 +126,10 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 | `onPreStep(handler)` | `ctx.on('agent/pre-step', listener)` | 返回 disposer；handler 在 fallback 之后执行，补丁见下 |
 | `every(ms, callback)` | `ctx.interval(callback, ms)` | 返回 disposer；`ms` 必须为正有限数 |
 | `compactRegion(start, end, agent, signal?)` | `ctx.compaction.compactRegion(...)` | 闭区间，调用方负责 open turn 时序 |
-| `createSession(request)` | `ctx.sessionController.createSession(request)` | 返回 `{ agent, agentPreset }` |
+| `createSession(request)` | `ctx.sessionController.create(request)` | 公开服务 `create` 返回 `{ sessionId, agentPreset? }`；适配层用 `resolveAgent(sessionId)` 归一成 `{ agent, agentPreset, sessionId }`，不调用内部类 `createSession`（C5-H1b） |
 | `prompt(request)` | `ctx.sessionController.prompt(request, AbortSignal.timeout(30000))` | 第二参必须是 AbortSignal；无 `requestId` 时补 `companion-<uuid>`；兼容旧宿主时在 signal 上附加 `kind`/`rpcId` |
 | `cancel(sessionIdOrRequest)` | `ctx.sessionController.cancel(request)` | 字符串自动包成 `{ sessionId }` |
-| `whenIdle(agentOrCreated)` | `agent.whenIdle()` | 接受 agent 句柄或 `createSession` 返回值 `{ agent }` |
+| `whenIdle(agentOrCreated)` | `agent.whenIdle()` | 接受 agent 句柄、会话 id 字符串，或 `createSession` 返回值；id/返回值经 `sessionController.resolveAgent` 反查（C5-H1b） |
 | `archiveSession(sessionId, options?)` | `ctx.workspaceRegistry.archiveSession(...)` | 归档线程；冻结场景应传 `{ stopActivity: true }` |
 | `measure(session, requestHeader?)` | `ctx.tokenMeter.measure(...)` | 返回平台计量对象 |
 | `estimateMessage(message)` | `ctx.tokenMeter.estimateMessage(...)` | 单条消息的启发式 token（surface 索引计价） |

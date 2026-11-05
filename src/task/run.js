@@ -119,6 +119,8 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
    * @param {number|Function} [options.now=Date.now] 时钟
    * @param {string} [options.cwd] worker 会话工作目录
    * @param {string} [options.agentPreset] worker 会话 preset
+   * @param {string} [options.claimKey] 本次执行的稳定标识；给了就生成
+   *   `companion-task:<taskId>:<claimKey>` 作为 prompt requestId（C5-H1b）
    * @param {string} [options.scope='main'] 回执/审计 scope
    * @returns {Promise<{ok: true, taskId: string, status: 'done'|'timeout'|'failed',
    *   receipt: string, sessionId: string|null, durationMs: number, error?: string}
@@ -135,6 +137,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
       now = Date.now,
       cwd,
       agentPreset,
+      claimKey,
       scope = 'main',
     } = options;
 
@@ -161,6 +164,9 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
             scope: receiptScope,
             prompt: goalText,
             summary: titleText,
+            ...(typeof claimKey === 'string' && claimKey !== ''
+              ? { requestId: `companion-task:${taskId}:${claimKey}` }
+              : {}),
             ...(agentPreset === undefined ? {} : { agentPreset }),
             ...(cwd === undefined ? {} : { cwd }),
           },
