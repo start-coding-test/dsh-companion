@@ -4,11 +4,12 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.7 已发布**（2026-11-05）。`node --test` 全绿：799 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.4.8 已发布**（2026-11-05）。`node --test` 全绿：815 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
 
 ## v0.4.8 变更摘要
 
-- **提醒失败退避不再覆盖原定时间（V5-L2）**：`reminders` 新增 `retry_at`（schema v12，旧行 NULL，按列检测幂等补列）。失败退避只写 `retry_at`（第 1 次 30s、第 2 次 60s），`next_fire_at` 始终是原定到点时间；调度按 `COALESCE(retry_at, next_fire_at)` 到期，成功或置 `expired` 时清空 `retry_at`。状态板提醒行显示原定日期，重试期间附「重试中，下次 HH:MM」（按 `config.timezone` 格式化）；requestId 仍按 `occurrence_key` 稳定。完整条目见 [CHANGELOG](CHANGELOG.md)。
+- **提醒失败退避不再覆盖原定时间（V5-L2）**：`reminders` 新增 `retry_at`（schema v12；v11 及更早旧库按列检测自动幂等迁移，旧行 NULL、`COALESCE` 回退到 `next_fire_at`，升级后到点行为不变）。失败退避只写 `retry_at`（第 1 次 30s、第 2 次 60s），`next_fire_at` 始终是原定到点时间；调度按 `COALESCE(retry_at, next_fire_at)` 到期，成功或置 `expired` 时清空 `retry_at`。状态板提醒行显示原定日期，重试期间附「重试中，下次 HH:MM」（按 `config.timezone` 格式化）；requestId 仍按 `occurrence_key` 稳定。完整条目见 [CHANGELOG](CHANGELOG.md)。
+- **复审**：发布前独立复审 pass（H=0 / M=0 / L=2，均为不阻断发布的建议项），见 [docs/review-v13.md](docs/review-v13.md)。
 
 ## v0.4.7 变更摘要
 

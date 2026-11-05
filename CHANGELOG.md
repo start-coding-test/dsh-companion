@@ -2,6 +2,26 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.8] - 2026-11-05
+
+V5-L2 真机观察到的提醒退避口径修复：失败退避不再改写原定到点时间，新增 `retry_at` 独立记录重试时刻（schema v12，旧库自动升级）；调度按 `COALESCE(retry_at, next_fire_at)` 判到期；提醒展示与 `/状态` 始终用原定时间，重试期间附「重试中，下次 HH:MM」。仍为零第三方运行时依赖；发布前独立复审 pass（H=0 / M=0 / L=2），见 [docs/review-v13.md](docs/review-v13.md)。
+
+### Fixed
+
+- **V5-L2 提醒失败退避覆盖原定时间**：`reminders` 新增 `retry_at`（schema v12，旧行 NULL，按列检测幂等补列）。投递失败时只写 `retry_at`（第 1 次 30s、第 2 次 60s，第 3 次置 `expired`），`next_fire_at` 从此在任何失败路径都不再被改写，始终代表用户原定的到点时间。调度（`dueReminders` 的到期过滤与排序）与 `fireDueReminders` 的 `onAttempt` 二次守卫统一按 `COALESCE(retry_at, next_fire_at)` / `max(next_fire_at, retry_at ?? 0)` 判断，重试项不会因原定时间早而抢队、同 tick 双 flush 也不会重复计数或重复投递。投递成功、失败超限 `expired`、`recoverReminderDeliveries` 回收与 `expireReminder` 四条路径都清空 `retry_at`。fireKey 契约改为由调用方拼「发生时刻 + 本次重试时刻」（`<next_fire_at>:<retry_at ?? 0>`），每次真重试 `delivery_attempts` 递增，requestId 仍按 `occurrence_key` 稳定不变。
+- **提醒展示改为原定时间 + 重试标注**：状态板提醒行一律显示 `next_fire_at` 的原定日期；`retry_at` 非空且尚未到期时附注「重试中，下次 HH:MM」（按 `config.timezone` 格式化，主路径 `runDeepSleep` 显式透传 `now` / 时区），已过去、为空或已过期回收后不附注。`/状态` 与提醒列表口径一致。
+
+### Changed
+
+- **迁移**：schema v11 → v12 在 `PRAGMA table_info` 检测后幂等 `ALTER TABLE ADD COLUMN retry_at`（旧行 NULL；`COALESCE` 自动回退到 `next_fire_at`，旧库到点行为不变）；`export.js` 的 `CURRENT_SCHEMA_VERSION` 同步为 `'12'`。
+- **文档**：`docs/usage.md` 更新失败退避、requestId、schema 版本三段，并新增提醒「展示口径」示例；README 增加 v0.4.8 摘要并修正 v0.4.5 段旧退避语义。
+- **测试**：新增 `test/v048-retry-at.test.js`（5 例，存储/调度层）、`test/v048-index-retry.test.js`（4 例，接线与展示）、`test/v048-regression.test.js`（7 例，经真实 `apply()` 覆盖失败两次后成功、重试未到拒绝、状态板附注出现/消失、v11→v12 迁移与三条冒烟）；同步改写 `c5`、`v045`、`v047`×2 与 e2e 提醒投递的旧 `next_fire_at` 断言。用例总数 799 → 815 / 16 个套件。
+
+### Verified
+
+- 三时区 `node --test`（默认 / `TZ=UTC` / `TZ=America/New_York`）815/815 pass、0 fail、16 个套件；`test/e2e/plugin-smoke.test.js` 4/4。
+- 发布门 `node scripts/probe/run-headless.mjs --plugin` 通过；工作树干净，`git tag -a v0.4.8` 后推送远端。
+
 ## [0.4.7] - 2026-11-05
 
 v0.4.6 后的真机反馈修复：提醒 requestId 按 occurrence 稳定并重置 attempts、`/状态` 巩固模型来源标注改为「自动选取」、provider/model 发现失败 warn 去重。仍为零第三方运行时依赖；schema 升至 v11（旧库自动升级）；发布前独立复审 pass（H=0 / M=0 / L=0），见 [docs/review-v12.md](docs/review-v12.md)。
