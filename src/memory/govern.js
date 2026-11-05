@@ -39,18 +39,41 @@ export const CREDENTIAL_HINT = '这类信息建议放环境变量或文件里，
  * V7-M3 在原有「身份证/银行卡/密码/住址」之外补齐凭据类字段名：
  * - `密码(?!学)`：排除「密码学」这类学科词，保留「wifi 密码」「银行卡密码」；
  * - `passw(?:or)?d`：password / passwd；
- * - `token` 用 `\btoken\b` 词边界，`tokenizer`、`tokens` 不命中；
  * - `key` 只在「字段名 + 分隔符 + 值」形式里判（见 CREDENTIAL_FIELD_PATTERN），
  *   `keyboard`、`SECRET-MARKER-42` 这类标记不命中；`secret` 同理；
  * - `sk-` 开头的 API key 字面值（至少 6 位）单独兜底。
+ *
+ * V9-L1（v0.4.10）收窄误报：
+ * - 去掉裸 `\btoken\b`：「用户这个月 token 额度约 10B」不再判敏感；token 仍由
+ *   「字段名 + 值」形式兜底（`token 是 abc123`、`API token：sk-xxxxxx` 仍命中）；
+ * - 去掉裸 `银行卡|信用卡`：「用户的银行卡在招行」这类纯提及不再判敏感；
+ *   卡号本身改由 CARD_NUMBER_PATTERN 按「12 位以上数字（允许空格/连字符分隔）」
+ *   拦，卡号字段名（`卡号`/`card number`）只在后面跟数字时命中。
+ *
+ * V9-L2（v0.4.10）补漏：新增 `口令` 强词（「路由器口令是蓝鲸-7788」），
+ * 设备/网络的「名词 + 是/为/:/= + 含数字或符号的值」形态见 DEVICE_VALUE_PATTERN
+ * （「WiFi 是 蓝鲸-7788」）。
  */
-const SENSITIVE_PATTERN = /身份证|银行卡|信用卡|住址|密码(?!学)|passw(?:or)?d|验证码|verification\s*code|\bCVC\b|\bCVV\b|私钥|密钥|卡号|card\s*number|api[\s_-]?key|\baccess[\s_-]?token\b|令牌|\btoken\b|\bsk-[A-Za-z0-9]{6,}/iu;
+const SENSITIVE_PATTERN = /身份证|住址|密码(?!学)|口令|passw(?:or)?d|验证码|verification\s*code|\bCVC\b|\bCVV\b|私钥|密钥|卡号\s*(?:是|为|:|：|=)?\s*\d|card\s*number\s*(?:is|是|:|：|=)?\s*\d|api[\s_-]?key|\baccess[\s_-]?token\b|令牌|\bsk-[A-Za-z0-9]{6,}/iu;
 
 /**
  * V7-M3：「字段名 + 值」形式（`key 是 abc123`、`secret: hunter2`、`pwd=1234`）。
  * 字段名后必须有分隔符/判断词，再跟至少 4 个非空白字符的值。
  */
 const CREDENTIAL_FIELD_PATTERN = /(?:^|[^A-Za-z0-9_])(?:key|secret|token|pwd|pass|passwd)\s*(?:是|为|:|：|=|is)\s*([^\s，。；,;]{4,})/iu;
+
+/**
+ * V9-L1：卡号形态——12 位以上数字，允许空格/连字符按 4 位分组
+ * （`6222 0202 0000 1234`、`6222-0202-0000-1234`、`6222020200001234`）。
+ * 只拦号码本身，不因为出现「银行卡/信用卡」字样就判敏感。
+ */
+const CARD_NUMBER_PATTERN = /\d{12,}|\d{4}(?:[\s-]\d{4}){2}(?:[\s-]\d{1,4})?/u;
+
+/**
+ * V9-L2：设备/网络名词 + 判断词 + 值，且值里含数字或符号
+ * （`WiFi 是 蓝鲸-7788`、`门禁口令：8848`）。纯名词或纯文字值不命中。
+ */
+const DEVICE_VALUE_PATTERN = /(?:wi-?fi|路由器|路由|门禁|门锁|热点)\s*(?:是|为|:|：|=)\s*([^\s，。；,;]{2,})/iu;
 
 /** 已由 privacy=secret 标记的事实不进入任何治理/导出视图。 */
 const SECRET_PRIVACY = 'secret';
@@ -60,8 +83,9 @@ const EPOCH_THRESHOLD = 1e11;
 /**
  * 判断文本是否命中敏感/凭据内容。
  *
- * 强敏感词直接命中；弱字段名（key/secret/token/pwd）只在「字段名 + 值」形式
- * 且值里含数字或符号时命中，避免 `key is abcd` 这类英文语句误报。
+ * 强敏感词直接命中；卡号按号码形态命中；弱字段名（key/secret/token/pwd）只在
+ * 「字段名 + 值」形式且值里含数字或符号时命中，避免 `key is abcd` 这类英文语句
+ * 误报；设备/网络名词同样要求「名词 + 判断词 + 含数字或符号的值」。
  * @param {unknown} text
  * @returns {boolean}
  */
@@ -69,9 +93,11 @@ export function isSensitiveText(text) {
   if (text === null || text === undefined) return false;
   const value = String(text);
   if (SENSITIVE_PATTERN.test(value)) return true;
+  if (CARD_NUMBER_PATTERN.test(value)) return true;
   const field = CREDENTIAL_FIELD_PATTERN.exec(value);
-  if (field === null) return false;
-  return /[\d\p{P}\p{S}]/u.test(field[1]);
+  if (field !== null && /[\d\p{P}\p{S}]/u.test(field[1])) return true;
+  const device = DEVICE_VALUE_PATTERN.exec(value);
+  return device !== null && /[\d\p{P}\p{S}]/u.test(device[1]);
 }
 
 /**
