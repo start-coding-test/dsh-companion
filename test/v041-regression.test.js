@@ -517,7 +517,7 @@ test('migrate：真实 v7 旧库 fixture 升 v11，幂等且数据不丢', (t) =
   for (let round = 0; round < 2; round += 1) {
     const store = Store.open(path);
     try {
-      assert.equal(store.getMeta('schema_version'), '12', `第 ${round + 1} 次打开应升到 v12`);
+      assert.equal(store.getMeta('schema_version'), '13', `第 ${round + 1} 次打开应升到 v13`);
       const columns = store.db
         .prepare("PRAGMA table_info('facts')")
         .all()

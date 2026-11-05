@@ -232,7 +232,7 @@ test('migrate：v4 库升级到 v7，补建 fact_vectors 并保留既有事实',
     first.close();
 
     const second = Store.open(path);
-    assert.equal(second.getMeta('schema_version'), '12');
+    assert.equal(second.getMeta('schema_version'), '13');
     assert.ok(second.getFact(fact.id));
     const table = second.db
       .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='fact_vectors'")
@@ -257,7 +257,7 @@ test('migrate：v5 库补 embedder_id、升级到 v7 并把旧行回填为 hash:
 
     const second = Store.open(path);
     try {
-      assert.equal(second.getMeta('schema_version'), '12');
+      assert.equal(second.getMeta('schema_version'), '13');
       const columns = second.db
         .prepare("PRAGMA table_info('fact_vectors')")
         .all()

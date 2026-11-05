@@ -224,7 +224,7 @@ test('V5-L2：v11 → v12 迁移补 retry_at，旧行 NULL 且能正常 claim', 
 
   const store = Store.open(dbPath);
   try {
-    assert.equal(store.getMeta('schema_version'), '12');
+    assert.equal(store.getMeta('schema_version'), '13');
     const columns = store.db
       .prepare("PRAGMA table_info('reminders')")
       .all()
@@ -257,7 +257,7 @@ test('V5-L2：v11 → v12 迁移补 retry_at，旧行 NULL 且能正常 claim', 
   // 重开：已是最新版本，补列幂等。
   const reopened = Store.open(dbPath);
   try {
-    assert.equal(reopened.getMeta('schema_version'), '12');
+    assert.equal(reopened.getMeta('schema_version'), '13');
     assert.equal(reopened.getReminder('old-11').status, 'fired');
     assert.equal(reopened.getReminder('old-11').retry_at, null);
   } finally {

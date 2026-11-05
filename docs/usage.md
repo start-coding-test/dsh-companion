@@ -434,7 +434,7 @@ node scripts/decrypt-encrypted.mjs secret.enc --out fact.json
 - 解密先校验再写文件，错误口令、损坏文件或认证失败不会留下明文半文件；错误统一为「解密失败（口令错误、文件损坏或认证失败）」。
 - 格式：AES-256-GCM + scrypt（N=2^14、r=8、p=1），随机 salt(16B) / iv(12B)，magic `DSH-COMPANION-EXPORT-1` + JSON header 保存 KDF 参数与 tag。`header.format = "v2"` 起 header 与 magic 行一起作为 AAD 认证，篡改 header / 密文 / tag 都会失败；`v1` 旧文件仍可解，新导出建议用 v2。
 
-### 隐私与凭据（V7-M3，v0.4.9；V9-M1/L1/L2，v0.4.10）
+### 隐私与凭据（V7-M3，v0.4.9；V9-M1/L1/L2，v0.4.10；V10-L1，v0.4.11）
 
 凭据类内容不进长期记忆。巩固落地前会逐条识别并跳过：
 
@@ -444,6 +444,8 @@ node scripts/decrypt-encrypted.mjs secret.enc --out fact.json
 - 「字段名 + 是/为/`:`/`=` + 值」形式（如 `api key = …`、`token: …`）；弱字段名要求值里含数字或符号，避免把普通技术讨论误判成凭据。
 
 被跳过的内容不写 `facts`（也不进 facts 的 FTS 索引）、不写 `reminders`，状态板渲染前还会逐行过滤，历史库里已有的敏感行同样不会显示。episode 在落库前会对凭据值逐字段脱敏：只把值替换成 `[凭据已省略]`、保留上下文（例如「路由器密码 [凭据已省略]」），不是整段丢弃；脱敏后仍残留可识别凭据值时才整段替换。原文仅存于会话，跨会话召回、注入、状态板与导出都不会出现明文。命中时巩固结果带 `sensitive` 计数与提示，日志记 `credential content skipped`。
+
+v0.4.10 之前落库的存量 episode 不受写入路径保护，可能仍带明文（并已投影进 `fts_episodes`）。v0.4.11 起打开旧库时（schema v13）会按上述同一口径对 `title` / `summary` / `evidence` / `mood_evidence` / `topics_json` / `entities_json` 一次性重跑脱敏，只更新真正变化的行并重建其 FTS 投影；完成后写 `schema_meta` 标记 `episode_scrub_v13`，重复打开直接跳过，审计只记一条计数事件（`action=scrub`，`detail={scanned,changed}`），不记录任何正文。
 
 此外，每轮用户消息命中凭据时，插件会给模型一次固定提示（同一轮只注入一次，不转录、不参与巩固）：不复述具体值、不调用记忆工具，并回复「这类信息建议放环境变量或文件里，我不代为保存。」
 
@@ -782,7 +784,7 @@ timing:
 历史行只作审计。升级到 v0.1.1 时旧库会迁移到 `schema_version=4`：清空 `consolidations`
 （开发期约定，旧值语义不可比）、把 `episodes.consolidation_id` 置空；facts/episodes 不受影响。
 v0.3.0 起 `schema_version=5`：只新增 `fact_vectors`（向量投影）表，既有数据不动。
-v0.4.0 起 `schema_version=7`：v5→v6 先给 `fact_vectors` 增加 `embedder_id`，旧向量行回填为 `hash:<dim>`；v6→v7 再给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind` 三列（旧行 NULL）和 `(scope, first_reneed_at)` 索引，用于 S0 首次再需要标定（见 [s0-calibration.md](s0-calibration.md)）。v0.4.1 起 `schema_version=8`：增加 `same_context` 与 `used` 升级口径，排除同会话即时召回。v0.4.2 起 `schema_version=9`：增加 `first_used_at` / `first_used_tier` / `used_same_context` 与 `(scope, first_used_at)` 索引，用上那一刻单独记录，recall 样本保留对照（旧行新列为 NULL）。旧库按列检测逐级推进，无需手工改版本。v0.4.4 起 `schema_version=10`：`reminders` 的 `status` CHECK 增加 `delivering`，新增 `delivery_attempts` 列（旧行 `0`），幂等重建表并重建两个索引，兼容 v3..v9。v0.4.7 起 `schema_version=11`：`reminders` 新增 `occurrence_key`（旧行 NULL，按列检测补列），用于让提醒 requestId 在同一次到点的退避重试中保持不变。v0.4.8 起 `schema_version=12`：`reminders` 新增 `retry_at`（退避时刻，旧行 NULL，按列检测补列）；失败退避只写 `retry_at`，`next_fire_at` 保持原定到点时间，成功/过期清空 `retry_at`。v0.4.9 起到期口径统一为 `max(next_fire_at, retry_at)`（调度与投递守卫同源，见上），`reminders` 的到期索引换成表达式索引 `ix_rm_due`、删除失效的 `ix_rm_fire`，并加 `trg_reminders_reschedule_clear_retry` 在改期时清空残留 `retry_at`；这些索引/触发器由 `migrate()` 幂等补建，`schema_version` 仍为 12，旧库打开即升级、无需手工操作。
+v0.4.0 起 `schema_version=7`：v5→v6 先给 `fact_vectors` 增加 `embedder_id`，旧向量行回填为 `hash:<dim>`；v6→v7 再给 `facts` 增加 `first_reneed_at` / `first_reneed_tier` / `reneed_kind` 三列（旧行 NULL）和 `(scope, first_reneed_at)` 索引，用于 S0 首次再需要标定（见 [s0-calibration.md](s0-calibration.md)）。v0.4.1 起 `schema_version=8`：增加 `same_context` 与 `used` 升级口径，排除同会话即时召回。v0.4.2 起 `schema_version=9`：增加 `first_used_at` / `first_used_tier` / `used_same_context` 与 `(scope, first_used_at)` 索引，用上那一刻单独记录，recall 样本保留对照（旧行新列为 NULL）。旧库按列检测逐级推进，无需手工改版本。v0.4.4 起 `schema_version=10`：`reminders` 的 `status` CHECK 增加 `delivering`，新增 `delivery_attempts` 列（旧行 `0`），幂等重建表并重建两个索引，兼容 v3..v9。v0.4.7 起 `schema_version=11`：`reminders` 新增 `occurrence_key`（旧行 NULL，按列检测补列），用于让提醒 requestId 在同一次到点的退避重试中保持不变。v0.4.8 起 `schema_version=12`：`reminders` 新增 `retry_at`（退避时刻，旧行 NULL，按列检测补列）；失败退避只写 `retry_at`，`next_fire_at` 保持原定到点时间，成功/过期清空 `retry_at`。v0.4.9 起到期口径统一为 `max(next_fire_at, retry_at)`（调度与投递守卫同源，见上），`reminders` 的到期索引换成表达式索引 `ix_rm_due`、删除失效的 `ix_rm_fire`，并加 `trg_reminders_reschedule_clear_retry` 在改期时清空残留 `retry_at`；这些索引/触发器由 `migrate()` 幂等补建，`schema_version` 仍为 12，旧库打开即升级、无需手工操作。v0.4.11 起 `schema_version=13`：纯数据迁移，无新列。v0.4.10 之前落库的存量 episode 可能仍有明文凭据值（`title` / `summary` / `evidence` / `mood_evidence` / `topics_json` / `entities_json`，并已投影进 `fts_episodes`），打开旧库时按写入路径同口径重跑一次脱敏（值级替换，漏网且仍残留值形态的整段替换为 `[凭据已省略]`），只更新真正变化的行并重建其 FTS；成功后写 `schema_meta` 标记 `episode_scrub_v13`，重复打开直接跳过，审计只记一条 `memory_events`（`action=scrub`，`detail={scanned,changed}`，不含正文）。
 
 ### 数据存在哪里？
 

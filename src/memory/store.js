@@ -31,7 +31,9 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { toBigrams, toMatchQuery } from './bigram.js';
-import { REDACTED_CREDENTIAL, hasUnredactedCredentialValue, redactSensitiveValues } from './govern.js';
+import {
+  REDACTED_CREDENTIAL, appendEventWithAction, hasUnredactedCredentialValue, redactSensitiveValues,
+} from './govern.js';
 import { RENEED_KINDS } from './reneed.js';
 import { DEFAULT_ALPHA, decayOf, reinforce } from './reinforce.js';
 import { boardFragments, renderBoard, scrubBoardText } from './state-board.js';
@@ -65,8 +67,18 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  * V8-L1/L2（不改变 schema_version，索引/触发器由 migrate 幂等补建）：
  *     - 到期索引改表达式索引 ix_rm_due(status, max(...)) 并删除 ix_rm_fire；
  *     - 改期（next_fire_at 变化）时清空残留 retry_at，库级触发器兜底。
+ * v13（V10-L1）：纯数据迁移，无新列。旧库的 episodes.title/summary/evidence/
+ *     mood_evidence/topics_json/entities_json 可能仍有 v0.4.10 之前落库的明文
+ *     凭据值（并已投影进 fts_episodes），打开旧库时一次性重跑写入路径的脱敏
+ *     口径（#scrubLegacyEpisodes），只有真正变化的行才更新并重建 FTS。成功后
+ *     在 schema_meta 写 episode_scrub_v13 标记，重复打开直接跳过；审计只写一条
+ *     memory_events（action=scrub，detail={scanned,changed}，不含正文）。
  */
-const SCHEMA_VERSION = '12';
+const SCHEMA_VERSION = '13';
+/** v13：存量 episode 脱敏标记；存在即表示一次性 scrub 已完成（幂等跳过）。 */
+const EPISODE_SCRUB_MARKER = 'episode_scrub_v13';
+/** v13 scrub 的 rowid 批大小：大库分批复用同一游标，避免一次读全表。 */
+const EPISODE_SCRUB_BATCH = 200;
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
 
@@ -552,6 +564,36 @@ function redactEpisodeText(value) {
 }
 
 /**
+ * V10-L1：存量 episodes 的 JSON 数组文本脱敏（topics_json/entities_json）。
+ *
+ * 逐项走 `redactEpisodeText`；只有某项真的变了才重新序列化，未命中的数组保持
+ * 原文本一个字节不动（避免存量库因格式化差异被无谓重写）。JSON 合法时输出
+ * 仍是合法 JSON 数组；不是 JSON 数组的坏数据退化为整段文本脱敏，与写入路径
+ * `redactEpisodeInput` 的取向一致。
+ *
+ * @param {unknown} text
+ * @returns {unknown}
+ */
+function scrubEpisodeJsonText(text) {
+  if (typeof text !== 'string' || text === '') return text;
+  if (text.trimStart().startsWith('[')) {
+    let parsed = null;
+    try {
+      const value = JSON.parse(text);
+      if (Array.isArray(value)) parsed = value;
+    } catch {
+      // 坏 JSON：走下面的整段文本脱敏。
+    }
+    if (parsed !== null) {
+      const items = redactEpisodeItems(parsed);
+      const changed = items.some((item, index) => item !== parsed[index]);
+      return changed ? JSON.stringify(items) : text;
+    }
+  }
+  return redactEpisodeText(text);
+}
+
+/**
  * 审计 detail_json：对象序列化，字符串原样，空值 null。
  * @param {unknown} value
  * @returns {string|null}
@@ -925,6 +967,9 @@ export class Store {
         CREATE INDEX IF NOT EXISTS ix_facts_used ON facts(scope, first_used_at);
       `);
       this.#ensureScopeRow('main');
+      // v13（V10-L1）：存量 episode/FTS 一次性脱敏。旧库升级与「已有数据但还没
+      // 打标记」的库都在这里补齐一次；已标记 / 空库直接跳过（幂等）。
+      this.#scrubLegacyEpisodes({ atomic: !upgrading });
       if (upgrading) this.#db.exec('COMMIT');
     } catch (error) {
       if (upgrading) {
@@ -1059,10 +1104,12 @@ export class Store {
    * （#ensureReminderOccurrenceColumn），旧行 NULL，不需要回填。
    * v11 → v12 只推进版本号；reminders.retry_at 由 migrate() 统一补列
    * （#ensureReminderRetryColumn），旧行 NULL，不需要回填。
+   * v12 → v13 只推进版本号（无新列）；存量 episode 的脱敏 scrub 由 migrate()
+   * 统一执行（#scrubLegacyEpisodes，带 schema_meta 标记，幂等）。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
-    if (from === '11' || from === '10' || from === '9' || from === '8'
+    if (from === '12' || from === '11' || from === '10' || from === '9' || from === '8'
       || from === '7' || from === '6') {
       this.#db
         .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
@@ -1110,6 +1157,111 @@ export class Store {
     this.#db
       .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
       .run(SCHEMA_VERSION);
+  }
+
+  /**
+   * V10-L1（v13）：存量 episodes 一次性脱敏 scrub。
+   *
+   * v0.4.10 的写入路径（insertEpisode / consolidate）已对 episode 六字段脱敏，
+   * 但更早落库的行仍可能含明文凭据值（如「路由器密码 蓝鲸-7788」），并已投影
+   * 进 fts_episodes。这里对历史行重跑写入路径的同一口径：
+   * - 文本字段走 `redactEpisodeText`（值级替换；仍残留值形态才整段替换）；
+   * - topics_json / entities_json 逐项脱敏并保持 JSON 合法；
+   * - 只有真正变化的行才 UPDATE 并 `#refreshEpisodesFts` 重建投影，未变化的行
+   *   一个字节都不动（幂等 + 大库可控）。
+   *
+   * 幂等与审计：成功后在 schema_meta 写 `episode_scrub_v13` 标记，之后重复打开
+   * 直接跳过；扫描过行就写一条 memory_events（action=scrub，detail 只含
+   * {scanned, changed}，不含正文）。空库不写标记也不写事件，避免给新建库留
+   * 审计噪音。凭据判定面在每行上逐字段重跑，不依赖 SQL 预筛（预筛只能当优化，
+   * 会漏掉 sk-/卡号/设备值等没有「密码」字样的形态）。
+   *
+   * 事务：升级路径由 `migrate()` 的 BEGIN IMMEDIATE 包住（失败连同版本号一起
+   * 回滚）；非升级的补齐路径（有数据但还没有标记）自己开事务，保证「改行 +
+   * 重建 FTS + 标记 + 审计」原子。调用方保证事务内不做网络/计时。
+   *
+   * @param {{atomic?: boolean}} [options]
+   * @returns {{skipped: boolean, scanned: number, changed: number, eventId: number|null}}
+   */
+  #scrubLegacyEpisodes(options = {}) {
+    if (this.getMeta(EPISODE_SCRUB_MARKER) !== null) {
+      return { skipped: true, scanned: 0, changed: 0, eventId: null };
+    }
+    const columns = new Set(
+      this.#db
+        .prepare("PRAGMA table_info('episodes')")
+        .all()
+        .map((column) => column.name),
+    );
+    if (columns.size === 0) {
+      throw new StoreError('[store] episodes table missing during v13 scrub');
+    }
+    // mood_evidence 之外的列在各旧版本 DDL 里都存在；按列检测只为兼容砍过列的库。
+    const fields = ['title', 'summary', 'evidence', 'topics_json', 'entities_json', 'mood_evidence']
+      .filter((name) => columns.has(name));
+    const total = Number(this.#db.prepare('SELECT COUNT(*) AS n FROM episodes').get().n);
+    if (total === 0) {
+      return { skipped: false, scanned: 0, changed: 0, eventId: null };
+    }
+
+    const atomic = options.atomic === true;
+    if (atomic) this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      const jsonFields = new Set(['topics_json', 'entities_json']);
+      const select = `SELECT rowid AS rid, id, ${fields.join(', ')} FROM episodes`;
+      const update = `UPDATE episodes SET ${fields.map((name) => `${name} = ?`).join(', ')} WHERE rowid = ?`;
+      const updateStmt = this.#db.prepare(update);
+      let cursor = 0;
+      let scanned = 0;
+      let changed = 0;
+      for (;;) {
+        const rows = this.#db
+          .prepare(`${select} WHERE rowid > ? ORDER BY rowid ASC LIMIT ?`)
+          .all(cursor, EPISODE_SCRUB_BATCH);
+        if (rows.length === 0) break;
+        for (const row of rows) {
+          cursor = Number(row.rid);
+          scanned += 1;
+          const next = {};
+          let touched = false;
+          for (const field of fields) {
+            const previous = row[field];
+            const value = jsonFields.has(field)
+              ? scrubEpisodeJsonText(previous)
+              : redactEpisodeText(previous);
+            next[field] = value;
+            if (value !== previous) touched = true;
+          }
+          if (!touched) continue;
+          updateStmt.run(...fields.map((field) => next[field]), row.rid);
+          // 只有发生变化的行才重建 FTS 投影；未变化的行不动投影（幂等）。
+          this.#refreshEpisodesFts(String(row.id));
+          changed += 1;
+        }
+        if (rows.length < EPISODE_SCRUB_BATCH) break;
+      }
+
+      // 标记在数据落库之后写；升级路径与 scrub 同一事务，半迁移不会留下标记。
+      this.setMeta(EPISODE_SCRUB_MARKER, String(nowSeconds()));
+      const eventId = appendEventWithAction(this, {
+        action: 'scrub',
+        tableName: 'episodes',
+        actor: 'migrator',
+        reason: 'v13-legacy-episode-scrub',
+        detail: { scanned, changed },
+      });
+      if (atomic) this.#db.exec('COMMIT');
+      return { skipped: false, scanned, changed, eventId };
+    } catch (error) {
+      if (atomic) {
+        try {
+          this.#db.exec('ROLLBACK');
+        } catch {
+          // 回滚失败时保留原始错误
+        }
+      }
+      throw error;
+    }
   }
 
   /**

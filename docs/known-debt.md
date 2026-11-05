@@ -69,10 +69,10 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 
 ### D-2 N-L2：治理/编辑绕过 `memory_events` CHECK
 
-- **现状**：`src/memory/govern.js` 的 `appendEventWithAction` 在写入 `govern`/`EDIT` 动作时执行 `PRAGMA ignore_check_constraints = ON`，写完后恢复（`src/memory/govern.js:246-293`，读取/开启/恢复分别在 `:269`、`:272`、`:289`）。原因是 `memory_events.action` 的 CHECK 白名单没有这两个动作，schema v7 仍在绕过。
+- **现状**：`src/memory/govern.js` 的 `appendEventWithAction` 在写入 `govern`/`EDIT` 动作时执行 `PRAGMA ignore_check_constraints = ON`，写完后恢复（`src/memory/govern.js:405-440`）。原因是 `memory_events.action` 的 CHECK 白名单没有这两个动作，schema v7 仍在绕过。v0.4.11（V10-L1，schema v13）的存量 episode scrub 审计（`action=scrub`）也复用同一入口，白名单缺的动作从两个变成三个。
 - **影响**：PRAGMA 是连接级开关，绕过期间其他 CHECK 也失效；一旦异常路径未恢复连接，后续写入可能落进非法动作；审计表的约束形同虚设，迁移/排障时容易误判。
 - **建议排期**：低优先级补丁，P1 前与 schema 迁移一起做。
-- **验收方式**：迁移中重建 `memory_events` 的 CHECK 白名单，加入 `govern`/`EDIT`（保留旧动作）；删除 `ignore_check_constraints` 开关；单测直接写两个动作不报错、非法动作仍被 CHECK 拒绝；`grep -R ignore_check_constraints src/` 无结果；用 v7 旧库跑一次迁移与治理命令。
+- **验收方式**：迁移中重建 `memory_events` 的 CHECK 白名单，加入 `govern`/`EDIT`/`scrub`（保留旧动作）；删除 `ignore_check_constraints` 开关；单测直接写三个动作不报错、非法动作仍被 CHECK 拒绝；`grep -R ignore_check_constraints src/` 无结果；用 v7 旧库跑一次迁移与治理命令。
 
 ### D-3 N-L3：`deepConsolidate` 用错 transcript 判断主会话是否有新内容
 
