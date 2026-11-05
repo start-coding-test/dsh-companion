@@ -2,6 +2,29 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.6] - 2026-11-05
+
+v0.4.5 后的必修项修复：提醒投递签名与用户消息污染、线程服务公开方法名、巩固模型解析（llm 晚注册）、压缩开关可见性、跳过日志级别与 `/线程` 不支持提示。仍为零第三方运行时依赖，无 schema 变更；发布前独立复审 pass（H=0 / M=0 / L=1，Low 项已随发布修完），见 [docs/review-v11.md](docs/review-v11.md)。
+
+### Fixed
+
+- **C5-H1a 提醒投递签名与用户消息污染**：Prompt 调用改为 `prompt(request, signal)`，第二参固定 `AbortSignal.timeout(30000)`；提醒/承诺/闲聊分别带稳定 `requestId`（`companion-reminder:<id>:<next_fire_at>`、`companion-commitment:<id>:<dayKey>`、`companion-chat:<dayKey>:daily`），同一 claim 重试复用同一 id。宿主把提醒正文记成 `user/message` 时按 `rpcId` 前缀或 `[提醒]` 前缀识别为 companion 消息：不重绑 `main_session_id`、不进巩固窗口与转录、也不作为召回查询。投递失败写 `memory_events`（`reason='delivery_error'`）并在 `/状态` 显示「最近失败：投递失败：<name>：<message>」；同一失败原因只 warn 一次。
+- **C5-H1b 线程服务方法名**：适配层改用公开 `ApiSessionList.create` / `resolveAgent`，不再调用内部 `createSession`；能力探测与 `thread_run` / `task_run` 投递同步到公开面，旧宿主仅保留只读兼容。
+- **C5-H2 巩固模型解析**：不再把首次解析到的 `null` 永久缓存；运行时能力位每次重新确认，成功的 provider/model 路由缓存 5 分钟、失败不缓存，llm 晚注册后巩固与闲聊都能恢复。`/状态` 显示「巩固：<provider>/<model>（配置|运行时）」「巩固：宿主注入模型」「巩固：无可用模型」；无模型时按 60s 节流记 `consolidation_failed`。发布门 round C 在无凭据时 SKIP，有凭据时要求至少一条巩固。
+- **C5-M1 压缩开关提示**：`/状态` 明确显示「压缩：宿主未开启（compaction-basic 未启用）」或「压缩：宿主已开启（compaction-basic 已启用）」，有待压缩区间时附「，待压缩 N 个区间」；文档补充云端已验证的 `cordis.patch.yml` 开启写法（`disabled: false` + `auto: false`）。
+- **C5-M2 日志级别**：巩固跳过（surface 文本不全、无可用模型）由 `debug` 升为 `warn`，并按原因去重；投递失败按 `ErrorName: message` 去重，只有真正投出消息后才清空去重状态。
+- **C5-L1 `/线程` 提示**：宿主没有 `sessionController` 时，`/线程` 直接返回与 `/状态` 相同的「线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）」，不查库、不返回空列表。
+
+### Changed
+
+- **文档**：`docs/platform-api.md` 增 §1.5 巩固模型路由与 llm 能力/适配层/错误码说明；`docs/usage.md` 增「宿主压缩开关（compaction-basic，v0.4.6）」与 `/线程` 不支持行为；`README` 同步状态、压缩能力与 v0.4.6 摘要。
+- **测试**：新增 `test/c5-h1a.test.js`、`test/c5-h1b.test.js`、`test/c5-h2.test.js`、`test/c5-m1-m2-l1.test.js` 与跨项集成回归 `test/v046-regression.test.js`（7 例，覆盖 C5 六项）；用例总数 766 → 789 / 16 个套件。
+
+### Verified
+
+- 三时区 `node --test`（默认 / `TZ=UTC` / `TZ=America/New_York`）789/789 pass、0 fail；`test/e2e/*.test.js` 127/127、`test/e2e/plugin-smoke.test.js` 4/4。
+- 发布门 `node scripts/probe/run-headless.mjs --plugin`：round A（插件激活）与 round B（召回注入）PASS；round C（巩固）无模型凭据 SKIP，总判定 PASS，日志 `.data/plugin-gate.log`。
+
 ## [0.4.5] - 2026-11-05
 
 v0.4.4 发布后评审（V4）的修复：提醒失败不再卡在 `delivering`，inject 消息形状校验点名到字段，召回加词法门槛并支持 2 字实体与短查询配置，召回块经压缩摘要回流完成调查与防线。仍为零第三方运行时依赖，无 schema 变更；发布前独立复审 pass（H=0 / M=0），见 [docs/review-v10.md](docs/review-v10.md)。

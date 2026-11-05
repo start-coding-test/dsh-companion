@@ -76,11 +76,13 @@ test('runTask 成功路径：createSession → prompt → whenIdle，并写完�
   assert.ok(created >= 0 && prompted >= 0 && idled >= 0, '缺少阶段调用');
   assert.ok(created < prompted && prompted < idled, '调用顺序不对');
 
-  // prompt 请求形状（T2 适配器）：sessionId + text 内容块
-  const [promptRequest, promptSource] = ctx.callsOf('sessionController.prompt')[0].args;
+  // prompt 请求形状（T2 适配器）：sessionId + text 内容块，第二参是 AbortSignal
+  const [promptRequest, promptSignal] = ctx.callsOf('sessionController.prompt')[0].args;
   assert.equal(promptRequest.sessionId, 'session-fake-1');
   assert.deepEqual(promptRequest.content, [{ type: 'text', text: '写一份周报' }]);
-  assert.equal(promptSource.kind, 'user');
+  assert.ok(promptSignal instanceof AbortSignal, 'prompt 第二参必须是 AbortSignal');
+  assert.equal(promptSignal.kind, 'user');
+  if (promptRequest.requestId) assert.equal(promptSignal.rpcId, promptRequest.requestId);
 
   // 回执已写完：一条 memory_events 审计行
   assert.equal(store.events.length, 1);
