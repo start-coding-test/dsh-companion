@@ -306,18 +306,13 @@ ctx.compactSession(session.id, 7, 8, { remap: [100] });    // 模拟压缩后的
 三个方法都在才为 `true`。探测**只读服务对象，绝不调用 `createSession`**，
 不会在探测阶段创建会话。
 
-接线约定（`src/index.js` 的 `registerTools` / 命令注册）：
+接线约定（`src/index.js` 的 `registerTools` / 命令 handler，v0.4.9 起）：
 
-- `threadTools === false`：**不注册** `thread_run`、`task_run` 以及所有
-  `thread_*` 工具（含 `thread_list`）。模型看不到这些工具，就不会在 headless /
-  自定义 bundle 上调用后收到 `PlatformError('no-session')`。
-- `threadTools === true`：行为与 v0.4.3 完全一致（工具集合不变）。
-- `/status` 在缺失时多一行：
-  `线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）`；
-  接线层把 `threadsSupported: platform.capabilities.threadTools` 传给
-  `handleCommand`。其余状态行与 `/记忆`、`/成本`、`/线程` 输出不变。
-- 能力清单里曾把 `sessionController` 当纯能力位；v0.4.4 起注册工具一律读
-  `threadTools`，两者目前同源，但后者语义固定在「能否注册线程/任务工具」。
+- **10 个工具一律注册**：注册项不再按 `threadTools` 过滤，模型始终能看到完整工具集；`thread_list` / `thread_run` / `task_run` 的 `execute` 在**每次调用时**读 `platform.capabilities.threadTools`（运行时 getter，不是 apply 期快照）。
+- `threadTools !== true`：这三个工具返回稳定 `{ ok: false, reason: 'capability_missing', message: '宿主未提供 sessionController，线程工具暂不可用' }`，不抛异常（空参数也返回该对象，不会变成 `TypeError`），不写半成品；其余 7 个工具照常可用。
+- 能力恢复（宿主晚挂载 `sessionController`）后**无需重装插件**：同一注册项下一次调用即真正执行。
+- `/status` 的 `threadsSupported` 与 `/threads` 都在命令 handler 内实时判断，统一文案 `线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）`（`src/runtime/commands.js` 单一常量，`/线程` 与 `/状态` 共用）。
+- 语义边界：`threadTools` 只表示「线程/任务工具此刻能否执行」，不再表示「是否注册」；与 `sessionController` 同源但独立读取。
 
 这也解释了 v0.4.3 真机回报里的 `sessionController present=false`：发布门跑的是
 headless profile（见 §1.3），不是桌面宿主；桌面 / Web GUI 宿主 present=true。

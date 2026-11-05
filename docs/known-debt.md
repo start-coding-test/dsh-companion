@@ -127,6 +127,7 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 
 ## 5. 已关闭（本轮修复）
 
+- **V7-M1 压缩起点可能落在系统提示词节点**：v0.4.9 修复。`src/session/surface.js` 的 `planRegion` 选定起点后调用导出的 `firstReplaceableIndex(snapshot, from)` 跳过 `role: 'system'` 节点（节点 0 正文缺失、`role` 未知时保守跳过），区间中途再遇系统节点则提前收尾，全部不可替换返回 `region: null, reason: 'no-replaceable-range'`；`src/index.js` 的 `maybeCompact` 在恢复历史 `pending_compact` 时用同一 helper 收紧起点，收紧后区间为空则丢弃 pending 并计 `compactionDrops`，不调用 `compactRegion`。常规巩固、deep-sleep 与 pending 恢复压缩共用同一道起点收紧。**观察项（终点 fence 未做）**：恢复的 pending 只收紧起点、未收紧终点；平台只保护 node 0（系统提示词），跨版本旧 pending 的中段系统节点仍可能被跨过。文档已补记于 [usage.md](usage.md) 的「压缩起点跳过系统节点」与「隐私与凭据」两节。
 - **V7-L1 发布门 round C 只跑单轮、tokenMeter=0**：v0.4.9 修复（与 V7-L2 同提交）。round C 改为同一会话两轮：第一轮 `--json` 取 `sessionId`，第二轮 `--session-id` 续跑（overlay 的 `compactHardTokens` 降到 120，两轮输入才过阈值）。判定要求 scheduler started 标记、tokenMeter 观测到非零 token（`tokens` 事件 `maxTokensIn > 0`）、`consolidations` 至少一行；无模型凭据时 SKIP（明确不算 PASS），有凭据而断言失败时发布门 exit 1。为可测试性导出 `parseSessionId` / `readConsolidationEvidence` / `evaluateConsolidationRound`，`runConsolidationRound` 接受 runner 与证据读取注入。
 - **V7-L2 巩固/压缩事件只有秒级 started_at/finished_at**：v0.4.9 修复（与 V7-L1 同提交）。巩固在 `consolidate({ clock })` 事务收尾用注入毫秒时钟算 `duration_ms`（生产传 `platform.now`），写进 episodes 事件 detail（`kind: 'consolidation'`）；压缩在 `compactRegion` 前后用 `platform.now()` 计时，成功后写 `memory_events`（`table_name: 'compactions'`、`action: 'UPDATE'`、`detail.kind: 'compaction'`）；新增 `eventDurationMs` 读取 helper，旧行没有该字段时返回 null（不影响读取）。
 

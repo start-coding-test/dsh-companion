@@ -118,7 +118,7 @@ rent | active | 租房 | 2026-11-03
 health | archived | 体检 | 2026-10-20
 ```
 
-没有线程时返回 `线程目录：暂无。`；宿主没有 `sessionController` 时不返回空目录，而是与 `/状态` 一致返回 `线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）`。
+没有线程时返回 `线程目录：暂无。`；宿主没有 `sessionController` 时不返回空目录，而是与 `/状态` 一致返回 `线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）`。两者都是**调用时实时判断**：能力晚挂载后无需重装插件，下一次调用即恢复。
 
 ### `/状态`
 
@@ -135,7 +135,7 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 最近 job：s2-purge ok upto_seq=0（2026-11-03 03:30）
 ```
 
-最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。「主会话：<id>（绑定 <mode>）」是当前提醒投递目标与绑定策略（`latest-user` 会跟随最新真实用户会话，`first` 保持首个，见[主会话绑定](#主会话绑定v044)）；宿主没有 `sessionController` 时多一行「线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）」。
+最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。「主会话：<id>（绑定 <mode>）」是当前提醒投递目标与绑定策略（`latest-user` 会跟随最新真实用户会话，`first` 保持首个，见[主会话绑定](#主会话绑定v044)）；宿主没有 `sessionController` 时多一行「线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）」（每次执行 `/状态` 时实时读取能力）。
 
 `/状态` 末尾还会给出自愈观测（无事件时显示「无」）：
 
@@ -312,7 +312,7 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 能力缺失时返回 `ok:false`，不会写入半成品：
 
 - `cwd-unavailable`：宿主未提供工作目录（新建分支）。
-- `session-unavailable`：宿主没有 `sessionController.createSession`。
+- `session-unavailable`：宿主没有 `sessionController.createSession`。这是工具集脱离插件能力门单独构造时的返回；在插件注册路径上，宿主缺 `sessionController` 时 `execute` 会先返回 `capability_missing`（见[宿主能力缺失](#宿主能力缺失)）。
 - `unarchive-unavailable`：复用已归档线程，但宿主没有 `workspaceRegistry.unarchiveSession`。
 - `prompt-unavailable`：宿主没有 `sessionController.prompt`，无法投递目标。
 
@@ -364,7 +364,7 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 - **软超时 600s**：只写一条 `warn` 日志与耗时，不打断 worker。
 - **硬超时 900s**：两段式回收——先 `cancel({sessionId, keepInbox:true})` 只中止
   当前轮，再 `cleanInbox(sessionId)` 清空排队；终态 `timeout`，回执写「超时」。
-- 宿主没有 `sessionController` 时返回 `{ "ok": false, "reason": "session-unavailable" }`。
+- 宿主没有 `sessionController` 时，插件注册路径返回 `{ "ok": false, "reason": "capability_missing", "message": "宿主未提供 sessionController，线程工具暂不可用" }`（工具集单独构造时才是 `session-unavailable`）。能力晚挂载后同一注册项直接可用，无需重装插件。
 - 每日 token 达到 3M 时返回 `{ "ok": false, "reason": "daily_budget_exceeded" }`；
   RSS 达到降级线时返回 `{ "ok": false, "reason": "memory_pressure" }`（入队前拒绝）。
   降级线由 `rssStopGiB`/`rssMainOnlyGiB` 配置（默认 3.0/3.15GiB；4G 机器建议 2.4/2.6）。
@@ -427,6 +427,17 @@ node scripts/decrypt-encrypted.mjs secret.enc --out fact.json
 - 解密先校验再写文件，错误口令、损坏文件或认证失败不会留下明文半文件；错误统一为「解密失败（口令错误、文件损坏或认证失败）」。
 - 格式：AES-256-GCM + scrypt（N=2^14、r=8、p=1），随机 salt(16B) / iv(12B)，magic `DSH-COMPANION-EXPORT-1` + JSON header 保存 KDF 参数与 tag。`header.format = "v2"` 起 header 与 magic 行一起作为 AAD 认证，篡改 header / 密文 / tag 都会失败；`v1` 旧文件仍可解，新导出建议用 v2。
 
+### 隐私与凭据（V7-M3，v0.4.9）
+
+凭据类内容不进长期记忆。巩固落地前会逐条识别并跳过：
+
+- 密码 / password / passwd（明确是密码语义时）、验证码 / verification code、CVV/CVC、私钥 / 密钥、卡号 / card number、API key / apikey、access token / 令牌，以及 `sk-` 开头的字面值；
+- 「字段名 + 是/为/`:`/`=` + 值」形式（如 `api key = …`、`token: …`）；弱字段名要求值里含数字或符号，避免把普通技术讨论误判成凭据。
+
+被跳过的内容不写 `facts`（也不进 facts 的 FTS 索引）、不写 `reminders`，状态板渲染前还会逐行过滤，历史库里已有的敏感行同样不会显示；对话原文仍按原样保留为 episode（会话记录，不是事实库）。命中时巩固结果带 `sensitive` 计数与提示，日志记 `credential content skipped`。
+
+此外，每轮用户消息命中凭据时，插件会给模型一次固定提示（同一轮只注入一次，不转录、不参与巩固）：不复述具体值、不调用记忆工具，并回复「这类信息建议放环境变量或文件里，我不代为保存。」
+
 ### 向量召回（可选）
 
 默认 `vector.enabled=false`：检索与 v0.2.0 逐字节一致，不读 `fact_vectors`。开启后 `hybridSearch` 用 RRF（`1/(60+rank)`）融合 FTS 与向量，同一 fact 去重；向量路只召回 active、normal、未删除、非 `sensitive`/`secret` 且 R ≥ 0.05 的事实。`vector.embedder` 支持 `hash`（默认，字符 bigram 哈希投影）、`local`（可选安装 `@huggingface/transformers`，默认 bge-small-zh-v1.5 512 维）、`remote`（默认关闭，显式 `vector.remote.enabled: true` 才启用；隐私例外见 [embedding.md](embedding.md)）与 `none`（等价关闭）。三种实现怎么选：
@@ -473,6 +484,18 @@ schema v9 对向量表本身没有新改动：v0.3.0（schema 5）新建 `fact_v
 4. `/状态` 的「水位重锚：N 次」与「未巩固被压缩：N 个节点」分别对应重锚次数和被摘要吞掉的未巩固节点数。
 
 **边界（R-L3）**：被压缩区间里尚未巩固的原始对话已经从 surface 消失，只能以平台摘要的形式进入记忆库；摘要没有保留的细节无法恢复。不要把「之后再巩固」当成丢失内容的兜底，重要信息应在压缩前写入记忆，或不要依赖外部压缩来保存。
+
+### 压缩起点跳过系统节点（V7-M1，v0.4.9）
+
+宿主 surface 的节点 0 通常是系统提示词（`role: 'system'`），平台不允许替换。插件在选压缩区间时：
+
+- 起点落在系统节点上时，`firstReplaceableIndex` 推进到其后第一个非系统节点；节点 0 正文缺失、`role` 未知时保守跳过；
+- 区间中途再遇到系统节点则提前收尾，系统节点不会被包进 region；
+- 整段都不可替换时返回 `no-replaceable-range`；恢复历史 `pending_compact` 时同样收紧起点，收紧后区间为空就丢弃 pending、计入内部指标 `compactionDrops` 并记 warn 日志（`no replaceable node` / `region expired`），不会调用 `compactRegion`。
+
+因此常规巩固、deep-sleep 与 pending 恢复压缩共用同一道起点收紧，系统提示词节点永不被压缩进 region。
+
+**边界**：收紧只作用于区间起点。平台侧只保证 node 0 不被替换，跨版本旧 pending 的中段系统节点仍可能被跨过（见 [known-debt.md](known-debt.md) §5 的 V7-M1 观察项）。
 
 ### 主会话绑定（v0.4.4）
 
@@ -623,7 +646,7 @@ rssMainOnlyGiB: 2.6
 - 无 main 会话或 `prompt` 不可用：主动消息发送失败会留在队列等待下个 tick；`thread_run` 返回 `prompt-unavailable`。召回只影响注入，不影响原始对话。
 - 无模型（`ctx.companion.consolidationLlm` 与 `ctx.llm` 都不可用）：巩固跳过并记 `warn` 日志（同一原因只告警一次），不阻塞对话，已有记忆照常检索。provider/model 发现失败（`listProviders` 或某个 provider 的 `listModels` 抛错）同样记 `warn`，按「provider 发现失败」「provider X 模型发现失败」去重，成功发现后重置，不会每 5 分钟刷屏；`/状态` 仍显示「巩固：无可用模型」。
 - 无 `unarchiveSession`：复用归档线程返回 `unarchive-unavailable`。
-- 无 `sessionController`：`thread_list` / `thread_run` / `task_run` **不注册**（其余 7 个工具不受影响），`/状态` 显示「线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）」；若被旧调用触发，`task_run` 返回 `session-unavailable`；`/记忆 导出` 仍可用（只读库）。headless / one-shot / SDK profile 属于正常降级；desktop profile 组合 web-app，能力齐全。
+- 无 `sessionController`：**10 个工具一律注册**（`thread_list` / `thread_run` / `task_run` 也在内）；线程/任务工具在 `execute` 时读 `platform.capabilities.threadTools`，不可用返回稳定 `{ "ok": false, "reason": "capability_missing", "message": "宿主未提供 sessionController，线程工具暂不可用" }`，不抛异常、不写半成品。`/状态` 与 `/线程` 每次调用都实时判断，统一显示「线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）」；能力晚挂载后无需重装插件，同一注册项即可用。`/记忆 导出` 仍可用（只读库）。headless / one-shot / SDK profile 属于正常降级；desktop profile 组合 web-app，能力齐全。
 - `vector.embedder: none`、`enabled: false` 或 remote 未显式 `remote.enabled: true`：检索退化为 bigram FTS，与旧版一致；`/状态` 显示「向量：关」。
 
 ### 工具错误
