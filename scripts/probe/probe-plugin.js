@@ -46,6 +46,7 @@ const CAPABILITY_KEYS = [
   'sessionProjections',
   'agents',
   'timer',
+  'llm',
 ];
 
 /** 单个字符串/源码片段的最大长度，避免 probe.json 膨胀。 */
@@ -613,6 +614,70 @@ function sessionsSnapshot(ctx) {
 }
 
 /**
+ * C5-H2：llm 服务的挂载与调用形状。
+ *
+ * dsh-llm 由 dsh-base 晚挂载（`super(ctx, 'llm')`，dsh-llm/lib/index.js:1816），
+ * 插件 apply 时通常还是 undefined。这里只记录能力与签名，不发起真实模型调用：
+ *   - listProviders() 同步返回 [{id,name}]（dsh-llm/lib/index.js:1908）；
+ *   - listModels(provider) 异步返回 [{id,name}]（:2086）；
+ *   - stream(options) 返回异步迭代器（:2393，经 ctx.waterfall('llm/stream')）。
+ * 探针在启动与首个 pre-step 各采样一次，便于观察晚注册。
+ *
+ * @param {object} ctx
+ * @returns {object}
+ */
+function llmSnapshot(ctx) {
+  const service = safeGet(() => ctx.get('llm'), undefined);
+  if (!service) {
+    return {
+      present: false,
+      capability: false,
+      mount: 'dsh-llm/lib/index.js:1816',
+      note: 'llm 由 dsh-base 晚挂载；apply 时不存在是正常的，插件每次调用前重新探测。',
+    };
+  }
+  let providers = null;
+  let providerError = null;
+  if (typeof service.listProviders === 'function') {
+    try {
+      const rows = service.listProviders();
+      providers = Array.isArray(rows)
+        ? rows.map((row) => ({ id: row?.id ?? null, name: row?.name ?? null })).slice(0, 20)
+        : null;
+    } catch (error) {
+      providerError = errorInfo(error);
+    }
+  }
+  return {
+    present: true,
+    capability: typeof service.stream === 'function',
+    mount: 'dsh-llm/lib/index.js:1816',
+    listProviders: {
+      typeof: typeof service.listProviders,
+      arity: typeof service.listProviders === 'function' ? service.listProviders.length : null,
+      sync: true,
+      source: methodSource(service, 'listProviders'),
+      providers,
+    },
+    listModels: {
+      typeof: typeof service.listModels,
+      arity: typeof service.listModels === 'function' ? service.listModels.length : null,
+      async: true,
+      source: methodSource(service, 'listModels'),
+      note: 'dsh-llm/lib/index.js:2086；provider 必须是非空字符串，返回去重后的模型目录。',
+    },
+    stream: {
+      typeof: typeof service.stream,
+      arity: typeof service.stream === 'function' ? service.stream.length : null,
+      source: methodSource(service, 'stream'),
+      note: 'dsh-llm/lib/index.js:2393；返回 async iterable，chunk.type=text-delta 累积文本，finish.reason 表示结束。',
+    },
+    providerError,
+    note: 'C5-H2：插件只在需要巩固/闲聊时重新解析，成功的 route 缓存 5 分钟，null 不缓存。',
+  };
+}
+
+/**
  * 把探针挂进当前 ctx：启动写一次，首个 pre-step 再补一次真实 payload。
  * @param {object} ctx DSH cordis 上下文
  * @param {object} [config] 平台传入的插件配置
@@ -632,6 +697,7 @@ export function apply(ctx, config) {
     tokenMeter: tokenMeterSnapshot(ctx),
     compaction: compactionSnapshot(ctx),
     sessions: sessionsSnapshot(ctx),
+    llm: llmSnapshot(ctx),
     events: {
       preStep: { registered: false, total: 0, sessions: {}, first: null, occurrences: [] },
       turnStopping: { registered: false, fired: 0, last: null },
@@ -732,6 +798,8 @@ export function apply(ctx, config) {
           if (!report.tokenMeter?.present) report.tokenMeter = tokenMeterSnapshot(ctx);
           if (!report.compaction?.present) report.compaction = compactionSnapshot(ctx);
           report.sessions = sessionsSnapshot(ctx);
+          // C5-H2：llm 可能晚于 apply 挂载，首步再采样一次能力/方法面。
+          report.llm = llmSnapshot(ctx);
 
           const meter = safeGet(() => ctx.get('tokenMeter'), undefined);
           if (typeof meter?.measure === 'function' && session) {

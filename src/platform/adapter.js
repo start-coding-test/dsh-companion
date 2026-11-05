@@ -806,14 +806,16 @@ export function createAdapter(ctx, opts = {}) {
 
   /**
    * 列出平台已注册的模型路由（`ctx.llm.listProviders()` 的只读投影）。
-   * @returns {Array<{id: string, name: string}>}
+   * 兼容同步/异步宿主实现；能力位在调用时动态判断（C5-H2）。
+   * @returns {Promise<Array<{id: string, name: string}>>}
    */
-  function listProviders() {
+  async function listProviders() {
     const impl = service('llm');
     if (typeof impl?.stream !== 'function') {
       throw unavailable('no-llm', 'ctx.llm.listProviders()');
     }
-    const rows = impl.listProviders?.() ?? [];
+    if (typeof impl.listProviders !== 'function') return [];
+    const rows = await impl.listProviders();
     return Array.isArray(rows)
       ? rows.map((row) => ({ id: row?.id, name: row?.name }))
       : [];

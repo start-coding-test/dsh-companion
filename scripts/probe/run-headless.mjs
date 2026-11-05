@@ -27,6 +27,7 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, 
 import { dirname, join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 import { Store } from '../../src/memory/store.js';
@@ -49,6 +50,22 @@ const PLUGIN_LOG = join(REPO_ROOT, '.data', 'plugin-gate.log');
 /** V3-H1 召回门：预置事实 + 命中消息；命中的 query 长度必须过 M3 查询门。 */
 const PLUGIN_RECALL_TASK = '周五要交的周报是什么时候';
 const PLUGIN_RECALL_STATEMENT = '每周五要交周报。';
+/** C5-H2 巩固门：独立库 + 低阈值，灌入明显超过阈值的文本。 */
+const PLUGIN_CONSOLIDATION_PATCH = join(REPO_ROOT, '.data', 'plugin-gate-round-c.patch.yml');
+const PLUGIN_CONSOLIDATION_DB = join(REPO_ROOT, '.data', 'plugin-gate', 'round-c.db');
+const PLUGIN_CONSOLIDATION_TASK = [
+  '请记住下面这段工作记录，之后我会问你细节。',
+  '周一上午我们确认了发布清单：C5-H2 需要让巩固在 llm 晚挂载后仍能运行，',
+  '选路顺序是宿主 hook、配置 consolidation.model、运行时 provider 探测。',
+  '周二修了 resolveConsolidationLlm 的负缓存，成功 route 缓存五分钟，null 不缓存。',
+  '周三检查 /状态 输出，要求显示实际的 provider 和 model，找不到时写「巩固：无可用模型」。',
+  '周四补了发布门 round C：有凭据时灌入超过阈值的对话，断言 consolidations 至少一行；',
+  '没有凭据时标注 SKIP。周五准备发布 v0.4.6，并确认三个时区的 node --test 全绿。',
+  '另外记下几个数字：工作记忆阈值 32000，自动压缩 24000，硬阈值 40000，',
+  '保留尾部 6144，提醒日上限 3，静默时段 23:00 到 08:00。',
+  '这些数字在配置里都有默认值，安装自检要求顶层恰好十六个键。',
+  '如果后续要调整巩固模型，只需要改 consolidation.model，不用动其他开关。',
+].join('');
 /** 真机崩溃原文（v0.4.3：裸内容块没有 source）。 */
 const PLUGIN_CRASH_RE = /reading ['"]kind['"]|Cannot read properties of undefined/u;
 
@@ -64,15 +81,17 @@ const HELP = `Gate 0 headless 探针采集器
   --two-turn         首轮之后用 --session-id 续跑同一会话，采集第 2 个 turn 的
                      pre-step/surface（模型凭据缺失时也能拿到第 2 个 pre-step）
   --plugin           C-H1 发布门：用 --patch 把本仓库真插件（src/index.js）挂到
-                     headless，跑两轮：
+                     headless，跑三轮：
                        A) 冒烟：出现 "[dsh-companion] scheduler started"、且没有
                           "did not activate"；
                        B) 召回（V3-H1）：在门专用库里预置 1 条 fact 后发命中消息，
                           断言输出里没有 reading 'kind' 崩溃，且该 fact 的
                           first_reneed_at 非空（证明召回真的注入过）。
-                     无模型凭据时 agent loop 到不了 pre-step，round B 标注 SKIP。
-                     退出码 0=通过，1=未通过，2=找不到 DSH；完整 stdout/stderr
-                     落盘到 .data/plugin-gate.log
+                       C) 巩固（C5-H2）：换独立库与低阈值，灌入超过阈值的文本，
+                          断言 consolidations 至少 1 行；无模型凭据时标注 SKIP。
+                      无模型凭据时 agent loop 到不了 pre-step，round B 也标注 SKIP。
+                      退出码 0=通过，1=未通过，2=找不到 DSH；完整 stdout/stderr
+                      落盘到 .data/plugin-gate.log
   --dsh <path>       DSH CLI 路径（默认依次尝试 DSH_CLI 环境变量、PATH、常见安装目录）
   --timeout <ms>     子进程超时，默认 120000
   --keep-home        保留临时 DSH_HOME（默认也会保留，便于查看日志；目录在 .data/ 下）
@@ -449,6 +468,29 @@ function writePluginPatch() {
 }
 
 /**
+ * round C 专用 overlay：独立库 + 低阈值，保证一段普通对话就会触发巩固。
+ * @returns {string} patch 文件路径
+ */
+function writeConsolidationPatch() {
+  const dbPath = PLUGIN_CONSOLIDATION_DB.split('\\').join('/');
+  const lines = [
+    '# 自动生成：run-headless.mjs --plugin round C（C5-H2 巩固门），请勿手改。',
+    '- insert:',
+    '    - id: dsh-companion-plugin-gate-c5h2',
+    '      name: ../src/index.js',
+    '      config:',
+    `        dbPath: ${JSON.stringify(dbPath)}`,
+    '        retainTokens: 1',
+    '        compactAtTokens: 50',
+    '        workingMemoryTokens: 100',
+    '        compactHardTokens: 200',
+    '',
+  ];
+  writeFileSync(PLUGIN_CONSOLIDATION_PATCH, lines.join('\n'), 'utf8');
+  return PLUGIN_CONSOLIDATION_PATCH;
+}
+
+/**
  * C-H1 发布门：把真插件挂到 headless 宿主上跑一次，断言它真的激活。
  *
  * 判定只看启动日志（scheduler started 在 apply 内、构建会话之前打印），
@@ -555,7 +597,44 @@ async function runPluginGate(options) {
     return 1;
   }
 
-  process.stdout.write('plugin-gate: PASS (round A + round B)\n');
+  // ---------------- round C：灌入超过阈值的文本（C5-H2 巩固真机门） ----------------
+  const third = await runConsolidationRound(launch, env, options);
+  process.stdout.write(
+    `plugin-gate: round C (consolidation) exit=${third.exitCode}${third.timedOut ? ' (timeout)' : ''} schedulerStarted=${third.started} didNotActivate=${third.inactive} consolidations=${third.count}${third.credentialsMissing ? ' credentials=missing' : ''}${third.error ? ` error=${third.error}` : ''}\n`,
+  );
+  logLines.push(
+    `round C task: ${PLUGIN_CONSOLIDATION_TASK}`,
+    `round C: exit=${third.exitCode}${third.timedOut ? ' (timeout)' : ''} schedulerStarted=${third.started} didNotActivate=${third.inactive} consolidations=${third.count} credentialsMissing=${third.credentialsMissing}${third.error ? ` error=${third.error}` : ''}`,
+    '--- round C stdout ---',
+    redact(third.stdout ?? ''),
+    '--- round C stderr ---',
+    redact(third.stderr ?? ''),
+  );
+  mkdirSync(dirname(PLUGIN_LOG), { recursive: true });
+  writeFileSync(PLUGIN_LOG, logLines.join('\n'));
+
+  if (third.error) {
+    process.stderr.write(`plugin-gate: FAIL (round C: ${third.error})\n`);
+    return 1;
+  }
+  if (third.inactive) {
+    process.stderr.write('plugin-gate: FAIL (round C: plugin did not activate)\n');
+    return 1;
+  }
+  if (third.count >= 1) {
+    process.stdout.write(`plugin-gate: round C PASS (consolidations=${third.count})\n`);
+  } else if (third.credentialsMissing) {
+    process.stdout.write(
+      'plugin-gate: round C SKIPPED (no model credentials; consolidation cannot run without a model)\n',
+    );
+  } else {
+    process.stderr.write(
+      'plugin-gate: FAIL (round C: no consolidation row written despite over-threshold input)\n',
+    );
+    return 1;
+  }
+
+  process.stdout.write('plugin-gate: PASS (round A + round B + round C)\n');
   process.stdout.write(`plugin-gate: full log ${PLUGIN_LOG}\n`);
   return 0;
 }
@@ -632,6 +711,60 @@ async function runRecallRound(launch, env, patch, options) {
       result.firstReneedAt = Number.isInteger(row?.first_reneed_at) ? row.first_reneed_at : null;
     } finally {
       readStore.close();
+    }
+  } catch (error) {
+    result.error = error instanceof Error ? error.message : String(error);
+  }
+  return result;
+}
+
+/**
+ * round C：灌入超过阈值的文本 → 断言 consolidations 至少一行（C5-H2）。
+ *
+ * 无模型凭据时 agent loop 不产生对话，巩固自然不会运行；此时只标注 SKIP，
+ * 不把「环境缺失」误判成「功能失败」。有凭据而 0 行才是真失败。
+ *
+ * @param {object} launch
+ * @param {NodeJS.ProcessEnv} env
+ * @param {object} options
+ * @returns {Promise<object>}
+ */
+async function runConsolidationRound(launch, env, options) {
+  const result = {
+    exitCode: null,
+    timedOut: false,
+    stdout: '',
+    stderr: '',
+    started: false,
+    inactive: false,
+    crash: false,
+    count: 0,
+    credentialsMissing: false,
+    error: null,
+  };
+  try {
+    for (const suffix of ['', '-wal', '-shm']) {
+      const file = `${PLUGIN_CONSOLIDATION_DB}${suffix}`;
+      if (existsSync(file)) rmSync(file, { force: true });
+    }
+    const patch = writeConsolidationPatch();
+    const args = [...launch.prefixArgs, '--profile', 'headless', '--patch', patch, PLUGIN_CONSOLIDATION_TASK];
+    const run = await runHeadless(launch, env, args, options.timeoutMs);
+    Object.assign(result, summarizePluginRun(run), {
+      exitCode: run.exitCode,
+      timedOut: run.timedOut,
+      stdout: run.stdout,
+      stderr: run.stderr,
+    });
+    result.credentialsMissing = /MISSING_CREDENTIAL|no API key/u.test(`${run.stdout}\n${run.stderr}`);
+    if (existsSync(PLUGIN_CONSOLIDATION_DB)) {
+      const db = new DatabaseSync(PLUGIN_CONSOLIDATION_DB, { readOnly: true });
+      try {
+        const row = db.prepare("SELECT COUNT(*) AS n FROM consolidations WHERE status IN ('written', 'compacted')").get();
+        result.count = Number(row?.n ?? 0);
+      } finally {
+        db.close();
+      }
     }
   } catch (error) {
     result.error = error instanceof Error ? error.message : String(error);

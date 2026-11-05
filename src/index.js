@@ -371,6 +371,15 @@ export function apply(ctx, rawConfig, hooks = {}) {
   // 失败只记日志/指标，召回本轮回退 FTS，idle-probe 按退避重试。
   prewarmEmbedder(state);
 
+  // C5-H2：llm 服务由 dsh-base 晚注册（启动时 undefined，约 30 秒后才可用）。
+  // 这里只做一次非阻塞预热，让 /状态 尽早拿到真实 provider/model；能力与路由在
+  // 每次使用时仍会重新解析，启动瞬间的否定结果不会被固化。
+  void resolveLlmRoute(state).catch((error) => {
+    platform.log('debug', '[dsh-companion] llm route prewarm failed', {
+      message: errorMessage(error),
+    });
+  });
+
   const disposers = [];
   const track = (disposer) => {
     if (typeof disposer === 'function') disposers.push(disposer);
@@ -570,12 +579,15 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     lastVectorHits: 0,
     /** dispose 后后台任务不再碰已关闭的 Store。 */
     disposed: false,
-    llmResolved: false,
-    llm: null,
+    // C5-H2：模型路由每次按需重新解析（否定结果不缓存）；成功路由带版本/时间。
     llmRoute: null,
+    llmRouteProbed: false,
+    llmRouteRefreshing: false,
+    llmRoutePromise: null,
+    llmRouteLastAttemptAt: null,
+    lastNoModelFailureAt: null,
     warnedNoLlm: false,
     /** P1-b：闲聊模型单独解析/缓存，不复用巩固模型（提示词与输出都不同）。 */
-    chatLlmResolved: false,
     chatLlm: null,
     chatLlmRoute: null,
     warnedNoChatLlm: false,
@@ -705,6 +717,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
         const lostUnconsolidated = Number(metricSnapshot.compactionLostUnconsolidated) || 0;
         const text = alias.name === 'status'
           ? `${withDeliveryFailure(store, result.reply)}\n${formatChatStatus(state, platform.now())}`
+            + `\n${formatConsolidationStatus(state, platform.now())}`
             + (reanchors > 0 ? `\n水位重锚：${reanchors} 次` : '')
             + (lostUnconsolidated > 0 ? `\n未巩固被压缩：${lostUnconsolidated} 个节点` : '')
           : result.reply;
@@ -2609,19 +2622,164 @@ function withoutRecallRecords(snapshot) {
 
 // ---------------------------------------------------------- 巩固模型接入
 
+/** C5-H2：成功路由的复用窗口；否定结果不缓存，每次调用重新探测。 */
+const LLM_ROUTE_TTL_MS = 5 * 60 * 1000;
+/** C5-H2：「无可用模型」失败事件的写库节流，避免 /状态 轮询刷屏。 */
+const LLM_NO_MODEL_RETRY_MS = 60 * 1000;
+
 /**
- * 解析巩固模型：优先宿主注入（`ctx.companion.consolidationLlm`），
- * 其次走平台唯一模型路径 `ctx.llm.stream`（自动选第一条 provider/model）。
+ * 读取 `consolidation.model` 的显式选路；未配置返回 null。
+ * @param {object} config
+ * @returns {{provider: string, model: string}|null}
+ */
+function configuredLlmModel(config) {
+  const configured = config?.consolidation?.model;
+  if (configured === null || configured === undefined) return null;
+  if (typeof configured?.provider !== 'string' || typeof configured?.model !== 'string') return null;
+  return { provider: configured.provider, model: configured.model };
+}
+
+/**
+ * llm 能力位是动态 getter：启动时服务尚未挂载、约 30 秒后才出现，因此每次调用都要重读。
+ * @param {object} state
+ * @returns {boolean}
+ */
+function llmCapability(state) {
+  try {
+    return state.platform?.capabilities?.llm === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 记录一次成功路由（带版本与解析时间）；否定结果不写入。
+ * @param {object} state
+ * @param {{provider: string|null, model: string|null, source: 'config'|'runtime'}} route
+ * @returns {object}
+ */
+function setLlmRoute(state, route) {
+  const version = Number(state.llmRoute?.version ?? 0) + 1;
+  state.llmRoute = Object.freeze({
+    ...route,
+    resolvedAt: state.platform.now(),
+    version,
+  });
+  return state.llmRoute;
+}
+
+/**
+ * 解析实际可用的 provider/model：显式配置优先；否则遍历 providers，跳过模型列表为空的，
+ * 取第一个有模型的 provider。失败/无模型一律返回 null（不缓存否定结果）。
+ *
+ * @param {object} state
+ * @returns {Promise<{provider: string, model: string, source: string}|null>}
+ */
+async function resolveLlmRoute(state) {
+  if (state.disposed) return null;
+  const now = state.platform.now();
+  if (!llmCapability(state)) {
+    state.llmRouteProbed = true;
+    state.llmRouteLastAttemptAt = now;
+    return null;
+  }
+
+  const configured = configuredLlmModel(state.config);
+  if (configured !== null) {
+    state.llmRouteProbed = true;
+    state.llmRouteLastAttemptAt = now;
+    return setLlmRoute(state, { ...configured, source: 'config' });
+  }
+
+  const cached = state.llmRoute;
+  if (cached?.source === 'runtime' && typeof cached.provider === 'string'
+    && now - Number(cached.resolvedAt ?? 0) < LLM_ROUTE_TTL_MS) {
+    state.llmRouteProbed = true;
+    return cached;
+  }
+
+  if (state.llmRoutePromise !== null) return state.llmRoutePromise;
+  state.llmRouteRefreshing = true;
+  const pending = (async () => {
+    let providers = [];
+    try {
+      providers = await state.platform.listProviders();
+    } catch (error) {
+      state.platform.log('debug', '[dsh-companion] llm provider discovery failed', {
+        message: errorMessage(error),
+      });
+    }
+    for (const row of Array.isArray(providers) ? providers : []) {
+      const providerId = typeof row?.id === 'string' && row.id !== '' ? row.id : null;
+      if (providerId === null) continue;
+      let models = [];
+      try {
+        models = await state.platform.listModels(providerId);
+      } catch (error) {
+        state.platform.log('debug', '[dsh-companion] llm model discovery failed', {
+          provider: providerId,
+          message: errorMessage(error),
+        });
+        continue;
+      }
+      const model = (Array.isArray(models) ? models : [])
+        .find((entry) => typeof entry?.id === 'string' && entry.id !== '');
+      if (!model) continue;
+      return setLlmRoute(state, { provider: providerId, model: model.id, source: 'runtime' });
+    }
+    if (state.llmRoute?.source === 'runtime') state.llmRoute = null;
+    return null;
+  })();
+  state.llmRoutePromise = pending;
+  try {
+    return await pending;
+  } finally {
+    if (state.llmRoutePromise === pending) state.llmRoutePromise = null;
+    state.llmRouteRefreshing = false;
+    state.llmRouteProbed = true;
+    state.llmRouteLastAttemptAt = state.platform.now();
+  }
+}
+
+/**
+ * C5-H2：无可用模型时写一条「巩固失败」审计，让 /状态 的「最近失败」可见。
+ * 按 LLM_NO_MODEL_RETRY_MS 节流；不创建 consolidations 行。
+ * @param {object} state
+ * @param {number} [now]
+ */
+function reportNoModelFailure(state, now = state.platform.now()) {
+  if (state.disposed) return;
+  if (state.lastNoModelFailureAt !== null
+    && now - Number(state.lastNoModelFailureAt) < LLM_NO_MODEL_RETRY_MS) {
+    return;
+  }
+  state.lastNoModelFailureAt = now;
+  try {
+    state.store.appendEvent({
+      at: Math.floor(now / 1000),
+      action: 'UPDATE',
+      table_name: 'consolidations',
+      row_id: null,
+      actor: 'consolidator',
+      reason: 'consolidation_failed',
+      detail_json: { kind: 'consolidation_no_model', message: '无可用模型' },
+    });
+  } catch {
+    // 审计写失败不影响业务，也不覆盖状态展示。
+  }
+}
+
+/**
+ * 解析巩固模型：优先宿主注入（`ctx.companion.consolidationLlm`），其次走平台唯一模型路径
+ * `ctx.llm.stream`。每次调用都重新确认能力与路由，晚注册的 llm 服务可以被下一次调用用上。
  * @param {object} state
  * @returns {Promise<Function|null>}
  */
 async function resolveConsolidationLlm(state) {
-  if (state.llmResolved) return state.llm;
-  state.llmResolved = true;
-
   const hook = state.companion?.consolidationLlm;
   if (typeof hook === 'function') {
-    state.llm = async ({ scope, seqFrom, seqTo, regionText, textSource, transcript }) => hook({
+    state.llmRouteProbed = true;
+    return async ({ scope, seqFrom, seqTo, regionText, textSource, transcript }) => hook({
       scope,
       seqFrom,
       seqTo,
@@ -2630,26 +2788,15 @@ async function resolveConsolidationLlm(state) {
       textSource: textSource ?? (regionText ? 'region' : 'transcript'),
       transcript: Array.isArray(transcript) ? transcript : state.transcript,
     });
-    return state.llm;
   }
 
-  if (!state.platform.capabilities.llm) return null;
-  try {
-    const providers = state.platform.listProviders();
-    const provider = Array.isArray(providers) ? providers.find((row) => row?.id) : null;
-    if (!provider) return null;
-    const models = await state.platform.listModels(provider.id);
-    const model = Array.isArray(models) ? models.find((row) => row?.id) : null;
-    if (!model) return null;
-    state.llmRoute = { provider: provider.id, model: model.id };
-  } catch (error) {
-    state.platform.log('debug', '[dsh-companion] llm route resolution failed', {
-      message: error instanceof Error ? error.message : String(error),
-    });
+  const route = await resolveLlmRoute(state);
+  if (route === null || typeof route.provider !== 'string') {
+    reportNoModelFailure(state);
     return null;
   }
-
-  state.llm = async ({ scope, seqFrom, seqTo, regionText, transcript }) => {
+  const { provider, model } = route;
+  return async ({ scope, seqFrom, seqTo, regionText, transcript }) => {
     const prompt = buildConsolidationPrompt({
       scope,
       seqFrom,
@@ -2658,15 +2805,13 @@ async function resolveConsolidationLlm(state) {
       transcript: Array.isArray(transcript) ? transcript : state.transcript,
     });
     const text = await state.platform.complete({
-      provider: state.llmRoute.provider,
-      model: state.llmRoute.model,
+      provider,
+      model,
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
     });
     return parseDraftJson(text);
   };
-  return state.llm;
 }
-
 
 /**
  * 解析模型返回的草稿 JSON；容忍 ```json 代码块包裹。
@@ -3155,6 +3300,45 @@ function formatChatStatus(state, now) {
 }
 
 /**
+ * C5-H2：/状态 里的巩固模型行。同步展示，缺路由时在后台触发一次解析。
+ *
+ * 优先级与真实调用一致：宿主注入 → consolidation.model 配置 → 运行时探测。
+ * 能力位为 false、或探测后没有任何「有模型」的 provider 时显示「无可用模型」，
+ * 并写一条节流后的失败事件供「最近失败」行展示。
+ *
+ * @param {object} state
+ * @param {number} now
+ * @returns {string}
+ */
+function formatConsolidationStatus(state, now) {
+  if (typeof state.companion?.consolidationLlm === 'function') {
+    state.llmRouteProbed = true;
+    return '巩固：宿主注入模型';
+  }
+  const configured = configuredLlmModel(state.config);
+  if (!llmCapability(state)) {
+    reportNoModelFailure(state, now);
+    return '巩固：无可用模型';
+  }
+  const route = state.llmRoute;
+  if (route?.source === 'runtime' && typeof route.provider === 'string') {
+    return `巩固：${route.provider}/${route.model}（运行时）`;
+  }
+  if (configured !== null) {
+    return `巩固：${configured.provider}/${configured.model}（配置）`;
+  }
+  const lastAttemptAt = state.llmRouteLastAttemptAt;
+  const stale = lastAttemptAt === null || now - Number(lastAttemptAt) >= LLM_NO_MODEL_RETRY_MS;
+  if (!state.llmRouteProbed || stale) {
+    void resolveLlmRoute(state).catch(() => {});
+    if (!state.llmRouteProbed) return '巩固：解析中';
+  }
+  if (state.llmRouteRefreshing) return '巩固：解析中';
+  reportNoModelFailure(state, now);
+  return '巩固：无可用模型';
+}
+
+/**
  * C5-H1a：投递失败优先显示在 /状态 的「最近失败」行。
  *
  * `src/runtime/commands.js` 的 formatFailureStatus 只认巩固/job 失败；主动消息
@@ -3187,7 +3371,18 @@ function withDeliveryFailure(store, reply) {
     if (latestDelivery !== null && latestConsolidationFailure !== null) break;
   }
   if (latestDelivery === null) return reply;
-  if (latestConsolidationFailure !== null
+  // C5-H2：无可用模型是配置状态而非更新的运行失败；不要让 /状态 自己写的
+  // no-model 事件遮住真实的投递失败（C5-H1a）。
+  let consolidationDetail = latestConsolidationFailure?.detail_json;
+  if (typeof consolidationDetail === 'string') {
+    try {
+      consolidationDetail = JSON.parse(consolidationDetail);
+    } catch {
+      consolidationDetail = null;
+    }
+  }
+  if (consolidationDetail?.kind !== 'consolidation_no_model'
+    && latestConsolidationFailure !== null
     && Number(latestConsolidationFailure.id) > Number(latestDelivery.id)) {
     return reply;
   }
@@ -3417,49 +3612,31 @@ function recordChatDelivery(state, report) {
 }
 
 /**
- * 解析闲聊模型：优先宿主 hook，其次平台 LLM 路由。
+ * 解析闲聊模型：优先宿主 hook，其次复用巩固模型的同一套路由解析
+ * （C5-H2：consolidation.model → 运行时探测；否定结果不缓存）。
  * @param {object} state
  * @returns {Promise<Function|null>}
  */
 async function resolveChatLlm(state) {
-  if (state.chatLlmResolved) return state.chatLlm;
-  state.chatLlmResolved = true;
   const hook = state.companion?.chatLlm;
   if (typeof hook === 'function') {
-    state.chatLlm = async (input) => hook(input);
     state.chatLlmRoute = { kind: 'hook' };
+    state.chatLlm = async (input) => hook(input);
     return state.chatLlm;
   }
-  const { platform } = state;
-  if (!platform?.capabilities?.llm) {
+  const route = await resolveLlmRoute(state);
+  if (route === null || typeof route.provider !== 'string') {
     state.chatLlm = null;
+    state.chatLlmRoute = null;
     return null;
   }
-  try {
-    const providers = (await platform.listProviders()) ?? [];
-    let provider = null;
-    let model = null;
-    for (const candidate of providers) {
-      const models = (await platform.listModels(candidate.id)) ?? [];
-      if (models.length > 0) {
-        provider = candidate.id;
-        model = models[0].id ?? models[0];
-        break;
-      }
-    }
-    if (provider === null || model === null) {
-      state.chatLlm = null;
-      return null;
-    }
-    state.chatLlmRoute = { provider, model };
-    state.chatLlm = async (input) => state.platform.complete({
-      provider,
-      model,
-      messages: [{ role: 'user', content: [{ type: 'text', text: buildChatPrompt(input) }] }],
-    });
-  } catch {
-    state.chatLlm = null;
-  }
+  const { provider, model } = route;
+  state.chatLlmRoute = { provider, model, source: route.source };
+  state.chatLlm = async (input) => state.platform.complete({
+    provider,
+    model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: buildChatPrompt(input) }] }],
+  });
   return state.chatLlm;
 }
 

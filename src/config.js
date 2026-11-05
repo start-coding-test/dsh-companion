@@ -106,6 +106,20 @@ Object.defineProperty(DEFAULT_VALUES, 'session', {
   configurable: false,
 });
 
+// C5-H2：巩固（以及闲聊复用）模型的显式选路。default null 表示运行时探测：
+// 依次 listProviders / listModels，跳过模型列表为空的 provider。
+// 该节同样不参与 16 键安装自检（与 vector/recall/session 一致）。
+const CONSOLIDATION_DEFAULTS = Object.freeze({
+  model: null,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'consolidation', {
+  value: CONSOLIDATION_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -403,6 +417,58 @@ export function normalizeSession(raw, warnings = []) {
 }
 
 /**
+ * 校验 consolidation 配置（C5-H2）。未知子键只 warning；非法值 fail-fast。
+ *
+ * `model` 缺省为 null，表示运行时探测可用 provider/model；显式配置时必须是
+ * `{ provider, model }` 两个非空字符串。该节默认不参与 Object.keys(DEFAULTS)
+ * 的 16 键安装自检（与 vector/recall/session 一致）。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{model: Readonly<{provider: string, model: string}>|null}>}
+ */
+export function normalizeConsolidation(raw, warnings = []) {
+  const defaults = DEFAULTS.consolidation;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError(
+      'consolidation',
+      `must be a plain object, got ${raw === null ? 'null' : typeof raw}`,
+    );
+  }
+  const allowed = new Set(['model']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "consolidation.${key}" ignored`);
+  }
+  const model = raw.model === undefined ? null : raw.model;
+  if (model === null) return defaults;
+  if (typeof model !== 'object' || Array.isArray(model)) {
+    throw new ConfigError(
+      'consolidation.model',
+      `must be { provider, model } with non-empty strings, got ${JSON.stringify(model)}`,
+    );
+  }
+  const nestedAllowed = new Set(['provider', 'model']);
+  for (const key of Object.keys(model)) {
+    if (!nestedAllowed.has(key)) {
+      warnings.push(`unknown config field "consolidation.model.${key}" ignored`);
+    }
+  }
+  for (const field of ['provider', 'model']) {
+    const value = model[field];
+    if (typeof value !== 'string' || value.trim() === '') {
+      throw new ConfigError(
+        `consolidation.model.${field}`,
+        `must be a non-empty string, got ${JSON.stringify(value)}`,
+      );
+    }
+  }
+  return Object.freeze({
+    model: Object.freeze({ provider: model.provider.trim(), model: model.model.trim() }),
+  });
+}
+
+/**
  * 合并默认值并校验配置；未知字段只产生 warning，不阻断。
  * @param {Record<string, unknown>} [raw]
  * @returns {Readonly<Record<string, unknown>>} 冻结后的配置（含 warnings 数组）
@@ -474,6 +540,7 @@ export function normalizeConfig(raw = {}) {
   cfg.vector = normalizeVector(input.vector === undefined ? DEFAULTS.vector : input.vector, warnings);
   cfg.recall = normalizeRecall(input.recall === undefined ? DEFAULTS.recall : input.recall, warnings);
   cfg.session = normalizeSession(input.session, warnings);
+  cfg.consolidation = normalizeConsolidation(input.consolidation, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

@@ -32,6 +32,10 @@
 | 18 | `session/event` | `ctx.on('session/event', (session, event) => void)`（post-commit，emit）；`event.seq` 为该事件的 session seq，`event.type ∈ {system,developer,user,assistant}/message`、`tool/result` | H1 surface 索引的增量正文来源 | api-catalog `dsh-tool-cordis/lib/types/api-catalog.js:4379-4384` |
 | 19 | `sessionQuery.readSurface` | `ctx.sessionQuery.readSurface(sessionId) → { session, inheritedEventCount, capturedThroughSeq, events }`；`events` 与 `session.surface.nodes` 逐位 1:1，含正文；每次 O(整段 log) | 索引冷启动/压缩后全量回填（每会话至多一次） | api-catalog `:2383-2386`；实现 `dsh-session-query/lib/index.js:1167-1175` |
 | 20 | `tokenMeter.estimateMessage` | `ctx.tokenMeter.estimateMessage(message) → number`；单条消息的启发式 token 估算 | surface 索引里实时事件的 token 计价 | api-catalog `:3297-3320`；内部 `dsh-token-meter/lib/index.js:531-551` |
+| 21 | llm 服务 | `ctx.llm`（`@deepseek-ai/dsh-llm` 构造函数 `super(ctx, 'llm')`）；**由 dsh-base 晚挂载**，插件 `apply` 时通常为 `undefined`，约 30 秒后才可用；能力位 `platform.capabilities.llm` 是实时 getter（`typeof ctx.llm?.stream === 'function'`），不能在 apply 时定死 | 巩固与主动闲聊的模型调用 | `dsh-llm/lib/index.js:1816`；capability getter `src/platform/adapter.js` |
+| 22 | `llm.listProviders` | `ctx.llm.listProviders() → [{ id, name }]`，**同步**；provider 目录可能含模型列表为空的条目（如 `deepseek-official`） | 运行时选路：按顺序找第一个有模型的 provider | `dsh-llm/lib/index.js:1908` |
+| 23 | `llm.listModels` | `await ctx.llm.listModels(providerId) → [{ id, name }]`，异步；`providerId` 必须是非空字符串，非法目录抛 `LlmError(INVALID_CATALOG)` | 选路时跳过空模型 provider | `dsh-llm/lib/index.js:2086` |
+| 24 | `llm.stream` | `ctx.llm.stream({ provider, model, messages, signal? }) → AsyncIterable`；经 `ctx.waterfall('llm/stream', options, …)`；chunk `type='text-delta'` 累积 `text`/`delta`，`type='finish'` 的 `reason.kind` 表示结束/错误 | 适配层 `platform.complete` 的唯一模型入口 | `dsh-llm/lib/index.js:2393`；适配层 `src/platform/adapter.js`（`complete`） |
 
 ### 1.1 pre-step 的两个关键细节
 
@@ -107,6 +111,32 @@
 pre-step 用 `commandHintMessage()` 注入一句「请用 /memory、/status、/cost、/threads」
 （完整平台消息形状见 §2.1.1）。
 
+### 1.5 llm 晚挂载与巩固选路（C5-H2）
+
+- **挂载时序**：`@deepseek-ai/dsh-llm` 由 `dsh-base` 装载，构造函数 `super(ctx, 'llm')`
+  （`dsh-llm/lib/index.js:1816`）。插件 `apply` 发生在它之前，所以启动时
+  `ctx.get('llm')` 是 `undefined`，约 30 秒后才出现。任何「apply 时解析一次并缓存
+  null」的写法都会让巩固永久不运行。
+- **能力位**：`platform.capabilities.llm` 是 getter，每次读取都重新看
+  `typeof ctx.get('llm')?.stream === 'function'`；插件在每次巩固/闲聊调用、以及
+  `/状态` 展示时实时判断。
+- **选路顺序**：
+  1. 宿主注入的 `ctx.companion.consolidationLlm` / `chatLlm`；
+  2. 配置 `consolidation.model: { provider, model }`（非枚举段，非法值抛 `ConfigError`）；
+  3. 运行时探测：`await listProviders()`（兼容同步/异步实现），按顺序
+     `await listModels(id)`，**跳过模型列表为空的 provider**，取第一个有模型的
+     provider 的第一个模型。
+- **缓存语义**：成功的 route 缓存 5 分钟（`{ provider, model, source, resolvedAt, version }`），
+  同时刷新 `source='runtime'`；**null/失败不缓存**，下一次调用重新探测。
+  并发调用共享同一个解析 Promise。
+- **可观测**：`/状态` 显示实际路由
+  （`巩固：<provider>/<model>（配置|运行时）`、`巩固：宿主注入模型`）；
+  没有可用模型时显示 `巩固：无可用模型`，并按 60 秒节流写
+  `memory_events(reason='consolidation_failed', detail.kind='consolidation_no_model')`，
+  「最近失败」即可见。
+- **闲聊复用**：`resolveChatLlm` 与巩固共用 `resolveLlmRoute`，因此两处选到
+  完全相同的 provider/model；只有宿主 hook 不同。
+
 ## 2. 适配层契约
 
 `src/platform/adapter.js` 只依赖 Node 内置模块与 `./errors.js`，不 import 任何
@@ -135,6 +165,9 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 | `estimateMessage(message)` | `ctx.tokenMeter.estimateMessage(...)` | 单条消息的启发式 token（surface 索引计价） |
 | `onSessionEvent(handler)` | `ctx.on('session/event', (session, event) => …)` | 返回 disposer；handler 异常被吞掉，不打断事件流 |
 | `readSurface(sessionId)` | `ctx.sessionQuery.readSurface(...)` | O(整段 log)：仅冷启动/漏事件回填用 |
+| `listProviders()` | `ctx.llm.listProviders()` | 异步归一（兼容同步/异步宿主）；无 `stream` 能力抛 `no-llm`；返回 `[{ id, name }]`；C5-H2 选路用 |
+| `listModels(provider)` | `ctx.llm.listModels(provider)` | 异步；`provider` 必须是非空字符串；宿主没有 `listModels` 时返回 `[]` |
+| `complete(request)` | `ctx.llm.stream(...)` | 聚合 `text-delta` 文本；`finish.reason.kind` 为 error/aborted 时抛 `model call failed: …`；无文本抛 `model call returned no text` |
 
 ### 2.1 `onPreStep` 补丁
 
@@ -193,7 +226,7 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 
 适配器对象上有只读的 `capabilities`（getter，随宿主服务装载实时变化）：
 `systemPrompt`、`preStep`、`timer`、`compaction`、`sessionController`、`threadTools`、
-`archive`、`tokenMeter`、`tokenEstimator`、`sessionEvent`、`sessionQuery`、`logger`。
+`archive`、`tokenMeter`、`tokenEstimator`、`sessionEvent`、`sessionQuery`、`logger`、`llm`。
 `threadTools` 与 `sessionController` 同源，是线程/任务工具的注册门槛（§5）。
 调用缺失能力时抛 `PlatformError`：
 
@@ -209,6 +242,7 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 | `no-token-estimator` | `estimateMessage` |
 | `no-session-event` | `onSessionEvent` |
 | `no-session-query` | `readSurface` |
+| `no-llm` | `listProviders` / `listModels` / `complete` |
 | `no-when-idle` | `whenIdle`（传入对象没有 `whenIdle()`） |
 
 `PlatformError` 定义在 `src/platform/errors.js`：`new PlatformError(code, message?)`，
@@ -235,6 +269,8 @@ const platform = createAdapter(ctx, { now: () => Date.now() });
 `sessionController.createSession`、`sessionController.prompt`、`sessionController.cancel`、
 `workspaceRegistry.archiveSession`、`tokenMeter.measure`、`tokenMeter.estimateMessage`、
 `sessionQuery.readSurface`，以及用真实 session 形态模拟的 `session/event` 源。
+`ctx.llm` 默认不存在，测试可在 apply 前后赋值（`listProviders`/`listModels`/`stream`），
+用于 C5-H2 的晚注册与选路回归。
 
 ```js
 import { FakeCtx } from './test/fakes/ctx.js';
