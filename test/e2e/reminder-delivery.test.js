@@ -346,7 +346,9 @@ test('v9 → v11 迁移：reminders 支持 delivering、delivery_attempts 与 oc
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'reminders'")
       .all()
       .map((row) => row.name);
-    assert.ok(indexes.includes('ix_rm_fire'));
+    // V8-L1：到期索引换成表达式索引，旧的裸列索引在建好后被 DROP。
+    assert.ok(indexes.includes('ix_rm_due'), `索引：${indexes.join(',')}`);
+    assert.ok(!indexes.includes('ix_rm_fire'), '旧 ix_rm_fire 必须被迁移删除');
     assert.ok(indexes.includes('ix_rm_done'));
   } finally {
     reopened.close();

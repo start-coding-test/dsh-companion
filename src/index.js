@@ -24,7 +24,7 @@ import { copyFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 import { isQuietAt, normalizeConfig } from './config.js';
-import { REMINDER_MAX_DELIVERY_ATTEMPTS, Store } from './memory/store.js';
+import { REMINDER_MAX_DELIVERY_ATTEMPTS, Store, reminderDueAt } from './memory/store.js';
 import { retrieve } from './memory/retrieve.js';
 import { createEmbedder } from './memory/embedders/index.js';
 import { assemble } from './memory/assemble.js';
@@ -3391,13 +3391,11 @@ function fireDueReminders(state) {
         if (fresh === null || fresh === undefined) return false;
         if (fresh.status !== 'pending' && fresh.status !== 'snoozed') return false;
         if (fresh.occurrence_key !== occurrenceKey) return false;
-        // V5-L2：到期时刻是 max(next_fire_at, retry_at)——重试期间按 retry_at 判断。
+        // V8-L2：到期时刻与 store.dueReminders 共用同一口径
+        // max(next_fire_at, retry_at)（reminderDueAt），不再各写一份 Math.max。
         const nowSeconds = Math.floor(platform.now() / 1000);
-        const dueAt = Math.max(
-          Number(fresh.next_fire_at ?? 0),
-          Number(fresh.retry_at ?? 0),
-        );
-        if (dueAt > nowSeconds) return false;
+        const dueAt = reminderDueAt(fresh);
+        if (dueAt === null || dueAt > nowSeconds) return false;
         // V5-L2：fireKey = 原定到点时刻 + 本次重试时刻，退避后每次重试都递增
         // attempts；同一 tick 双 flush 看到同一个 retry_at，不会重复计数。
         const fireKey = `${fresh.next_fire_at}:${fresh.retry_at ?? 0}`;

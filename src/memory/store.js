@@ -58,8 +58,12 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  *     next_fire_at 取值，失败退避改写 next_fire_at 后重试仍复用同一 rpcId；
  *     投递成功/置 expired 时清空，下一次到点重新生成。旧行 NULL，按列检测补列。
  * v12（V5-L2）：reminders 增加 retry_at。next_fire_at 恢复为「原定到点时间」，
- *     失败退避只写 retry_at；调度按 COALESCE(retry_at, next_fire_at) 判断到期，
- *     成功/过期时清空 retry_at。旧行 NULL，按列检测补列。
+ *     失败退避只写 retry_at；调度按 max(next_fire_at, retry_at) 判断到期
+ *     （V8-L2 起与 onAttempt 统一口径，见 REMINDER_DUE_AT_SQL），成功/过期时
+ *     清空 retry_at。旧行 NULL，按列检测补列。
+ * V8-L1/L2（不改变 schema_version，索引/触发器由 migrate 幂等补建）：
+ *     - 到期索引改表达式索引 ix_rm_due(status, max(...)) 并删除 ix_rm_fire；
+ *     - 改期（next_fire_at 变化）时清空残留 retry_at，库级触发器兜底。
  */
 const SCHEMA_VERSION = '12';
 /** S2 物理删除默认冷静期（天）。 */
@@ -73,7 +77,7 @@ export const REMINDER_MAX_DELIVERY_ATTEMPTS = 3;
  *
  * 第 n 次失败（`delivery_attempts = n`）按下标 `n - 1` 取值：30s → 60s → 120s，
  * 超出数组长度后沿用最后一档。退避只写入 `retry_at`（v0.4.8 起，V5-L2）：
- * `next_fire_at` 保持原定到点时间不动，调度按 COALESCE(retry_at, next_fire_at)
+ * `next_fire_at` 保持原定到点时间不动，调度按 max(next_fire_at, retry_at)
  * 判断到期。失败一次就往后推，而不是让调度器每个 tick（30s）立刻重试——否则
  * 约 3 个 tick 就可能把 `delivery_attempts` 耗尽并把提醒置 `expired`
  * （v0.4.4 评审 V4-H1）。
@@ -148,6 +152,53 @@ const EPISODE_STATUSES = new Set(['active', 'dormant', 'tombstoned']);
 const MOOD_VALUES = new Set(['positive', 'neutral', 'tired', 'anxious', 'low', 'excited']);
 const FIDELITY_VALUES = new Set(['full', 'gist', 'index']);
 const BOARD_SECTIONS = new Set(['in_progress', 'decided', 'open_question', 'upcoming', 'threads']);
+
+/**
+ * V8-L2：提醒「唯一到期口径」的 SQL 表达式。
+ *
+ * 到期时刻 = `max(next_fire_at, retry_at)`：next_fire_at 是原定到点时间，
+ * 失败退避只写 retry_at。取 max 而不是 COALESCE(retry_at, next_fire_at)，是因为
+ * onAttempt 一直按 max 判定「退避是否已到」——两处口径必须一致，否则旧库/旧数据
+ * 里 retry_at 早于 next_fire_at 时会出现「调度认为没到期、onAttempt 认为已到期」
+ * 或相反的分叉。NULL 参与 max 时按 0 处理（epoch 秒恒为正，0 等价于「无时间」），
+ * 是否真有到期时间由调用方另外用 `next_fire_at IS NOT NULL OR retry_at IS NOT NULL`
+ * 过滤。
+ *
+ * 同一个常量同时用于 queries 与表达式索引，保证 EXPLAIN QUERY PLAN 能命中
+ * ix_rm_due（SQLite 按表达式树匹配索引）。
+ */
+export const REMINDER_DUE_AT_SQL = 'max(COALESCE(next_fire_at, 0), COALESCE(retry_at, 0))';
+
+/**
+ * 单行提醒的到期时刻（Unix 秒），与 {@link REMINDER_DUE_AT_SQL} 完全同义。
+ *
+ * 调度侧（dueReminders 的 SQL）与投递侧（index.js 的 onAttempt）共用这一口径：
+ * 两处都按 max(next_fire_at, retry_at) 判断，不再各写一份 Math.max/COALESCE。
+ * @param {{next_fire_at?: number|null, retry_at?: number|null}|null|undefined} row
+ * @returns {number|null} 两个时间都为空时返回 null
+ */
+export function reminderDueAt(row) {
+  if (row === null || row === undefined || typeof row !== 'object') return null;
+  const next = toEpochOrNull(row.next_fire_at);
+  const retry = toEpochOrNull(row.retry_at);
+  if (next === null && retry === null) return null;
+  return Math.max(next ?? 0, retry ?? 0);
+}
+
+/**
+ * 可选 epoch 值 → 整数秒或 null（不抛错，供展示/比较的只读路径使用）。
+ * @param {unknown} value
+ * @returns {number|null}
+ */
+function toEpochOrNull(value) {
+  if (value === null || value === undefined) return null;
+  if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === 'string' && value.trim() !== '') {
+    const num = Number(value);
+    if (Number.isFinite(num)) return Math.trunc(num);
+  }
+  return null;
+}
 
 /**
  * §8.2 DDL。表按外键依赖排序（consolidations 先于 episodes），
@@ -303,7 +354,11 @@ CREATE TABLE IF NOT EXISTS reminders (
   updated_at        INTEGER NOT NULL DEFAULT (unixepoch()),
   deleted_at        INTEGER
 );
-CREATE INDEX IF NOT EXISTS ix_rm_fire ON reminders(status, next_fire_at) WHERE status IN ('pending','snoozed');
+-- V8-L1：到期扫描按 status + max(next_fire_at, retry_at) 过滤与排序，索引必须是
+-- 同一表达式才能命中；旧的 ix_rm_fire(status, next_fire_at) 永远服务不了这条查询。
+-- 注意：ix_rm_due 不在这里建——它引用 retry_at，而旧库（v3..v11）此时还没有该列，
+-- 直接在 SCHEMA_SQL 里建会在补列之前报 no such column。它由
+-- #ensureReminderDueIndex 在补列之后统一创建并对旧库就地补建（同时 DROP 旧索引）。
 CREATE INDEX IF NOT EXISTS ix_rm_done ON reminders(closed_at) WHERE status IN ('done','cancelled');
 
 CREATE TABLE IF NOT EXISTS state_board (
@@ -514,6 +569,37 @@ function clampOffset(value) {
   const num = Number(value);
   if (!Number.isFinite(num) || num < 0) return 0;
   return Math.trunc(num);
+}
+
+/**
+ * 构造 dueReminders 的查询（V8-L1/L2）。
+ *
+ * 单独导出是为了让测试能对**同一条 SQL** 跑 EXPLAIN QUERY PLAN，断言命中
+ * ix_rm_due；同时保证查询表达式与索引表达式来自同一个常量
+ * {@link REMINDER_DUE_AT_SQL}，不会各写一份而漂移。
+ * @param {{now?: number|Date, scope?: string, limit?: number}} [options]
+ * @returns {{sql: string, args: (number|string)[]}}
+ */
+export function buildDueRemindersQuery(options = {}) {
+  const at = epochOr(options.now, nowSeconds());
+  const where = [
+    "status IN ('pending','snoozed')",
+    // 到期口径是 max(...)，两侧都为 NULL 的行没有到期时间，必须排除。
+    '(next_fire_at IS NOT NULL OR retry_at IS NOT NULL)',
+    `${REMINDER_DUE_AT_SQL} <= ?`,
+    'deleted_at IS NULL',
+  ];
+  const args = [at];
+  if (options.scope !== undefined) {
+    where.push('scope = ?');
+    args.push(options.scope);
+  }
+  const limit = clampLimit(options.limit, 100);
+  return {
+    sql: `SELECT * FROM reminders WHERE ${where.join(' AND ')}
+          ORDER BY ${REMINDER_DUE_AT_SQL} ASC, id ASC LIMIT ?`,
+    args: [...args, limit],
+  };
 }
 
 /** 存储层错误对象：用于区分校验失败与 SQLite 原生错误。 */
@@ -781,6 +867,8 @@ export class Store {
       this.#ensureReminderOccurrenceColumn();
       // v12：reminders 增加 retry_at（V5-L2 退避时刻），按列检测补列，旧行 NULL。
       this.#ensureReminderRetryColumn();
+      // V8-L1/L2：到期表达式索引 + 改期清空 retry_at 的库级不变量（幂等，旧库就地补建）。
+      this.#ensureReminderDueIndex();
       // v6/v7/v8/v9 的列与索引放在迁移之后处理：旧表此时才补上 embedder_id 与
       // first_reneed_*/same_context/first_used_* 列。ALTER 按列检测，重复调用安全。
       this.#ensureFactsReneedColumns();
@@ -1028,8 +1116,8 @@ export class Store {
           FROM reminders;
       DROP TABLE reminders;
       ALTER TABLE reminders_v10 RENAME TO reminders;
-      CREATE INDEX IF NOT EXISTS ix_rm_fire ON reminders(status, next_fire_at)
-        WHERE status IN ('pending','snoozed');
+      -- 只补不依赖 retry_at 的索引；ix_rm_due 由 #ensureReminderDueIndex 在
+      -- 补列之后创建（v9 库此时还没有 retry_at 列）。
       CREATE INDEX IF NOT EXISTS ix_rm_done ON reminders(closed_at)
         WHERE status IN ('done','cancelled');
     `);
@@ -1054,7 +1142,8 @@ export class Store {
   /**
    * v12（V5-L2）：reminders 增加 retry_at（退避时刻，NULL 表示未在重试）。
    *
-   * 只加可空列，不重建表；旧行保持 NULL（COALESCE 后退回 next_fire_at）。
+   * 只加可空列，不重建表；旧行保持 NULL（到期口径 max(next_fire_at, retry_at)
+   * 里 NULL 按 0 处理，等价于「还没有退避时刻」）。
    * 逐列检测因此对新库、v11 旧库、v3..v10 升级/重建路径都幂等；调用方
    * （migrate）已包在 BEGIN IMMEDIATE 里。
    */
@@ -1065,6 +1154,39 @@ export class Store {
       .map((column) => column.name);
     if (columns.includes('retry_at')) return;
     this.#db.exec('ALTER TABLE reminders ADD COLUMN retry_at INTEGER');
+  }
+
+  /**
+   * V8-L1/L2：提醒到期索引迁移 + 改期清空 retry_at 的库级不变量。
+   *
+   * 1) `ix_rm_due(status, max(COALESCE(next_fire_at,0), COALESCE(retry_at,0)))`
+   *    是 dueReminders 唯一可能命中的索引（表达式必须与查询里的表达式树一致）。
+   * 2) 删除旧 `ix_rm_fire(status, next_fire_at)`：它建在裸列上，而到期判断自
+   *    v0.4.8 起只用 max(...) 表达式，任何查询都走不到它；保留只会让每次提醒
+   *    状态变更多维护一棵 B 树（还多一份写入放大），并给 planner 一个永远不被
+   *    选中的候选。全仓没有其它按 (status, next_fire_at) 过滤的查询。
+   * 3) 触发器在「next_fire_at 被改写」时清空残留的 retry_at（V8-L2）：唯一到期
+   *    口径是 max(...)，旧的 retry_at 会压过新时间导致改期后仍按旧退避时刻到期。
+   *    把它放在库级而不是只放在某个方法里，是为了让导入/恢复、手工 SQL、将来新增
+   *    的 snooze 路径共享同一条不变量；触发器的内层 UPDATE 不再改 next_fire_at，
+   *    不会递归。
+   *
+   * 全部是 CREATE/DROP ... IF [NOT] EXISTS，可重复执行；旧库（v3..v12）在
+   * migrate() 的升级事务里就地补建，不需要提升 schema_version。
+   */
+  #ensureReminderDueIndex() {
+    this.#db.exec(`
+      DROP INDEX IF EXISTS ix_rm_fire;
+      CREATE INDEX IF NOT EXISTS ix_rm_due ON reminders(status, ${REMINDER_DUE_AT_SQL})
+        WHERE status IN ('pending','snoozed');
+      CREATE TRIGGER IF NOT EXISTS trg_reminders_reschedule_clear_retry
+      AFTER UPDATE OF next_fire_at ON reminders
+      WHEN NEW.next_fire_at IS NOT OLD.next_fire_at
+       AND NEW.retry_at IS NOT NULL
+      BEGIN
+        UPDATE reminders SET retry_at = NULL WHERE id = NEW.id;
+      END;
+    `);
   }
 
   close() {
@@ -1816,34 +1938,71 @@ export class Store {
   /**
    * 到点提醒：status IN ('pending','snoozed') 且到期时刻 <= now。
    *
-   * 到期时刻取 COALESCE(retry_at, next_fire_at)（V5-L2）：next_fire_at 是原定
-   * 到点时间，失败退避写在 retry_at；重试期间按 retry_at 到期，成功后 retry_at
-   * 清空又回到原定时间。排序同样按该表达式，保证重试项不会因为原定时间早而
-   * 抢在别的提醒前面。
+   * 到期时刻统一取 `max(next_fire_at, retry_at)`（V8-L2，表达式见
+   * {@link REMINDER_DUE_AT_SQL}）：next_fire_at 是原定到点时间，失败退避写在
+   * retry_at，两者取较大者——这与 index.js 的 onAttempt 判定（同样用
+   * {@link reminderDueAt}）是同一口径。排序也用该表达式，重试项不会因为原定
+   * 时间早而抢在别的提醒前面。查询形状与 ix_rm_due 的表达式索引严格对应
+   * （V8-L1），EXPLAIN QUERY PLAN 命中 `ix_rm_due`。
    * @param {{now?: number|Date, scope?: string, limit?: number}} [options]
    * @returns {object[]}
    */
   dueReminders(options = {}) {
-    const at = epochOr(options.now, nowSeconds());
-    const dueAt = 'COALESCE(retry_at, next_fire_at)';
-    const where = [
-      "status IN ('pending','snoozed')",
-      `${dueAt} IS NOT NULL`,
-      `${dueAt} <= ?`,
-      'deleted_at IS NULL',
-    ];
-    const args = [at];
-    if (options.scope !== undefined) {
-      where.push('scope = ?');
-      args.push(options.scope);
+    const { sql, args } = buildDueRemindersQuery(options);
+    return this.#db.prepare(sql).all(...args);
+  }
+
+  /**
+   * 改期（snooze / 重新排期）：更新原定到点时间并清空一切「上一次到点」的残留。
+   *
+   * V8-L2：唯一到期口径是 max(next_fire_at, retry_at)，所以改期必须同时清空
+   * retry_at，否则旧退避时刻会压过新时间、改期后仍按旧时刻到期。这里一并清掉
+   * occurrence_key / last_fire_key / delivery_attempts / closed_at，让改期后的
+   * 到点算新的一次 occurrence（新 rpcId、退避预算从 0 开始）。
+   *
+   * 只对仍在等待投递的行（pending/snoozed、未删除）生效；行不存在或已结束
+   * （done/cancelled/expired/fired）时返回 null。这是插件内唯一的改期入口；
+   * 其它直接写 next_fire_at 的路径由 trg_reminders_reschedule_clear_retry 兜底
+   * 清空 retry_at。
+   * @param {string} id
+   * @param {{next_fire_at: number|Date, due_at?: number|Date|null,
+   *          due_granularity?: string|null, status?: 'pending'|'snoozed'}} options
+   * @returns {object|null} 更新后的行；没有可改期的活跃行时 null
+   */
+  rescheduleReminder(id, options = {}) {
+    const reminderId = requireString(id, 'reminders.id');
+    if (options.next_fire_at === null || options.next_fire_at === undefined) {
+      throw new TypeError('[store] rescheduleReminder requires next_fire_at');
     }
-    const limit = clampLimit(options.limit, 100);
-    return this.#db
+    const nextFireAt = toEpoch(options.next_fire_at);
+    const dueAt = epochOr(options.due_at, null);
+    const dueGranularity = options.due_granularity ?? null;
+    const status = options.status === undefined
+      ? null
+      : requireString(options.status, 'reminders.status');
+    if (status !== null && status !== 'pending' && status !== 'snoozed') {
+      throw new TypeError('[store] rescheduleReminder status must be pending or snoozed');
+    }
+    const info = this.#db
       .prepare(
-        `SELECT * FROM reminders WHERE ${where.join(' AND ')}
-          ORDER BY ${dueAt} ASC, id ASC LIMIT ?`,
+        `UPDATE reminders
+            SET next_fire_at = ?,
+                due_at = COALESCE(?, due_at),
+                due_granularity = COALESCE(?, due_granularity),
+                status = COALESCE(?, status),
+                retry_at = NULL,
+                occurrence_key = NULL,
+                last_fire_key = NULL,
+                delivery_attempts = 0,
+                closed_at = NULL,
+                updated_at = unixepoch()
+          WHERE id = ?
+            AND deleted_at IS NULL
+            AND status IN ('pending','snoozed')`,
       )
-      .all(...args, limit);
+      .run(nextFireAt, dueAt, dueGranularity, status, reminderId);
+    if (Number(info.changes) === 0) return null;
+    return this.getReminder(reminderId);
   }
 
   /**
@@ -1955,7 +2114,7 @@ export class Store {
    * 两阶段投递第二步（失败）：delivering → pending，并写入退避时刻 `retry_at`。
    *
    * V5-L2：`next_fire_at` 是原定到点时间，失败退避不得覆盖它；退避只写
-   * `retry_at`，调度按 COALESCE(retry_at, next_fire_at) 到期。成功后 retry_at
+   * `retry_at`，调度按 max(next_fire_at, retry_at) 到期。成功后 retry_at
    * 清空，展示侧仍用原定时间。
    *
    * - 保留 `last_fire_key`：同一 occurrence 的重复 claim 不重复计数；
