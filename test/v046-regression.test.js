@@ -357,10 +357,13 @@ test('v0.4.6 C5-H1b：strict 宿主无 createSession，线程走 create/resolveA
 
   const threadResult = await thread.execute({ key: 'new', name: 'v046', goal: '验证公开线程服务' });
   assert.equal(threadResult.ok, true, JSON.stringify(threadResult));
-  assert.deepEqual(ctx.callsOf('sessionController.create')[1].args[0], {
-    cwd: '/hooked/cwd',
-    agentPreset: 'companion-thread',
-  });
+  const createRequest = ctx.callsOf('sessionController.create')[1].args[0];
+  assert.equal(createRequest.cwd, '/hooked/cwd');
+  assert.equal(
+    Object.hasOwn(createRequest, 'agentPreset'),
+    false,
+    'v0.4.11 起未配置 thread.agentPreset 时不传，走宿主默认',
+  );
   const threadRequest = ctx.callsOf('sessionController.prompt')[0].args[0];
   assert.match(threadRequest.requestId, /^companion-thread:.+:run-/);
 

@@ -113,6 +113,8 @@ export function commandHintMessage(text) {
  * @param {boolean} [options.compactionSupported] C5-M1：宿主是否提供
  *   compaction.compactRegion（compaction-basic）；false 时 /状态 明确提示
  * @param {number} [options.pendingCompactions] C5-M1：待压缩区间数（仅展示用）
+ * @param {string|null} [options.threadAgentPreset] V10-H1：thread.agentPreset
+ *   配置值；null/空串时 /状态 显示「宿主默认」
  * @returns {{handled: boolean, reply: string}}
  */
 export function handleCommand({
@@ -127,6 +129,7 @@ export function handleCommand({
   mainSession,
   compactionSupported,
   pendingCompactions,
+  threadAgentPreset,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -164,6 +167,7 @@ export function handleCommand({
       mainSession,
       compactionSupported,
       pendingCompactions,
+      threadAgentPreset,
     }),
   };
 }
@@ -515,7 +519,7 @@ function formatGiB(value) {
   return String(Math.round(n * 100) / 100);
 }
 
-/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] @param {{threadsSupported?: boolean, mainSession?: {id?: string|null, binding?: string}}} [options] */
+/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] @param {{threadsSupported?: boolean, mainSession?: {id?: string|null, binding?: string}, threadAgentPreset?: string|null}} [options] */
 function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   const stats = store.stats();
   const tables = [
@@ -557,6 +561,14 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
     const id = typeof mainSession.id === 'string' && mainSession.id !== '' ? mainSession.id : '未绑定';
     lines.push(`主会话：${id}（绑定 ${binding}）`);
   }
+  // V10-H1：线程 preset 是否来自配置；排障 preset_unknown 时先看这一行。
+  const threadPreset = typeof options.threadAgentPreset === 'string'
+    && options.threadAgentPreset.trim() !== ''
+    ? options.threadAgentPreset.trim()
+    : null;
+  lines.push(threadPreset === null
+    ? '线程 preset：宿主默认'
+    : `线程 preset：${threadPreset}（配置：thread.agentPreset）`);
   lines.push(`水位 ${scope}：${watermark}`, `最近 job：${jobText}`, failureText);
   return lines.join('\n');
 }

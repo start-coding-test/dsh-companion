@@ -8,7 +8,9 @@
  * - 每个工具都带合法 JSON Schema（type=object + properties + required）；
  * - 必填参数缺失时同步抛 TypeError，便于模型侧拿到明确错误；
  * - thread_run 遵循 05 §2.8.1：先用 registry 做复用/新建/拒绝判定，
- *   新建时 createSession(preset='companion-thread') 并写 threads 行。
+ *   新建时按配置 thread.agentPreset 决定 createSession 的 preset（未配置则不传，
+ *   走宿主默认），并写 threads 行；宿主报未知 preset 时返回 preset_unknown
+ *   而不是把错误抛给模型。
  */
 
 import { forgetMemory } from '../memory/forget.js';
@@ -156,6 +158,8 @@ const LIMIT_SCHEMA = Object.freeze({
  * @param {() => number} [deps.clock] 可注入时钟（毫秒），默认 Date.now
  * @param {string} [deps.cwd] thread_run 新建会话的默认工作目录
  * @param {string} [deps.timeZone=DEFAULT_TIMEZONE] cost_report 日界线所用 IANA 时区
+ * @param {string|null} [deps.threadAgentPreset] 新建线程会话的宿主 preset；
+ *   null/空串表示不传 agentPreset（走宿主默认 preset，与 task_run 一致）。
  * @param {() => (string|null|undefined)} [deps.currentScope] 当前会话 scope
  *   （pre-step 记录）；undefined=尚未路由（按 main），null=subagent（拒绝记忆工具）。
  * @param {() => {allowTask?: boolean, allowThread?: boolean, taskReason?: string,
@@ -172,6 +176,7 @@ export function createTools({
   clock = Date.now,
   cwd,
   timeZone = DEFAULT_TIMEZONE,
+  threadAgentPreset,
   currentScope,
   budgetGate,
   metrics,
@@ -189,6 +194,10 @@ export function createTools({
   }
   const nowMs = () => Number(clock());
   const defaultCwd = typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined;
+  // V10-H1：null/空串统一为「不传 preset」；非空字符串只 trim（合法性由宿主判定）。
+  const threadPreset = typeof threadAgentPreset === 'string' && threadAgentPreset.trim() !== ''
+    ? threadAgentPreset.trim()
+    : null;
 
   /**
    * 当前会话 scope：undefined=尚未路由（兼容旧调用，按 main）；null=subagent，
@@ -540,10 +549,23 @@ export function createTools({
             // cwd 必须由接线层从宿主注入；不读 process.cwd()（L3）。
             return { ok: false, action: 'create', key: plan.key, reason: 'cwd-unavailable' };
           }
-          const created = await platform.createSession({
-            cwd: targetCwd,
-            agentPreset: 'companion-thread',
-          });
+          const request = { cwd: targetCwd };
+          if (threadPreset !== null) request.agentPreset = threadPreset;
+          let created;
+          try {
+            created = await platform.createSession(request);
+          } catch (error) {
+            // V10-H1：宿主的 preset 列表运行时才可知；配置了宿主不认识的 preset
+            // 时返回可诊断的 preset_unknown，不把异常抛给模型/用户。
+            if (!isUnknownAgentPresetError(error)) throw error;
+            return {
+              ok: false,
+              action: 'create',
+              key: plan.key,
+              reason: 'preset_unknown',
+              message: errorMessage(error),
+            };
+          }
           createdHandle = created;
           const sessionId = sessionIdOf(created);
           if (sessionId === null) {
@@ -730,6 +752,33 @@ function optionalEnum(value, allowed, tool, field) {
 /** @param {string|undefined} goal @returns {boolean} */
 function exceedsGoalLimit(goal) {
   return goal !== undefined && Array.from(goal).length > GOAL_MAX_CODEPOINTS;
+}
+
+/** 从任意抛出值取可读错误文本（保留宿主原话）。 @param {unknown} error @returns {string} */
+function errorMessage(error) {
+  if (error instanceof Error) return error.message;
+  if (error !== null && typeof error === 'object' && typeof error.message === 'string') {
+    return error.message;
+  }
+  return String(error ?? '');
+}
+
+/**
+ * 判断平台错误是否是「未知 agent preset」一类（V10-H1）。
+ * 兼容英文宿主文案的大小写/空格差异，以及 `code` 形式的错误。
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function isUnknownAgentPresetError(error) {
+  const code = error !== null && typeof error === 'object' && typeof error.code === 'string'
+    ? error.code
+    : '';
+  if (/unknown.?agent.?preset|agent.?preset.?unknown|preset.?not.?found/i.test(code)) return true;
+  const message = errorMessage(error);
+  if (message === '') return false;
+  if (/unknown\s+agent\s+preset/i.test(message)) return true;
+  return /agent\s+preset/i.test(message)
+    && /(unknown|not\s+found|unrecognized|unsupported|invalid|does\s+not\s+exist|no\s+such)/i.test(message);
 }
 
 /** @param {object} registry @param {{store:object,key:string,name?:string}} input */

@@ -18,6 +18,9 @@
  *   `createSession`（C5-H1b）。
  * - 晚挂载（V7-H1）：构造时 `missing: ['sessionController']`，随后调用
  *   `attachSessionController()` 模拟宿主在 apply 之后才提供服务。
+ * - 宿主 preset 白名单（V10-H1）：构造参数 `agentPresets` 给出宿主实际支持的
+ *   preset 列表；`sessionController.create()` 收到列表外的 agentPreset 时抛
+ *   `Unknown agent preset: X`（与真实宿主一致）。不传该参数则不校验。
  */
 export class FakeCtx {
   /**
@@ -27,6 +30,7 @@ export class FakeCtx {
    *   fail?: Record<string, Error>,
    *   returns?: Record<string, unknown>,
    *   strict?: boolean,
+   *   agentPresets?: string[],
    * }} [options]
    */
   constructor(options = {}) {
@@ -46,6 +50,8 @@ export class FakeCtx {
     this.returns = options.returns ?? {};
     this.failures = new Map(Object.entries(options.fail ?? {}));
     this.missing = new Set(options.missing ?? []);
+    // V10-H1：可选宿主 preset 白名单；null 表示不校验（旧测试照常）。
+    this.agentPresets = Array.isArray(options.agentPresets) ? options.agentPresets.slice() : null;
 
     if (!this.missing.has('logger')) {
       this.logger = {};
@@ -229,6 +235,14 @@ export class FakeCtx {
       if (!this.strict) {
         this._record('sessionController.createSession', [request]);
         this._failAt('sessionController.createSession');
+      }
+      // V10-H1：模拟真实宿主的 preset 校验。agentPreset 只在 create 时传入；
+      // 未传（undefined/null/空串）表示走宿主默认 preset，始终合法。
+      const requestedPreset = request?.agentPreset;
+      if (this.agentPresets !== null
+        && typeof requestedPreset === 'string' && requestedPreset !== ''
+        && !this.agentPresets.includes(requestedPreset)) {
+        throw new Error(`Unknown agent preset: ${requestedPreset}`);
       }
       this._sessionSeq += 1;
       const fallbackId = request?.sessionId ?? `session-fake-${this._sessionSeq}`;

@@ -315,6 +315,9 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 - `session-unavailable`：宿主没有 `sessionController.createSession`。这是工具集脱离插件能力门单独构造时的返回；在插件注册路径上，宿主缺 `sessionController` 时 `execute` 会先返回 `capability_missing`（见[宿主能力缺失](#宿主能力缺失)）。
 - `unarchive-unavailable`：复用已归档线程，但宿主没有 `workspaceRegistry.unarchiveSession`。
 - `prompt-unavailable`：宿主没有 `sessionController.prompt`，无法投递目标。
+- `preset_unknown`：配置了 `thread.agentPreset`，但宿主不认识该 preset（v0.4.11 起）。
+  返回 `{ "ok": false, "action": "create", "key": "...", "reason": "preset_unknown", "message": "宿主原始错误文本" }`，
+  不抛异常、不写 `threads` 行；按提示改用宿主实际存在的 preset，或删除配置走宿主默认。
 
 #### 执行槽：`thread_run` 与 `task_run` 共用
 
@@ -627,6 +630,29 @@ rssMainOnlyGiB: 2.6
 
 完整配置项与默认值见 [README](../README.md#配置)。
 
+### 线程会话 preset（V10-H1，v0.4.11）
+
+`thread_run` 新建线程会话时使用宿主 preset。默认不配置（`thread.agentPreset: null`），
+此时插件**不传** `agentPreset`，由宿主使用默认 preset；`/状态` 显示「线程 preset：宿主默认」。
+
+首次安装时，由安装 agent 读取宿主的实际 preset 列表（例如 DSH 0.2.1-rc.5 为
+`read-only` / `workspace-write` / `danger-full-access`），按「够用的最小权限」选一个写入：
+
+```yaml
+thread:
+  agentPreset: workspace-write
+```
+
+安装 agent 的约束：
+
+- 线程会话需要读写工作目录并调用工具，通常 `workspace-write` 即够用；
+  **不得选 `danger-full-access`**。
+- 无法确认宿主 preset 列表或所选值不存在时，不要猜测：先留空走宿主默认，
+  或按宿主报错改成实际存在的值。配置了宿主不认识的 preset 时，`thread_run`
+  返回 `reason: "preset_unknown"` 并附宿主原错误文本，不会抛异常、不会写半截线程行。
+- 配置后 `/状态` 显示「线程 preset：<name>（配置：thread.agentPreset）」；
+  该节是可选段，不参与 16 键安装自检。
+
 ## 错误与降级
 
 ### 启动与配置
@@ -654,7 +680,7 @@ rssMainOnlyGiB: 2.6
 ### 工具错误
 
 - 参数非法：抛 `TypeError`，消息带工具名与字段名；调用方修正后重试。
-- 业务失败：返回 `ok:false` 加 `reason`（如 `not-found`、`not-active`、`too-many-threads`、`cwd-unavailable`）。
+- 业务失败：返回 `ok:false` 加 `reason`（如 `not-found`、`not-active`、`too-many-threads`、`cwd-unavailable`、`preset_unknown`）。
 - 检索无命中：返回空列表，不注入、不编造。
 
 ### 自愈与重试

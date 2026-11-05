@@ -205,7 +205,8 @@ test('thread_run：新建线程会话、写 threads 行并投递目标', async (
     assert.equal(result.prompted, true);
 
     assert.equal(harness.platform.sessions.length, 1);
-    assert.equal(harness.platform.sessions[0].agentPreset, 'companion-thread');
+    // V10-H1：未配置 thread.agentPreset 时不传该参数，走宿主默认 preset。
+    assert.equal(Object.hasOwn(harness.platform.sessions[0], 'agentPreset'), false);
     assert.equal(harness.platform.prompts[0].sessionId, 'sess-created');
     assert.equal(harness.platform.prompts[0].content[0].text, '帮我找两居室');
 

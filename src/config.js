@@ -120,6 +120,21 @@ Object.defineProperty(DEFAULT_VALUES, 'consolidation', {
   configurable: false,
 });
 
+// V10-H1：线程会话的宿主 preset。null 表示交给宿主默认 preset（与 task_run 一致）；
+// 非空字符串在创建线程会话时原样传给 createSession。宿主支持哪些 preset 只有运行时
+// 才知道，因此这里不枚举校验，未知值由 thread_run 转成 preset_unknown 返回。
+// 该节同样不参与 16 键安装自检（与 vector/recall/session/consolidation 一致）。
+const THREAD_DEFAULTS = Object.freeze({
+  agentPreset: null,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'thread', {
+  value: THREAD_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -469,6 +484,39 @@ export function normalizeConsolidation(raw, warnings = []) {
 }
 
 /**
+ * 校验 thread 配置（V10-H1）。未知子键只 warning；非法值 fail-fast。
+ *
+ * `agentPreset` 缺省为 null（不传 preset，走宿主默认）；非空字符串只 trim，
+ * 不做枚举校验——宿主支持的 preset 列表运行时才可知，未知值由 thread_run
+ * 捕获平台错误后返回 preset_unknown。null / 空串归一为 null。
+ *
+ * 该节默认不参与 Object.keys(DEFAULTS) 的 16 键安装自检（与 vector/recall/
+ * session/consolidation 一致）。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{agentPreset: string|null}>}
+ */
+export function normalizeThread(raw, warnings = []) {
+  const defaults = DEFAULTS.thread;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('thread', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['agentPreset']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "thread.${key}" ignored`);
+  }
+  const value = raw.agentPreset === undefined ? defaults.agentPreset : raw.agentPreset;
+  if (value === null) return defaults;
+  if (typeof value !== 'string') {
+    throw new ConfigError('thread.agentPreset', `must be a string or null, got ${JSON.stringify(value)}`);
+  }
+  const agentPreset = value.trim() === '' ? null : value.trim();
+  return Object.freeze({ agentPreset });
+}
+
+/**
  * 合并默认值并校验配置；未知字段只产生 warning，不阻断。
  * @param {Record<string, unknown>} [raw]
  * @returns {Readonly<Record<string, unknown>>} 冻结后的配置（含 warnings 数组）
@@ -541,6 +589,7 @@ export function normalizeConfig(raw = {}) {
   cfg.recall = normalizeRecall(input.recall === undefined ? DEFAULTS.recall : input.recall, warnings);
   cfg.session = normalizeSession(input.session, warnings);
   cfg.consolidation = normalizeConsolidation(input.consolidation, warnings);
+  cfg.thread = normalizeThread(input.thread, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

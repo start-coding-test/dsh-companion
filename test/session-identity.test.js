@@ -352,7 +352,8 @@ test('thread_run：createSession 成功后把 session_id 写回 threads 行，�
     assert.equal(result.ok, true);
     assert.equal(result.action, 'create');
     assert.equal(result.sessionId, 'sess-created');
-    assert.equal(platform.created[0].agentPreset, 'companion-thread');
+    // V10-H1：未配置 thread.agentPreset 时不传，走宿主默认 preset。
+    assert.equal(Object.hasOwn(platform.created[0], 'agentPreset'), false);
     const row = store.getThread(result.key);
     assert.equal(row.session_id, 'sess-created');
     assert.equal(row.status, 'active');

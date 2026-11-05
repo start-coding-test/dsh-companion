@@ -102,9 +102,9 @@ test('C5-H1b：apply 注册线程工具；create 参数/返回值与 resolveAgen
     const result = await thread.execute({ key: 'new', name: 'C5-H1b', goal: '验证公开线程服务' });
     assert.equal(result.ok, true, JSON.stringify(result));
 
+    // V10-H1：未配置 thread.agentPreset 时 create 请求不带该字段。
     assert.deepEqual(ctx.callsOf('sessionController.create')[0].args[0], {
       cwd: '/hooked/cwd',
-      agentPreset: 'companion-thread',
     });
     assert.equal(ctx.callsOf('sessionController.createSession').length, 0);
     assert.equal(result.sessionId, ctx.agents[0].id);

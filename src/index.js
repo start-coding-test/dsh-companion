@@ -743,6 +743,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
               id: currentMainSessionId(state),
               binding: mainBindingOf(config),
             },
+            // V10-H1：/状态 展示线程 preset 来源（配置值或宿主默认）。
+            threadAgentPreset: config.thread?.agentPreset ?? null,
             // C5-M1：web-app 默认 compaction-basic disabled:true；能力位 false 时
             // /状态 直接说明原因，并展示待压缩区间数（真开时）。
             compactionSupported: platform.capabilities.compaction,
@@ -799,6 +801,8 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     clock: platform.now,
     cwd: typeof platform.cwd === 'function' ? platform.cwd() : undefined,
     timeZone: config.timezone,
+    // V10-H1：线程会话 preset 由配置决定；null 时 thread_run 不传（宿主默认）。
+    threadAgentPreset: config.thread?.agentPreset ?? null,
     currentScope,
     budgetGate,
     metrics,
