@@ -189,9 +189,9 @@ test('V10-H1 thread_run：配置合法 preset 时 createSession 原样携带', a
 
 test('V10-H1 thread_run：宿主报未知 preset 返回 preset_unknown，不抛异常也不写半截线程行', async () => {
   const harness = makeToolHarness({
-    threadAgentPreset: 'companion-thread',
+    threadAgentPreset: 'host-unknown-preset',
     createSession() {
-      throw new Error('Unknown agent preset: companion-thread');
+      throw new Error('Unknown agent preset: host-unknown-preset');
     },
   });
   try {
@@ -199,7 +199,7 @@ test('V10-H1 thread_run：宿主报未知 preset 返回 preset_unknown，不抛�
     assert.equal(result.ok, false);
     assert.equal(result.action, 'create');
     assert.equal(result.reason, 'preset_unknown');
-    assert.match(result.message, /Unknown agent preset: companion-thread/u, '保留宿主原错误文本');
+    assert.match(result.message, /Unknown agent preset: host-unknown-preset/u, '保留宿主原错误文本');
     assert.equal(harness.store.listThreads().length, 0, 'preset_unknown 不得写 threads 行');
     assert.equal(harness.platform.prompts.length, 0);
   } finally {
@@ -254,8 +254,8 @@ test('V10-H1 thread_run：非 preset 的 createSession 错误照常上抛', asyn
 test('V10-H1 FakeCtx：宿主 preset 白名单拒绝未知值（模拟真实宿主）', () => {
   const ctx = new FakeCtx({ now: TEST_NOW, strict: true, agentPresets: HOST_PRESETS });
   assert.throws(
-    () => ctx.get('sessionController').create({ cwd: '/x', agentPreset: 'companion-thread' }),
-    /Unknown agent preset: companion-thread/u,
+    () => ctx.get('sessionController').create({ cwd: '/x', agentPreset: 'host-unknown-preset' }),
+    /Unknown agent preset: host-unknown-preset/u,
   );
   // 未传 preset（宿主默认）始终合法。
   const created = ctx.get('sessionController').create({ cwd: '/x' });
@@ -305,7 +305,7 @@ test('V10-H1 apply：配置宿主不存在的 preset → preset_unknown，不抛
   const ctx = makePluginCtx();
   const handle = applyPlugin(ctx, {
     dbPath: ':memory:',
-    thread: { agentPreset: 'companion-thread' },
+    thread: { agentPreset: 'host-unknown-preset' },
   });
   try {
     const result = await toolOf(ctx, 'thread_run').execute({
@@ -315,7 +315,7 @@ test('V10-H1 apply：配置宿主不存在的 preset → preset_unknown，不抛
     });
     assert.equal(result.ok, false);
     assert.equal(result.reason, 'preset_unknown');
-    assert.match(result.message, /Unknown agent preset: companion-thread/u);
+    assert.match(result.message, /Unknown agent preset: host-unknown-preset/u);
 
     assert.equal(ctx.callsOf('sessionController.create').length, 1, '只尝试一次，不重试');
     assert.equal(ctx.callsOf('sessionController.prompt').length, 0);
@@ -323,7 +323,7 @@ test('V10-H1 apply：配置宿主不存在的 preset → preset_unknown，不抛
     const listed = await toolOf(ctx, 'thread_list').execute({});
     assert.deepEqual(listed.items, [], 'preset_unknown 不得写 threads 行');
     // /状态 仍能正常构建（配置值原样展示，便于排障）。
-    assert.match(statusOf(ctx), /^线程 preset：companion-thread（配置：thread\.agentPreset）$/mu);
+    assert.match(statusOf(ctx), /^线程 preset：host-unknown-preset（配置：thread\.agentPreset）$/mu);
   } finally {
     handle.dispose();
   }

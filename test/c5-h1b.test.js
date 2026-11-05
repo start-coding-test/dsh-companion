@@ -67,7 +67,7 @@ test('C5-H1b：strict FakeCtx 只暴露 create/resolveAgent/prompt/cancel', () =
 test('C5-H1b：adapter.createSession 走 create，并用 resolveAgent 归一 agent', async () => {
   const ctx = makeStrictCtx();
   const adapter = createAdapter(ctx);
-  const request = { cwd: '/repo', agentPreset: 'companion-thread' };
+  const request = { cwd: '/repo', agentPreset: 'workspace-write' };
 
   const created = await adapter.createSession(request);
   assert.deepEqual(ctx.callsOf('sessionController.create')[0].args[0], request);

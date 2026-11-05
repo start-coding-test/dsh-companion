@@ -339,7 +339,7 @@ test('v0.4.6 C5-H1b：strict 宿主无 createSession，线程走 create/resolveA
   assert.equal(controller.createSession, undefined, '公开服务没有 createSession');
 
   const adapter = createAdapter(ctx);
-  const created = await adapter.createSession({ cwd: '/repo', agentPreset: 'companion-thread' });
+  const created = await adapter.createSession({ cwd: '/repo', agentPreset: 'workspace-write' });
   assert.equal(ctx.callsOf('sessionController.createSession').length, 0, '不得调用内部类方法');
   assert.equal(ctx.callsOf('sessionController.create').length, 1);
   assert.equal(created.sessionId, ctx.agents[0].id);

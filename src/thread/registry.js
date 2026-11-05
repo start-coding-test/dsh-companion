@@ -4,8 +4,8 @@
  *
  * 约定：
  * - `planThreadRun()` 只读 Store（getThread/listThreads），不写库；真正的
- *   `createSession(preset='companion-thread', scope='thread:<key>')` 与
- *   `threads` 行写入由上层 thread_run 工具完成（本卡只有目录规则）。
+ *   `createSession(preset=config.thread.agentPreset（未配置用宿主默认）, scope='thread:<key>')`
+ *   与 `threads` 行写入由上层 thread_run 工具完成（本卡只有目录规则）。
  * - 同时活跃线程上限 6；超限拒绝而不是静默冻结（冻结由每日 03:00 的
  *   `freezeIdleThreads()` 负责）。
  * - Store 的线程状态是 active|archived|retired（v3.3 无 frozen 字面量），
