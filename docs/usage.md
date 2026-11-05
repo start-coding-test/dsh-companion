@@ -617,7 +617,7 @@ rssMainOnlyGiB: 2.6
 - 无 `timer`：不启动调度器，提醒与主动消息不推送。
 - 无 `tokenMeter`：`/状态` 的 tokens 段显示 0，其余计数正常。
 - 无 main 会话或 `prompt` 不可用：主动消息发送失败会留在队列等待下个 tick；`thread_run` 返回 `prompt-unavailable`。召回只影响注入，不影响原始对话。
-- 无模型（`ctx.companion.consolidationLlm` 与 `ctx.llm` 都不可用）：巩固跳过并记 debug 日志，不阻塞对话，已有记忆照常检索。
+- 无模型（`ctx.companion.consolidationLlm` 与 `ctx.llm` 都不可用）：巩固跳过并记 `warn` 日志（同一原因只告警一次），不阻塞对话，已有记忆照常检索。provider/model 发现失败（`listProviders` 或某个 provider 的 `listModels` 抛错）同样记 `warn`，按「provider 发现失败」「provider X 模型发现失败」去重，成功发现后重置，不会每 5 分钟刷屏；`/状态` 仍显示「巩固：无可用模型」。
 - 无 `unarchiveSession`：复用归档线程返回 `unarchive-unavailable`。
 - 无 `sessionController`：`thread_list` / `thread_run` / `task_run` **不注册**（其余 7 个工具不受影响），`/状态` 显示「线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）」；若被旧调用触发，`task_run` 返回 `session-unavailable`；`/记忆 导出` 仍可用（只读库）。headless / one-shot / SDK profile 属于正常降级；desktop profile 组合 web-app，能力齐全。
 - `vector.embedder: none`、`enabled: false` 或 remote 未显式 `remote.enabled: true`：检索退化为 bigram FTS，与旧版一致；`/状态` 显示「向量：关」。

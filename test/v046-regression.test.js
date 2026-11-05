@@ -13,7 +13,7 @@
  *   C5-H1a 宿主记成 user 的提醒消息不重绑主会话、不进巩固窗口、不喂召回。
  *   C5-H1b strict 宿主无 createSession，线程走 create/resolveAgent，投递带
  *          companion-thread:/companion-task: requestId。
- *   C5-H2  llm 晚注册后巩固成功、/状态 显示运行时 route；配置 route 优先。
+ *   C5-H2  llm 晚注册后巩固成功、/状态 显示自动选取标注；配置 route 优先。
  *   C5-M1  /状态 压缩未开启 / 已开启文案。
  *   C5-L1  无 sessionController 时 /线程 与 /状态 同句提示且不注册线程工具。
  */
@@ -372,7 +372,7 @@ test('v0.4.6 C5-H1b：strict 宿主无 createSession，线程走 create/resolveA
 
 // ------------------------------------------------------------ C5-H2
 
-test('v0.4.6 C5-H2：apply 时无 llm，稍后注册仍能巩固并显示运行时 route', async (t) => {
+test('v0.4.6 C5-H2：apply 时无 llm，稍后注册仍能巩固并显示自动选取 route', async (t) => {
   const temp = makeTempStore();
   const ctx = makeCtx();
   const session = ctx.addSession({
@@ -416,7 +416,7 @@ test('v0.4.6 C5-H2：apply 时无 llm，稍后注册仍能巩固并显示运行�
     () => consolidationRows(temp.store).some((row) => row.status === 'written'),
     { label: '晚注册 llm 后巩固成功' },
   );
-  assert.match(statusText(ctx), /巩固：deepseek-official\/deepseek-chat（运行时）/u);
+  assert.match(statusText(ctx), /巩固：deepseek-official\/deepseek-chat（自动选取）/u);
 });
 
 test('v0.4.6 C5-H2：consolidation.model 配置优先，/状态 标注（配置）且请求走该 route', async (t) => {

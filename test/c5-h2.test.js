@@ -163,7 +163,7 @@ test('C5-H2：apply 时 llm 不存在，稍后注册仍能完成巩固', async (
     { label: '晚注册 llm 后巩固成功' },
   );
   assert.equal(rows[0].status, 'written');
-  assert.match(statusText(ctx), /巩固：deepseek-official\/deepseek-chat（运行时）/u);
+  assert.match(statusText(ctx), /巩固：deepseek-official\/deepseek-chat（自动选取）/u);
 });
 
 test('C5-H2：跳过模型列表为空的 provider，取第一个有模型的', async (t) => {

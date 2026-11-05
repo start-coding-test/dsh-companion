@@ -585,6 +585,8 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     llmRouteRefreshing: false,
     llmRoutePromise: null,
     llmRouteLastAttemptAt: null,
+    /** V6-L3：llm 发现失败按原因去重；成功解析出路由后清空。 */
+    llmDiscoveryWarnReasons: new Set(),
     lastNoModelFailureAt: null,
     /** C5-M2：同一 skip 原因只 warn 一次；巩固真正继续时清空。 */
     skipWarnReason: null,
@@ -2686,6 +2688,43 @@ function setLlmRoute(state, route) {
 }
 
 /**
+ * V6-L3：llm provider/model 发现失败按原因只 warn 一次。
+ *
+ * 真机 web 宿主只展示 info 及以上，原 debug 日志看不到；但调度每 5 分钟重试
+ * 一次解析，直接升 warn 会刷屏。这里按「providers」与「models:<providerId>」
+ * 两类原因去重；对应发现成功时清掉该键，成功解析出路由后整体清空。
+ *
+ * @param {object} state
+ * @param {string} reason
+ * @param {string} message
+ * @param {Record<string, unknown>} meta
+ */
+function warnLlmDiscoveryOnce(state, reason, message, meta) {
+  if (!(state.llmDiscoveryWarnReasons instanceof Set)) {
+    state.llmDiscoveryWarnReasons = new Set();
+  }
+  if (state.llmDiscoveryWarnReasons.has(reason)) return;
+  state.llmDiscoveryWarnReasons.add(reason);
+  state.platform.log('warn', message, { reason, ...meta });
+}
+
+/** V6-L3：成功解析出路由后清空发现失败的去重键，之后再失败可重新告警。 */
+function clearLlmDiscoveryWarnings(state) {
+  if (state.llmDiscoveryWarnReasons instanceof Set) {
+    state.llmDiscoveryWarnReasons.clear();
+  } else {
+    state.llmDiscoveryWarnReasons = new Set();
+  }
+}
+
+/** V6-L3：某一类发现成功后清掉对应去重键，之后再失败可重新告警。 */
+function clearLlmDiscoveryReason(state, reason) {
+  if (state.llmDiscoveryWarnReasons instanceof Set) {
+    state.llmDiscoveryWarnReasons.delete(reason);
+  }
+}
+
+/**
  * 解析实际可用的 provider/model：显式配置优先；否则遍历 providers，跳过模型列表为空的，
  * 取第一个有模型的 provider。失败/无模型一律返回 null（不缓存否定结果）。
  *
@@ -2721,8 +2760,10 @@ async function resolveLlmRoute(state) {
     let providers = [];
     try {
       providers = await state.platform.listProviders();
+      // V6-L3：provider 发现恢复，之后再失败可以重新告警一次。
+      clearLlmDiscoveryReason(state, 'providers');
     } catch (error) {
-      state.platform.log('debug', '[dsh-companion] llm provider discovery failed', {
+      warnLlmDiscoveryOnce(state, 'providers', '[dsh-companion] llm provider discovery failed', {
         message: errorMessage(error),
       });
     }
@@ -2732,17 +2773,25 @@ async function resolveLlmRoute(state) {
       let models = [];
       try {
         models = await state.platform.listModels(providerId);
+        clearLlmDiscoveryReason(state, `models:${providerId}`);
       } catch (error) {
-        state.platform.log('debug', '[dsh-companion] llm model discovery failed', {
-          provider: providerId,
-          message: errorMessage(error),
-        });
+        warnLlmDiscoveryOnce(
+          state,
+          `models:${providerId}`,
+          '[dsh-companion] llm model discovery failed',
+          {
+            provider: providerId,
+            message: errorMessage(error),
+          },
+        );
         continue;
       }
       const model = (Array.isArray(models) ? models : [])
         .find((entry) => typeof entry?.id === 'string' && entry.id !== '');
       if (!model) continue;
-      return setLlmRoute(state, { provider: providerId, model: model.id, source: 'runtime' });
+      const route = setLlmRoute(state, { provider: providerId, model: model.id, source: 'runtime' });
+      clearLlmDiscoveryWarnings(state);
+      return route;
     }
     if (state.llmRoute?.source === 'runtime') state.llmRoute = null;
     return null;
@@ -3331,9 +3380,10 @@ function formatChatStatus(state, now) {
 /**
  * C5-H2：/状态 里的巩固模型行。同步展示，缺路由时在后台触发一次解析。
  *
- * 优先级与真实调用一致：宿主注入 → consolidation.model 配置 → 运行时探测。
- * 能力位为 false、或探测后没有任何「有模型」的 provider 时显示「无可用模型」，
- * 并写一条节流后的失败事件供「最近失败」行展示。
+ * 优先级与真实调用一致：宿主注入 → consolidation.model 配置 → 运行时自动选取。
+ * 来源标注（V6-L1）：宿主注入 →「（宿主注入）」、配置 →「（配置）」、
+ * 自动选取 →「（自动选取）」。能力位为 false、或探测后没有任何「有模型」的
+ * provider 时显示「无可用模型」，并写一条节流后的失败事件供「最近失败」行展示。
  *
  * @param {object} state
  * @param {number} now
@@ -3342,7 +3392,7 @@ function formatChatStatus(state, now) {
 function formatConsolidationStatus(state, now) {
   if (typeof state.companion?.consolidationLlm === 'function') {
     state.llmRouteProbed = true;
-    return '巩固：宿主注入模型';
+    return '巩固：宿主注入模型（宿主注入）';
   }
   const configured = configuredLlmModel(state.config);
   if (!llmCapability(state)) {
@@ -3351,7 +3401,7 @@ function formatConsolidationStatus(state, now) {
   }
   const route = state.llmRoute;
   if (route?.source === 'runtime' && typeof route.provider === 'string') {
-    return `巩固：${route.provider}/${route.model}（运行时）`;
+    return `巩固：${route.provider}/${route.model}（自动选取）`;
   }
   if (configured !== null) {
     return `巩固：${configured.provider}/${configured.model}（配置）`;

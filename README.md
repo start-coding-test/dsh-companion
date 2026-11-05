@@ -10,7 +10,7 @@
 
 - **提醒投递签名与用户消息污染（C5-H1a）**：`prompt(request, signal)` 第二参固定为 `AbortSignal.timeout(30000)`；提醒/承诺/闲聊带稳定 `requestId`，同一 claim 重试复用。被宿主记成 `user/message` 的提醒按 `rpcId` 前缀或 `[提醒]` 前缀识别，不重绑主会话、不进巩固、不喂召回查询；投递失败写 `delivery_error`，`/状态` 显示「最近失败：投递失败：…」，同一原因只 warn 一次。
 - **线程服务改用公开方法名（C5-H1b）**：适配层改用 `sessionController.create` / `resolveAgent`，不再调用内部 `createSession`；能力探测、`thread_run` / `task_run` 投递与 `whenIdle` 同步到公开面。
-- **巩固模型解析（C5-H2）**：不再永久缓存首次 `null`；每次重新确认动态能力位，成功路由缓存 5 分钟、失败不缓存，llm 晚注册后巩固可恢复。`/状态` 显示「巩固：<provider>/<model>（配置|运行时）」/「宿主注入模型」/「无可用模型」，无模型时按 60s 节流记失败事件；发布门新增 round C。
+- **巩固模型解析（C5-H2）**：不再永久缓存首次 `null`；每次重新确认动态能力位，成功路由缓存 5 分钟、失败不缓存，llm 晚注册后巩固可恢复。`/状态` 显示「巩固：<provider>/<model>（配置|自动选取）」/「宿主注入模型（宿主注入）」/「无可用模型」，无模型时按 60s 节流记失败事件；provider/model 发现失败升为 `warn` 并按原因去重；发布门新增 round C。
 - **压缩开关、日志与 `/线程` 提示（C5-M1/M2/L1）**：`/状态` 明确显示压缩是否开启与待压缩区间数，文档给出 `compaction-basic` 的 `disabled: false` + `auto: false` 写法；巩固跳过由 `debug` 升为 `warn` 并去重；宿主无 `sessionController` 时 `/线程` 直接返回「线程：宿主不支持」。
 - **复审**：发布前独立复审 pass（H=0 / M=0 / L=1，Low 项已随发布修完），见 [docs/review-v11.md](docs/review-v11.md)。完整条目见 [CHANGELOG](CHANGELOG.md)。
 
