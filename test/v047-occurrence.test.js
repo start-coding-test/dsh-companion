@@ -184,11 +184,12 @@ test('V6-M1 e2e：同一 occurrence 连续失败 requestId 不变，成功换代
     assert.equal(row.status, 'pending');
     assert.equal(row.delivery_attempts, 1);
     const occurrence = row.occurrence_key;
-    const firstRetryAt = row.next_fire_at;
+    const originalFireAt = row.next_fire_at;
+    const firstRetryAt = row.retry_at;
     assert.ok(occurrence, '入队前必须生成 occurrence_key');
     assert.equal(firstRequestId, `companion-reminder:${reminder.id}:${occurrence}`);
 
-    // 退避 30s 后第二次失败：next_fire_at 被改写，但 requestId 必须完全一致。
+    // 退避 30s 后第二次失败：只改写 retry_at，但 requestId 必须完全一致。
     ctx.advance(30_000);
     await ctx.fireTimers();
     await settle(50);
@@ -199,7 +200,8 @@ test('V6-M1 e2e：同一 occurrence 连续失败 requestId 不变，成功换代
     assert.equal(row.status, 'pending');
     assert.equal(row.delivery_attempts, 2, 'attempts 仍按尝试递增');
     assert.equal(row.occurrence_key, occurrence);
-    assert.equal(row.next_fire_at, firstRetryAt + 60, '退避 60s 确实改写了 next_fire_at');
+    assert.equal(row.next_fire_at, originalFireAt, '失败退避不得改写原定到点时间');
+    assert.equal(row.retry_at, firstRetryAt + 60, '退避 60s 改写的是一次性 retry_at');
 
     // 退避 60s 后第三次成功：fired，occurrence/计数全部复位。
     ctx.failures.delete('sessionController.prompt');

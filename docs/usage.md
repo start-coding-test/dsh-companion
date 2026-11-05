@@ -498,6 +498,7 @@ session:
 - **失败退避（v0.4.8 起语义调整）**：`onAttempt` 把行从 `pending` 置 `delivering` 并累加 `delivery_attempts`；投递失败或本轮放弃时 `onFailed` 把行放回 `pending`，并把退避时刻写入 `retry_at`：第 1 次失败退避 30s，第 2 次失败退避 60s；第 3 次失败不再重试、直接置 `expired`（退避表第 3 档 120s 在当前上限下不可达，仅调高 `REMINDER_MAX_DELIVERY_ATTEMPTS` 后才会用到）。`next_fire_at` 始终是**原定到点时间**，失败重试不改写它；调度按 `COALESCE(retry_at, next_fire_at)` 判断是否到期，投递成功或置 `expired` 时清空 `retry_at`。
 - **requestId 按 occurrence 稳定（v0.4.7）**：每次真正到点入队前，先取（或惰性生成）`reminders.occurrence_key`，requestId 固定为 `companion-reminder:<id>:<occurrence_key>`。失败退避只写 `retry_at`、不改 `next_fire_at`，重试仍复用同一个 occurrence_key，因此 rpcId 不变，宿主能按 rpcId 去重；投递成功或置 `expired` 时清空 occurrence_key/last_fire_key 与 retry_at，并把 `delivery_attempts` 归零，下一次到点生成新 key、attempts 从 0 重新计数。提醒展示与 `/状态` 始终使用原定时间，重试期间额外标注「重试中，下次 HH:MM」（取 `retry_at`）。
 - **上限与回收**：`delivery_attempts` 达到 3 次才置 `expired`；连续 3 个 30s tick 不会把一条刚失败的提醒直接耗成过期。进程崩溃残留的 `delivering` 行在启动时统一回收为 `pending` 并补发；回收时已超上限的行置 `expired`，同样清空 occurrence/计数。
+- **展示口径**：状态板的提醒行始终用 `next_fire_at`（原定到点时间）显示日期；退避期间在同一条后追加「重试中，下次 HH:MM」（`retry_at`，按 `config.timezone` 格式化），例如 `- 交房租（11-05，重试中，下次 17:02）`。退出重试（成功/过期/过期回收）后附注自动消失，原定时间仍保留。
 - 投递失败、取不到主会话或安静时段内，消息留在 backlog，下个 tick 继续尝试；`/状态` 的积压数与当日计数照常反映这些排队项。
 
 ## 配置示例

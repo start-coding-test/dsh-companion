@@ -149,9 +149,10 @@ test('v0.4.7 回归：提醒连续失败两次 requestId 不变，成功换代�
     'requestId 必须由 occurrence 决定',
   );
   assert.equal(calls[0].signal.rpcId, firstRequestId, '旧宿主兼容：signal 上附 rpcId');
-  const firstRetryAt = row.next_fire_at;
+  const originalFireAt = row.next_fire_at;
+  const firstRetryAt = row.retry_at;
 
-  // 退避 30s 后第二次失败：next_fire_at 被改写，但 requestId 完全一致。
+  // 退避 30s 后第二次失败：只改写 retry_at，但 requestId 完全一致。
   ctx.advance(30_000);
   await ctx.fireTimers();
   await settle(50);
@@ -162,7 +163,8 @@ test('v0.4.7 回归：提醒连续失败两次 requestId 不变，成功换代�
   assert.equal(row.status, 'pending', '失败两次仍 pending');
   assert.equal(row.delivery_attempts, 2, 'attempts 按尝试递增到 2');
   assert.equal(row.occurrence_key, occurrence);
-  assert.equal(row.next_fire_at, firstRetryAt + 60, '退避 60s 确实改写了 next_fire_at');
+  assert.equal(row.next_fire_at, originalFireAt, '失败退避不得改写原定到点时间');
+  assert.equal(row.retry_at, firstRetryAt + 60, '退避 60s 改写的是一次性 retry_at');
   assert.match(statusText(ctx), /最近失败：投递失败/u, '连续失败仍可从 /状态 看到');
 
   // 退避 60s 后第三次成功：fired，occurrence/计数全部复位。

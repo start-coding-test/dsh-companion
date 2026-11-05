@@ -82,13 +82,27 @@ function toSeconds(value) {
   return null;
 }
 
-/** @param {number|null} seconds @returns {string} 形如 11-03（产品默认时区，不随进程 TZ 漂移） */
-function formatDay(seconds) {
+/** @param {number|null} seconds @param {string} [timeZone] @returns {string} 形如 11-03（产品默认时区，不随进程 TZ 漂移） */
+function formatDay(seconds, timeZone = DEFAULT_TIMEZONE) {
   if (seconds === null) return '';
   const ms = seconds * 1000;
   if (!Number.isFinite(ms)) return '';
-  const parts = zonedParts(ms, DEFAULT_TIMEZONE);
+  const parts = zonedParts(ms, timeZone);
   return `${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}`;
+}
+
+/**
+ * 格式化 HH:MM（重试提示用；时区按 config.timezone，缺省产品默认时区）。
+ * @param {number|null} seconds
+ * @param {string} [timeZone]
+ * @returns {string}
+ */
+function formatClock(seconds, timeZone = DEFAULT_TIMEZONE) {
+  if (seconds === null) return '';
+  const ms = seconds * 1000;
+  if (!Number.isFinite(ms)) return '';
+  const parts = zonedParts(ms, timeZone);
+  return `${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}`;
 }
 
 /** 压成单行并截断到 max 个字符（含省略号）。 */
@@ -158,21 +172,38 @@ function mapEpisode(row) {
   };
 }
 
-/** 提醒行 → 「- 标题（MM-DD）」。 */
-function mapReminder(row) {
+/**
+ * 提醒行 → 「- 标题（MM-DD）」；退避重试中再附「重试中，下次 HH:MM」。
+ *
+ * V5-L2：`next_fire_at` 是原定到点时间（失败退避只写 `retry_at`），展示一律
+ * 用它；`retry_at` 非空且仍在未来时说明这条正在退避重试，附注下次重试时刻。
+ * @param {Record<string, unknown>} row
+ * @param {{now: number, timeZone: string}} display
+ */
+function mapReminder(row, display) {
   if (CLOSED_REMINDER_STATUSES.has(row.status)) return null;
   const title = clip(row.title ?? row.text, 50);
   if (title === '') return null;
-  const due = toSeconds(row.due_at ?? row.next_fire_at);
-  const day = formatDay(due);
+  // 原定到点时间优先取 next_fire_at；旧数据/只有 due_at 时退回 due_at。
+  const due = toSeconds(row.next_fire_at ?? row.due_at);
+  const day = formatDay(due, display.timeZone);
+  const retryAt = toSeconds(row.retry_at);
+  const retrying = retryAt !== null && retryAt > display.now;
+  const notes = [];
+  if (day !== '') notes.push(day);
+  if (retrying) {
+    const clock = formatClock(retryAt, display.timeZone);
+    notes.push(`重试中，下次 ${clock}`);
+  }
+  const suffix = notes.length === 0 ? '' : `（${notes.join('，')}）`;
   return {
-    text: day === '' ? `- ${title}` : `- ${title}（${day}）`,
-    at: due ?? toSeconds(row.created_at),
+    text: `- ${title}${suffix}`,
+    at: due ?? toSeconds(row.created_at ?? row.retry_at),
   };
 }
 
 /** 线程行 → 「- key：描述｜进展：…｜活跃 MM-DD」。 */
-function mapThread(row) {
+function mapThread(row, display = { timeZone: DEFAULT_TIMEZONE }) {
   const key = clip(row.key, 24);
   if (key === '') return null;
   const parts = [`- ${key}`];
@@ -180,7 +211,7 @@ function mapThread(row) {
   if (description !== '') parts.push(`：${description}`);
   const progress = clip(row.last_progress, 24);
   if (progress !== '') parts.push(`｜进展：${progress}`);
-  const day = formatDay(toSeconds(row.last_active_at));
+  const day = formatDay(toSeconds(row.last_active_at), display.timeZone);
   if (day !== '') parts.push(`｜活跃 ${day}`);
   return { text: parts.join(''), at: toSeconds(row.last_active_at) };
 }
@@ -188,9 +219,10 @@ function mapThread(row) {
 /**
  * 把四组输入整理成 5 个区块（先按最近排、再按上限截行）。
  * @param {{recent?: unknown[], facts?: unknown[], threads?: unknown[], reminders?: unknown[]}} input
+ * @param {{now: number, timeZone: string}} display 提醒退避提示用的当前时刻与时区
  * @returns {Array<{title: string, entries: Array<{text: string, at: number|null, seq: number, removed?: boolean}>}>}
  */
-function buildSections(input) {
+function buildSections(input, display) {
   const facts = asRows(input.facts);
   const recent = asRows(input.recent);
   const threads = asRows(input.threads);
@@ -199,11 +231,11 @@ function buildSections(input) {
   const scheduleReminders = reminders.filter((row) => SCHEDULE_REMINDER_KINDS.has(row.kind));
 
   const bucket = [
-    { title: SECTION_TITLES[0], rows: facts, map: mapFact },
-    { title: SECTION_TITLES[1], rows: recent, map: mapEpisode },
-    { title: SECTION_TITLES[2], rows: todoReminders, map: mapReminder },
-    { title: SECTION_TITLES[3], rows: threads, map: mapThread },
-    { title: SECTION_TITLES[4], rows: scheduleReminders, map: mapReminder },
+    { title: SECTION_TITLES[0], rows: facts, map: (row) => mapFact(row) },
+    { title: SECTION_TITLES[1], rows: recent, map: (row) => mapEpisode(row) },
+    { title: SECTION_TITLES[2], rows: todoReminders, map: (row) => mapReminder(row, display) },
+    { title: SECTION_TITLES[3], rows: threads, map: (row) => mapThread(row, display) },
+    { title: SECTION_TITLES[4], rows: scheduleReminders, map: (row) => mapReminder(row, display) },
   ];
 
   /** @type {Array<{title: string, entries: ReturnType<typeof makeEntries>['entries']}>} */
@@ -268,12 +300,19 @@ export function estimateBoardTokens(text) {
 /**
  * 渲染状态板文本：5 区块、总量 ≤800 token；超限时按最后提及时间从最旧
  * 的行开始挤掉。
+ *
+ * `input.now` / `input.timeZone` 仅用于提醒的「重试中，下次 HH:MM」附注：
+ * 缺省取当前时刻与产品默认时区（调用方有 config.timezone 时应显式传入）。
  * @param {{recent?: unknown[], facts?: unknown[], threads?: unknown[],
- *          reminders?: unknown[]}} [input]
+ *          reminders?: unknown[], now?: number|Date, timeZone?: string}} [input]
  * @returns {string}
  */
 export function renderBoard(input = {}) {
-  const sections = buildSections(input ?? {});
+  const raw = input ?? {};
+  const nowSeconds = toSeconds(raw.now) ?? Math.floor(Date.now() / 1000);
+  const timeZone =
+    typeof raw.timeZone === 'string' && raw.timeZone !== '' ? raw.timeZone : DEFAULT_TIMEZONE;
+  const sections = buildSections(raw, { now: nowSeconds, timeZone });
   let text = renderSections(sections);
   while (estimateBoardTokens(text) > BOARD_TOKEN_LIMIT) {
     const victim = pickOldestSection(sections);

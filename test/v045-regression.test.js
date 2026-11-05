@@ -180,6 +180,11 @@ test('V4-H1 集成：提醒失败一次后下一 tick 只送达一条，无重�
     assert.equal(failed.delivery_attempts, 1);
     assert.equal(
       failed.next_fire_at,
+      toEpochSeconds(TEST_NOW) - 60,
+      '失败退避不得改写原定到点时间',
+    );
+    assert.equal(
+      failed.retry_at,
       toEpochSeconds(TEST_NOW) + 60 + 30,
       '失败后应退避 30s（下一次 tick 不立即重试）',
     );
@@ -235,6 +240,8 @@ test('V4-H1 集成：连续 3 个 tick 失败重试不会把提醒提前耗成 e
     let row = temp.store.getReminder(reminder.id);
     assert.equal(row.status, 'pending');
     assert.equal(row.delivery_attempts, 1);
+    assert.equal(row.next_fire_at, toEpochSeconds(TEST_NOW) - 60, '原定时间保持不变');
+    assert.equal(row.retry_at, toEpochSeconds(TEST_NOW) + 90, '第一次退避 30s');
 
     ctx.advance(30_000); // 17:01:30 失败 → 退避 60s
     await ctx.fireTimers();
@@ -242,6 +249,8 @@ test('V4-H1 集成：连续 3 个 tick 失败重试不会把提醒提前耗成 e
     row = temp.store.getReminder(reminder.id);
     assert.equal(row.status, 'pending');
     assert.equal(row.delivery_attempts, 2);
+    assert.equal(row.next_fire_at, toEpochSeconds(TEST_NOW) - 60, '原定时间仍不变');
+    assert.equal(row.retry_at, toEpochSeconds(TEST_NOW) + 150, '第二次退避 60s');
 
     ctx.advance(30_000); // 17:02:00 退避未到：第三个 tick 不得 claim
     await ctx.fireTimers();

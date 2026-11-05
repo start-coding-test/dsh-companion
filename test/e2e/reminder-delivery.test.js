@@ -369,8 +369,9 @@ test('V4-H1：prompt 首次抛错后下一次 tick 只送达一条，文本不�
     const failed = temp.store.getReminder(reminder.id);
     assert.equal(failed.status, 'pending');
     assert.equal(failed.delivery_attempts, 1);
-    // 失败退避：30s 后才允许下一次重试。
-    assert.equal(failed.next_fire_at, toEpochSeconds(TEST_NOW + 60_000) + 30);
+    // 失败退避：只写 retry_at，原定到点时间不动；30s 后才允许下一次重试。
+    assert.equal(failed.next_fire_at, toEpochSeconds(TEST_NOW) - 60, '原定到点时间不得被改写');
+    assert.equal(failed.retry_at, toEpochSeconds(TEST_NOW + 60_000) + 30);
 
     ctx.failures.delete('sessionController.prompt');
     ctx.advance(30_000);
@@ -448,7 +449,8 @@ test('V4-H1：失败退避 30s→60s→120s，3 个 tick 内不会把 attempts �
     let row = temp.store.getReminder(reminder.id);
     assert.equal(row.status, 'pending');
     assert.equal(row.delivery_attempts, 1);
-    assert.equal(row.next_fire_at, t0 + 30);
+    assert.equal(row.next_fire_at, t0 - 120, '原定到点时间保持不变');
+    assert.equal(row.retry_at, t0 + 30);
 
     ctx.advance(30_000); // 17:01:30 第二次失败 → 退避 60s
     await ctx.fireTimers();
@@ -456,7 +458,8 @@ test('V4-H1：失败退避 30s→60s→120s，3 个 tick 内不会把 attempts �
     row = temp.store.getReminder(reminder.id);
     assert.equal(row.status, 'pending');
     assert.equal(row.delivery_attempts, 2);
-    assert.equal(row.next_fire_at, t0 + 30 + 60);
+    assert.equal(row.next_fire_at, t0 - 120, '原定到点时间仍不变');
+    assert.equal(row.retry_at, t0 + 30 + 60);
 
     ctx.advance(30_000); // 17:02:00 退避未到：不得提前重试、不得累加 attempts
     await ctx.fireTimers();

@@ -6,6 +6,10 @@
 
 当前状态：**v0.4.7 已发布**（2026-11-05）。`node --test` 全绿：799 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
 
+## v0.4.8 变更摘要
+
+- **提醒失败退避不再覆盖原定时间（V5-L2）**：`reminders` 新增 `retry_at`（schema v12，旧行 NULL，按列检测幂等补列）。失败退避只写 `retry_at`（第 1 次 30s、第 2 次 60s），`next_fire_at` 始终是原定到点时间；调度按 `COALESCE(retry_at, next_fire_at)` 到期，成功或置 `expired` 时清空 `retry_at`。状态板提醒行显示原定日期，重试期间附「重试中，下次 HH:MM」（按 `config.timezone` 格式化）；requestId 仍按 `occurrence_key` 稳定。完整条目见 [CHANGELOG](CHANGELOG.md)。
+
 ## v0.4.7 变更摘要
 
 - **提醒 requestId 按 occurrence 稳定（V6-M1）**：`reminders` 新增 `occurrence_key`（schema v11），requestId 固定为 `companion-reminder:<id>:<occurrence_key>`；失败退避改写 `next_fire_at` 重试时 rpcId 不变，成功或 `expired` 后清空 occurrence/last_fire_key 并把 `delivery_attempts` 归零，下一次到点换新 key、attempts 从 0 起。v10 旧库自动幂等迁移。
@@ -23,7 +27,7 @@
 
 ## v0.4.5 变更摘要
 
-- **提醒投递不再卡 `delivering`（V4-H1）**：队列键固定为 `reminder:<id>`，安静时段/日上限/退避期间不会堆出多份；提醒不参与文本合并，投递前逐份判定；失败按 30s → 60s 退避（第 1/2 次），第 3 次才 `expired`，启动回收崩溃残留的 `delivering`。
+- **提醒投递不再卡 `delivering`（V4-H1）**：队列键固定为 `reminder:<id>`，安静时段/日上限/退避期间不会堆出多份；提醒不参与文本合并，投递前逐份判定；失败按 30s → 60s 退避（第 1/2 次），第 3 次才 `expired`，启动回收崩溃残留的 `delivering`。v0.4.8 起退避只写 `retry_at`，原定 `next_fire_at` 不再被改写。
 - **inject 形状校验点名到字段（V4-L1）**：`patch.inject` 的每个元素校验 `id` / `role` / `content` / `source.kind`，不合法抛 `TypeError` 并以 `onPreStep "inject"[i]` 点名；合法召回消息原样通过。
 - **召回词法门槛与 2 字实体（V4-M1）**：`recall.minQueryChars` 默认 2（此前写死 4），2–3 字 CJK 实体可召回；非空查询需 ≥2 个有效 bigram 命中或 ≥30% 命中比例，停用 bigram 不计入；纯寒暄/短查询在读库前短路。
 - **召回块经压缩摘要回流（V4-L2）**：召回块带 `[相关记忆] … [/相关记忆]` 成对标记，巩固窗口与转录整段剔除、标记不全时保守保留；提示词明确不得据此新建事实，残余风险与结论见 [docs/recall-compaction.md](docs/recall-compaction.md)。
