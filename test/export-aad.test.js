@@ -129,7 +129,7 @@ test('schema_version：meta 缺失时回退当前版本而不是旧常量', (t) 
   store.db.prepare("DELETE FROM schema_meta WHERE key = 'schema_version'").run();
   const exported = exportAll({ store, format: 'json', dir, now: TEST_NOW });
   const payload = JSON.parse(readFileSync(exported.path, 'utf8'));
-  assert.equal(payload.schema_version, '11');
+  assert.equal(payload.schema_version, '12');
 });
 
 test('导出文件名：秒级时间戳，同一秒重复追加 -2/-3 而不覆盖', (t) => {

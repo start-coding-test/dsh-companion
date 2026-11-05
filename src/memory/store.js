@@ -57,8 +57,11 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  * v11：reminders 增加 occurrence_key（V6-M1）：requestId 按「本次到点」而非
  *     next_fire_at 取值，失败退避改写 next_fire_at 后重试仍复用同一 rpcId；
  *     投递成功/置 expired 时清空，下一次到点重新生成。旧行 NULL，按列检测补列。
+ * v12（V5-L2）：reminders 增加 retry_at。next_fire_at 恢复为「原定到点时间」，
+ *     失败退避只写 retry_at；调度按 COALESCE(retry_at, next_fire_at) 判断到期，
+ *     成功/过期时清空 retry_at。旧行 NULL，按列检测补列。
  */
-const SCHEMA_VERSION = '11';
+const SCHEMA_VERSION = '12';
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
 
@@ -69,9 +72,11 @@ export const REMINDER_MAX_DELIVERY_ATTEMPTS = 3;
  * 提醒投递失败后的重试退避（秒）。
  *
  * 第 n 次失败（`delivery_attempts = n`）按下标 `n - 1` 取值：30s → 60s → 120s，
- * 超出数组长度后沿用最后一档。退避直接写入 `next_fire_at`：失败一次就往后推，
- * 而不是让调度器每个 tick（30s）立刻重试——否则约 3 个 tick 就可能把
- * `delivery_attempts` 耗尽并把提醒置 `expired`（v0.4.4 评审 V4-H1）。
+ * 超出数组长度后沿用最后一档。退避只写入 `retry_at`（v0.4.8 起，V5-L2）：
+ * `next_fire_at` 保持原定到点时间不动，调度按 COALESCE(retry_at, next_fire_at)
+ * 判断到期。失败一次就往后推，而不是让调度器每个 tick（30s）立刻重试——否则
+ * 约 3 个 tick 就可能把 `delivery_attempts` 耗尽并把提醒置 `expired`
+ * （v0.4.4 评审 V4-H1）。
  */
 export const REMINDER_RETRY_BACKOFF_SECONDS = Object.freeze([30, 60, 120]);
 
@@ -286,6 +291,7 @@ CREATE TABLE IF NOT EXISTS reminders (
   due_granularity   TEXT CHECK (due_granularity IN ('exact','day','week','month','none')),
   rrule             TEXT,
   next_fire_at      INTEGER,
+  retry_at          INTEGER,
   last_fire_key     TEXT,
   occurrence_key    TEXT,
   status            TEXT NOT NULL DEFAULT 'pending'
@@ -773,6 +779,8 @@ export class Store {
       this.#ensureRemindersDeliveryColumns();
       // v11：reminders 增加 occurrence_key（V6-M1），按列检测补列，旧行 NULL。
       this.#ensureReminderOccurrenceColumn();
+      // v12：reminders 增加 retry_at（V5-L2 退避时刻），按列检测补列，旧行 NULL。
+      this.#ensureReminderRetryColumn();
       // v6/v7/v8/v9 的列与索引放在迁移之后处理：旧表此时才补上 embedder_id 与
       // first_reneed_*/same_context/first_used_* 列。ALTER 按列检测，重复调用安全。
       this.#ensureFactsReneedColumns();
@@ -915,10 +923,13 @@ export class Store {
    * 由 migrate() 统一重建（#ensureRemindersDeliveryColumns）。
    * v10 → v11 只推进版本号；reminders.occurrence_key 由 migrate() 统一补列
    * （#ensureReminderOccurrenceColumn），旧行 NULL，不需要回填。
+   * v11 → v12 只推进版本号；reminders.retry_at 由 migrate() 统一补列
+   * （#ensureReminderRetryColumn），旧行 NULL，不需要回填。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
-    if (from === '10' || from === '9' || from === '8' || from === '7' || from === '6') {
+    if (from === '11' || from === '10' || from === '9' || from === '8'
+      || from === '7' || from === '6') {
       this.#db
         .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
         .run(SCHEMA_VERSION);
@@ -994,6 +1005,7 @@ export class Store {
         due_granularity   TEXT CHECK (due_granularity IN ('exact','day','week','month','none')),
         rrule             TEXT,
         next_fire_at      INTEGER,
+        retry_at          INTEGER,
         last_fire_key     TEXT,
         occurrence_key    TEXT,
         status            TEXT NOT NULL DEFAULT 'pending'
@@ -1037,6 +1049,22 @@ export class Store {
       .map((column) => column.name);
     if (columns.includes('occurrence_key')) return;
     this.#db.exec('ALTER TABLE reminders ADD COLUMN occurrence_key TEXT');
+  }
+
+  /**
+   * v12（V5-L2）：reminders 增加 retry_at（退避时刻，NULL 表示未在重试）。
+   *
+   * 只加可空列，不重建表；旧行保持 NULL（COALESCE 后退回 next_fire_at）。
+   * 逐列检测因此对新库、v11 旧库、v3..v10 升级/重建路径都幂等；调用方
+   * （migrate）已包在 BEGIN IMMEDIATE 里。
+   */
+  #ensureReminderRetryColumn() {
+    const columns = this.#db
+      .prepare("PRAGMA table_info('reminders')")
+      .all()
+      .map((column) => column.name);
+    if (columns.includes('retry_at')) return;
+    this.#db.exec('ALTER TABLE reminders ADD COLUMN retry_at INTEGER');
   }
 
   close() {
@@ -1753,8 +1781,8 @@ export class Store {
       .prepare(
         `INSERT INTO reminders (
            id, scope, kind, title, detail, counterparty, due_at, due_granularity, rrule,
-           next_fire_at, last_fire_key, status, closed_at, source_episode_id, deleted_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           next_fire_at, retry_at, last_fire_key, status, closed_at, source_episode_id, deleted_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -1767,6 +1795,7 @@ export class Store {
         input.due_granularity ?? null,
         input.rrule ?? null,
         epochOr(input.next_fire_at, null),
+        epochOr(input.retry_at, null),
         input.last_fire_key ?? null,
         input.status ?? 'pending',
         epochOr(input.closed_at, null),
@@ -1785,13 +1814,24 @@ export class Store {
   }
 
   /**
-   * 到点提醒：status IN ('pending','snoozed') 且 next_fire_at <= now。
+   * 到点提醒：status IN ('pending','snoozed') 且到期时刻 <= now。
+   *
+   * 到期时刻取 COALESCE(retry_at, next_fire_at)（V5-L2）：next_fire_at 是原定
+   * 到点时间，失败退避写在 retry_at；重试期间按 retry_at 到期，成功后 retry_at
+   * 清空又回到原定时间。排序同样按该表达式，保证重试项不会因为原定时间早而
+   * 抢在别的提醒前面。
    * @param {{now?: number|Date, scope?: string, limit?: number}} [options]
    * @returns {object[]}
    */
   dueReminders(options = {}) {
     const at = epochOr(options.now, nowSeconds());
-    const where = ["status IN ('pending','snoozed')", 'next_fire_at IS NOT NULL', 'next_fire_at <= ?', 'deleted_at IS NULL'];
+    const dueAt = 'COALESCE(retry_at, next_fire_at)';
+    const where = [
+      "status IN ('pending','snoozed')",
+      `${dueAt} IS NOT NULL`,
+      `${dueAt} <= ?`,
+      'deleted_at IS NULL',
+    ];
     const args = [at];
     if (options.scope !== undefined) {
       where.push('scope = ?');
@@ -1801,7 +1841,7 @@ export class Store {
     return this.#db
       .prepare(
         `SELECT * FROM reminders WHERE ${where.join(' AND ')}
-          ORDER BY next_fire_at ASC, id ASC LIMIT ?`,
+          ORDER BY ${dueAt} ASC, id ASC LIMIT ?`,
       )
       .all(...args, limit);
   }
@@ -1809,7 +1849,7 @@ export class Store {
   /**
    * V6-M1：取（或惰性创建）本次到点的 occurrence key。
    *
-   * requestId 必须按「occurrence」稳定：同一次到点因失败退避改写 `next_fire_at`
+   * requestId 必须按「occurrence」稳定：同一次到点因失败退避写入 `retry_at`
    * 之后，重试仍复用同一个 key（宿主按 rpcId 去重）；投递成功或置 `expired` 时
    * 清空，下一次到点再生成新 key。只有真正到了入队时刻才写库，插入提醒本身不
    * 产生 key。
@@ -1854,8 +1894,13 @@ export class Store {
    * 计数：同一 tick 内 reminders 与 idle-probe 两次 flush 对同一条提醒重试不会
    * 重复消耗预算。失败回 pending 时保留 last_fire_key 供下次重试。
    *
+   * V5-L2：fireKey 由调用方按「发生时刻 + 本次重试时刻」构造（例如
+   * `<next_fire_at>@<retry_at>`）。next_fire_at 在退避期间不再变化，因此只用它
+   * 会让每次重试看上去都是同一次尝试；把本次的 retry_at（或当前 tick）拼进去，
+   * 每次真正重试才累加 attempts，同一 tick 的重复 flush 仍不重复计数。
+   *
    * @param {string} id
-   * @param {string} fireKey
+   * @param {string} fireKey 调用方构造的「发生时刻 + 本次重试时刻」
    * @param {number} [maxAttempts]
    * @returns {boolean} 是否占位成功
    */
@@ -1886,6 +1931,7 @@ export class Store {
    *
    * V6-M1：一次到点结束，清空 occurrence_key/last_fire_key 并把 attempts 归零，
    * 下一次到点重新生成 occurrence（新 rpcId），也不会继承上一次的失败计数。
+   * V5-L2：同时清空 retry_at，成功后不再残留退避时刻。
    * @param {string} id
    * @returns {boolean}
    */
@@ -1896,6 +1942,7 @@ export class Store {
             SET status = 'fired',
                 occurrence_key = NULL,
                 last_fire_key = NULL,
+                retry_at = NULL,
                 delivery_attempts = 0,
                 updated_at = unixepoch()
           WHERE id = ? AND status = 'delivering'`,
@@ -1905,13 +1952,17 @@ export class Store {
   }
 
   /**
-   * 两阶段投递第二步（失败）：delivering → pending，并写入退避后的 `next_fire_at`。
+   * 两阶段投递第二步（失败）：delivering → pending，并写入退避时刻 `retry_at`。
+   *
+   * V5-L2：`next_fire_at` 是原定到点时间，失败退避不得覆盖它；退避只写
+   * `retry_at`，调度按 COALESCE(retry_at, next_fire_at) 到期。成功后 retry_at
+   * 清空，展示侧仍用原定时间。
    *
    * - 保留 `last_fire_key`：同一 occurrence 的重复 claim 不重复计数；
    * - 按 `delivery_attempts` 取退避 30s → 60s → 120s（见
    *   `REMINDER_RETRY_BACKOFF_SECONDS`），避免失败后每个 tick（30s）立刻重试、
    *   约 3 个 tick 就把 attempts 耗尽置 `expired`；
-   * - attempts 已达上限：直接置 `expired`，不再无限重试。
+   * - attempts 已达上限：直接置 `expired` 并清空 retry_at，不再无限重试。
    *
    * 只对 `delivering` 行生效；对尚未 claim 的 `pending` 行是空操作（返回 false），
    * 因此调用方可以对「本轮没轮到投递」的条目无脑回调 onFailed 而不会改动它们。
@@ -1929,12 +1980,14 @@ export class Store {
     if (attempts >= REMINDER_MAX_DELIVERY_ATTEMPTS) {
       // V6-M1：本次 occurrence 彻底失败，清掉 occurrence/last_fire_key 并把
       // 计数归零，与成功投递的「一次 occurrence 结束」语义保持一致。
+      // V5-L2：结束态不残留 retry_at。
       const expired = this.#db
         .prepare(
           `UPDATE reminders
               SET status = 'expired',
                   occurrence_key = NULL,
                   last_fire_key = NULL,
+                  retry_at = NULL,
                   delivery_attempts = 0,
                   updated_at = unixepoch()
             WHERE id = ? AND status = 'delivering' AND delivery_attempts = ?`,
@@ -1952,7 +2005,7 @@ export class Store {
       .prepare(
         `UPDATE reminders
             SET status = 'pending',
-                next_fire_at = ?,
+                retry_at = ?,
                 updated_at = unixepoch()
           WHERE id = ? AND status = 'delivering' AND delivery_attempts = ?`,
       )
@@ -1986,6 +2039,7 @@ export class Store {
             SET status = 'expired',
                 occurrence_key = NULL,
                 last_fire_key = NULL,
+                retry_at = NULL,
                 delivery_attempts = 0,
                 updated_at = unixepoch()
           WHERE status = 'delivering' AND delivery_attempts >= ?`,
@@ -2002,6 +2056,7 @@ export class Store {
    *
    * V6-M1：同样结束本次 occurrence——清空 occurrence_key/last_fire_key 并把
    * attempts 归零，避免同一条提醒将来重新启用时继承旧计数/rpcId。
+   * V5-L2：同时清空 retry_at，结束态不残留退避时刻。
    * @param {string} id
    * @returns {boolean}
    */
@@ -2012,6 +2067,7 @@ export class Store {
             SET status = 'expired',
                 occurrence_key = NULL,
                 last_fire_key = NULL,
+                retry_at = NULL,
                 delivery_attempts = 0,
                 updated_at = unixepoch()
           WHERE id = ? AND status IN ('pending','snoozed','delivering')

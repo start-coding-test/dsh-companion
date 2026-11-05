@@ -320,7 +320,7 @@ test('v9 → v11 迁移：reminders 支持 delivering、delivery_attempts 与 oc
       .map((column) => column.name);
     assert.ok(columns.includes('delivery_attempts'), 'v10 必须补 delivery_attempts');
     assert.ok(columns.includes('occurrence_key'), 'v11 必须补 occurrence_key');
-    assert.equal(store.getMeta('schema_version'), '11');
+    assert.equal(store.getMeta('schema_version'), '12');
 
     const migrated = store.getReminder('old-1');
     assert.equal(migrated.title, '旧提醒');
@@ -340,7 +340,7 @@ test('v9 → v11 迁移：reminders 支持 delivering、delivery_attempts 与 oc
   // 重开：已是最新版本时不再重建，迁移幂等。
   const reopened = Store.open(dbPath);
   try {
-    assert.equal(reopened.getMeta('schema_version'), '11');
+    assert.equal(reopened.getMeta('schema_version'), '12');
     assert.equal(reopened.getReminder('old-1').status, 'fired');
     const indexes = reopened.db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'reminders'")

@@ -274,7 +274,7 @@ test('v0.4.7 回归：v10 旧库经 apply 迁移到 v11，occurrence_key 为 NUL
   handle.dispose();
   const reopened = Store.open(dbPath);
   try {
-    assert.equal(reopened.getMeta('schema_version'), '11');
+    assert.equal(reopened.getMeta('schema_version'), '12');
     const migrated = reopened.getReminder('old-10');
     assert.equal(migrated.status, 'fired', '迁移后的旧行应完成投递');
     assert.equal(migrated.occurrence_key, null, '成功投递后 occurrence_key 清空');
