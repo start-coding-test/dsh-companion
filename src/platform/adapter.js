@@ -293,8 +293,11 @@ export function createAdapter(ctx, opts = {}) {
       return hasThreadControl();
     },
     /**
-     * H3②：线程/任务工具的能力门槛，与 `sessionController` 同源。
-     * 为 false 时接线层**不要注册** thread_run/task_run/thread_* 工具
+     * V7-H1：线程/任务工具的能力位，与 `sessionController` 同源。
+     *
+     * 接线层**一律注册** thread_list/thread_run/task_run，只在每次 execute 时
+     * 用这个 getter 判断；缺失就返回 capability_missing。不能按 apply 时快照
+     * 决定是否注册：宿主可能在 apply 之后才挂载 sessionController，快照会误判
      * （见 docs/platform-api.md §5）。
      */
     get threadTools() {

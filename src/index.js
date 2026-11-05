@@ -148,11 +148,26 @@ const RECALL_BUDGET_TOKENS = 2050;
 const RECALL_SOURCE_KIND = 'companion-recall';
 
 /**
- * H3②：线程/任务类工具。宿主没有 sessionController（capabilities.threadTools
- * 为 false）时这些工具既无法创建会话也无法取消，注册了只会让模型调到必失败
- * 的工具，因此整组不注册。
+ * V7-H1：线程/任务类工具。
+ *
+ * 能力只能在**调用时**判断：sessionController 由宿主在 apply 之后才挂载
+ * （adapter.capabilities 是 getter），apply 时读到 false 只代表「还没挂上」。
+ * 若据此少注册工具，真宿主上这组工具就永远不会注册；因此一律注册，执行时
+ * 再按 `capabilities.threadTools` 决定返回 capability_missing 还是真正执行。
  */
 const THREAD_TOOL_NAMES = new Set(['thread_list', 'thread_run', 'task_run']);
+
+/**
+ * V7-H1：线程能力缺失时的稳定错误对象。每次新建，避免调用方改写共享常量。
+ * @returns {{ok: false, reason: string, message: string}}
+ */
+function threadCapabilityMissing() {
+  return {
+    ok: false,
+    reason: 'capability_missing',
+    message: '宿主未提供 sessionController，线程工具暂不可用',
+  };
+}
 
 /**
  * V3-L3：中文命令提示注入正文的固定前缀。
@@ -397,6 +412,9 @@ export function apply(ctx, rawConfig, hooks = {}) {
     // H1：surface 索引。优先用 session/event 增量维护；宿主没有该事件时靠
     // readSurface 冷启动回填（每次 O(整段 log)，只在缺失时触发）。
     state.surface = createSurfaceIndex({ platform, tailTokens: state.config.retainTokens });
+    // V7-H1 审计：session/event 是 Context 事件 API（ctx.on 存在性），不是
+    // 晚挂载的 service；监听器又只能在 apply 阶段注册，故这里保留 apply 时判断
+    // （capability 由 ctx.on 是否可调用决定，apply 后不会变）。
     if (platform.capabilities.sessionEvent) {
       track(platform.onSessionEvent((session, event) => {
         state.surface.record(session, event);
@@ -407,10 +425,13 @@ export function apply(ctx, rawConfig, hooks = {}) {
     publishOnThreadUnarchive(platform, store);
 
     registerSections(platform, store, track);
+    // V7-H1 审计：pre-step 是事件钩子注册（只能在 apply 阶段完成），能力位来自
+    // Context 事件 API 而非晚挂载 service，故保留 apply 时判断。
     if (platform.capabilities.preStep) {
       track(platform.onPreStep((payload) => runPreStep(state, payload)));
     }
     // M4：turn 结束时结算本轮 token；没有该事件时由下一次 pre-step 的差值兜底。
+    // V7-H1 审计：同上，turnStopping 是事件钩子注册，apply 时决定。
     if (platform.capabilities.turnStopping && typeof platform.onTurnStopping === 'function') {
       track(platform.onTurnStopping((payload) => {
         const usage = measureTokens(state, payload);
@@ -608,6 +629,8 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
  * @param {(disposer: Function) => void} track
  */
 function registerSections(platform, store, track) {
+  // V7-H1 审计：systemPrompt 是声明的 inject，cordis 在 apply 前就绪；段注册
+  // 也只能在 apply 阶段完成，故保留 apply 时判断（不存在晚挂载后补注册的路径）。
   if (!platform.capabilities.systemPrompt) return;
   for (const section of buildSections(DEFAULT_CARD)) {
     track(platform.section(section));
@@ -658,6 +681,8 @@ function publishOnThreadUnarchive(platform, store) {
  * @param {object} [state] 闲聊开关/最近一次需要读写 state.store 的 schema_meta
  */
 function registerCommands(platform, store, config, metrics, track, currentScope, budgetInfo, state) {
+  // V7-H1 审计：commands 是声明的 inject，apply 前就绪；命令注册只能在 apply
+  // 阶段完成，故保留 apply 时判断。命令内部的能力位则在下文按调用时读取。
   if (!platform.capabilities.commands) return;
   for (const alias of COMMAND_ALIASES) {
     track(platform.registerCommand({
@@ -699,8 +724,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             metrics,
             timeZone: config.timezone,
             budget: typeof budgetInfo === 'function' ? budgetInfo() : undefined,
-            // V3-H3②：宿主无 sessionController 时明确显示「线程：宿主不支持」。
-            threadsSupported: platform.capabilities.threadTools,
+            // V7-H1：每次命令调用时读能力位，不用 apply 时快照（宿主可能晚挂载）。
+            threadsSupported: platform.capabilities.threadTools === true,
             // V3-M2：/状态 展示当前主会话与绑定模式。
             mainSession: {
               id: currentMainSessionId(state),
@@ -737,8 +762,9 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
 }
 
 /**
- * 注册 9 个模型工具。工具的 parameters 已是 JSON Schema，直接按平台裸注册
- * 契约补齐 output（宽 schema + 文本 render），不做 defineTool 依赖。
+ * 注册 10 个模型工具（9 个来自 createTools + 下方 memory_update）。工具的
+ * parameters 已是 JSON Schema，直接按平台裸注册契约补齐 output（宽 schema +
+ * 文本 render），不做 defineTool 依赖。线程/任务工具在 execute 里调用时判能力。
  * @param {object} platform
  * @param {Store} store
  * @param {Readonly<Record<string, unknown>>} config
@@ -750,6 +776,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
  * @param {object} [vectorCfg] 召回用的 vector 配置（embedder 不可用时 enabled=false）
  */
 function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg) {
+  // V7-H1 审计：tools 是声明的 inject，apply 前就绪；工具注册只能在 apply
+  // 阶段完成，故保留 apply 时判断。线程能力见下方 execute 内的调用时判断。
   if (!platform.capabilities.tools) return;
   const tools = createTools({
     store,
@@ -765,8 +793,6 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
-    // V3-H3②：没有 sessionController 时线程/任务工具不可用，整组不注册。
-    if (platform.capabilities.threadTools === false && THREAD_TOOL_NAMES.has(tool.name)) continue;
     track(platform.registerTool({
       name: tool.name,
       description: tool.description,
@@ -775,7 +801,14 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => [{ type: 'text', text: renderToolValue(value) }],
       },
-      execute: (args) => tool.execute(args ?? {}),
+      execute: (args) => {
+        // V7-H1：线程/任务工具一律注册，执行时再判能力（宿主可能晚于 apply
+        // 挂载 sessionController）；缺失时返回稳定错误对象，不抛未捕获异常。
+        if (THREAD_TOOL_NAMES.has(tool.name) && platform.capabilities.threadTools !== true) {
+          return threadCapabilityMissing();
+        }
+        return tool.execute(args ?? {});
+      },
     }));
   }
   track(platform.registerTool({
@@ -3086,6 +3119,8 @@ function decayFacts(state, nowMs) {
  */
 function startScheduler(state) {
   const { platform, store, config, metrics } = state;
+  // V7-H1 审计：timer 是声明的 inject（cordis 在 apply 前就绪）；调度器只能
+  // 注册一次，故保留 apply 时判断，不存在晚挂载后补启动的路径。
   if (!platform.capabilities.timer) return () => {};
 
   const proactive = createProactive({

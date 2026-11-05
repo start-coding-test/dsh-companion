@@ -143,7 +143,7 @@ test('V3-H3②：/状态 在 threadsSupported=false 时显示「线程：宿主�
       threadsSupported: false,
     }).reply;
     assert.match(reply, /线程：宿主不支持/);
-    assert.match(reply, /thread_run\/task_run\/thread_\*/);
+    assert.match(reply, /线程工具调用返回 capability_missing/);
   } finally {
     store.close();
   }

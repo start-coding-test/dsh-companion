@@ -16,6 +16,8 @@
  * - strict：构造参数 strict=true 时 sessionController 只暴露真实宿主公开的
  *   `{ create, resolveAgent, prompt, cancel }`，**没有**内部类方法
  *   `createSession`（C5-H1b）。
+ * - 晚挂载（V7-H1）：构造时 `missing: ['sessionController']`，随后调用
+ *   `attachSessionController()` 模拟宿主在 apply 之后才提供服务。
  */
 export class FakeCtx {
   /**
@@ -122,116 +124,7 @@ export class FakeCtx {
       };
     }
 
-    if (!this.missing.has('sessionController')) {
-      this.sessionController = {};
-
-      /** 造一个 agent 句柄（whenIdle 计入调用，deferIdle 时挂起）。 */
-      const makeAgent = (sessionId) => ({
-        id: sessionId,
-        session: { id: sessionId },
-        inbox: {
-          cleared: 0,
-          clear() {
-            this.cleared += 1;
-            return true;
-          },
-        },
-        whenIdle: async () => {
-          this._record('agent.whenIdle', []);
-          this._failAt('agent.whenIdle');
-          if (this.deferIdle) {
-            return new Promise((resolve) => {
-              this.idleWaiters.set(sessionId, resolve);
-            });
-          }
-          return { id: sessionId };
-        },
-      });
-
-      /**
-       * 公开服务 `create(request)`（C5-H1b）：真实宿主返回
-       * `{ sessionId, agentPreset? }`，agent 由 `resolveAgent` 反查。
-       * 测试仍可用 returns 注入旧形状 `{ agent, agentPreset }`。
-       */
-      const create = (request) => {
-        this._record('sessionController.create', [request]);
-        this._failAt('sessionController.create');
-        // 非 strict：兼容旧测试断言，把同一调用同时记到已废弃的
-        // createSession 名下；strict 不暴露这个内部类方法（C5-H1b）。
-        if (!this.strict) {
-          this._record('sessionController.createSession', [request]);
-          this._failAt('sessionController.createSession');
-        }
-        this._sessionSeq += 1;
-        const fallbackId = request?.sessionId ?? `session-fake-${this._sessionSeq}`;
-        const override = Object.hasOwn(this.returns, 'sessionController.create')
-          ? this.returns['sessionController.create']
-          : (Object.hasOwn(this.returns, 'sessionController.createSession')
-            ? this.returns['sessionController.createSession']
-            : undefined);
-        let agent;
-        let sessionId = fallbackId;
-        let agentPreset = null;
-        if (typeof override === 'string') {
-          sessionId = override;
-        } else if (override !== null && typeof override === 'object') {
-          agent = override.agent ?? undefined;
-          sessionId = override.sessionId
-            ?? agent?.id
-            ?? agent?.session?.id
-            ?? fallbackId;
-          agentPreset = override.agentPreset ?? null;
-        }
-        if (agent === undefined) agent = makeAgent(sessionId);
-        if (agent.id !== sessionId) sessionId = agent.id ?? sessionId;
-        this.agents.push(agent);
-        return { sessionId, agentPreset };
-      };
-      this._fakeCreate = create;
-
-      // strict 模式只模拟真实宿主：没有 createSession（那是内部类方法）。
-      if (!this.strict) {
-        if (!this.missing.has('sessionController.createSession')) {
-          this.sessionController.createSession = (request) => {
-            const created = create(request);
-            const agent = this.agents.find((candidate) => candidate.id === created.sessionId);
-            return this._value('sessionController.createSession', {
-              agent,
-              agentPreset: created.agentPreset,
-            });
-          };
-        }
-      }
-      if (!this.missing.has('sessionController.create')) {
-        this.sessionController.create = create;
-      }
-      if (!this.missing.has('sessionController.resolveAgent')) {
-        this.sessionController.resolveAgent = async (sessionId) => {
-          this._record('sessionController.resolveAgent', [sessionId]);
-          this._failAt('sessionController.resolveAgent');
-          const agent = this.agents.find(
-            (candidate) => candidate.id === sessionId || candidate.session?.id === sessionId,
-          );
-          return this._value('sessionController.resolveAgent', agent === undefined
-            ? { error: new Error(`unknown session ${sessionId}`) }
-            : { agent });
-        };
-      }
-      if (!this.missing.has('sessionController.prompt')) {
-        this.sessionController.prompt = (request, source) => {
-          this._record('sessionController.prompt', [request, source]);
-          this._failAt('sessionController.prompt');
-          return this._value('sessionController.prompt', { accepted: true });
-        };
-      }
-      if (!this.missing.has('sessionController.cancel')) {
-        this.sessionController.cancel = (request) => {
-          this._record('sessionController.cancel', [request]);
-          this._failAt('sessionController.cancel');
-          return this._value('sessionController.cancel', true);
-        };
-      }
-    }
+    this.mountSessionController();
 
     if (!this.missing.has('workspaceRegistry')) {
       this.workspaceRegistry = {
@@ -290,6 +183,132 @@ export class FakeCtx {
         },
       };
     }
+  }
+
+  /**
+   * 挂载 sessionController 服务切片（构造时调用；也供宿主晚挂载模拟复用）。
+   * @returns {boolean} 本次是否真的挂载
+   */
+  mountSessionController() {
+    if (this.missing.has('sessionController') || this.sessionController !== undefined) return false;
+    this.sessionController = {};
+
+    /** 造一个 agent 句柄（whenIdle 计入调用，deferIdle 时挂起）。 */
+    const makeAgent = (sessionId) => ({
+      id: sessionId,
+      session: { id: sessionId },
+      inbox: {
+        cleared: 0,
+        clear() {
+          this.cleared += 1;
+          return true;
+        },
+      },
+      whenIdle: async () => {
+        this._record('agent.whenIdle', []);
+        this._failAt('agent.whenIdle');
+        if (this.deferIdle) {
+          return new Promise((resolve) => {
+            this.idleWaiters.set(sessionId, resolve);
+          });
+        }
+        return { id: sessionId };
+      },
+    });
+
+    /**
+     * 公开服务 `create(request)`（C5-H1b）：真实宿主返回
+     * `{ sessionId, agentPreset? }`，agent 由 `resolveAgent` 反查。
+     * 测试仍可用 returns 注入旧形状 `{ agent, agentPreset }`。
+     */
+    const create = (request) => {
+      this._record('sessionController.create', [request]);
+      this._failAt('sessionController.create');
+      // 非 strict：兼容旧测试断言，把同一调用同时记到已废弃的
+      // createSession 名下；strict 不暴露这个内部类方法（C5-H1b）。
+      if (!this.strict) {
+        this._record('sessionController.createSession', [request]);
+        this._failAt('sessionController.createSession');
+      }
+      this._sessionSeq += 1;
+      const fallbackId = request?.sessionId ?? `session-fake-${this._sessionSeq}`;
+      const override = Object.hasOwn(this.returns, 'sessionController.create')
+        ? this.returns['sessionController.create']
+        : (Object.hasOwn(this.returns, 'sessionController.createSession')
+          ? this.returns['sessionController.createSession']
+          : undefined);
+      let agent;
+      let sessionId = fallbackId;
+      let agentPreset = null;
+      if (typeof override === 'string') {
+        sessionId = override;
+      } else if (override !== null && typeof override === 'object') {
+        agent = override.agent ?? undefined;
+        sessionId = override.sessionId
+          ?? agent?.id
+          ?? agent?.session?.id
+          ?? fallbackId;
+        agentPreset = override.agentPreset ?? null;
+      }
+      if (agent === undefined) agent = makeAgent(sessionId);
+      if (agent.id !== sessionId) sessionId = agent.id ?? sessionId;
+      this.agents.push(agent);
+      return { sessionId, agentPreset };
+    };
+    this._fakeCreate = create;
+
+    // strict 模式只模拟真实宿主：没有 createSession（那是内部类方法）。
+    if (!this.strict) {
+      if (!this.missing.has('sessionController.createSession')) {
+        this.sessionController.createSession = (request) => {
+          const created = create(request);
+          const agent = this.agents.find((candidate) => candidate.id === created.sessionId);
+          return this._value('sessionController.createSession', {
+            agent,
+            agentPreset: created.agentPreset,
+          });
+        };
+      }
+    }
+    if (!this.missing.has('sessionController.create')) {
+      this.sessionController.create = create;
+    }
+    if (!this.missing.has('sessionController.resolveAgent')) {
+      this.sessionController.resolveAgent = async (sessionId) => {
+        this._record('sessionController.resolveAgent', [sessionId]);
+        this._failAt('sessionController.resolveAgent');
+        const agent = this.agents.find(
+          (candidate) => candidate.id === sessionId || candidate.session?.id === sessionId,
+        );
+        return this._value('sessionController.resolveAgent', agent === undefined
+          ? { error: new Error(`unknown session ${sessionId}`) }
+          : { agent });
+      };
+    }
+    if (!this.missing.has('sessionController.prompt')) {
+      this.sessionController.prompt = (request, source) => {
+        this._record('sessionController.prompt', [request, source]);
+        this._failAt('sessionController.prompt');
+        return this._value('sessionController.prompt', { accepted: true });
+      };
+    }
+    if (!this.missing.has('sessionController.cancel')) {
+      this.sessionController.cancel = (request) => {
+        this._record('sessionController.cancel', [request]);
+        this._failAt('sessionController.cancel');
+        return this._value('sessionController.cancel', true);
+      };
+    }
+    return true;
+  }
+
+  /**
+   * V7-H1：模拟宿主在 apply 之后才提供 sessionController（线程能力由 false 变 true）。
+   * @returns {boolean}
+   */
+  attachSessionController() {
+    this.missing.delete('sessionController');
+    return this.mountSessionController();
   }
 
   /**

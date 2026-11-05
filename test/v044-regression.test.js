@@ -566,25 +566,31 @@ test('V3-M4：memory_update 后旧值搜不到、新值搜得到（FTS + 向量�
 
 // --------------------------------------------------- V3-H3② 能力缺失注册
 
-test('V3-H3②：无 sessionController 不注册线程/任务工具，/状态 显示宿主不支持', () => {
+test('V3-H3②/V7-H1：无 sessionController 仍注册全部工具，调用返回 capability_missing，/状态 显示宿主不支持', () => {
   const temp = makeTempStore();
-  const { ctx } = makeCtx({ missing: ['sessionController'] });
+  const { ctx } = makeCtx({ missing: ['sessionController'], strict: true });
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const names = ctx.tools.registrations.map((definition) => definition.name);
-    assert.equal(names.length, 7, `应只注册 7 个工具，实际：${names.join(',')}`);
-    for (const name of ['thread_list', 'thread_run', 'task_run']) {
-      assert.ok(!names.includes(name), `不得注册 ${name}`);
-    }
+    assert.equal(names.length, 10, `应注册 10 个工具，实际：${names.join(',')}`);
     for (const name of ['memory_search', 'memory_write', 'memory_forget', 'memory_update', 'reminder_add', 'reminder_done', 'cost_report']) {
       assert.ok(names.includes(name), `必须保留 ${name}`);
+    }
+    for (const name of ['thread_list', 'thread_run', 'task_run']) {
+      assert.ok(names.includes(name), `V7-H1：仍应注册 ${name}`);
+      const definition = ctx.tools.registrations.find((entry) => entry.name === name);
+      assert.deepEqual(definition.execute({ key: 'new', name: 'x', goal: 'y' }), {
+        ok: false,
+        reason: 'capability_missing',
+        message: '宿主未提供 sessionController，线程工具暂不可用',
+      });
     }
 
     const status = ctx.commands.registrations.find((definition) => definition.name === 'status');
     const reply = status.handler({ rawInput: '' });
     assert.equal(reply.kind, 'success');
     assert.match(reply.text, /线程：宿主不支持/u);
-    assert.match(reply.text, /thread_run\/task_run\/thread_\*/u);
+    assert.match(reply.text, /线程工具调用返回 capability_missing/u);
     assert.match(reply.text, /主会话：/u);
   } finally {
     handle.dispose();

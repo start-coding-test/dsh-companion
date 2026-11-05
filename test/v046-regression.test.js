@@ -33,7 +33,7 @@ const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks)
 
 const RECALL_KIND = 'companion-recall';
 const REMINDER_TEXT = '[提醒] 交房租';
-const THREADS_UNSUPPORTED = '线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）';
+const THREADS_UNSUPPORTED = '线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）';
 const COMPACTION_DISABLED = '压缩：宿主未开启（compaction-basic 未启用）';
 const COMPACTION_ENABLED = '压缩：宿主已开启（compaction-basic 已启用）';
 
@@ -494,8 +494,8 @@ test('v0.4.6 C5-M1：/状态 反映宿主压缩开关（未开启 / 已开启）
 
 // ------------------------------------------------------------ C5-L1
 
-test('v0.4.6 C5-L1：无 sessionController 时 /线程 与 /状态 同句提示，且不注册线程工具', async (t) => {
-  const ctx = makeCtx({ missing: ['sessionController'] });
+test('v0.4.6 C5-L1 / V7-H1：无 sessionController 时 /线程 与 /状态 同句提示，线程工具仍注册但返回 capability_missing', async (t) => {
+  const ctx = makeCtx({ missing: ['sessionController'], strict: true });
   const handle = apply(ctx, { dbPath: ':memory:' });
   t.after(() => handle.dispose());
 
@@ -506,12 +506,14 @@ test('v0.4.6 C5-L1：无 sessionController 时 /线程 与 /状态 同句提示�
     statusText(ctx).includes(THREADS_UNSUPPORTED),
     '/状态 与 /线程 必须共用同一句宿主不支持提示',
   );
-  assert.equal(
-    ctx.tools.registrations.some((definition) => definition.name === 'thread_run'),
-    false,
-  );
-  assert.equal(
-    ctx.tools.registrations.some((definition) => definition.name === 'task_run'),
-    false,
-  );
+  for (const name of ['thread_list', 'thread_run', 'task_run']) {
+    const definition = ctx.tools.registrations.find((entry) => entry.name === name);
+    assert.ok(definition, `${name} 仍应注册（V7-H1：宿主可能晚挂载）`);
+    const result = await definition.execute({ key: 'new', name: 'x', goal: 'y' });
+    assert.deepEqual(result, {
+      ok: false,
+      reason: 'capability_missing',
+      message: '宿主未提供 sessionController，线程工具暂不可用',
+    });
+  }
 });

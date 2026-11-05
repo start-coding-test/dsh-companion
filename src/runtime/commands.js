@@ -32,8 +32,8 @@ const MEMORY_COMMANDS = new Set(['记忆', '成本', '线程', '状态']);
 const MAX_FORGET = 5;
 const RSS_LEVEL_NAMES = Object.freeze(['ok', 'warn', 'stop_dispatch', 'main_only']);
 
-/** C5-L1：/线程 与 /状态 共用的「宿主没有线程能力」提示。 */
-const THREADS_UNSUPPORTED_TEXT = '线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）';
+/** C5-L1：/线程 与 /状态 共用的「宿主没有线程能力」提示（V7-H1：工具仍注册）。 */
+const THREADS_UNSUPPORTED_TEXT = '线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）';
 
 /** C5-M1：/状态 的压缩开关文案；undefined 表示调用方未提供能力位（不显示）。 */
 const COMPACTION_DISABLED_TEXT = '压缩：宿主未开启（compaction-basic 未启用）';
@@ -106,7 +106,8 @@ export function commandHintMessage(text) {
  *   rssLevel?: string, rssLevelCode?: number, rssMB?: number,
  *   rssLimits?: {warnGiB?: number, stopGiB?: number, mainOnlyGiB?: number}}} [options.budget] M4 预算/RSS 快照
  * @param {boolean} [options.threadsSupported] H3②：宿主是否提供 sessionController
- *   （即线程/任务工具是否已注册）；false 时 /状态 明确显示「线程：宿主不支持」
+ *   （V7-H1：由接线层在每次命令调用时读取，不用 apply 时快照）；false 时
+ *   /状态 明确显示「线程：宿主不支持」
  * @param {{id?: string|null, binding?: string}} [options.mainSession] V3-M2：
  *   当前主会话 id 与绑定模式（latest-user / first），/状态 展示用
  * @param {boolean} [options.compactionSupported] C5-M1：宿主是否提供
@@ -533,8 +534,8 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   const limitsText = formatRssLimits(budget);
   const lines = [`状态：${counts} / ${fts}${tokenText}`];
   if (limitsText !== null) lines.push(limitsText);
-  // H3②：宿主没有 sessionController 时不注册线程/任务工具，状态里说清楚，
-  // 免得用户以为 /线程 为空是数据问题。
+  // H3②：宿主没有 sessionController 时线程/任务工具虽已注册但调用会返回
+  // capability_missing，状态里说清楚，免得用户以为 /线程 为空是数据问题。
   if (options.threadsSupported === false) {
     lines.push(THREADS_UNSUPPORTED_TEXT);
   }

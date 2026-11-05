@@ -17,7 +17,7 @@ import { TEST_NOW, makeTempStore, settle, toEpochSeconds, waitFor } from './e2e/
 
 const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
-const THREADS_UNSUPPORTED = '线程：宿主不支持（无 sessionController，未注册 thread_run/task_run/thread_*）';
+const THREADS_UNSUPPORTED = '线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）';
 
 /** 基础 FakeCtx：commands/tools 注册桩 + tokenMeter 默认值。 */
 function makeCtx({ now = TEST_NOW } = {}) {
