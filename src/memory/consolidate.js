@@ -16,6 +16,7 @@
  * 本模块只做编排，不直接持有连接、不改 store.js。
  */
 
+import { CREDENTIAL_HINT, isSensitiveText } from './govern.js';
 import { decayOf } from './reinforce.js';
 import { renderBoard, stageBoard } from './state-board.js';
 
@@ -64,6 +65,46 @@ function matchesExcludedStatement(statement, excluded) {
   return excluded.some(
     (target) => target !== '' && (normalized === target || normalized.includes(target) || target.includes(normalized)),
   );
+}
+
+/**
+ * 拼接一行里所有用于敏感判定的文本字段。
+ * @param {Record<string, unknown>|null|undefined} row
+ * @param {string[]} keys
+ * @returns {string}
+ */
+function rowSensitiveText(row, keys) {
+  return keys
+    .map((key) => row?.[key])
+    .filter((value) => typeof value === 'string' && value !== '')
+    .join(' ');
+}
+
+/**
+ * 过滤掉含凭据的行（状态板渲染前的第一道防线）。
+ *
+ * V7-M3：事实看 statement + subject/object，提醒看 title + detail；episode 看
+ * title + summary。被过滤的行不上状态板；事实/提醒另外在落库前就被拦截。
+ * @template T
+ * @param {T[]} rows
+ * @param {string[]} keys
+ * @returns {T[]}
+ */
+function withoutSensitiveRows(rows, keys) {
+  if (!Array.isArray(rows)) return [];
+  return rows.filter((row) => !isSensitiveText(rowSensitiveText(row, keys)));
+}
+
+/**
+ * 兜底：按行剔除仍含凭据的状态板行（模型可能把凭据跨字段拼接）。
+ * 区块标题行（【…】）始终保留，保证 5 区块结构不破。
+ * @param {string} text
+ * @returns {string}
+ */
+function scrubSensitiveLines(text) {
+  const lines = String(text ?? '').split('\n');
+  const kept = lines.filter((line) => line.startsWith('【') || !isSensitiveText(line));
+  return kept.length === lines.length ? text : kept.join('\n');
 }
 
 /**
@@ -449,7 +490,7 @@ export function buildConsolidationPrompt(input = {}) {
  *   index.js 已在 surface 层面选好窗口，传 false 以允许水位从射线外推进
  * @returns {Promise<{skipped: boolean, upto_seq: number, textSource: string,
  *                    episodeId?: string, facts?: number, kind?: string,
- *                    excluded?: number}>}
+ *                    excluded?: number, sensitive?: number, notice?: string|null}>}
  */
 export async function consolidate(input = {}) {
   const { store, seqFrom, seqTo, llm } = input;
@@ -503,11 +544,19 @@ export async function consolidate(input = {}) {
     textSource,
     transcript,
   });
-  const { episode, facts: draftedFacts, reminders } = normalizeDraft(draft);
-  const facts = draftedFacts.filter(
+  const { episode, facts: draftedFacts, reminders: draftedReminders } = normalizeDraft(draft);
+  const matchedFacts = draftedFacts.filter(
     (fact) => !matchesExcludedStatement(fact.statement, excludedStatements),
   );
-  const excludedFacts = draftedFacts.length - facts.length;
+  const facts = matchedFacts.filter(
+    (fact) => !isSensitiveText(rowSensitiveText(fact, ['statement', 'subject_text', 'object_text'])),
+  );
+  const excludedFacts = draftedFacts.length - matchedFacts.length;
+  const reminders = draftedReminders.filter(
+    (reminder) => !isSensitiveText(rowSensitiveText(reminder, ['title', 'detail'])),
+  );
+  const sensitiveCount =
+    (matchedFacts.length - facts.length) + (draftedReminders.length - reminders.length);
 
   // 3) 单事务写库（含水位 consolidations.upto_seq）；抛错整体回滚。
   const written = store.transaction(() => {
@@ -619,12 +668,25 @@ export async function consolidate(input = {}) {
     }
 
     // 状态板只写 staged（发布由 publishBoard 在四个时机执行）。
-    const boardText = renderBoard({
-      recent: store.listEpisodes({ scope, limit: 6 }),
-      facts: store.listFacts({ scope, status: 'active', limit: 10 }),
-      threads: store.listThreads({ status: 'active', limit: 10 }),
-      reminders: store.listReminders({ scope, limit: 12 }),
-    });
+    // V7-M3：历史库里的敏感行（旧的 facts/episodes/threads/reminders）不上板。
+    const boardText = scrubSensitiveLines(renderBoard({
+      recent: withoutSensitiveRows(
+        store.listEpisodes({ scope, limit: 6 }),
+        ['title', 'summary'],
+      ),
+      facts: withoutSensitiveRows(
+        store.listFacts({ scope, status: 'active', limit: 10 }),
+        ['statement', 'subject_text', 'object_text'],
+      ),
+      threads: withoutSensitiveRows(
+        store.listThreads({ status: 'active', limit: 10 }),
+        ['key', 'description', 'last_progress'],
+      ),
+      reminders: withoutSensitiveRows(
+        store.listReminders({ scope, limit: 12 }),
+        ['title', 'detail'],
+      ),
+    }));
     stageBoard(store, scope, boardText);
 
     store.appendEvent({
@@ -637,7 +699,7 @@ export async function consolidate(input = {}) {
       detail_json: { upto_seq: to, facts: insertedFacts, reminders: reminders.length },
     });
 
-    return { episodeId: episodeRow.id, facts: insertedFacts };
+    return { episodeId: episodeRow.id, facts: insertedFacts, sensitive: sensitiveCount };
   });
 
   // 4) 事务已提交，水位推进到 to。
@@ -649,5 +711,7 @@ export async function consolidate(input = {}) {
     episodeId: written.episodeId,
     facts: written.facts,
     excluded: excludedFacts,
+    sensitive: written.sensitive,
+    notice: written.sensitive > 0 ? CREDENTIAL_HINT : null,
   };
 }

@@ -45,6 +45,7 @@ import {
 import {
   appendEventWithAction,
   apply as applyGovernance,
+  CREDENTIAL_HINT,
   exportMirror,
   isSensitiveText,
   scan as scanGovernance,
@@ -176,6 +177,16 @@ function threadCapabilityMissing() {
  * 这个前缀兜底识别；文案与 runtime/commands.js 的 commandHintMessage 一致。
  */
 const COMMAND_HINT_TEXT_PREFIX = '宿主只注册 ASCII 命令名';
+
+/**
+ * V7-M3：凭据提示注入消息的 source.kind 与正文前缀。
+ *
+ * 用户消息命中凭据类内容（密码/key/token/验证码…）时，pre-step 注入一句给模型
+ * 的指令：不要复述具体值、不要调用记忆工具保存，并在回复里带上固定提示。
+ * 提示本身也带 source.kind，转录/巩固/主会话绑定都按 kind 或前缀排除。
+ */
+const PRIVACY_HINT_SOURCE_KIND = 'companion-privacy-hint';
+const PRIVACY_HINT_TEXT_PREFIX = '用户消息里含凭据类信息';
 
 /** 召回块文本标记（assemble 渲染）；surface 记录只有 role/text，没有 source。 */
 const RECALL_MARKER = '[相关记忆]';
@@ -860,6 +871,8 @@ function hasRealUserInput(messages) {
     if (sourceKind === 'runtime-context' || sourceKind === RECALL_SOURCE_KIND) continue;
     // V3-L3：中文命令提示也是插件注入，不算用户真实输入（不会抢占主会话绑定）。
     if (sourceKind === COMMAND_HINT_SOURCE_KIND) continue;
+    // V7-M3：凭据提示是插件注入，不算用户真实输入。
+    if (sourceKind === PRIVACY_HINT_SOURCE_KIND) continue;
     // C5-H1a：插件主动投递（提醒/任务/线程）被宿主记成 user，不重绑主会话。
     if (isCompanionMessage(message)) continue;
     const blocks = Array.isArray(message.content)
@@ -1223,10 +1236,53 @@ async function runPreStep(state, payload) {
   }
 
   const hint = injectCommandHint(state, payload, messages, turnKey);
+  const privacy = injectPrivacyHint(state, payload, messages, turnKey);
   const injection = await injectRecall(state, payload, messages, turnKey, scope);
-  if (hint === null) return injection;
-  if (injection === null) return { inject: [hint] };
-  return { inject: [hint, ...injection.inject] };
+  const hints = [hint, privacy, ...(injection?.inject ?? [])].filter((item) => item !== null);
+  if (hints.length === 0) return injection;
+  return { ...(injection ?? {}), inject: hints };
+}
+
+/**
+ * V7-M3：用户消息里含凭据类内容时注入一句给模型的指令。
+ *
+ * 不做拦截（用户仍能说出口），只要求模型：不复述具体值、不用记忆工具保存，
+ * 并在回复里带固定提示。不注入的话，模型很可能把「wifi 密码是 xxx」当成普通
+ * 偏好写进记忆工具，而这是用户明确不希望保存的内容。
+ *
+ * 同一 turn 只注入一次（platform 会把注入消息回灌到后续 step）。
+ *
+ * @param {object} state
+ * @param {object} payload
+ * @param {unknown[]} messages
+ * @param {string|null} turnKey
+ * @returns {{id: string, role: 'user', content: object[], source: object}|null}
+ */
+function injectPrivacyHint(state, payload, messages, turnKey) {
+  const key = `privacy:${sessionIdOf(payload) ?? SCOPE}:${turnKey ?? `step:${String(payload?.step ?? 'unknown')}`}`;
+  if (state.turnSeen.has(key)) return null;
+  const message = privacyHintMessage(lastUserText(messages));
+  if (message === null) return null;
+  state.turnSeen.add(key);
+  return message;
+}
+
+/**
+ * 构造凭据提示注入消息（完整平台消息，V3-H1 形状）。
+ * @param {unknown} text 用户输入
+ * @returns {{id: string, role: 'user', content: object[], source: object}|null}
+ */
+function privacyHintMessage(text) {
+  if (typeof text !== 'string' || text.trim() === '' || !isSensitiveText(text)) return null;
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{
+      type: 'text',
+      text: `${PRIVACY_HINT_TEXT_PREFIX}，请勿复述具体值、不要调用记忆工具保存。请直接回复用户一句：${CREDENTIAL_HINT}`,
+    }],
+    source: { kind: PRIVACY_HINT_SOURCE_KIND },
+  };
 }
 
 /**
@@ -2073,17 +2129,31 @@ async function executeConsolidationJob(state, job) {
     clearWatermarkAnchor(state.store, job.scope);
     state.consolidationRetry = null;
     metrics.inc('consolidations');
+    const sensitive = Number(result.sensitive) || 0;
+    const notice = typeof result.notice === 'string' && result.notice !== '' ? result.notice : null;
     state.lastConsolidationResult = {
       ok: true,
       scope: job.scope,
       trigger: job.trigger,
       upto_seq: result.upto_seq,
+      sensitive,
+      notice,
     };
-    platform.log('info', '[dsh-companion] consolidation written', {
+    platform.log(sensitive > 0 ? 'warn' : 'info', '[dsh-companion] consolidation written', {
       upto_seq: result.upto_seq,
       facts: result.facts ?? 0,
+      sensitive,
+      notice,
       trigger: job.trigger,
     });
+    if (notice !== null) {
+      // V7-M3：凭据类内容未落库，回执里给用户同一句建议。
+      platform.log('info', '[dsh-companion] credential content skipped', {
+        scope: job.scope,
+        sensitive,
+        notice,
+      });
+    }
   } catch (error) {
     const message = errorMessage(error);
     metrics.inc('consolidationFailures');
@@ -2570,6 +2640,7 @@ function isInjectedMessage(message) {
   const kind = message.source?.kind;
   return kind === RECALL_SOURCE_KIND
     || kind === COMMAND_HINT_SOURCE_KIND
+    || kind === PRIVACY_HINT_SOURCE_KIND
     || isCompanionMessage(message);
 }
 
@@ -2617,7 +2688,9 @@ function isCompanionRecord(record) {
 function isRecallRecord(record) {
   if (record?.role !== 'user' || typeof record.text !== 'string') return false;
   const text = record.text.trimStart();
-  return text.startsWith(RECALL_MARKER) || text.startsWith(COMMAND_HINT_TEXT_PREFIX);
+  return text.startsWith(RECALL_MARKER)
+    || text.startsWith(COMMAND_HINT_TEXT_PREFIX)
+    || text.startsWith(PRIVACY_HINT_TEXT_PREFIX);
 }
 
 /**

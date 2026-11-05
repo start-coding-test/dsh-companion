@@ -27,21 +27,51 @@ export const DUPLICATE_THRESHOLD = 0.92;
 export const STALE_R = 0.05;
 /** 导出镜像默认上限。 */
 export const MIRROR_MAX_LINES = 200;
-/** 敏感词：命中即视为不可进入 FTS / 导出镜像。 */
-const SENSITIVE_PATTERN = /身份证|银行卡|密码|住址/u;
+/**
+ * V7-M3：命中凭据类内容时给用户的固定提示。
+ * 回复与巩固回执共用同一句，避免文案分叉。
+ */
+export const CREDENTIAL_HINT = '这类信息建议放环境变量或文件里，我不代为保存。';
+
+/**
+ * 敏感词：命中即视为不可进入 facts / FTS / 状态板 / 导出镜像。
+ *
+ * V7-M3 在原有「身份证/银行卡/密码/住址」之外补齐凭据类字段名：
+ * - `密码(?!学)`：排除「密码学」这类学科词，保留「wifi 密码」「银行卡密码」；
+ * - `passw(?:or)?d`：password / passwd；
+ * - `token` 用 `\btoken\b` 词边界，`tokenizer`、`tokens` 不命中；
+ * - `key` 只在「字段名 + 分隔符 + 值」形式里判（见 CREDENTIAL_FIELD_PATTERN），
+ *   `keyboard`、`SECRET-MARKER-42` 这类标记不命中；`secret` 同理；
+ * - `sk-` 开头的 API key 字面值（至少 6 位）单独兜底。
+ */
+const SENSITIVE_PATTERN = /身份证|银行卡|信用卡|住址|密码(?!学)|passw(?:or)?d|验证码|verification\s*code|\bCVC\b|\bCVV\b|私钥|密钥|卡号|card\s*number|api[\s_-]?key|\baccess[\s_-]?token\b|令牌|\btoken\b|\bsk-[A-Za-z0-9]{6,}/iu;
+
+/**
+ * V7-M3：「字段名 + 值」形式（`key 是 abc123`、`secret: hunter2`、`pwd=1234`）。
+ * 字段名后必须有分隔符/判断词，再跟至少 4 个非空白字符的值。
+ */
+const CREDENTIAL_FIELD_PATTERN = /(?:^|[^A-Za-z0-9_])(?:key|secret|token|pwd|pass|passwd)\s*(?:是|为|:|：|=|is)\s*([^\s，。；,;]{4,})/iu;
+
 /** 已由 privacy=secret 标记的事实不进入任何治理/导出视图。 */
 const SECRET_PRIVACY = 'secret';
 /** 秒/毫秒判别阈值。 */
 const EPOCH_THRESHOLD = 1e11;
 
 /**
- * 判断文本是否命中敏感词。
+ * 判断文本是否命中敏感/凭据内容。
+ *
+ * 强敏感词直接命中；弱字段名（key/secret/token/pwd）只在「字段名 + 值」形式
+ * 且值里含数字或符号时命中，避免 `key is abcd` 这类英文语句误报。
  * @param {unknown} text
  * @returns {boolean}
  */
 export function isSensitiveText(text) {
   if (text === null || text === undefined) return false;
-  return SENSITIVE_PATTERN.test(String(text));
+  const value = String(text);
+  if (SENSITIVE_PATTERN.test(value)) return true;
+  const field = CREDENTIAL_FIELD_PATTERN.exec(value);
+  if (field === null) return false;
+  return /[\d\p{P}\p{S}]/u.test(field[1]);
 }
 
 /**
