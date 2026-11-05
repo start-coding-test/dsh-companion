@@ -135,6 +135,22 @@ Object.defineProperty(DEFAULT_VALUES, 'thread', {
   configurable: false,
 });
 
+// G0-9（v0.4.11）：压缩/巩固耗时的观测阈值。只用于「超阈值写一条 warn + /状态
+// 标注（超阈值）」，不设硬超时、不中止任务；默认值对应真机验收口径
+// （压缩 p95 ≤ 20s、巩固 p95 ≤ 60s）。
+// 该节同样不参与 16 键安装自检（与 vector/recall/session/consolidation/thread 一致）。
+const TIMING_DEFAULTS = Object.freeze({
+  compactWarnMs: 20_000,
+  consolidateWarnMs: 60_000,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'timing', {
+  value: TIMING_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -517,6 +533,44 @@ export function normalizeThread(raw, warnings = []) {
 }
 
 /**
+ * 校验 timing 配置（G0-9）：压缩/巩固耗时的观测阈值。
+ *
+ * 两个字段都是正整数毫秒；缺省取 DEFAULTS.timing（压缩 20000、巩固 60000）。
+ * 阈值只用于告警与 /状态 标注，运行时不设硬超时、不中止压缩/巩固。
+ *
+ * 该节默认不参与 Object.keys(DEFAULTS) 的 16 键安装自检（与 vector/recall/
+ * session/consolidation/thread 一致）。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{compactWarnMs: number, consolidateWarnMs: number}>}
+ */
+export function normalizeTiming(raw, warnings = []) {
+  const defaults = DEFAULTS.timing;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('timing', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['compactWarnMs', 'consolidateWarnMs']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "timing.${key}" ignored`);
+  }
+  const resolved = {
+    compactWarnMs: raw.compactWarnMs === undefined ? defaults.compactWarnMs : raw.compactWarnMs,
+    consolidateWarnMs: raw.consolidateWarnMs === undefined
+      ? defaults.consolidateWarnMs
+      : raw.consolidateWarnMs,
+  };
+  for (const field of ['compactWarnMs', 'consolidateWarnMs']) {
+    const value = resolved[field];
+    if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+      throw new ConfigError(`timing.${field}`, `must be a positive integer (ms), got ${JSON.stringify(value)}`);
+    }
+  }
+  return Object.freeze(resolved);
+}
+
+/**
  * 合并默认值并校验配置；未知字段只产生 warning，不阻断。
  * @param {Record<string, unknown>} [raw]
  * @returns {Readonly<Record<string, unknown>>} 冻结后的配置（含 warnings 数组）
@@ -590,6 +644,7 @@ export function normalizeConfig(raw = {}) {
   cfg.session = normalizeSession(input.session, warnings);
   cfg.consolidation = normalizeConsolidation(input.consolidation, warnings);
   cfg.thread = normalizeThread(input.thread, warnings);
+  cfg.timing = normalizeTiming(input.timing, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

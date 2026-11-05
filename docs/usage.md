@@ -128,6 +128,8 @@ health | archived | 体检 | 2026-10-20
 /状态
 状态：entities 8 / episodes 120 / facts 96 / reminders 4 / state_board 2 / state_board_rev 9 / threads 3 / consolidations 21 / memory_events 310 / fts facts 96/episodes 120 / tokens 本轮 入 8000 出 1200（超预算 0 次）｜今日 0/3000000｜RSS ok 128MB｜向量：关
 RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
+最近压缩耗时：12.3s
+最近巩固耗时：31.0s
 主会话：main-3f2a（绑定 latest-user）
 水位重锚：2 次
 未巩固被压缩：1 个节点
@@ -136,6 +138,8 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 ```
 
 最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。「主会话：<id>（绑定 <mode>）」是当前提醒投递目标与绑定策略（`latest-user` 会跟随最新真实用户会话，`first` 保持首个，见[主会话绑定](#主会话绑定v044)）；宿主没有 `sessionController` 时多一行「线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）」（每次执行 `/状态` 时实时读取能力）。
+
+「最近压缩耗时」「最近巩固耗时」是 G0-9 的观测行：前者取最近一次实际压缩（`compactRegion` 调用及其后的重读 surface / 写库 / 发布看板），后者取最近一次实际巩固执行（从巩固任务入口到 `consolidate()` 返回，含选区与模型解析）；失败样本也记录，但成功/失败不进 `/状态`、只用于日志。没有样本时显示 `—`；超过 `timing.compactWarnMs`（默认 20000ms）/`timing.consolidateWarnMs`（默认 60000ms）时在值后标注「（超阈值）」，同时写一条 warn（同类在同一进程内只告警一次，出现一次不超阈值的样本后重置）。阈值只用于观测与告警，**没有硬超时、不会中止**压缩或巩固，详见[压缩/巩固耗时观测](#压缩巩固耗时观测g0-9v0411)。
 
 `/状态` 末尾还会给出自愈观测（无事件时显示「无」）：
 
@@ -652,6 +656,39 @@ thread:
   返回 `reason: "preset_unknown"` 并附宿主原错误文本，不会抛异常、不会写半截线程行。
 - 配置后 `/状态` 显示「线程 preset：<name>（配置：thread.agentPreset）」；
   该节是可选段，不参与 16 键安装自检。
+
+### 压缩/巩固耗时观测（G0-9，v0.4.11）
+
+`/状态` 展示最近一次实际执行的压缩/巩固耗时，用于真机核对「压缩 p95 ≤ 20s、
+巩固 p95 ≤ 60s」的验收口径：
+
+```text
+最近压缩耗时：12.3s
+最近巩固耗时：31.0s
+```
+
+超过阈值时在值后标注「（超阈值）」，例如 `最近巩固耗时：72.4s（超阈值）`；
+还没有样本时显示 `—`。
+
+口径：
+
+- **压缩**：`platform.compactRegion(...)` 调用开始 → 重读 surface、写
+  compaction 事件、发布状态板完成（`maybeCompact` 的成功路径整段）。
+- **巩固**：`executeConsolidationJob` 入口 → `consolidate()` 返回（含选区规划
+  与模型解析）；失败样本同样记录耗时，但成功/失败不展示，只用于日志。
+
+阈值可配置（正整数毫秒；默认值对应验收口径）：
+
+```yaml
+timing:
+  compactWarnMs: 20000
+  consolidateWarnMs: 60000
+```
+
+单次超过阈值时写一条 warn（如 `[dsh-companion] consolidation took 72.4s (>60s)`），
+同类（压缩/巩固）在同一进程内只告警一次，直到出现一次不超阈值的样本后重置。
+阈值只用于观测与告警，**不设硬超时、不会中止任务**；现有压缩/巩固流程与
+线程/任务超时逻辑都不变。该节是可选段，不参与 16 键安装自检。
 
 ## 错误与降级
 

@@ -85,6 +85,7 @@ import {
   retryDelayMs,
 } from './runtime/retry.js';
 import { COMMAND_HINT_SOURCE_KIND, commandHintMessage, handleCommand } from './runtime/commands.js';
+import { elapsedMs, nowMs, recordTimingSample } from './runtime/timing.js';
 import { createMetrics } from './runtime/metrics.js';
 import { createProactive } from './runtime/proactive.js';
 import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
@@ -608,6 +609,15 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     lastConsolidationResult: null,
     /** t17：失败巩固的重试登记（job + attempts + nextAt）。 */
     consolidationRetry: null,
+    /**
+     * G0-9：最近一次压缩/巩固实际执行的耗时（毫秒，失败样本也记录，只用于
+     * 日志与 /状态 展示）；null 表示还没有样本。
+     */
+    lastCompactMs: null,
+    lastConsolidateMs: null,
+    /** G0-9：超阈值 warn 去重标记；同类出现一次不超过阈值的样本后重置。 */
+    compactSlowWarned: false,
+    consolidateSlowWarned: false,
     /** P2-b：最近一次召回注入里由向量路命中并实际注入的条数。 */
     lastVectorHits: 0,
     /** dispose 后后台任务不再碰已关闭的 Store。 */
@@ -749,6 +759,13 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             // /状态 直接说明原因，并展示待压缩区间数（真开时）。
             compactionSupported: platform.capabilities.compaction,
             pendingCompactions: state.pendingCompact.size,
+            // G0-9：/状态 展示最近一次压缩/巩固耗时与「（超阈值）」标注。
+            timing: {
+              lastCompactMs: state.lastCompactMs,
+              lastConsolidateMs: state.lastConsolidateMs,
+              compactWarnMs: config.timing?.compactWarnMs,
+              consolidateWarnMs: config.timing?.consolidateWarnMs,
+            },
           });
         } catch (error) {
           return {
@@ -2027,6 +2044,9 @@ function warnSkipOnce(state, reason, message, meta) {
  */
 async function executeConsolidationJob(state, job) {
   const { store, platform, metrics, config } = state;
+  // G0-9：巩固耗时从任务入口计到 consolidate() 返回/抛错（含选区与模型解析）。
+  // 只观测，不设超时；无窗口/无模型等早退不算一次执行，不采样。
+  const consolidationStartedMs = nowMs(platform.now);
   const retrying = typeof job.consolidationId === 'string' && job.consolidationId !== '';
   let startSeq;
   let endSeq;
@@ -2113,6 +2133,11 @@ async function executeConsolidationJob(state, job) {
       // 窗口已在 surface 层选好；水位推进允许跨过旧值。
       guardWatermark: false,
     });
+    // G0-9：成功样本（含 skipped；耗时口径见函数入口注释）。采样/告警失败不影响主流程。
+    recordTimingSample(state, 'consolidate', elapsedMs(platform.now, consolidationStartedMs), {
+      ok: true,
+      warnMs: config.timing?.consolidateWarnMs,
+    });
     if (result?.skipped) {
       state.lastConsolidationResult = {
         ok: true,
@@ -2162,6 +2187,11 @@ async function executeConsolidationJob(state, job) {
     }
   } catch (error) {
     const message = errorMessage(error);
+    // G0-9：失败样本也记录耗时（只用于日志）；不影响下面的失败登记与重试。
+    recordTimingSample(state, 'consolidate', elapsedMs(platform.now, consolidationStartedMs), {
+      ok: false,
+      warnMs: config.timing?.consolidateWarnMs,
+    });
     metrics.inc('consolidationFailures');
     state.lastConsolidationResult = {
       ok: false,
@@ -2354,7 +2384,7 @@ function maybeRetryConsolidation(state) {
  * @param {string} [scope] 当前会话作用域
  */
 async function maybeCompact(state, payload, scope = SCOPE) {
-  const { platform, store } = state;
+  const { platform, store, config } = state;
   const pending = peekPendingCompact(state.pendingCompact, scope);
   if (pending === null) return;
   if (!platform.capabilities.compaction) {
@@ -2422,6 +2452,12 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     // V7-L2：压缩完成事件带毫秒耗时（detail.kind='compaction' 与巩固事件区分）。
     // 审计写失败不影响已成功的压缩。
     const durationMs = Math.max(0, Math.round(platform.now() - startedMs));
+    // G0-9：压缩耗时口径 = compactRegion 调用 + 之后的重读 surface/写库/发布看板；
+    // 只观测，不设超时（失败样本在 catch 里记录）。
+    recordTimingSample(state, 'compact', durationMs, {
+      ok: true,
+      warnMs: config.timing?.compactWarnMs,
+    });
     try {
       store.appendEvent({
         at: Math.floor(platform.now() / 1000),
@@ -2453,6 +2489,11 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     });
   } catch (error) {
     state.metrics.inc('compactionFailures');
+    // G0-9：失败样本也记录耗时（只用于日志），压缩仍保持 pending_compact、不中止。
+    recordTimingSample(state, 'compact', elapsedMs(platform.now, startedMs), {
+      ok: false,
+      warnMs: config.timing?.compactWarnMs,
+    });
     platform.log('warn', '[dsh-companion] compactRegion failed; keeping pending_compact', {
       start,
       end,

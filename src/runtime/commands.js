@@ -19,6 +19,7 @@ import { randomUUID } from 'node:crypto';
 
 import { forgetMemory } from '../memory/forget.js';
 import { DAILY_TOKEN_LIMIT } from './budget.js';
+import { formatTimingLines } from './timing.js';
 import {
   DEFAULT_TIMEZONE,
   isValidTimeZone,
@@ -115,6 +116,9 @@ export function commandHintMessage(text) {
  * @param {number} [options.pendingCompactions] C5-M1：待压缩区间数（仅展示用）
  * @param {string|null} [options.threadAgentPreset] V10-H1：thread.agentPreset
  *   配置值；null/空串时 /状态 显示「宿主默认」
+ * @param {{lastCompactMs?: number|null, lastConsolidateMs?: number|null,
+ *   compactWarnMs?: number, consolidateWarnMs?: number}} [options.timing]
+ *   G0-9：最近一次压缩/巩固耗时与阈值；传入时 /状态 追加两行耗时
  * @returns {{handled: boolean, reply: string}}
  */
 export function handleCommand({
@@ -130,6 +134,7 @@ export function handleCommand({
   compactionSupported,
   pendingCompactions,
   threadAgentPreset,
+  timing,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -168,6 +173,7 @@ export function handleCommand({
       compactionSupported,
       pendingCompactions,
       threadAgentPreset,
+      timing,
     }),
   };
 }
@@ -551,6 +557,11 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
     const pending = Number(options.pendingCompactions);
     const suffix = Number.isFinite(pending) && pending > 0 ? `，待压缩 ${pending} 个区间` : '';
     lines.push(`${COMPACTION_ENABLED_TEXT}${suffix}`);
+  }
+  // G0-9：最近一次压缩/巩固实际耗时（只观测，不设超时）；无样本显示 —。
+  // timing 只在接线层传入时输出，保持旧调用方（单测）的 /状态 格式不变。
+  if (options.timing !== null && options.timing !== undefined && typeof options.timing === 'object') {
+    lines.push(...formatTimingLines(options.timing));
   }
   // V3-M2：主会话绑定对排障关键（提醒投错会话时先看这里）。
   const mainSession = options.mainSession;

@@ -60,6 +60,17 @@ rssWarnGiB: 2.95
 rssStopGiB: 3
 rssMainOnlyGiB: 3.15
 
+# ── 压缩/巩固耗时观测（G0-9，可选段，不参与 16 键安装自检）──────────
+# 只用于「单次超阈值写一条 warn（同类去重）」与 /状态 的
+# 「最近压缩耗时/最近巩固耗时」是否标注「（超阈值）」；
+# 不设硬超时、不中止压缩/巩固。默认值对应真机验收口径：
+# 压缩 p95 ≤ 20s、巩固 p95 ≤ 60s。
+# 需要覆盖时把下面三行去掉注释并入 config.yml（正整数毫秒）：
+#
+# timing:
+#   compactWarnMs: 20000
+#   consolidateWarnMs: 60000
+
 # ── 宿主压缩服务（compaction-basic）────────────────────────────────
 # 下面不是本插件的配置键，而是 cordis.patch.yml 里 compaction-basic 的写法；
 # 不要写进 config.yml。
