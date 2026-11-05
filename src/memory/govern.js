@@ -101,6 +101,65 @@ export function isSensitiveText(text) {
 }
 
 /**
+ * V9-M1：episode 等落库文本里凭据值的统一占位符。
+ * 只替换「值」，保留「用户提到一个密码」这类上下文，episode 仍可读。
+ */
+export const REDACTED_CREDENTIAL = '[凭据已省略]';
+
+/** 值里含数字或符号才算凭据值（与弱字段/设备值的判定口径一致）。 */
+const CREDENTIAL_VALUE_SHAPE = /[\d\p{P}\p{S}]/u;
+
+/**
+ * V9-M1 脱敏面：与 isSensitiveText 的判定面一一对应，但只抹「值」。
+ *
+ * - `PASSWORD_CONNECTIVE`：密码/口令/password + 是/为/:/：/=/is + 值。有显式
+ *   连接词时值一定是凭据，纯文字密码（`密码是 bluewhale`）也抹；
+ * - `PASSWORD_BARE`：密码/口令 + 空白 + 值（「路由器密码 蓝鲸-7788」），
+ *   要求值含数字或符号，避免「密码 忘了」这类叙述被误伤；
+ * - `CREDENTIAL_FIELD_REDACT`：api key / access token / secret / token / key
+ *   等字段名 + 连接词 + 值（「token 是 abc123」「API token：sk-xxxxxx」）；
+ * - `DEVICE_VALUE_REDACT`：设备/网络名词 + 判断词 + 含数字或符号的值
+ *   （「WiFi 是 蓝鲸-7788」），与 DEVICE_VALUE_PATTERN 同口径；
+ * - `CARD_NUMBER_REDACT` / `SK_KEY_REDACT`：卡号形态与 `sk-` 字面值，
+ *   没有上下文也能认出来，直接整段值替换。
+ */
+const PASSWORD_CONNECTIVE = /(密码(?!学)|口令|passw(?:or)?d|pwd|passwd)(\s*(?:是|为|:|：|=|is)\s*)([^\s，。；,;]+)/giu;
+const PASSWORD_BARE = /(密码(?!学)|口令|passw(?:or)?d|passwd)(\s+)([^\s，。；,;]+)/giu;
+const CREDENTIAL_FIELD_REDACT = /(api[\s_-]?key|access[\s_-]?token|access[\s_-]?key|secret[\s_-]?key|\bkey\b|\btoken\b|\bsecret\b|\bpwd\b|\bpass\b)(\s*(?:是|为|:|：|=|is)\s*)([^\s，。；,;]+)/giu;
+const DEVICE_VALUE_REDACT = /(wi-?fi|路由器|路由|门禁|门锁|热点)(\s*(?:是|为|:|：|=)\s*)([^\s，。；,;]+)/giu;
+const CARD_NUMBER_REDACT = /\d{12,}|\d{4}(?:[\s-]\d{4}){2}(?:[\s-]\d{1,4})?/gu;
+const SK_KEY_REDACT = /\bsk-[A-Za-z0-9_-]{6,}/gu;
+
+/**
+ * V9-M1：把凭据上下文中的「值」替换为 `[凭据已省略]`。
+ *
+ * 判定面与 isSensitiveText 对齐（密码/口令、password、凭据字段名、设备/网络
+ * 值、卡号形态、`sk-` 字面值），区别是只抹值、保留上下文。约定：
+ * - 非字符串（null/undefined/数字/对象）原样返回，调用方可无条件透传；
+ * - 没有命中时返回原字符串；
+ * - 幂等：对已脱敏文本再调用结果不变（占位符不含可再命中的凭据值）。
+ *
+ * @param {unknown} text
+ * @returns {unknown} 脱敏后的同类型值
+ */
+export function redactSensitiveValues(text) {
+  if (typeof text !== 'string' || text === '') return text;
+  let out = text;
+
+  out = out.replace(PASSWORD_CONNECTIVE, (_match, label, connective) => `${label}${connective}${REDACTED_CREDENTIAL}`);
+  out = out.replace(PASSWORD_BARE, (match, label, gap, value) => (
+    CREDENTIAL_VALUE_SHAPE.test(value) ? `${label}${gap}${REDACTED_CREDENTIAL}` : match
+  ));
+  out = out.replace(CREDENTIAL_FIELD_REDACT, (_match, label, connective) => `${label}${connective}${REDACTED_CREDENTIAL}`);
+  out = out.replace(DEVICE_VALUE_REDACT, (match, label, connective, value) => (
+    CREDENTIAL_VALUE_SHAPE.test(value) ? `${label}${connective}${REDACTED_CREDENTIAL}` : match
+  ));
+  out = out.replace(SK_KEY_REDACT, REDACTED_CREDENTIAL);
+  out = out.replace(CARD_NUMBER_REDACT, REDACTED_CREDENTIAL);
+  return out;
+}
+
+/**
  * 统一毫秒时间戳；非法值回退 Date.now()。
  * @param {unknown} value
  * @returns {number}

@@ -31,6 +31,7 @@ import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { toBigrams, toMatchQuery } from './bigram.js';
+import { redactSensitiveValues } from './govern.js';
 import { RENEED_KINDS } from './reneed.js';
 import { DEFAULT_ALPHA, decayOf, reinforce } from './reinforce.js';
 import { boardFragments, renderBoard, scrubBoardText } from './state-board.js';
@@ -503,6 +504,37 @@ function toJsonArray(value) {
   if (Array.isArray(value)) return JSON.stringify(value);
   if (typeof value === 'string' && value.trim() !== '') return value;
   return '[]';
+}
+
+/**
+ * V9-M1：episode 文本字段的防御性脱敏（任何调用方都不落明文）。
+ *
+ * 巩固层写库前已按字段脱敏一次，这里再对 title/summary/evidence/
+ * mood_evidence/topics/entities 套一遍：`redactSensitiveValues` 对非字符串
+ * 原样返回、对无命中文本返回原文、且幂等，所以对已脱敏的值不会叠加占位符。
+ * fts_episodes 由 `#refreshEpisodesFts` 从主表投影，自动跟着干净。
+ *
+ * @param {unknown} value 文本或文本数组（topics/entities）
+ * @returns {unknown}
+ */
+function redactEpisodeInput(value) {
+  if (Array.isArray(value)) return redactEpisodeItems(value);
+  // 有些调用方直接传 topics_json 文本；先按 JSON 解析再逐项脱敏，
+  // 避免把引号/方括号当成值的一部分而破坏 JSON 结构。
+  if (typeof value === 'string' && value.trimStart().startsWith('[')) {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return redactEpisodeItems(parsed);
+    } catch {
+      // 坏 JSON 退化为整段文本脱敏（不改变「尽量不落明文」的取向）。
+    }
+  }
+  return redactSensitiveValues(value);
+}
+
+/** @param {unknown[]} items */
+function redactEpisodeItems(items) {
+  return items.map((item) => (typeof item === 'string' ? redactSensitiveValues(item) : item));
 }
 
 /**
@@ -1380,13 +1412,13 @@ export class Store {
         input.consolidation_id ?? null,
         startedAt,
         endedAt,
-        requireString(input.title, 'episodes.title'),
-        input.summary ?? null,
-        input.evidence ?? null,
-        toJsonArray(input.topics ?? input.topics_json),
-        toJsonArray(input.entities ?? input.entities_json),
+        redactEpisodeInput(requireString(input.title, 'episodes.title')),
+        redactEpisodeInput(input.summary ?? null),
+        redactEpisodeInput(input.evidence ?? null),
+        toJsonArray(redactEpisodeInput(input.topics ?? input.topics_json)),
+        toJsonArray(redactEpisodeInput(input.entities ?? input.entities_json)),
         input.mood ?? null,
-        input.mood_evidence ?? null,
+        redactEpisodeInput(input.mood_evidence ?? null),
         salience,
         input.privacy ?? 'normal',
         strengthDays,

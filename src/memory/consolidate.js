@@ -16,7 +16,9 @@
  * 本模块只做编排，不直接持有连接、不改 store.js。
  */
 
-import { CREDENTIAL_HINT, isSensitiveText } from './govern.js';
+import {
+  CREDENTIAL_HINT, REDACTED_CREDENTIAL, isSensitiveText, redactSensitiveValues,
+} from './govern.js';
 import { decayOf } from './reinforce.js';
 import { renderBoard, stageBoard } from './state-board.js';
 
@@ -361,6 +363,53 @@ function normalizeDraft(draft) {
   return { episode, facts, reminders };
 }
 
+// ------------------------------------------------------- V9-M1 episode 脱敏
+
+/**
+ * V9-M1：episode 单字段脱敏。
+ *
+ * 先按值脱敏（保留「用户提到一个密码」这类上下文），若整段仍命中
+ * isSensitiveText（凭据值被空格/标点拆开而与上下文拼接，正则漏网），再整段
+ * 替换为占位符。episode 是「叙事摘要」，宁可丢一句描述也不落明文。
+ *
+ * @param {unknown} value
+ * @returns {unknown}
+ */
+function redactEpisodeField(value) {
+  if (typeof value !== 'string' || value === '') return value;
+  const redacted = redactSensitiveValues(value);
+  return isSensitiveText(redacted) ? REDACTED_CREDENTIAL : redacted;
+}
+
+/**
+ * V9-M1：episode 列表字段（topics/entities）同样脱敏——fts_episodes 会投影
+ * topics，模型也可能把凭据值塞进列表项。
+ * @param {unknown} values
+ * @returns {unknown}
+ */
+function redactEpisodeList(values) {
+  if (!Array.isArray(values)) return values;
+  return values.map((item) => redactEpisodeField(item));
+}
+
+/**
+ * V9-M1：episode 落库前的脱敏副本（title/summary/evidence/mood_evidence +
+ * topics/entities）。不改原对象，返回可直接交给 store.insertEpisode 的新对象。
+ * @param {object} episode
+ * @returns {object}
+ */
+function redactEpisode(episode) {
+  return {
+    ...episode,
+    title: redactEpisodeField(episode.title),
+    summary: redactEpisodeField(episode.summary),
+    evidence: redactEpisodeField(episode.evidence),
+    mood_evidence: redactEpisodeField(episode.mood_evidence),
+    topics: redactEpisodeList(episode.topics),
+    entities: redactEpisodeList(episode.entities),
+  };
+}
+
 // ------------------------------------------------------------ 写库辅助
 
 function requireStore(store) {
@@ -484,6 +533,7 @@ export function buildConsolidationPrompt(input = {}) {
     '           "subject_text":"...","predicate":"...","object_text":"...","statement":"..."}],',
     ' "reminders":[{"kind":"todo","title":"..."}]}',
     '对话里形如 [相关记忆] … [/相关记忆] 的段落是历史检索快照，只能作为已知内容的佐证，不得据此新建事实或改写现有结论。',
+    '不得复述密码、口令、token、卡号等凭据值；必须提及时写成「用户提到一个密码」这类描述。',
     `scope=${scope} seq=${input.seqFrom}-${input.seqTo}`,
     '对话：',
     body,
@@ -584,6 +634,9 @@ export async function consolidate(input = {}) {
     transcript,
   });
   const { episode, facts: draftedFacts, reminders: draftedReminders } = normalizeDraft(draft);
+  // V9-M1：episode 四字段（及 topics/entities）落库前逐个脱敏，凭据值不落库；
+  // store.insertEpisode 还会再做一次防御性脱敏（任何调用方都不落明文）。
+  const safeEpisode = redactEpisode(episode);
   const matchedFacts = draftedFacts.filter(
     (fact) => !matchesExcludedStatement(fact.statement, excludedStatements),
   );
@@ -617,18 +670,18 @@ export async function consolidate(input = {}) {
       scope,
       session_id: sessionId,
       consolidation_id: consolidation.id,
-      started_at: episode.started_at ?? at,
-      ended_at: episode.ended_at ?? at,
-      title: episode.title,
-      summary: episode.summary,
-      evidence: episode.evidence,
-      topics: episode.topics,
-      entities: episode.entities,
-      mood: episode.mood,
-      mood_evidence: episode.mood_evidence,
-      salience: episode.salience,
-      privacy: episode.privacy,
-      fidelity: episode.fidelity,
+      started_at: safeEpisode.started_at ?? at,
+      ended_at: safeEpisode.ended_at ?? at,
+      title: safeEpisode.title,
+      summary: safeEpisode.summary,
+      evidence: safeEpisode.evidence,
+      topics: safeEpisode.topics,
+      entities: safeEpisode.entities,
+      mood: safeEpisode.mood,
+      mood_evidence: safeEpisode.mood_evidence,
+      salience: safeEpisode.salience,
+      privacy: safeEpisode.privacy,
+      fidelity: safeEpisode.fidelity,
     });
 
     // facts：key+value 完全相同的跳过（MVP 的「cos 去重」简化）。
