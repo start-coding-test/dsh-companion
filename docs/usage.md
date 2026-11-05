@@ -692,6 +692,33 @@ timing:
 阈值只用于观测与告警，**不设硬超时、不会中止任务**；现有压缩/巩固流程与
 线程/任务超时逻辑都不变。该节是可选段，不参与 16 键安装自检。
 
+### headless 一次性运行与 round C 口径（V10-M1，v0.4.11）
+
+**headless / one-shot 不会发生巩固。** headless（`--profile headless`）、one-shot
+bundle 与 SDK 单次调用都在 turn 结束后让进程退出；巩固由插件在 turn 收尾时用
+`setImmediate` 排到后台（`src/index.js` 的 `scheduleConsolidation` /
+`runConsolidationJob`，pre-step 只做同步判断），进程退出后没有后续 tick，不会真正
+执行 `consolidate()`。云端实测 headless 会话 `tokenMeter` 有值、`consolidations=0`
+属正常现象，不是巩固失败，也不代表记忆丢失；需要巩固时让进程常驻（desktop /
+常驻 headless 服务），巩固会在 turn 收尾后的后台 tick 执行。
+
+**round C 的通过口径（v0.4.11 起）**：在**常驻实例**上连续运行并观察到
+**8 次巩固成功**（`consolidations` 成功行累计 8 条，且没有重试耗尽/最终失败）即判
+round C 通过；不再要求 headless 门内完成。headless 发布门
+（`node scripts/probe/run-headless.mjs --plugin`）仍保留 round A/B（插件激活、
+召回注入）的冒烟断言；其 round C 在无模型凭据时显示 `SKIP`（未计 PASS），有凭据
+时也只断言门内可观测到的部分，**不作为 round C 的通过依据**。
+
+以下三种「让 headless 门内完成巩固」的改造均**未实现，属推迟项**：
+
+1. `DSH_COMPANION_GATE_SYNC` 环境变量：让门在进程退出前等待已排队的巩固跑完；
+2. 常驻版门脚本：启动一个常驻实例，累计统计到 8 次成功巩固后判定 PASS；
+3. dispose 限时等待：`dispose()` 时给在飞/已排队的巩固一个有限等待窗口。
+
+因此发布时 round C 要在常驻实例上人工或由外部脚本验收；headless 门只证明插件能
+激活、能注入召回，不证明巩固。门槛改造与验收方式见
+[known-debt.md](known-debt.md) 的 D-10。
+
 ## 错误与降级
 
 ### 启动与配置

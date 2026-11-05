@@ -71,6 +71,15 @@ rssMainOnlyGiB: 3.15
 #   compactWarnMs: 20000
 #   consolidateWarnMs: 60000
 
+# ── 线程会话 preset（V10-H1，可选段，不参与 16 键安装自检）──────────
+# 线程会话的宿主 agent preset（可选；不填=宿主默认，与 task_run 一致）。
+# 安装时读取宿主实际 preset 列表，选「够用的最小权限」（通常 workspace-write），
+# 不得选 danger-full-access。未知值运行时返回 preset_unknown。
+# 需要时把下面两行去掉注释并入 config.yml：
+#
+# thread:
+#   agentPreset: workspace-write
+
 # ── 宿主压缩服务（compaction-basic）────────────────────────────────
 # 下面不是本插件的配置键，而是 cordis.patch.yml 里 compaction-basic 的写法；
 # 不要写进 config.yml。

@@ -2,6 +2,20 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.11] - 2026-11-05
+
+按用户 v0.4.11 清单修复四项：V10-H1（thread preset 可配置、未知 preset 不抛异常）、G0-9（压缩/巩固耗时阈值与告警，不中止）、V10-L1（存量 episode/FTS 一次性脱敏 scrub，幂等）、V10-M1（round C 口径与 headless 巩固限制写入文档）。仍为零第三方运行时依赖；schema 升至 v13（纯数据迁移，无新列）。
+
+### Fixed
+
+- **V10-H1 `thread_run` 的 preset 可配置、未知 preset 不抛异常**（`58ed1ad`）：新增可选配置 `thread.agentPreset`（默认 `null`；非空字符串 `trim` 后生效）。未配置时 `thread_run` **不传** `agentPreset`，由宿主使用默认 preset；配置后传入该值。宿主报未知 preset 时返回 `{ "ok": false, "reason": "preset_unknown", "message": "<宿主原文>" }`，不抛异常、不写 `threads` 行；其它 `createSession` 错误照常上抛。`/状态` 新增「线程 preset：宿主默认」/「线程 preset：<name>（配置：thread.agentPreset）」；`docs/usage.md` 补安装步骤（读取宿主实际 preset 列表、选够用的最小权限、不得 `danger-full-access`）。
+- **G0-9 压缩/巩固耗时阈值、warn 去重与 `/状态` 展示**（`52dc3e0`）：新增可选配置 `timing.compactWarnMs`（默认 `20000`）与 `timing.consolidateWarnMs`（默认 `60000`，正整数毫秒；非法值抛 `ConfigError('timing.*')`）。`maybeCompact` 与 `executeConsolidationJob` 的成功/失败路径都采样最近耗时；超阈值只写一条 warn（同类每进程一次，出现不超阈值样本后重置），**不设硬超时、不中止压缩/巩固**。`/状态` 在压缩行后追加「最近压缩耗时」「最近巩固耗时」（无样本 `—`，超阈值标注「（超阈值）」；失败样本只记耗时，成功/失败不展示）。该节为可选段，不参与 16 键安装自检。
+- **V10-L1 存量 episode/FTS 一次性脱敏 scrub**（`ca8f3d3`）：schema 升至 v13（纯数据迁移，无新列）。打开 v12 或更早（以及已有数据但无标记）的库时，对存量 episodes 的 `title` / `summary` / `evidence` / `mood_evidence` / `topics_json` / `entities_json` 一次性重跑写入路径脱敏（值级 `redactSensitiveValues`；脱敏后仍残留值形态的整段替换为 `[凭据已省略]`；JSON 数组逐项脱敏并保持合法）。只 UPDATE 真正变化的行并重建其 `fts_episodes` 投影；成功后写 `schema_meta` 标记 `episode_scrub_v13`（重复打开跳过），并写一条 `memory_events`（`action=scrub`，`detail={scanned,changed}`，不含正文）；空库不写标记、不留审计噪音。升级事务失败连同版本号回滚；按 rowid 每批 200 行。
+
+### Changed
+
+- **V10-M1 round C 口径与 headless 巩固限制（文档项）**：round C 的通过口径改为 **常驻实例上 8 次巩固成功**，不再要求 headless 门内完成。headless / one-shot 在 turn 结束后进程即退出，巩固由 `setImmediate` 排到后台，因此**不会发生巩固**；云端实测 `tokenMeter` 有值、`consolidations=0` 属正常。`docs/usage.md` 新增「headless 一次性运行与 round C 口径」一节；`docs/known-debt.md` 记录 `DSH_COMPANION_GATE_SYNC`、常驻版门脚本、dispose 限时等待三种门改造均未实现、属推迟项。`config.example.yml` 补 `thread.agentPreset` 可选注释段。
+
 ## [0.4.10] - 2026-11-05
 
 按用户 v0.4.10 清单修复三项：V9-L1（token / 银行卡误报收窄）、V9-M1 / V9-M1b（episode 落库前凭据值脱敏，字段兜底只对残留值）、V9-L2（「口令」与设备 / 网络值漏报）。仍为零第三方运行时依赖；本次无 schema 变更（`schema_version` 仍为 12）；发布前独立复审链路为 [review-v16](docs/review-v16.md)（pass，H=0 / M=0 / L=0）。
@@ -28,6 +42,8 @@
 按用户 v0.4.9 必修清单修复七项：V7-H1（工具注册改为调用时判能力）、V7-M1（压缩起点跳过系统节点）、V7-M3（凭据类内容不落库）、V7-L1（发布门 round C 两轮）、V7-L2（巩固/压缩 `duration_ms`）、V8-L1（到期表达式索引）、V8-L2（到期口径统一）。仍为零第三方运行时依赖；发布前独立复审链路为 review-v14（needs_revision，唯一 M 为文档契约）→ `d14e2b2` 文档修复 → [review-v15](docs/review-v15.md)（pass，H=0 / M=0 / L=0）。
 
 > **发布门说明**：本机没有模型凭据，round C 走 SKIP（**未计 PASS**，门不因 SKIP 判失败）；需在有凭据的环境复跑 `node scripts/probe/run-headless.mjs --plugin`，确认 round C 的 `verdict=pass`（第二轮真实写入 `consolidations` 且 tokenMeter 非零）。
+>
+> **v0.4.11 口径调整**：round C 的通过口径改为常驻实例 8 次巩固成功；headless 门不再要求完成 round C，只作激活/召回冒烟（见本文件 0.4.11 段）。
 
 ### Fixed
 

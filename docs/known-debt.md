@@ -125,6 +125,13 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **建议排期**：本版不修；后续强化提醒状态机时，把 store 写失败视为投递失败并走 `onFailed`（同时累计 `delivery_attempts`）。
 - **验收方式**：构造 store 写失败（注入抛错的 `claimReminderDelivery`），断言提醒不重复发送或明确置 `expired`。
 
+### D-10 round C 门改造：headless 门内无法完成巩固（V10-M1，按用户口径降级）
+
+- **现状**：headless / one-shot 在 turn 结束后进程即退出；巩固由插件在 turn 收尾时用 `setImmediate` 排到后台（`src/index.js` 的 `scheduleConsolidation` / `runConsolidationJob`），进程退出后没有后续 tick，不会执行 `consolidate()`。云端实测 headless 会话 `tokenMeter` 有值、`consolidations=0` 属正常。v0.4.11 起 round C 的通过口径改为**常驻实例上 8 次巩固成功**，不再要求 headless 门内完成；headless 门只作插件激活/召回冒烟。三种门改造均未实现：`DSH_COMPANION_GATE_SYNC`（门内等待巩固完成）、常驻版门脚本（累计 8 次成功后判定 PASS）、dispose 限时等待（给已排队/在飞巩固一个有限窗口）。
+- **影响**：发布门无法自动判定 round C，需要在常驻实例上人工或由外部脚本观测；headless 门只能证明激活与召回，不能证明巩固。**已按用户口径降级，不阻断评测。**
+- **建议排期**：round C 常驻验收随 v0.4.11 发布执行；三种门改造推迟，不阻断两周评测。
+- **验收方式**：常驻实例连续运行，`consolidations` 成功行累计 ≥8 且无最终失败；headless 门保持 round A/B PASS、round C 显示 SKIP（未计 PASS，不作为通过依据）。
+
 ## 5. 已关闭（本轮修复）
 
 - **V9-M1 episode 落库前仍保留凭据原文**：v0.4.10 修复，commit `a4fe4e0`，字段级兜底口径由 `6e1ade8` 补齐。`consolidate` 写 episode 前对 `title` / `summary` / `evidence` / `mood_evidence` 与 `topics` / `entities` 逐字段脱敏，只把凭据值换成 `[凭据已省略]`、保留「路由器密码 …」这类上下文（不是整段丢弃）；`store.insertEpisode` 再做一次防御性值级脱敏（含 `topics_json` 字符串形态），`fts_episodes` 由主表投影故自动无明文。跨会话召回、注入、状态板与 JSON 导出经 `test/e2e/v0910-privacy.test.js` 验证均无明文；巩固提示词同时要求「不得复述密码、口令、token、卡号等凭据值」。
@@ -132,7 +139,7 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **V9-L2 口令 / WiFi 漏报**：v0.4.10 修复，commit `a6de86d`。强模式补「口令」（「密码学」负向断言不变）；新增设备值模式（WiFi / 路由器 / 路由 / 门禁 / 门锁 / 热点 + 是/为/`:`/`=` + 值，值须含数字或符号），「路由器口令是 …」「WiFi 是 …」这类表述现在会被识别，并在 episode 落库前脱敏。
 
 - **V7-M1 压缩起点可能落在系统提示词节点**：v0.4.9 修复。`src/session/surface.js` 的 `planRegion` 选定起点后调用导出的 `firstReplaceableIndex(snapshot, from)` 跳过 `role: 'system'` 节点（节点 0 正文缺失、`role` 未知时保守跳过），区间中途再遇系统节点则提前收尾，全部不可替换返回 `region: null, reason: 'no-replaceable-range'`；`src/index.js` 的 `maybeCompact` 在恢复历史 `pending_compact` 时用同一 helper 收紧起点，收紧后区间为空则丢弃 pending 并计 `compactionDrops`，不调用 `compactRegion`。常规巩固、deep-sleep 与 pending 恢复压缩共用同一道起点收紧。**观察项（终点 fence 未做）**：恢复的 pending 只收紧起点、未收紧终点；平台只保护 node 0（系统提示词），跨版本旧 pending 的中段系统节点仍可能被跨过。文档已补记于 [usage.md](usage.md) 的「压缩起点跳过系统节点」与「隐私与凭据」两节。
-- **V7-L1 发布门 round C 只跑单轮、tokenMeter=0**：v0.4.9 修复（与 V7-L2 同提交）。round C 改为同一会话两轮：第一轮 `--json` 取 `sessionId`，第二轮 `--session-id` 续跑（overlay 的 `compactHardTokens` 降到 120，两轮输入才过阈值）。判定要求 scheduler started 标记、tokenMeter 观测到非零 token（`tokens` 事件 `maxTokensIn > 0`）、`consolidations` 至少一行；无模型凭据时 SKIP（明确不算 PASS），有凭据而断言失败时发布门 exit 1。为可测试性导出 `parseSessionId` / `readConsolidationEvidence` / `evaluateConsolidationRound`，`runConsolidationRound` 接受 runner 与证据读取注入。
+- **V7-L1 发布门 round C 只跑单轮、tokenMeter=0**：v0.4.9 修复（与 V7-L2 同提交）。round C 改为同一会话两轮：第一轮 `--json` 取 `sessionId`，第二轮 `--session-id` 续跑（overlay 的 `compactHardTokens` 降到 120，两轮输入才过阈值）。判定要求 scheduler started 标记、tokenMeter 观测到非零 token（`tokens` 事件 `maxTokensIn > 0`）、`consolidations` 至少一行；无模型凭据时 SKIP（明确不算 PASS），有凭据而断言失败时发布门 exit 1。为可测试性导出 `parseSessionId` / `readConsolidationEvidence` / `evaluateConsolidationRound`，`runConsolidationRound` 接受 runner 与证据读取注入。 **v0.4.11（V10-M1）口径调整**：round C 的通过口径改为常驻实例 8 次巩固成功，headless 门不再要求完成 round C，只作激活/召回冒烟；三种门改造未实现，见 D-10。
 - **V7-L2 巩固/压缩事件只有秒级 started_at/finished_at**：v0.4.9 修复（与 V7-L1 同提交）。巩固在 `consolidate({ clock })` 事务收尾用注入毫秒时钟算 `duration_ms`（生产传 `platform.now`），写进 episodes 事件 detail（`kind: 'consolidation'`）；压缩在 `compactRegion` 前后用 `platform.now()` 计时，成功后写 `memory_events`（`table_name: 'compactions'`、`action: 'UPDATE'`、`detail.kind: 'compaction'`）；新增 `eventDurationMs` 读取 helper，旧行没有该字段时返回 null（不影响读取）。
 
 - **S2-M1 `used` 升级锁死首次注入时间/档位/same_context**：v0.4.2 修复，commit `890f028`。新增 `first_used_at` / `first_used_tier` / `used_same_context`（schema v9），用上那一刻写入并按 `observed_at` 重新判定 same_context；「首次」指首次非 same_context 用上，same_context 的 used 可被后续非 same_context used 覆盖一次，reverse 不覆盖；`first_reneed_*` 保留为 recall 对照样本。SQL 与口径见 [s0-calibration.md](s0-calibration.md)。

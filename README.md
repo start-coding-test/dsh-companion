@@ -21,7 +21,7 @@
 - **发布门 round C 两轮（V7-L1）**：同一会话两轮续跑（`--patch` 在 `--json` 之前，第二轮 `--session-id`），`compactHardTokens` 降到 120；无凭据 → SKIP 且明确不算 PASS，有凭据但 tokenMeter 为零或无 consolidations 行 → fail。
 - **`duration_ms`（V7-L2）**：巩固事件与压缩事件都写入非负整数毫秒耗时（同秒内可区分），`eventDurationMs` 兼容旧行/坏 JSON。
 - **到期索引与口径统一（V8-L1/L2）**：`ix_rm_fire` 换成表达式索引 `ix_rm_due(status, max(...))`（旧库幂等补建、删除旧索引，`schema_version` 仍 12）；到期口径统一为 `max(next_fire_at, retry_at)`，`dueReminders` 与 `onAttempt` 同源；改期走 `rescheduleReminder` 并清空 `retry_at`/occurrence，裸 SQL 改期由触发器兜底。
-- **复审**：发布前独立复审链路 review-v14（needs_revision，唯一 M 为文档契约）→ 文档修复 `d14e2b2` → [review-v15](docs/review-v15.md)（pass，H=0 / M=0 / L=0）。发布门 round C 因本机无模型凭据为 **SKIP（未计 PASS）**，需在有凭据环境复跑 `node scripts/probe/run-headless.mjs --plugin` 确认 `verdict=pass`。完整条目见 [CHANGELOG](CHANGELOG.md)。
+- **复审**：发布前独立复审链路 review-v14（needs_revision，唯一 M 为文档契约）→ 文档修复 `d14e2b2` → [review-v15](docs/review-v15.md)（pass，H=0 / M=0 / L=0）。发布门 round C 因本机无模型凭据为 **SKIP（未计 PASS）**；v0.4.11 起 round C 不再要求在 headless 门内完成，改以常驻实例 8 次巩固成功为通过口径。完整条目见 [CHANGELOG](CHANGELOG.md)（0.4.11 段）。
 
 ## v0.4.8 变更摘要
 
