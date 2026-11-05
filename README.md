@@ -4,7 +4,17 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.8 已发布**（2026-11-05）。`node --test` 全绿：815 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.4.9 已发布**（2026-11-05）。`node --test` 全绿：859 个用例 / 16 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/Los_Angeles` 三时区）。
+
+## v0.4.9 变更摘要
+
+- **工具注册改为调用时判能力（V7-H1）**：`apply()` 不再按 `threadTools` 过滤，10 个工具一律注册；`thread_list` / `thread_run` / `task_run` 在注册的 `execute` 内实时读能力，宿主没有 `sessionController` 时返回 `{ ok: false, reason: 'capability_missing' }` 而不是不注册，能力晚挂载后无需重装插件即可用；`/状态` 与 `/线程` 同步改为运行时判断。
+- **压缩起点跳过系统节点（V7-M1）**：`planRegion` 与 `maybeCompact` 共用 `firstReplaceableIndex`，人格/平台系统段永远不会被压进摘要；区间全是系统节点时返回 `no-replaceable-range`，恢复的 pending 区间收紧后为空则直接丢弃。
+- **凭据类内容不落库（V7-M3）**：敏感判定扩到 password/验证码/CVV/私钥/卡号/api key/access token/`sk-` 等（`密码学` 等负向排除），巩固前过滤敏感事实与提醒（不写 facts/FTS/reminders），状态板逐行过滤并对历史行兜底；命中时每 turn 注入一次不含具体值的隐私提示并回 `CREDENTIAL_HINT`。
+- **发布门 round C 两轮（V7-L1）**：同一会话两轮续跑（`--patch` 在 `--json` 之前，第二轮 `--session-id`），`compactHardTokens` 降到 120；无凭据 → SKIP 且明确不算 PASS，有凭据但 tokenMeter 为零或无 consolidations 行 → fail。
+- **`duration_ms`（V7-L2）**：巩固事件与压缩事件都写入非负整数毫秒耗时（同秒内可区分），`eventDurationMs` 兼容旧行/坏 JSON。
+- **到期索引与口径统一（V8-L1/L2）**：`ix_rm_fire` 换成表达式索引 `ix_rm_due(status, max(...))`（旧库幂等补建、删除旧索引，`schema_version` 仍 12）；到期口径统一为 `max(next_fire_at, retry_at)`，`dueReminders` 与 `onAttempt` 同源；改期走 `rescheduleReminder` 并清空 `retry_at`/occurrence，裸 SQL 改期由触发器兜底。
+- **复审**：发布前独立复审链路 review-v14（needs_revision，唯一 M 为文档契约）→ 文档修复 `d14e2b2` → [review-v15](docs/review-v15.md)（pass，H=0 / M=0 / L=0）。发布门 round C 因本机无模型凭据为 **SKIP（未计 PASS）**，需在有凭据环境复跑 `node scripts/probe/run-headless.mjs --plugin` 确认 `verdict=pass`。完整条目见 [CHANGELOG](CHANGELOG.md)。
 
 ## v0.4.8 变更摘要
 

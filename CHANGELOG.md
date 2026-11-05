@@ -2,6 +2,32 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.9] - 2026-11-05
+
+按用户 v0.4.9 必修清单修复七项：V7-H1（工具注册改为调用时判能力）、V7-M1（压缩起点跳过系统节点）、V7-M3（凭据类内容不落库）、V7-L1（发布门 round C 两轮）、V7-L2（巩固/压缩 `duration_ms`）、V8-L1（到期表达式索引）、V8-L2（到期口径统一）。仍为零第三方运行时依赖；发布前独立复审链路为 review-v14（needs_revision，唯一 M 为文档契约）→ `d14e2b2` 文档修复 → [review-v15](docs/review-v15.md)（pass，H=0 / M=0 / L=0）。
+
+> **发布门说明**：本机没有模型凭据，round C 走 SKIP（**未计 PASS**，门不因 SKIP 判失败）；需在有凭据的环境复跑 `node scripts/probe/run-headless.mjs --plugin`，确认 round C 的 `verdict=pass`（第二轮真实写入 `consolidations` 且 tokenMeter 非零）。
+
+### Fixed
+
+- **V7-H1 线程/任务工具注册改为调用时判能力**：`apply()` 不再按 `platform.capabilities.threadTools` 过滤，10 个工具一律注册；`thread_list` / `thread_run` / `task_run` 在各自的注册 `execute` 里实时读取能力，宿主未提供 `sessionController` 时返回稳定的 `{ ok: false, reason: 'capability_missing', message: '宿主未提供 sessionController，线程工具暂不可用' }`，不抛异常、不要求重装插件，能力晚挂载后同一注册项立即可用。`/状态` 与 `/线程` 同样改为命令 handler 内实时读取，文案统一为「线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）」。apply 期仍需读取的能力（`sessionEvent` / `preStep` / `turnStopping` / 段与命令与工具注册 / 调度器）逐处补注释说明原因，`measureTokens` / `maybeCompact` / `llmCapability` / `freezeThreads` 本就在调用时读取。
+- **V7-M1 压缩区间起点跳过系统节点**：`src/session/surface.js` 新增导出 `firstReplaceableIndex(snapshot, from)`，`planRegion` 选定起点后立即推进到第一个可替换节点，区间内再遇系统节点则提前收尾；全部不可替换时返回 `{ region: null, reason: 'no-replaceable-range' }`。`maybeCompact` 在调用 `compactRegion` 前用同一 helper 收紧恢复的 pending 区间，收紧后为空则丢弃 pending 并计入 `compactionDrops`。系统节点（人格/平台段）从此不会被压进摘要；常规巩固、deep-sleep 与 pending 恢复三条 region 路径共用该 helper，S1 定向巩固本就不构造 region。
+- **V7-M3 凭据类内容不写入 facts 与状态板**：`isSensitiveText` 的敏感面从「身份证/银行卡/密码/住址」扩展到凭据类（`密码学` 用负向断言排除，覆盖 password/passwd、验证码、CVV/CVC、私钥/密钥、卡号、api key、access token/令牌、`sk-` 字面值），新增「字段名 + 是/为/:/= + 值」形态（弱字段要求值含数字或符号，`key is abcd` 不误报）。巩固落地前统一过滤敏感事实（statement/subject/object）与敏感提醒，不写 facts、不进 FTS、不写 reminders；状态板逐行过滤并对历史库残留行再兜底 scrub（episode 仍按原对话保留）。pre-step 对命中的用户消息每 turn 注入一次隐私提示（`source.kind='companion-privacy-hint'`，不含具体值，且被转录/巩固/主会话判定排除），巩固回执返回 `sensitive` 计数与 `CREDENTIAL_HINT`。
+
+### Changed
+
+- **V7-L1 发布门 round C 改为同一会话两轮**：第一轮 `--patch <overlay> --json <task1>` 从 NDJSON 取 `sessionId`，第二轮 `--session-id <id>` 续跑 task2（`--patch` 必须排在 `--json` 之前，否则 CLI 报 `unknown option '--patch'`）；overlay 的 `compactHardTokens` 降到 120，两轮输入才稳定越过巩固阈值。新增纯函数 `evaluateConsolidationRound`：崩溃/未激活/缺 scheduler started 标记 → fail；无凭据 → skip（不算 PASS）；有凭据但 tokenMeter 无非零 token 或无 `consolidations` 行 → fail。
+- **V7-L2 巩固/压缩 `duration_ms`**：`consolidate({ clock })` 注入毫秒时钟（生产传 `platform.now`），事务收尾把 `duration_ms = max(0, round(finish - start))` 写入 episodes 事件 `detail`（`kind: 'consolidation'`）并随返回值返回；`maybeCompact` 为压缩事件写 `memory_events`（`action='UPDATE'`、`table_name='compactions'`、`detail.kind='compaction'`、`start`/`end`/`watermark`/`duration_ms`），写事件失败只 warn。导出 `eventDurationMs(view)` 兼容 `detail_json` 字符串/对象、旧行无字段返回 `null`、负数返回 `null`、四舍五入为整数，同秒内的耗时可区分。
+- **V8-L1 到期索引改为表达式索引**：到期扫描按 `status` + `max(next_fire_at, retry_at)` 过滤/排序，索引必须是同一表达式才能命中；`reminders` 的 `ix_rm_fire(status, next_fire_at)` 换成 `ix_rm_due(status, max(COALESCE(next_fire_at,0), COALESCE(retry_at,0))) WHERE status IN ('pending','snoozed')`，查询与索引共用导出的 `REMINDER_DUE_AT_SQL`。旧索引删除（裸列索引永远服务不了 max 表达式，全仓无其它按 `(status, next_fire_at)` 过滤的查询，保留只增写入放大与 planner 噪声）。迁移由 `#ensureReminderDueIndex` 幂等完成（`DROP INDEX IF EXISTS` + `CREATE INDEX IF NOT EXISTS`），在补 `retry_at` 列之后执行，旧库打开即就地补建；索引不写进 `SCHEMA_SQL`，避免旧库在补列前报 `no such column`。`schema_version` 仍为 12。
+- **V8-L2 到期口径统一为 `max(next_fire_at, retry_at)`**：`dueReminders` / `buildDueRemindersQuery` 与 `index.js` 的 `onAttempt` 共用导出的 `reminderDueAt(row)`，不再各写一份 `COALESCE` 与 `Math.max`；两个时间都为 NULL 的行永不到期（另用 `next_fire_at IS NOT NULL OR retry_at IS NOT NULL` 过滤）。改期统一走新增的 `store.rescheduleReminder(id, { next_fire_at, ... })`：同一条 UPDATE 清空 `retry_at` / `occurrence_key` / `last_fire_key`、`delivery_attempts` 归零、`closed_at` 清空，只对 `pending` / `snoozed` 生效；绕过 store 的裸 SQL 改期由库级触发器 `trg_reminders_reschedule_clear_retry` 兜底（`next_fire_at` 变化且 `retry_at` 非空时清空，内层 UPDATE 不改 `next_fire_at` 故不递归）。失败退避仍只写 `retry_at`，退避未到不投递。
+
+### Verified
+
+- 三时区 `node --test`（`TZ=UTC` / `TZ=Asia/Shanghai` / `TZ=America/Los_Angeles`）859/859 pass、0 fail、16 个套件；`test/e2e/plugin-smoke.test.js` 4/4。
+- 新增 `test/v049-v7h1.test.js`（4 例）、`test/v049-v7m1.test.js`（7 例）、`test/v049-v7m3.test.js`（6 例）、`test/v049-v7l1-l2.test.js`（11 例）、`test/v049-v8l1-l2.test.js`（10 例）与跨项集成回归 `test/v049-regression.test.js`（6 例，经真实 `apply()` 覆盖线程晚挂载、压缩起点、凭据过滤、`duration_ms`、到期口径）；同步更新 v044/v046/c5 旧断言与 e2e 提醒投递的索引断言。用例总数 815 → 859 / 16 个套件。
+- 发布门 `node scripts/probe/run-headless.mjs --plugin`：round A/B PASS；round C `schedulerStarted=true`、`tokenEvents=1`、`maxTokensIn=0`、`credentials=missing` → `verdict=skip`（无模型凭据，按契约 SKIP 不计 PASS），门 exit 0。
+- 工作树干净，`git tag -a v0.4.9` 后推送远端。
+
 ## [0.4.8] - 2026-11-05
 
 V5-L2 真机观察到的提醒退避口径修复：失败退避不再改写原定到点时间，新增 `retry_at` 独立记录重试时刻（schema v12，旧库自动升级）；调度按 `COALESCE(retry_at, next_fire_at)` 判到期；提醒展示与 `/状态` 始终用原定时间，重试期间附「重试中，下次 HH:MM」。仍为零第三方运行时依赖；发布前独立复审 pass（H=0 / M=0 / L=2），见 [docs/review-v13.md](docs/review-v13.md)。
