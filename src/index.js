@@ -97,6 +97,7 @@ import {
 } from './state/pending-compact.js';
 import {
   createSurfaceIndex,
+  firstReplaceableIndex,
   planRegion,
   surfaceSeqs,
   watermarkAfterCompact,
@@ -2288,7 +2289,7 @@ async function maybeCompact(state, payload, scope = SCOPE) {
   const snapshot = await refreshSurface(state, payload);
   if (snapshot === null) return;
   const seqs = snapshot.seqs;
-  const startIdx = seqs.indexOf(pending.startSeq);
+  let startIdx = seqs.indexOf(pending.startSeq);
   const endIdx = seqs.indexOf(pending.endSeq);
   if (startIdx < 0 || endIdx < 0 || endIdx < startIdx) {
     // 区间已不在当前 surface（被别的压缩替换 / 会话切换）：丢弃，不重试旧 seq。
@@ -2301,6 +2302,21 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     state.metrics.inc('compactionDrops');
     return;
   }
+
+  // V7-M1：旧 pending 可能把起点记在 surface 节点 0（系统提示词）上，宿主会拒绝
+  // 替换。所有 compactRegion 调用点都先做同一道收紧：跳过系统节点，区间为空就丢弃。
+  const fencedIdx = firstReplaceableIndex(snapshot, startIdx);
+  if (fencedIdx > endIdx) {
+    platform.log('warn', '[dsh-companion] pending compaction region has no replaceable node; dropping', {
+      startSeq: pending.startSeq,
+      endSeq: pending.endSeq,
+      nodes: seqs.length,
+    });
+    takePendingCompact(state.pendingCompact, scope);
+    state.metrics.inc('compactionDrops');
+    return;
+  }
+  startIdx = fencedIdx;
 
   const start = seqs[startIdx];
   const end = seqs[endIdx];

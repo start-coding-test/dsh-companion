@@ -113,6 +113,9 @@ export function watermarkAfterCompact({ newSeqs = [], oldSeqs = [], startIdx = 0
  *   调用方应跳过本轮而不是从位置 0 重来（否则会重复巩固）。
  * - 尾部从后往前累加 token，把最后 ≤6,144 tokens 留给模型；跨过预算的那个节点
  *   留在尾部里，所以窗口可能在预算内提前结束。
+ * - V7-M1：surface 的前导系统节点（role=system，宿主 node 0 的系统提示词）不可被
+ *   压缩替换。起点落在系统节点上时用 `firstReplaceableIndex` 推进到其后第一个
+ *   非系统节点；推进后没有可替换节点则返回 `reason: 'no-replaceable-range'`。
  *
  * @param {{seqs: number[], nodes: object[], records: object[]}} snapshot
  * @param {{afterSeq?: number, budgetTokens?: number}} [options]
@@ -140,6 +143,10 @@ export function planRegion(snapshot, options = {}) {
     startIdx = at + 1;
   }
 
+  // V7-M1：系统提示词所在的节点不可替换，起点必须落在它之后。
+  startIdx = firstReplaceableIndex(snapshot, startIdx);
+  if (startIdx >= seqs.length) return { region: null, reason: 'no-replaceable-range' };
+
   let tailTokens = 0;
   let tailStartIdx = seqs.length;
   for (let index = seqs.length - 1; index >= 0; index -= 1) {
@@ -156,10 +163,23 @@ export function planRegion(snapshot, options = {}) {
     return { region: null, reason: 'inside-tail', tailStartIdx };
   }
 
+  // 区间内也不包系统节点：遇到系统节点就提前收尾，它后面的内容留到下一轮
+  // （下一轮 afterSeq 会落在它之前，再由 firstReplaceableIndex 跳过）。
+  let stopIdx = endIdx;
+  for (let index = startIdx; index <= endIdx; index += 1) {
+    if (normalizeRole(records[index]?.role) === 'system') {
+      stopIdx = index - 1;
+      break;
+    }
+  }
+  if (stopIdx < startIdx) {
+    return { region: null, reason: 'no-replaceable-range', tailStartIdx };
+  }
+
   const lines = [];
   let tokens = 0;
   let missing = 0;
-  for (let index = startIdx; index <= endIdx; index += 1) {
+  for (let index = startIdx; index <= stopIdx; index += 1) {
     const record = records[index] ?? null;
     const text = typeof record?.text === 'string' ? record.text : '';
     if (record === null || record?.missing === true) missing += 1;
@@ -170,17 +190,45 @@ export function planRegion(snapshot, options = {}) {
   return {
     region: {
       startIdx,
-      endIdx,
+      endIdx: stopIdx,
       startSeq: seqs[startIdx],
-      endSeq: seqs[endIdx],
+      endSeq: seqs[stopIdx],
       tokens,
-      count: endIdx - startIdx + 1,
+      count: stopIdx - startIdx + 1,
       text: lines.join('\n'),
       missing,
     },
     reason: 'ok',
     tailStartIdx,
   };
+}
+
+/**
+ * V7-M1：从 `from` 起找到第一个可被压缩替换的节点下标。
+ *
+ * 宿主把 surface 节点 0 的系统提示词视为不可替换（`surface replace: node 0 holds
+ * the system prompt ...`）。这里跳过 role=system 的前导节点，返回其后的第一个
+ * 非系统节点；全部都是系统节点时返回 `seqs.length`。所有压缩调用点（常规巩固、
+ * deep-sleep 与 pending 恢复后的 compactRegion）都必须先用它收紧起点。
+ *
+ * @param {{seqs: number[], records: object[]}} snapshot
+ * @param {number} [from] 起始下标（含）；负数或非整数按 0 处理
+ * @returns {number} 可替换节点下标，或 seqs.length 表示没有
+ */
+export function firstReplaceableIndex(snapshot, from = 0) {
+  const seqs = Array.isArray(snapshot?.seqs) ? snapshot.seqs : [];
+  const records = Array.isArray(snapshot?.records) ? snapshot.records : [];
+  const raw = Number(from);
+  let index = Number.isInteger(raw) && raw > 0 ? raw : 0;
+  for (; index < seqs.length; index += 1) {
+    const role = normalizeRole(records[index]?.role);
+    if (role === 'system') continue;
+    // 节点 0 的位置本身受宿主保护；正文缺失（role 未知）时无法证明它不是系统
+    // 提示词，保守跳过，宁可本轮不压缩也不触发 surface replace 报错。
+    if (index === 0 && role === 'unknown') continue;
+    return index;
+  }
+  return seqs.length;
 }
 
 /**
