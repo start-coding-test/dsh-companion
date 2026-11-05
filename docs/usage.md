@@ -427,14 +427,16 @@ node scripts/decrypt-encrypted.mjs secret.enc --out fact.json
 - 解密先校验再写文件，错误口令、损坏文件或认证失败不会留下明文半文件；错误统一为「解密失败（口令错误、文件损坏或认证失败）」。
 - 格式：AES-256-GCM + scrypt（N=2^14、r=8、p=1），随机 salt(16B) / iv(12B)，magic `DSH-COMPANION-EXPORT-1` + JSON header 保存 KDF 参数与 tag。`header.format = "v2"` 起 header 与 magic 行一起作为 AAD 认证，篡改 header / 密文 / tag 都会失败；`v1` 旧文件仍可解，新导出建议用 v2。
 
-### 隐私与凭据（V7-M3，v0.4.9）
+### 隐私与凭据（V7-M3，v0.4.9；V9-M1/L1/L2，v0.4.10）
 
 凭据类内容不进长期记忆。巩固落地前会逐条识别并跳过：
 
-- 密码 / password / passwd（明确是密码语义时）、验证码 / verification code、CVV/CVC、私钥 / 密钥、卡号 / card number、API key / apikey、access token / 令牌，以及 `sk-` 开头的字面值；
+- 密码 / password / passwd（明确是密码语义时）、口令、验证码 / verification code、CVV/CVC、私钥 / 密钥、API key / apikey、access token / 令牌，以及 `sk-` 开头的字面值；
+- 银行卡只拦卡号形态：12 位以上数字（允许 4 位分组的空格或连字符）；`卡号` / `card number` 字段名要求后跟数字，纯提及不拦；
+- 设备 / 网络值：WiFi / 路由器 / 门禁 / 门锁 / 热点 + 是/为/`:`/`=` + 值（值须含数字或符号，`WiFi 是 公司网络` 不拦）；
 - 「字段名 + 是/为/`:`/`=` + 值」形式（如 `api key = …`、`token: …`）；弱字段名要求值里含数字或符号，避免把普通技术讨论误判成凭据。
 
-被跳过的内容不写 `facts`（也不进 facts 的 FTS 索引）、不写 `reminders`，状态板渲染前还会逐行过滤，历史库里已有的敏感行同样不会显示；对话原文仍按原样保留为 episode（会话记录，不是事实库）。命中时巩固结果带 `sensitive` 计数与提示，日志记 `credential content skipped`。
+被跳过的内容不写 `facts`（也不进 facts 的 FTS 索引）、不写 `reminders`，状态板渲染前还会逐行过滤，历史库里已有的敏感行同样不会显示。episode 在落库前会对凭据值逐字段脱敏：只把值替换成 `[凭据已省略]`、保留上下文（例如「路由器密码 [凭据已省略]」），不是整段丢弃；脱敏后仍残留可识别凭据值时才整段替换。原文仅存于会话，跨会话召回、注入、状态板与导出都不会出现明文。命中时巩固结果带 `sensitive` 计数与提示，日志记 `credential content skipped`。
 
 此外，每轮用户消息命中凭据时，插件会给模型一次固定提示（同一轮只注入一次，不转录、不参与巩固）：不复述具体值、不调用记忆工具，并回复「这类信息建议放环境变量或文件里，我不代为保存。」
 
