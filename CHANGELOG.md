@@ -2,6 +2,27 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.10] - 2026-11-05
+
+按用户 v0.4.10 清单修复三项：V9-L1（token / 银行卡误报收窄）、V9-M1 / V9-M1b（episode 落库前凭据值脱敏，字段兜底只对残留值）、V9-L2（「口令」与设备 / 网络值漏报）。仍为零第三方运行时依赖；本次无 schema 变更（`schema_version` 仍为 12）；发布前独立复审链路为 [review-v16](docs/review-v16.md)（pass，H=0 / M=0 / L=0）。
+
+### Fixed
+
+- **V9-L1 token / 银行卡误报收窄**（`a6de86d`）：`SENSITIVE_PATTERN` 移除裸 `token` 与裸「银行卡 / 信用卡」，「用户这个月 token 额度约 10B」「用户的银行卡在招行」不再判敏感；token 仍由「字段名 + 是/为/:/：/= + 含数字或符号的值」兜底（`token 是 abc123`、`API token：sk-…` 仍命中），银行卡收窄为卡号形态（`CARD_NUMBER_PATTERN`：12 位以上数字，允许 4 位分组的空格或连字符），`卡号` / `card number` 字段名要求后跟数字（旧用例「银行卡号 + 卡号数字」仍命中）；强模式同时补「口令」（「密码学」负向断言保留），并新增 `DEVICE_VALUE_PATTERN`（WiFi / wi-fi / 路由器 / 路由 / 门禁 / 门锁 / 热点 + 是/为/`:`/`：`/`=` + 值，值须含数字或符号），「路由器口令是 …」「WiFi 是 …」这类表述不再漏报。
+- **V9-M1 episode 落库前凭据值脱敏 + 巩固 prompt 约束**（`a4fe4e0`）：`consolidate` 写 episode 前对 `title` / `summary` / `evidence` / `mood_evidence` 与 `topics` / `entities` 逐字段调用 `redactSensitiveValues`，只把凭据值换成 `[凭据已省略]`、保留「路由器密码 …」这类上下文（不是整段丢弃）；`store.insertEpisode` 再做一次防御性值级脱敏（含 `topics_json` 字符串形态，先解析再逐项脱敏），`fts_episodes` 由主表投影故自动无明文。巩固提示词新增「不得复述密码、口令、token、卡号等凭据值；必须提及时写成「用户提到一个密码」这类描述」；`CHANGELOG` 中「episode 仍按原对话保留」的旧说明同步更正。
+- **V9-M1b 字段兜底只对残留值，叙事不再被整段抹掉**（`6e1ade8`）：兜底判定由 `isSensitiveText` 改为 `hasUnredactedCredentialValue`（先剔除占位符，只认残留的卡号 / `sk-` 字面值 / 弱字段值 / 设备值），「用户提到一个密码」「我昨天忘了密码」「密码学」这类叙事保留原文；「密码 是 X - 7788」拼接形态由值尾段模式完整抹除，不残留尾号；store 侧按同一口径做值级脱敏。
+
+### Changed
+
+- **测试**：新增 `test/sensitive-v0910.test.js`（11 例，逐条覆盖 v0.4.10 验收正反例 + V7-M3 旧敏感面回归 + `scan` / `apply` 集成）、`test/episode-redaction.test.js`（10 例，脱敏正例 14 组、`hasUnredactedCredentialValue` 正反例 18 组、字段级兜底、store 直写防御、consolidate / `fts_episodes` 无明文）与 `test/e2e/v0910-privacy.test.js`（1 例，真实链路跨会话问「路由器密码」不召回明文、普通事实仍可召回）。用例总数 859 → 881 / 16 个套件。
+- **文档**：`docs/usage.md` 的「隐私与凭据」一节补 episode 脱敏与 V9-M1/L1/L2 口径；`docs/known-debt.md` 关闭 V9-M1 / V9-L1 / V9-L2；`src/memory/govern.js` 注释中的测试凭据字面值改为占位（行为不变）。
+
+### Verified
+
+- 三时区 `node --test`（默认 / `TZ=UTC` / `TZ=America/New_York`）881/881 pass、0 fail、16 个套件；v0.4.10 三个测试文件单跑 22/22。
+- 跨会话隐私 e2e 走真实 `apply()` + 后台 hard 巩固 + `retrieve`：episodes 列 / 整行 JSON、`fts_episodes`、staged+published 状态板、JSON 导出、召回 items/injected 与新会话 `decision` 均无明文，「路由器密码 [凭据已省略]」上下文与普通事实「极光展」仍在。
+- 工作树干净；发布提交打 annotated tag `v0.4.10` 并推送远端。
+
 ## [0.4.9] - 2026-11-05
 
 按用户 v0.4.9 必修清单修复七项：V7-H1（工具注册改为调用时判能力）、V7-M1（压缩起点跳过系统节点）、V7-M3（凭据类内容不落库）、V7-L1（发布门 round C 两轮）、V7-L2（巩固/压缩 `duration_ms`）、V8-L1（到期表达式索引）、V8-L2（到期口径统一）。仍为零第三方运行时依赖；发布前独立复审链路为 review-v14（needs_revision，唯一 M 为文档契约）→ `d14e2b2` 文档修复 → [review-v15](docs/review-v15.md)（pass，H=0 / M=0 / L=0）。

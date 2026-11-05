@@ -4,7 +4,14 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.9 已发布**（2026-11-05）。`node --test` 全绿：859 个用例 / 16 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/Los_Angeles` 三时区）。
+当前状态：**v0.4.10 已发布**（2026-11-05）。`node --test` 全绿：881 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+
+## v0.4.10 变更摘要
+
+- **episode 落库前凭据值脱敏（V9-M1）**：`consolidate` 对 `title` / `summary` / `evidence` / `mood_evidence` 与 `topics` / `entities` 逐字段脱敏，只把凭据值换成 `[凭据已省略]`、保留「路由器密码 …」这类上下文；`store.insertEpisode` 再做一次防御性值级脱敏（含 `topics_json` 字符串形态），`fts_episodes` 由主表投影故自动无明文。兜底判定改用 `hasUnredactedCredentialValue`，只对残留值整段替换，「用户提到一个密码」这类叙事不再被误抹；巩固提示词要求不得复述密码、口令、token、卡号等凭据值。
+- **token / 银行卡误报收窄（V9-L1）**：`SENSITIVE_PATTERN` 去掉裸 `token` 与裸「银行卡 / 信用卡」，「token 额度 10B」「银行卡在招行」不再误报；token 仍由「字段名 + 连接词 + 含数字或符号的值」命中（`token 是 abc123`、`API token：sk-…`），银行卡只拦卡号形态（12 位以上数字，允许 4 位分组的空格或连字符）。
+- **「口令」与设备值补漏（V9-L2）**：强模式补「口令」，新增设备值模式（WiFi / wi-fi / 路由器 / 路由 / 门禁 / 门锁 / 热点 + 是/为/`:`/`=` + 含数字或符号的值），「路由器口令是 …」「WiFi 是 …」不再漏报，并在 episode 落库前脱敏。
+- **复审**：发布前独立复审 [review-v16](docs/review-v16.md)（pass，H=0 / M=0 / L=0）。完整条目见 [CHANGELOG](CHANGELOG.md)。
 
 ## v0.4.9 变更摘要
 
