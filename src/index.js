@@ -358,7 +358,7 @@ function createSeats(ctx, hooks) {
  * 插件入口。
  * @param {object} ctx 平台上下文
  * @param {Record<string, unknown>} [rawConfig] 用户原始配置
- * @param {Record<string, unknown>} [hooks] 显式注入的测试席位（now/cwd/rssReader/companion）
+ * @param {Record<string, unknown>} [hooks] 显式注入的测试席位（now/cwd/rssReader/companion/personaDeps）
  * @returns {{dispose: () => void}|undefined}
  */
 export function apply(ctx, rawConfig, hooks = {}) {
@@ -387,7 +387,7 @@ export function apply(ctx, rawConfig, hooks = {}) {
   const metrics = createMetrics({ clock: platform.now });
   const state = createWiringState({ platform, store, config, metrics, embedder, seats });
   // v0.4.12：人格卡只在 apply 时加载一次（不做热加载）；失败回落内置卡并 warn。
-  applyPersonaCard(state);
+  applyPersonaCard(state, hooks);
   // V3-H2：先把上次进程崩溃时残留的 delivering 提醒收回 pending，避免永久卡住。
   recoverReminderDeliveries(state);
   if (embedder !== null && embedder.kind === 'remote') {
@@ -655,10 +655,12 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
  * 不含卡正文）；/状态 会显示「加载失败，已用内置：<原因>」。改卡需重启。
  *
  * @param {object} state
+ * @param {Record<string, unknown>} [hooks] 测试席位；`hooks.personaDeps` 可注入
+ *   loadPersonaCard 的 env/homedir（生产不传时读 process.env 与 os.homedir()）
  */
-function applyPersonaCard(state) {
+function applyPersonaCard(state, hooks = {}) {
   const { platform, config } = state;
-  const loaded = loadPersonaCard(config.persona?.cardPath ?? null);
+  const loaded = loadPersonaCard(config.persona?.cardPath ?? null, hooks.personaDeps ?? {});
   state.card = loaded.card;
   state.cardSource = loaded;
 

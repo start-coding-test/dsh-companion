@@ -58,6 +58,30 @@ const FILE_CARD = Object.freeze({
 /** 五句话的闲聊文案；「收到啦」是文件卡的禁用话术、内置卡不屏蔽（对照组）。 */
 const CHAT_WITH_BANNED = '收到啦。今天天气不错。中午吃了面。下午把桌子收拾了。晚上准备早点休息。';
 
+/**
+ * M-2 回归：五种现实坏 JSON 形状（每种埋一个哨兵串，断言 warn / /状态 / reason 都不含它）。
+ * 这些形状的共同点是 V8 的 SyntaxError message 会回显源文件开头字符。
+ */
+const BAD_JSON_SHAPES = Object.freeze([
+  { name: '裸 token 起始', content: 'SECRET_BODY_SENTINEL_INITIAL', sentinel: 'SECRET_BODY_SENTINEL_INITIAL' },
+  {
+    name: 'BOM 前缀',
+    content: `\uFEFF${JSON.stringify({ name: 'BOM_SENTINEL_NAME', address: '你' })}`,
+    sentinel: 'BOM_SENTINEL_NAME',
+  },
+  { name: '纯文本占位符', content: 'TODO_put_me_SENTINEL_PLACEHOLDER', sentinel: 'TODO_put_me_SENTINEL_PLACEHOLDER' },
+  {
+    name: '误写成 YAML',
+    content: 'name: 隐私姓名YAML_SENTINEL\naddress: 你\ntone:\n  style: 简洁\n',
+    sentinel: '隐私姓名YAML_SENTINEL',
+  },
+  {
+    name: '单引号 JSON',
+    content: "{'name': 'QUOTE_SENTINEL_NAME', 'address': '你'}",
+    sentinel: 'QUOTE_SENTINEL_NAME',
+  },
+]);
+
 const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
 /**
@@ -220,25 +244,48 @@ test('resolveCardPath：null/空白 → null；绝对路径原样；相对路径
   });
 });
 
-test('resolveDshHome：DSH_HOME 优先；未设置或空白时回退注入的 ~/.dsh（不读真实用户目录）', () => {
+test('resolveDshHome：DSH_HOME 优先；未设置或空白时回退 <homedir>/.dsh（不读真实用户目录）', () => {
   const dshHome = join(tmpdir(), 'dsh-home-env');
   const home = join(tmpdir(), 'home-of-tester');
+  const expectedHome = join(home, '.dsh');
 
   assert.equal(resolveDshHome({ env: { DSH_HOME: ` ${dshHome} ` } }), dshHome);
-  assert.equal(resolveDshHome({ env: { DSH_HOME: '' }, homedir: home }), home);
-  assert.equal(resolveDshHome({ env: {}, homedir: () => home }), home);
-  assert.equal(resolveDshHome({ env: { DSH_HOME: '   ' }, homedir: () => ` ${home} ` }), home);
+  // M-1：未设置 DSH_HOME 时回退的是 <用户主目录>/.dsh，注入的 homedir 与 os.homedir() 一视同仁。
+  assert.equal(resolveDshHome({ env: { DSH_HOME: '' }, homedir: home }), expectedHome);
+  assert.equal(resolveDshHome({ env: {}, homedir: () => home }), expectedHome);
+  assert.equal(resolveDshHome({ env: { DSH_HOME: '   ' }, homedir: () => ` ${home} ` }), expectedHome);
 
-  // 相对 cardPath 跟着 home 走；注入 homedir 覆盖真实 ~。
-  assert.equal(resolveCardPath('persona.json', { env: {}, homedir: home }), resolve(home, 'persona.json'));
+  // 相对 cardPath 跟着 <home>/.dsh 走；注入 homedir 覆盖真实 ~。
+  assert.equal(resolveCardPath('persona.json', { env: {}, homedir: home }), join(expectedHome, 'persona.json'));
   assert.equal(
     resolveCardPath('persona.json', { env: {}, homedir: () => home }),
-    resolve(home, 'persona.json'),
+    join(expectedHome, 'persona.json'),
   );
 
-  // 未注入任何 deps 时回退 os.homedir()（只拼路径，不读目录内容）。
-  assert.equal(resolveDshHome({ env: {} }), osHomedir());
-  assert.equal(resolveCardPath('persona.json', { env: {} }), resolve(osHomedir(), 'persona.json'));
+  // 未注入任何 deps 时回退 os.homedir()/.dsh（只拼路径，不读目录内容）。
+  assert.equal(resolveDshHome({ env: {} }), join(osHomedir(), '.dsh'));
+  assert.equal(resolveCardPath('persona.json', { env: {} }), join(osHomedir(), '.dsh', 'persona.json'));
+});
+
+test('loadPersonaCard：DSH_HOME 未设置时相对路径读 <注入 home>/.dsh/persona.json；旧位置 <home>/persona.json 回落', (t) => {
+  const home = tempCardDir(t);
+  mkdirSync(join(home, '.dsh'), { recursive: true });
+  const expectedPath = join(home, '.dsh', 'persona.json');
+  writeFileSync(expectedPath, JSON.stringify(FILE_CARD), 'utf8');
+
+  const loaded = loadPersonaCard('persona.json', { env: {}, homedir: home });
+  assert.equal(loaded.status, CARD_STATUS.FILE, '必须读到 ~/.dsh 下的卡，而不是 ~/persona.json');
+  assert.equal(loaded.path, expectedPath);
+  assert.equal(loaded.card.name, '阿岩');
+
+  // 卡放在旧错误位置 <home>/persona.json：现在应 ENOENT 兜底，且 reason 指向 .dsh 下的路径。
+  const wrongHome = tempCardDir(t);
+  writeFileSync(join(wrongHome, 'persona.json'), JSON.stringify(FILE_CARD), 'utf8');
+  const missing = loadPersonaCard('persona.json', { env: {}, homedir: wrongHome });
+  assert.equal(missing.status, CARD_STATUS.FALLBACK);
+  assert.match(missing.reason, /^文件不存在（ENOENT）：/u);
+  assert.equal(missing.path, join(wrongHome, '.dsh', 'persona.json'), '解析后路径必须是 <.dsh> 下的位置');
+  assert.ok(missing.reason.includes(join(wrongHome, '.dsh', 'persona.json')));
 });
 
 // ---------------------------------------------------------------------------
@@ -305,17 +352,21 @@ test('loadPersonaCard：文件不存在 → fallback + 内置卡 + 原因含 ENO
   assert.ok(loaded.reason.includes(path));
 });
 
-test('loadPersonaCard：JSON 非法 → fallback + 原因含 invalid JSON 与路径、不含文件正文', (t) => {
+test('loadPersonaCard：坏 JSON 五种现实形状 → 全部 fallback，reason 不含卡正文且单行（M-2）', (t) => {
   const dir = tempCardDir(t);
-  const path = join(dir, 'broken.json');
-  writeFileSync(path, '{"name":"秘卡正文勿外泄","address":"你",', 'utf8');
+  BAD_JSON_SHAPES.forEach((shape, index) => {
+    const path = join(dir, `bad-shape-${index}.json`);
+    writeFileSync(path, shape.content, 'utf8');
 
-  const loaded = loadPersonaCard(path);
-  assert.equal(loaded.status, CARD_STATUS.FALLBACK);
-  assert.deepEqual(loaded.card, DEFAULT_CARD);
-  assert.match(loaded.reason, /invalid JSON/u);
-  assert.ok(loaded.reason.includes(path));
-  assert.doesNotMatch(loaded.reason, /秘卡正文勿外泄/u, '原因里不能带卡正文');
+    const loaded = loadPersonaCard(path);
+    assert.equal(loaded.status, CARD_STATUS.FALLBACK, `${shape.name}: 必须兜底`);
+    assert.deepEqual(loaded.card, DEFAULT_CARD, `${shape.name}: 兜底用内置卡`);
+    assert.match(loaded.reason, /invalid JSON/u, `${shape.name}: 固定文案`);
+    assert.ok(loaded.reason.includes(path), `${shape.name}: reason 含解析后路径`);
+    assert.equal(loaded.reason.includes(shape.sentinel), false, `${shape.name}: reason 不能回显卡正文`);
+    assert.doesNotMatch(loaded.reason, /[\r\n\t\u0000-\u001f\u007f]/u, `${shape.name}: reason 必须单行`);
+    assert.ok(loaded.reason.length <= 160, `${shape.name}: reason 超长`);
+  });
 });
 
 test('loadPersonaCard：必填字段缺失（name 空白 / 缺 tone）→ fallback + 原因指出字段名', (t) => {
@@ -564,6 +615,64 @@ test('生产接线：DSH_HOME 指向临时目录 + 相对 cardPath="persona.json
 });
 
 // ---------------------------------------------------------------------------
+// 生产接线（M-1）：DSH_HOME 未设置 → 回退 <home>/.dsh
+// ---------------------------------------------------------------------------
+
+test('生产接线（M-1）：DSH_HOME 未设置 + 注入 home → 读 <home>/.dsh/persona.json，人格段与 /状态 生效', (t) => {
+  const temp = makeTempStore();
+  const home = tempCardDir(t);
+  mkdirSync(join(home, '.dsh'), { recursive: true });
+  const cardPath = join(home, '.dsh', 'persona.json');
+  writeFileSync(cardPath, JSON.stringify(FILE_CARD), 'utf8');
+
+  const ctx = makePluginCtx();
+  let handle;
+  try {
+    handle = apply(
+      ctx,
+      { dbPath: temp.dbPath, persona: { cardPath: 'persona.json' } },
+      { personaDeps: { env: {}, homedir: home } },
+    );
+    assert.ok(handle);
+    assert.equal(loadFailureWarns(ctx).length, 0, '相对路径必须回退到 <home>/.dsh 并读到卡');
+    assert.ok(coreTextOf(ctx).includes('你是阿岩，用户的私人管家。'));
+    assert.ok(coreTextOf(ctx).includes('称呼用户为“老板”。'));
+    assert.equal(personaLineOf(ctx), `人格卡：阿岩 v2（${cardPath}）`);
+  } finally {
+    handle?.dispose();
+    temp.cleanup();
+  }
+});
+
+test('生产接线（M-1）：卡在旧错误位置 <home>/persona.json → ENOENT 兜底，reason 指向 <home>/.dsh/persona.json', (t) => {
+  const temp = makeTempStore();
+  const home = tempCardDir(t);
+  writeFileSync(join(home, 'persona.json'), JSON.stringify(FILE_CARD), 'utf8');
+  const expectedPath = join(home, '.dsh', 'persona.json');
+
+  const ctx = makePluginCtx();
+  let handle;
+  try {
+    handle = apply(
+      ctx,
+      { dbPath: temp.dbPath, persona: { cardPath: 'persona.json' } },
+      { personaDeps: { env: {}, homedir: home } },
+    );
+    assert.ok(handle, 'apply 不能因卡路径不匹配而失败');
+    const warns = loadFailureWarns(ctx);
+    assert.equal(warns.length, 1);
+    assert.equal(warns[0].meta.path, expectedPath);
+    assert.match(warns[0].meta.reason, /^文件不存在（ENOENT）：/u);
+    assert.ok(warns[0].meta.reason.includes(expectedPath));
+    assert.ok(coreTextOf(ctx).includes('你是珞然，用户的私人管家。'));
+    assert.match(personaLineOf(ctx), /^人格卡：珞然 v1（加载失败，已用内置：/u);
+  } finally {
+    handle?.dispose();
+    temp.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
 // 生产接线：加载失败兜底（apply 不抛、一条 warn、不含卡正文）
 // ---------------------------------------------------------------------------
 
@@ -616,6 +725,38 @@ test('生产接线（失败）：JSON 非法 → 一条 warn 不含卡正文，�
     handle?.dispose();
     temp.cleanup();
   }
+});
+
+test('生产接线（M-2）：五种坏 JSON 形状 → warn 与 /状态 都不泄漏卡正文，且单行', (t) => {
+  BAD_JSON_SHAPES.forEach((shape, index) => {
+    const temp = makeTempStore();
+    const dir = tempCardDir(t);
+    const cardPath = join(dir, `bad-${index}.json`);
+    writeFileSync(cardPath, shape.content, 'utf8');
+    const ctx = makePluginCtx();
+    let handle;
+    try {
+      handle = apply(ctx, { dbPath: temp.dbPath, persona: { cardPath } });
+      assert.ok(handle, `${shape.name}: apply 不能因坏 JSON 而抛`);
+
+      const warns = loadFailureWarns(ctx);
+      assert.equal(warns.length, 1, `${shape.name}: 加载失败只 warn 一次`);
+      assert.equal(
+        JSON.stringify(warns).includes(shape.sentinel),
+        false,
+        `${shape.name}: warn 所有字段都不能带卡正文`,
+      );
+
+      const line = personaLineOf(ctx);
+      assert.ok(line, `${shape.name}: /状态 必须有 人格卡 行`);
+      assert.equal(line.includes(shape.sentinel), false, `${shape.name}: /状态 不能带卡正文`);
+      assert.doesNotMatch(line, /[\u0000-\u001f\u007f]/u, `${shape.name}: /状态 行必须单行`);
+      assert.ok(line.includes(warns[0].meta.reason), `${shape.name}: /状态 复用同一条安全原因`);
+    } finally {
+      handle?.dispose();
+      temp.cleanup();
+    }
+  });
 });
 
 test('生产接线（失败）：必填字段缺失 → 一条 warn 指出字段，回落内置卡', (t) => {

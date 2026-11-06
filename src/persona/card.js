@@ -10,7 +10,7 @@
 
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { isAbsolute, resolve as resolvePath } from 'node:path';
+import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 
 /** 敏感对象键，深合并时直接忽略，避免原型污染。 */
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -63,6 +63,9 @@ export const DEFAULT_CARD = deepFreeze({
  *
  * @param {string} [path] 人格卡 JSON 路径
  * @returns {Readonly<object>} 深度冻结的人格卡
+ * @deprecated v0.4.12 起生产接线改用 loadPersonaCard()：本函数对不存在的文件
+ *   **静默**返回内置卡，无法写「加载失败」warn，调用方也分不清「没配卡」与
+ *   「配了但文件丢了」。配置了 persona.cardPath 时不要用 loadCard()。
  */
 export function loadCard(path) {
   if (path === undefined || path === null || path === '') {
@@ -95,7 +98,12 @@ function parseCardSource(source, path = '') {
   try {
     parsed = JSON.parse(source);
   } catch (err) {
-    throw new TypeError(`loadCard(${path}): invalid JSON: ${err.message}`, { cause: err });
+    // M-2（v0.4.12）：不把 JSON.parse 的原始 message 拼进来——V8 会回显源文件
+    // 开头若干字符（姓名、占位符、真实换行），导致 warn / /状态 泄漏卡正文。
+    throw new TypeError(
+      `loadCard(${path}): invalid JSON（${describeJsonSyntaxError(err, source)}）`,
+      { cause: err },
+    );
   }
   if (!isPlainObject(parsed)) {
     throw new TypeError(`loadCard(${path}): card must be a JSON object`);
@@ -114,8 +122,11 @@ function parseCardSource(source, path = '') {
 }
 
 /**
- * 解析 DSH 主目录：`DSH_HOME`（trim 后非空）优先，否则 `~/.dsh`。
+ * 解析 DSH 主目录：`DSH_HOME`（trim 后非空）优先，否则 `<用户主目录>/.dsh`。
  * deps 可注入 env/homedir，便于测试；生产路径不读全局单例。
+ *
+ * `deps.homedir`（字符串或函数）与 `os.homedir()` 语义相同——都是「用户主目录」，
+ * 不是 DSH 主目录本身，因此未设置 `DSH_HOME` 时同样要拼 `.dsh`（M-1，v0.4.12）。
  *
  * @param {{env?: Record<string, string|undefined>, homedir?: string|(() => string)}} [deps]
  * @returns {string}
@@ -127,8 +138,8 @@ export function resolveDshHome(deps = {}) {
 
   const injected = deps.homedir;
   const home = typeof injected === 'function' ? injected() : injected;
-  if (typeof home === 'string' && home.trim() !== '') return home.trim();
-  return homedir();
+  const base = typeof home === 'string' && home.trim() !== '' ? home.trim() : homedir();
+  return join(base, '.dsh');
 }
 
 /**
@@ -249,15 +260,90 @@ function describeReadError(err, resolved) {
 }
 
 /**
- * 解析/校验失败的展示原因：错误消息已含路径时不再重复，超长截断。
+ * 把 JSON.parse 的 SyntaxError 压成**不含源文本**的诊断（M-2，v0.4.12）：
+ * 位置 + 固定类别。V8 的原始 message 会回显源文件开头字符（`"SECRET_BOD"...`），
+ * 这里只用它提取位置数字与语法类别，绝不把 message 本身拼进对外 reason。
+ *
+ * @param {any} err
+ * @param {string} source
+ * @returns {string} 如 `位置 1:6；意外字符` / `内容提前结束`
+ */
+function describeJsonSyntaxError(err, source) {
+  const message = err instanceof Error ? err.message : String(err);
+  const position = syntaxErrorPosition(message, source);
+  const reason = syntaxErrorReason(message);
+  return position === null ? reason : `位置 ${position}；${reason}`;
+}
+
+/**
+ * 定位 JSON 语法错误（行:列）。优先用 V8 的 `line/column`；只有 `at position`
+ * 时按源文本自行换算（position 为 UTF-16 code unit 下标，逐字符累计行列）。
+ * @param {string} message
+ * @param {string} source
+ * @returns {string|null}
+ */
+function syntaxErrorPosition(message, source) {
+  const lineCol = /line (\d+) column (\d+)/u.exec(message);
+  if (lineCol !== null) return `${Number(lineCol[1])}:${Number(lineCol[2])}`;
+  const at = /at position (\d+)/u.exec(message);
+  if (at === null) return null;
+  const index = Number(at[1]);
+  let line = 1;
+  let column = 1;
+  for (let i = 0; i < index && i < source.length; i += 1) {
+    if (source[i] === '\n') {
+      line += 1;
+      column = 1;
+    } else if (source[i] !== '\r') {
+      column += 1;
+    }
+  }
+  return `${line}:${column}`;
+}
+
+/**
+ * JSON 语法错误的安全类别。只映射已知的 V8 短语，未知一律「无法解析」。
+ * @param {string} message
+ * @returns {string}
+ */
+function syntaxErrorReason(message) {
+  if (/Unexpected end of (?:JSON )?input/u.test(message)) return '内容提前结束';
+  if (/Unterminated string/u.test(message)) return '字符串未闭合';
+  if (/Bad escaped character/u.test(message)) return '非法转义字符';
+  if (/Bad control character/u.test(message)) return '非法控制字符';
+  const expected = /Expected ([,:\[\]{}])/u.exec(message);
+  if (expected !== null) return `期望 ${expected[1]}`;
+  if (/Unexpected token/u.test(message)) return '意外字符';
+  if (/Unexpected (?:string|number)/u.test(message)) return '意外 token';
+  return '无法解析';
+}
+
+/**
+ * 解析/校验失败的展示原因：错误消息已含路径时不再重复；单行、≤160 字符，
+ * 且剥离控制字符与 V8 的 `"..."` 回显（M-2，v0.4.12：warn 与 /状态 不含卡正文）。
  * @param {any} err
  * @param {string} resolved
  * @returns {string}
  */
 function describeParseError(err, resolved) {
   const message = err instanceof Error ? err.message : String(err);
-  const text = message.length > 160 ? `${message.slice(0, 160)}…` : message;
-  return text.includes(resolved) ? text : `${text}（${resolved}）`;
+  const text = sanitizeParseReason(message);
+  const withPath = text.includes(resolved) ? text : `${text}（${resolved}）`;
+  return withPath.length > 160 ? `${withPath.slice(0, 159)}…` : withPath;
+}
+
+/**
+ * 清理对外 reason：去掉源文件回显片段、控制字符，空白折叠，保证单行。
+ * @param {string} message
+ * @returns {string}
+ */
+function sanitizeParseReason(message) {
+  return String(message)
+    // V8 形状：`, "SECRET_BOD"... is not valid JSON`——引号内是源文件回显，整段剥掉。
+    .replace(/,\s*"(?:[^"\\]|\\.)*"(?:\.\.\.)?\s*(?:is not valid JSON)?/gu, '')
+    .replace(/[\u0000-\u001f\u007f]+/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim();
 }
 
 /**
