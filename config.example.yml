@@ -80,6 +80,22 @@ rssMainOnlyGiB: 3.15
 # thread:
 #   agentPreset: workspace-write
 
+# ── 人格卡（V11-P1，可选段，不参与 16 键安装自检）────────────────────
+# 自定义人格卡（JSON，结构见 persona.example.md，字段与内置默认卡一致）。
+# 不配置 = 内置「珞然」；只读加载一次，改卡后需重启宿主（无热加载）。
+# cardPath 绝对路径原样使用；相对路径相对 DSH_HOME（$DSH_HOME trim 后非空
+# 优先，否则 ~/.dsh）。例如 DSH_HOME=/opt/dsh-companion-home 时，下面这行
+# 指向 /opt/dsh-companion-home/persona.json。
+# 加载失败不阻断启动：回落到内置卡并写一条 warn（日志关键词
+# 「persona card load failed」），/状态 显示「加载失败，已用内置：<原因>」。
+# 数组字段 values/taboos/bannedPhrases 是整体替换，不是追加。
+# 卡的 proactive.dailyCap/quietStart/quietEnd 本版被同名配置覆盖（不一致只
+# warn，合并留 v0.4.13），主动节奏请改上面的 proactiveDailyCap/quietStart/quietEnd。
+# 需要时把下面两行去掉注释并入 config.yml：
+#
+# persona:
+#   cardPath: persona.json
+
 # ── 宿主压缩服务（compaction-basic）────────────────────────────────
 # 下面不是本插件的配置键，而是 cordis.patch.yml 里 compaction-basic 的写法；
 # 不要写进 config.yml。

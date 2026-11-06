@@ -131,13 +131,14 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 最近压缩耗时：12.3s
 最近巩固耗时：31.0s
 主会话：main-3f2a（绑定 latest-user）
+人格卡：珞然 v1（内置默认）
 水位重锚：2 次
 未巩固被压缩：1 个节点
 水位 main：120
 最近 job：s2-purge ok upto_seq=0（2026-11-03 03:30）
 ```
 
-最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。「主会话：<id>（绑定 <mode>）」是当前提醒投递目标与绑定策略（`latest-user` 会跟随最新真实用户会话，`first` 保持首个，见[主会话绑定](#主会话绑定v044)）；宿主没有 `sessionController` 时多一行「线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）」（每次执行 `/状态` 时实时读取能力）。
+最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。「主会话：<id>（绑定 <mode>）」是当前提醒投递目标与绑定策略（`latest-user` 会跟随最新真实用户会话，`first` 保持首个，见[主会话绑定](#主会话绑定v044)）；宿主没有 `sessionController` 时多一行「线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）」（每次执行 `/状态` 时实时读取能力）。v0.4.12 起还会多一行「人格卡：<name> v<version>（内置默认 | <绝对路径> | 加载失败，已用内置：<原因>）」，来源、切换与兜底行为见[人格卡](#人格卡v11-p1v0412)。
 
 「最近压缩耗时」「最近巩固耗时」是 G0-9 的观测行：前者取最近一次实际压缩（`compactRegion` 调用及其后的重读 surface / 写库 / 发布看板），后者取最近一次实际巩固执行（从巩固任务入口到 `consolidate()` 返回，含选区与模型解析）；失败样本也记录，但成功/失败不进 `/状态`、只用于日志。没有样本时显示 `—`；超过 `timing.compactWarnMs`（默认 20000ms）/`timing.consolidateWarnMs`（默认 60000ms）时在值后标注「（超阈值）」，同时写一条 warn（同类在同一进程内只告警一次，出现一次不超阈值的样本后重置）。阈值只用于观测与告警，**没有硬超时、不会中止**压缩或巩固，详见[压缩/巩固耗时观测](#压缩巩固耗时观测g0-9v0411)。
 
@@ -691,6 +692,95 @@ timing:
 同类（压缩/巩固）在同一进程内只告警一次，直到出现一次不超阈值的样本后重置。
 阈值只用于观测与告警，**不设硬超时、不会中止任务**；现有压缩/巩固流程与
 线程/任务超时逻辑都不变。该节是可选段，不参与 16 键安装自检。
+
+### 人格卡（V11-P1，v0.4.12）
+
+v0.4.12 起，人格卡是运行时唯一的人格数据源：人格段、承诺跟进的称呼、轻闲聊提示词与
+闲聊违禁词过滤都读同一张卡。插件在 `apply` 时**加载一次**，整个进程生命周期内不再读文件。
+
+**配置键**（可选段，不参与 16 键安装自检）：
+
+```yaml
+persona:
+  # 人格卡 JSON 文件路径（结构见 persona.example.md）。
+  # 不写或 null = 内置「珞然」卡；未知子键只写 warning。
+  cardPath: persona.json
+```
+
+取值与校验：
+
+- `null`、不写、或 trim 后空串：使用内置默认卡，不读文件；
+- 非空字符串：按下面的规则解析成绝对路径；
+- `persona` 不是普通对象、或 `cardPath` 不是字符串（也不是 `null`）：与其它配置键一致，
+  fail-fast 抛 `ConfigError`（`persona` / `persona.cardPath`），不会静默回落。
+
+**路径解析**：
+
+- 绝对路径：原样使用；
+- 相对路径：相对 `DSH_HOME`——环境变量 `DSH_HOME`（trim 后非空）优先，否则 `~/.dsh`。
+  例如 `DSH_HOME=/opt/dsh-companion-home` 时 `cardPath: persona.json` 指向
+  `/opt/dsh-companion-home/persona.json`；未设置 `DSH_HOME` 时指向
+  `~/.dsh/persona.json`。相对路径**不是**相对工作目录或配置文件所在目录。
+
+**字段**（文件内容与内置默认值逐层深合并；`name` / `address` / `tone` 必须显式写在文件里）：
+
+| 字段 | 默认值 | 说明 |
+| --- | --- | --- |
+| `name` | `珞然` | 助手自称；人格段与轻闲聊提示词都会用 |
+| `address` | `你` | 对用户的称呼；人格段、承诺跟进、轻闲聊都会用 |
+| `tone` | 简洁 / 温和 / 先结论 | `style` / `warmth` / `structure` 三子键，进人格段与轻闲聊提示词 |
+| `relation` | 管家 0.7 / 朋友 0.3 | 关系配比；本版只保留字段，不参与提示词渲染 |
+| `proactive` | 每日 3 条 / 聊天 1 条 / 安静 23:00–08:00 | 本版**不生效**，主动节奏以配置为准（见下） |
+| `bannedPhrases` | 5 条 | 轻闲聊的提示词与输出过滤都会用 |
+| `values` | 4 条 | 行为准则，进人格段 |
+| `taboos` | 6 条 | 不主动触碰的话题，进人格段 |
+| `version` | `1` | 人格卡版本号，只用于 `/状态` 展示 |
+
+**数组合并语义**：`values` / `taboos` / `bannedPhrases` 是**整体替换**，不是追加。
+只写一条就只剩一条；想保留默认项，必须把需要的项完整复制进 `persona.json`。
+对象字段（`tone` / `relation` / `proactive`）才是逐层深合并，可只写要改的子键。
+
+**改完需重启**：人格卡只在 `apply` 时加载一次，没有热加载；修改 `persona.json` 后要重启
+宿主（或重载 profile）才生效。字段校验（必填字段、字符串数组、`version` 正整数）也在
+加载时做一次。
+
+**加载失败兜底**：文件不存在、不是普通文件、无读取权限、JSON 非法、必填字段缺失等任何
+加载错误都**不会阻断启动**，也不会让 `apply` 抛错——插件回落到内置默认卡继续运行，
+并写一条 warn：
+
+```text
+[dsh-companion] persona card load failed; using built-in card
+  path=/opt/dsh-companion-home/persona.json
+  reason=文件不存在（ENOENT）：/opt/dsh-companion-home/persona.json
+```
+
+日志里搜 `[dsh-companion]` + `persona card`；`reason` 会带绝对路径，常见如
+`loadCard(<path>): invalid JSON: ...`（JSON 非法）或
+`persona card: "name" must be a non-empty string（<path>）`（必填字段缺失）。
+
+**`/状态` 来源行**：加载结果有三种，`/状态` 对应三态：
+
+```text
+人格卡：珞然 v1（内置默认）
+人格卡：阿岩 v2（/opt/dsh-companion-home/persona.json）
+人格卡：珞然 v1（加载失败，已用内置：文件不存在（ENOENT）：/opt/dsh-companion-home/persona.json）
+```
+
+**主动节奏以配置为准**：卡的 `proactive.dailyCap` / `quietStart` / `quietEnd` 与配置的
+`proactiveDailyCap` / `quietStart` / `quietEnd` 重复。本版运行时以配置为准，卡里的这三个值
+不生效；两边不一致时启动写一条 warn 提醒去重：
+
+- 文件卡：`[dsh-companion] persona card proactive settings conflict with config; config wins`，
+  `fields` 形如 `proactive.dailyCap≠proactiveDailyCap`；
+- 内置默认卡（含加载失败后的兜底）：`[dsh-companion] 人格卡（内置默认）的
+  proactive.dailyCap=3 与配置 proactiveDailyCap=1 不一致，以配置为准`。
+
+内置卡也参与比较：内置 proactive 值等于默认配置，只有你改过 `proactiveDailyCap` /
+`quietStart` / `quietEnd` 才会触发；此时使用内置卡看到这条提示属正常（提醒字段重复），
+可忽略。`proactive.chatPerDay` 在配置里没有对应键，文件卡只记一条 debug 说明、不告警
+（内置卡不记）。卡的 proactive 与配置的合并方案留到 v0.4.13。
+
+完整 JSON 示例与复制模板见 [persona.example.md](../persona.example.md)。
 
 ### headless 一次性运行与 round C 口径（V10-M1，v0.4.11）
 

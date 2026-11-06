@@ -178,8 +178,9 @@ DSH 会把 `name` 转成 `file://` URL 再动态 import：绝对路径按 `pathT
 | `recall.minVectorScore` | `0.35` | 向量候选的相关性下限；低于且无 FTS/bigram 命中即丢弃 | 数字 `0`–`1` |
 | `recall.skipSmallTalk` | `true` | 长度 <4、纯算术/符号与常见问候跳过召回 | 布尔 |
 | `session.mainBinding` | `"latest-user"` | 主会话绑定策略：`latest-user` 跟随最新真实用户会话，`first` 保持首个主会话 | `latest-user` / `first` |
+| `persona.cardPath` | `null` | 人格卡 JSON 路径（v0.4.12）；相对路径相对 `DSH_HOME`（未设置时 `~/.dsh`） | 字符串或 `null`；`null` / 空串用内置卡 |
 
-token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置，v0.4.2 新增 `vector.backfillTimeoutMs` 并把 `backfillBatchSize` 默认降到 8；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。v0.4.4 起新增非枚举的 `recall.*` 与 `session.mainBinding`，同样不参与 16 键安装自检；v0.4.11 起新增非枚举的 `thread.agentPreset`（默认 `null`）与 `timing.compactWarnMs` / `timing.consolidateWarnMs`（默认 `20000` / `60000`），同样不参与 16 键安装自检。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
+token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`；RSS 三档必须满足 `0 < rssWarnGiB < rssStopGiB < rssMainOnlyGiB`。未知配置键只记警告，不阻断启动。v0.3.0 起新增可选的 `vector.*`（默认关闭），v0.4.0 扩展为 `hash` / `local` / `remote` / `none` 与 remote 端点配置，v0.4.2 新增 `vector.backfillTimeoutMs` 并把 `backfillBatchSize` 默认降到 8；`DEFAULTS.vector` 不可枚举，首次安装自检仍按 16 个基础键输出（含 RSS 三档）。v0.4.4 起新增非枚举的 `recall.*` 与 `session.mainBinding`，同样不参与 16 键安装自检；v0.4.11 起新增非枚举的 `thread.agentPreset`（默认 `null`）与 `timing.compactWarnMs` / `timing.consolidateWarnMs`（默认 `20000` / `60000`），同样不参与 16 键安装自检；v0.4.12 起新增非枚举的 `persona.cardPath`（默认 `null`），同样不参与 16 键安装自检。治理/编辑、承诺跟进、轻闲聊与失败自愈仍由既有配置与固定阈值控制。
 
 **宿主压缩能力（compaction-basic）**：插件通过宿主的 `compaction.compactRegion` 服务压缩上下文，压缩后由水位重锚接管。DSH web-app 默认把 `compaction-basic` 设为 `disabled: true`，插件拿不到该能力，`/状态` 会显示「压缩：宿主未开启（compaction-basic 未启用）」：巩固照常写库，但 `pending_compact` 只保留区间，surface 不会真正缩小。云端已验证的开启写法（写进 `cordis.patch.yml`，不是本插件的 config）：
 
@@ -193,6 +194,8 @@ token 四档必须满足 `0 < retainTokens < compactAtTokens < workingMemoryToke
 `auto: false` 表示宿主不再每轮自动压缩，只由插件在空闲边界（`idleMs`，默认 30 分钟）调用 `compactRegion`，避免与巩固抢时机。开启后 `/状态` 显示「压缩：宿主已开启（compaction-basic 已启用）」，有待压缩区间时附「，待压缩 N 个区间」。
 
 **主会话绑定（v0.4.4）**：默认 `session.mainBinding: 'latest-user'`——只有当**线程外**会话出现真实用户输入时才把 `main_session_id` 重绑到该会话，并记一条 info 日志（旧/新 id）；runtime-context、召回注入与中文命令提示都不算用户输入，不会触发重绑。`'first'` 保持原主会话不变。提醒投递到当前主会话，`/状态` 会显示「主会话：<id>（绑定 <mode>）」。
+
+**人格卡（v0.4.12）**：`persona.cardPath` 指向一份 JSON 人格卡（结构见 [persona.example.md](persona.example.md)），插件在 `apply` 时**加载一次**，人格段、承诺跟进称呼、轻闲聊提示词与闲聊违禁词过滤共用同一张卡；默认 `null` 用内置「珞然」卡。绝对路径原样使用，相对路径相对 `DSH_HOME`（`DSH_HOME` trim 后非空优先，否则 `~/.dsh`）。对象字段逐层深合并，数组字段（`values` / `taboos` / `bannedPhrases`）**整体替换**、不与默认项合并。**改卡后需重启宿主**（无热加载）。加载失败不会阻断启动：回落到内置卡并写一条 warn（`[dsh-companion] persona card load failed; using built-in card`，带 `path` 与 `reason`），`/状态` 显示「加载失败，已用内置：<原因>」。卡里的 `proactive.dailyCap` / `quietStart` / `quietEnd` 本版**不生效**，主动节奏以配置为准（不一致只写一条 warn、内置默认卡也参与比较；`chatPerDay` 无配置对应键），合并方案留到 v0.4.13。详见[人格卡（V11-P1，v0.4.12）](docs/usage.md#人格卡v11-p1v0412)。
 
 所有墙上时间判断（安静时段 `quietStart`/`quietEnd`、每日 `03:00`/`03:30`/`04:00` 任务、日界线与备份文件名）一律按 `timezone` 计算，与进程环境变量 `TZ` 无关。
 
@@ -234,6 +237,8 @@ node scripts/calibrate/run.mjs
 命令：`/记忆`（`列表 [关键词]`、`忘掉`、`改 <id> <内容>`、`治理 [--dry-run]`、`导出 [md|json]`、`置顶`、`取消置顶`）、`/成本`、`/线程`、`/状态`、`/别闲聊`、`/恢复闲聊`。
 
 **宿主只注册 ASCII 命令名。** DSH 的命令名正则只接受 `^[a-z][a-z0-9_-]*$`，所以插件实际注册的是 `memory`、`cost`、`threads`、`status`、`chat-off`、`chat-on`；`/记忆`、`/状态`、`/成本`、`/线程` 只是同一功能的别名提示，直接输入中文命令**不会**被执行。误输入时 pre-step 会回一句「请用 /memory、/status、/cost、/threads」，请改用 ASCII 命令名（参数写法不变，例如 `/memory 忘掉 <id>`）。
+
+`/status`（`/状态`）会显示人格卡来源：`人格卡：<name> v<version>（内置默认 | <绝对路径> | 加载失败，已用内置：<原因>）`，三态示例与切换方式见 [docs/usage.md 的人格卡一节](docs/usage.md#人格卡v11-p1v0412)。
 
 工具（宿主提供 `sessionController` 时 10 个）：`memory_search`、`memory_write`、`memory_update`、`memory_forget`、`reminder_add`、`reminder_done`、`thread_list`、`thread_run`、`task_run`、`cost_report`。宿主没有 `sessionController`（例如 headless / one-shot bundle）时**不注册** `thread_list`、`thread_run`、`task_run`，`/状态` 会显示「线程：宿主不支持」；其余工具不受影响。
 
