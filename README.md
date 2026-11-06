@@ -4,7 +4,15 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.11 已发布**（2026-11-05）。`node --test` 全绿：918 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.4.12 已发布**（2026-11-06）。`node --test` 全绿：964 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+
+## v0.4.12 变更摘要
+
+- **人格卡接上运行时（V11-P1）**：新增可选配置 `persona.cardPath`（默认 `null`，非枚举、不参与 16 键安装自检），相对路径相对 `DSH_HOME`（`DSH_HOME` trim 后非空优先，未设置时 `~/.dsh`）。`apply` 时**加载一次**，人格段、承诺跟进称呼、轻闲聊提示词与闲聊违禁词四处共用同一张卡（`DEFAULT_CARD` 只剩 `src/persona/card.js`），改卡需重启。加载失败（文件不存在 / 非法 JSON / 必填字段缺失 / 读取错误）不阻断启动：回落内置卡并写**一条** warn（仅 `path` 与 `reason`，不含卡正文），`/状态` 增加「人格卡：<name> v<version>（内置默认 | <绝对路径> | 加载失败，已用内置：<原因>）」。
+- **proactive 冲突以配置为准**：卡里的 `proactive.dailyCap` / `quietStart` / `quietEnd` 与配置同名项不一致时只写一条 warn（列出字段与两边取值，内置默认卡也参与比较）；运行时行为不变，合并方案留 v0.4.13。
+- **复审修复**：review-v18 的 M-1（未设置 `DSH_HOME` 时回退 `<home>/.dsh`，而不是裸 `~`）、M-2（坏 JSON 的诊断不再把 V8 的源文件回显写进 warn / `/状态`，剥引号片段与控制字符、单行 ≤160）。
+- **复审与发布门**：发布前独立复审 [review-v19](docs/review-v19.md)（pass，H=0 / M=0 / L=3）；发布门 round A/B PASS，round C 无模型凭据按 v0.4.11 口径 **SKIP（不计 PASS）**。
+- **范围**：仅人格接线；schema 仍 v13，记忆 / 提醒 / 线程行为未改；零新增运行时依赖。完整条目见 [CHANGELOG](CHANGELOG.md)（0.4.12 段）。
 
 ## v0.4.11 变更摘要
 

@@ -2,6 +2,31 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.4.12] - 2026-11-06
+
+按用户 v0.4.12 清单把人格卡接上运行时（V11-P1）：新增可选配置 `persona.cardPath`（默认 `null`；非枚举，不参与 16 键安装自检），相对路径相对 `DSH_HOME`（trim 后非空优先，未设置时 `~/.dsh`）；`apply` 时**加载一次**，人格段、承诺跟进称呼、轻闲聊提示词与闲聊违禁词四处共用同一张卡，`DEFAULT_CARD` 只剩 `src/persona/card.js`；改卡需重启。加载失败（文件不存在 / 非法 JSON / 必填字段缺失 / 读取错误）都不阻断启动：回落内置卡并写**一条** warn（仅 `path` 与 `reason`，不含卡正文），`/状态` 新增人格卡来源行。卡里的 proactive 同名字段本版以配置为准（不一致只写一条 warn、内置默认卡也参与比较，合并方案留 v0.4.13）。**仅人格接线，schema 仍 v13，记忆 / 提醒 / 线程行为未改**；零新增运行时依赖。本次发布 **964 个用例 / 16 个套件**，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过。
+
+### Added
+
+- **人格卡运行时接线（V11-P1）**（`6625158`）：新增可选配置 `persona.cardPath`（默认 `null`；`null` / 空串用内置卡，非字符串抛 `ConfigError('persona.cardPath')`）。绝对路径原样使用，相对路径相对 `DSH_HOME`（`DSH_HOME` trim 后非空优先，否则 `<用户主目录>/.dsh`）。`apply` 时加载一次并写入 `state.card`，替换人格段、承诺跟进称呼、轻闲聊提示词与闲聊违禁词四个使用点；`buildSections(card)` 改为必须显式传卡（`null` / `undefined` 抛清晰 `TypeError`），`DEFAULT_CARD` 只剩 `src/persona/card.js`。加载失败四类（文件不存在 / 非法 JSON / 必填字段缺失 / 其它读取错误）一律回落内置卡并写一条 warn（`[dsh-companion] persona card load failed; using built-in card`，meta 仅 `path` 与 `reason`，不含卡正文）。`/状态` 新增 `人格卡：<name> v<version>（内置默认 | <绝对路径> | 加载失败，已用内置：<原因>）`；旧调用方未传该选项时不输出此行。
+
+### Fixed
+
+- **review-v18 M-1：未设置 `DSH_HOME` 时相对路径回退 `~/.dsh`**（`3abc9d3`）：`resolveDshHome` 的两个 fallback（注入 `deps.homedir` 与 `os.homedir()`）统一 `join(base, '.dsh')`；显式 `DSH_HOME` 仍原样使用。修复相对 `persona.json` 被解析成 `~/persona.json`、导致「配了卡却静默回落内置卡」。补单测与生产 `apply` 用例：读到 `<home>/.dsh/persona.json`；卡放在旧位置 `<home>/persona.json` 时 ENOENT 兜底且原因指向 `.dsh` 下的解析路径。
+- **review-v18 M-2：坏 JSON 不泄漏卡正文**（`3abc9d3`）：JSON 语法错误不再拼接 V8 原始 message（会回显源文件开头字符），改为 `invalid JSON（位置 <line>:<col>；<固定类别>）`；`describeParseError` 再剥离 `"..."` 回显与控制字符，保证单行、≤160 字符。五种现实形状（裸 token / BOM / 纯文本占位符 / 误写 YAML / 单引号 JSON）在 warn 与 `/状态` 均无泄漏。
+- **L-1：旧 `loadCard()` 标 `@deprecated`**（`3abc9d3`）：指向 `loadPersonaCard()`，并说明配置了 `cardPath` 时不要用（ENOENT 会静默返回内置卡）。
+
+### Changed
+
+- **proactive 同名字段本版以配置为准、内置默认卡也参与冲突告警**（`90e3383`）：卡里的 `proactive.dailyCap` / `quietStart` / `quietEnd` 与配置 `proactiveDailyCap` / `quietStart` / `quietEnd` 不一致时写一条 warn（列出不一致字段与两边取值，不含卡正文）；运行时仍只读配置、主动节奏行为不变。文件卡与内置卡（含加载失败兜底）都参与；`chatPerDay` 无配置对应键，只记录说明。字段合并方案留 v0.4.13。
+- **文档**：`docs/usage.md` 补人格卡一节（路径三种来源、四类失败兜底、`/状态` 三态示例、改卡需重启），`config.example.yml` 补 `persona.cardPath` 注释段，`docs/deploy-v0412.md` 写部署两种路径。安装面仍为 16 个基础键。
+
+### Tests
+
+- 新增 `test/v0412-persona-card.test.js`、`test/persona-proactive.test.js` 与 `test/e2e/persona-card.test.js`（生产 `apply` 全链路：`DSH_HOME` 与 `~/.dsh` 回退、四使用点、四类失败兜底、`/状态` 三态、proactive 冲突、坏 JSON 五形状矩阵）；`test/persona.test.js` 同步改为「必须显式传卡」。三时区 `node --test` 964/964 pass、0 fail、16 个套件；发布门 round A/B 重跑 PASS（报告见 `docs/review-round-ab-v0412.md`）。
+
+发布前独立复审：[review-v19](docs/review-v19.md)（pass，H=0 / M=0 / L=3，均为不阻塞观察）。发布门 round A/B PASS；round C 因本机无模型凭据 `verdict=skip`（按 v0.4.11 口径不计 PASS，由部署环境首次启动补跑）。
+
 ## [0.4.11] - 2026-11-05
 
 按用户 v0.4.11 清单修复四项：V10-H1（thread preset 可配置、未知 preset 不抛异常）、G0-9（压缩/巩固耗时阈值与告警，不中止）、V10-L1（存量 episode/FTS 一次性脱敏 scrub，幂等）、V10-M1（round C 口径与 headless 巩固限制写入文档）。仍为零第三方运行时依赖；schema 升至 v13（纯数据迁移，无新列）。本次发布 **918 个用例 / 16 个套件**，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过。

@@ -132,6 +132,13 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **建议排期**：round C 常驻验收随 v0.4.11 发布执行；三种门改造推迟，不阻断两周评测。
 - **验收方式**：常驻实例连续运行，`consolidations` 成功行累计 ≥8 且无最终失败；headless 门保持 round A/B PASS、round C 显示 SKIP（未计 PASS，不作为通过依据）。
 
+### D-11 L-3：`loadCard()` 已 `@deprecated`，但仍对 ENOENT 静默返回内置卡
+
+- **现状**：`src/persona/card.js` 的 `loadCard()` 自 v0.4.12 起标 `@deprecated`（review-v18 L-1），生产接线改用 `loadPersonaCard()`；但 `loadCard()` 保留旧语义——文件不存在时静默返回内置卡，不写 warn、也不区分「没配卡」与「配了但文件丢了」。当前 `src/` 内无调用方，仅旧测试/外部引用可能使用。
+- **影响**：若后续代码误用 `loadCard()` 加载用户卡，路径写错或文件丢失会被静默吞掉，表现为「改了卡不生效」且无任何告警。
+- **建议排期**：v0.4.13 清理调用方并让其与 `loadPersonaCard()` 行为对齐（ENOENT 也走 fallback 状态 + warn，或直接删除导出）。
+- **验收方式**：`git grep -n loadCard -- src` 无调用；单测覆盖 ENOENT 的成功/失败分支与 `loadPersonaCard()` 一致；`/状态` 与 warn 口径不变。
+
 ## 5. 已关闭（本轮修复）
 
 - **V9-M1 episode 落库前仍保留凭据原文**：v0.4.10 修复，commit `a4fe4e0`，字段级兜底口径由 `6e1ade8` 补齐。`consolidate` 写 episode 前对 `title` / `summary` / `evidence` / `mood_evidence` 与 `topics` / `entities` 逐字段脱敏，只把凭据值换成 `[凭据已省略]`、保留「路由器密码 …」这类上下文（不是整段丢弃）；`store.insertEpisode` 再做一次防御性值级脱敏（含 `topics_json` 字符串形态），`fts_episodes` 由主表投影故自动无明文。跨会话召回、注入、状态板与 JSON 导出经 `test/e2e/v0910-privacy.test.js` 验证均无明文；巩固提示词同时要求「不得复述密码、口令、token、卡号等凭据值」。
