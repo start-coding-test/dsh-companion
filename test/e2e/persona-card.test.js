@@ -14,14 +14,17 @@
  *   4) B1 生产装配：状态板段 + 召回注入 + 人格段 + `/状态` 行在一轮 pre-step 中
  *      同时可见；
  *   5) 失败兜底不阻断：坏 JSON 时 apply 不抛、恰一条加载 warn（叠加改过的
- *      proactive 配置时另有内置卡冲突 warn），仍能跑完一轮 turn 且闲聊照常投递。
+ *      proactive 配置时另有内置卡冲突 warn），仍能跑完一轮 turn 且闲聊照常投递；
+ *   6) v2 重跑新增：未设置 `DSH_HOME` 时相对路径回退 `<home>/.dsh` 的文件卡端到端；
+ *   7) v2 重跑新增：5 种坏 JSON 形状矩阵，warn 与 `/状态` 均不泄漏卡正文（M-2）。
  *
- * 约束：不读用户 `~/.dsh`（DSH_HOME 指向 mkdtemp），不联网，零第三方依赖。
+ * 约束：不读用户 `~/.dsh`（DSH_HOME 指向 mkdtemp；回退分支用 `personaDeps.homedir`
+ * 注入临时 home），不联网，零第三方依赖。
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -56,6 +59,40 @@ const OTHER_CARD = Object.freeze({
 
 /** 五句话的闲聊文案；「收到啦」是文件卡禁用话术、内置卡不屏蔽（对照组）。 */
 const CHAT_WITH_BANNED = '收到啦。今天天气不错。中午吃了面。下午把桌子收拾了。晚上准备早点休息。';
+
+/**
+ * B4（v2 重跑）：五种现实坏 JSON 形状。前四种在 V8 的 `JSON.parse` 错误
+ * message 里会回显源文件开头字符（M-2 的泄漏路径），单引号 JSON 只给位置；
+ * 这里统一断言 reason / warn / `/状态` 都不含各自的哨兵串。
+ */
+const BAD_JSON_SHAPES = Object.freeze([
+  {
+    name: '裸 token 起始',
+    content: 'SECRET_BARE_TOKEN_SENTINEL_1234567890',
+    sentinel: 'SECRET_BARE_TOKEN_SENTINEL_1234567890',
+  },
+  {
+    name: 'BOM 前缀',
+    content: `\uFEFF${JSON.stringify({ name: 'BOM_CARD_SENTINEL', address: '你', tone: { style: '简洁' } })}`,
+    sentinel: 'BOM_CARD_SENTINEL',
+    extraForbidden: '\uFEFF',
+  },
+  {
+    name: '纯文本占位符',
+    content: 'TODO_put_me_SENTINEL_PLACEHOLDER',
+    sentinel: 'TODO_put_me_SENTINEL_PLACEHOLDER',
+  },
+  {
+    name: '误写成 YAML',
+    content: 'name: 隐私姓名YAML_SENTINEL\naddress: 你\ntone:\n  style: 简洁\n',
+    sentinel: '隐私姓名YAML_SENTINEL',
+  },
+  {
+    name: '单引号 JSON',
+    content: "{'name': 'QUOTE_SENTINEL_NAME', 'address': '你', 'tone': {'style': '简洁'}}",
+    sentinel: 'QUOTE_SENTINEL_NAME',
+  },
+]);
 
 /**
  * v0.4.11（08493eb）内置卡三段文本的 SHA-256。
@@ -479,5 +516,87 @@ test('集成（失败兜底）：坏 JSON 时 apply 不抛、两条 warn，仍�
   } finally {
     handle.dispose();
     temp.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 6) B2 路径来源 b：未设置 DSH_HOME → 回退 <home>/.dsh
+// ---------------------------------------------------------------------------
+
+test('集成（B2 未设置 DSH_HOME）：相对 cardPath 回退 <home>/.dsh/persona.json，文件卡生效', (t) => {
+  const temp = makeTempStore();
+  const home = tempCardDir(t);
+  mkdirSync(join(home, '.dsh'), { recursive: true });
+  const cardPath = join(home, '.dsh', 'persona.json');
+  writeFileSync(cardPath, JSON.stringify(FILE_CARD, null, 2), 'utf8');
+  // 旧错误位置放一张同名卡做诱饵：修后行为必须只读 <.dsh> 下的这张。
+  writeFileSync(join(home, 'persona.json'), JSON.stringify(OTHER_CARD, null, 2), 'utf8');
+
+  const ctx = makePluginCtx();
+  let handle;
+  try {
+    assert.doesNotThrow(() => {
+      // 未设置 DSH_HOME（env 为空对象），homedir 注入临时 home，不读真实 ~/.dsh。
+      handle = apply(
+        ctx,
+        { dbPath: temp.dbPath, persona: { cardPath: 'persona.json' } },
+        { personaDeps: { env: {}, homedir: home } },
+      );
+    });
+    assert.equal(loadFailureWarns(ctx).length, 0, '相对路径必须回退 ~/.dsh 并读到卡');
+    assert.ok(coreTextOf(ctx).includes('你是阿岩，用户的私人管家。'));
+    assert.ok(coreTextOf(ctx).includes('称呼用户为“老板”。'));
+    assert.equal(coreTextOf(ctx).includes('替换后'), false, '旧位置 ~/persona.json 不能再生效');
+    assert.equal(personaLineOf(ctx), `人格卡：阿岩 v2（${cardPath}）`);
+  } finally {
+    handle?.dispose();
+    temp.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// 7) B4 JSON 错误消息形状矩阵：5 种形状逐条兜底且不泄漏正文
+// ---------------------------------------------------------------------------
+
+test('集成（B4 JSON 错误消息形状矩阵）：5 种坏卡逐条兜底，warn 与 /状态 不泄漏卡正文且单行', async (t) => {
+  for (const shape of BAD_JSON_SHAPES) {
+    await t.test(shape.name, (t) => {
+      const temp = makeTempStore();
+      const dir = tempCardDir(t);
+      const cardPath = writeCardFile(dir, shape.content);
+      const ctx = makePluginCtx();
+      let handle;
+      try {
+        assert.doesNotThrow(() => {
+          handle = apply(ctx, { dbPath: temp.dbPath, persona: { cardPath } });
+        }, `${shape.name}: apply 不能因坏 JSON 而抛`);
+
+        const warns = loadFailureWarns(ctx);
+        assert.equal(warns.length, 1, `${shape.name}: 加载失败只 warn 一次`);
+        assert.deepEqual(Object.keys(warns[0].meta).sort(), ['path', 'reason']);
+        assert.equal(warns[0].meta.path, cardPath);
+        assert.ok(warns[0].meta.reason.includes('invalid JSON'));
+        assert.equal(
+          JSON.stringify(warns).includes(shape.sentinel),
+          false,
+          `${shape.name}: warn 所有字段都不能回显卡正文`,
+        );
+
+        const line = personaLineOf(ctx);
+        assert.ok(line, `${shape.name}: /状态 必须有 人格卡 行`);
+        assert.match(line, /^人格卡：珞然 v1（加载失败，已用内置：/u);
+        assert.equal(line.includes(shape.sentinel), false, `${shape.name}: /状态 不能带卡正文`);
+        if (shape.extraForbidden !== undefined) {
+          assert.equal(line.includes(shape.extraForbidden), false, `${shape.name}: /状态 不能带 BOM`);
+        }
+        assert.doesNotMatch(line, /[\u0000-\u001f\u007f]/u, `${shape.name}: /状态 行必须单行`);
+        assert.ok(line.includes(warns[0].meta.reason), `${shape.name}: /状态 复用同一条安全原因`);
+
+        assert.ok(coreTextOf(ctx).includes('你是珞然'), `${shape.name}: 兜底用内置卡`);
+      } finally {
+        handle?.dispose();
+        temp.cleanup();
+      }
+    });
   }
 });

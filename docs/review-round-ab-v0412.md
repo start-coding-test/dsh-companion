@@ -48,3 +48,55 @@
 | low | round C 未执行 | 本机无模型凭据，`credentials=missing → verdict=skip`；需在有凭据环境复跑，确认 `consolidations ≥ 1` 且 tokenMeter 非零。 |
 | low | 仓库无 `eval-boundary.md` | 全仓搜索未找到该文件（仅 `docs/known-debt.md`、`docs/review-v5.md` 提到 D-5）；部署清单已写明部署时追加「配置变更」条，正式记录在发布环境完成。 |
 | low | 集成测试的重启语义用 `:memory:` | 不校验跨重启持久化（该行为由现有 store 测试覆盖），只校验加载时机与 warn 次数。 |
+
+## v2 重跑（t8 修复后）
+
+- 触发：review-v18（`8e5a8df`）判 `needs_revision`（M-1/M-2），t8 `3abc9d3` 修复后重跑；起点 HEAD `3abc9d3`，本轮只改 `test/`、`docs/deploy-v0412.md` 与本报告。
+- 结论：**A1–A7 全 PASS；B1–B5 全 PASS**；M-1/M-2 经独立探针与生产接线复核已生效。round C 仍无凭据 SKIP（沿用 v0.4.11 口径，不计 PASS）。
+- 集成测试：`node --test test/e2e/persona-card.test.js` → `tests 12 / pass 12 / fail 0`（v1 5 个 + 新增 B2 回退 1 个 + B4 矩阵 6 个）。
+
+### 一、t8 修复独立复核（自跑，不信回报）
+
+| 检查 | 结果 |
+| --- | --- |
+| `resolveDshHome({env:{},homedir:<tmp>})` | **PASS**：`<tmp>/.dsh` |
+| `loadPersonaCard('persona.json',{env:{},homedir:<tmp>})` | **PASS**：`status=file`，读到 `<tmp>/.dsh/persona.json` |
+| `DSH_HOME=<tmp>` 不再拼 `.dsh` | **PASS**：解析为 `<tmp>/persona.json` 并读到 |
+| 5 种坏 JSON 形状 reason | **PASS**：V8 原文回显 `"SECRET_BAR"`/`"TODO_put_m"`/`"name: 隐私姓名Y"` 等；修后 reason 仅 `invalid JSON（意外字符）`/`（位置 1:2；无法解析）`，无哨兵、单行、≤160 |
+| 探针汇总 | 11/11 PASS（`.data/t9-probe/probe.mjs`，gitignored） |
+
+### round A（静态与契约）
+
+| # | 结果 | 证据 |
+| --- | --- | --- |
+| A1 | **PASS** | 默认 / `TZ=UTC` / `TZ=America/New_York` 各 `tests 964 / pass 964 / fail 0 / skipped 0`（`.data/t9-tz-*.log`；v1 为 953，新增 11 个测试） |
+| A2 | **PASS** | `git grep -n DEFAULT_CARD -- src` 8 处，全部 `src/persona/card.js`（29/72/82/119/184/196/212/447） |
+| A3 | **PASS** | `node --test test/calibration.test.js` → `tests 10 / pass 10 / fail 0`；16 键安装面不变 |
+| A4 | **PASS** | `src/memory/store.js:77` 与 `src/memory/export.js:86` 均 `'13'`；本轮 diff 无迁移 |
+| A5 | **PASS** | `dependencies=null`、`devDependencies=null` |
+| A6 | **PASS** | README 57 + usage 18 = 75 条（66 文件 + 9 同页锚点），死链 0 |
+| A7 | **PASS** | 提交后 `git status --porcelain` 空；CHANGELOG 顶部仍 `[0.4.11] … 918 个用例`，无 `0.4.12` 字样 |
+
+### round B（生产路径，含新增 B4/B5）
+
+| # | 结果 | 证据 |
+| --- | --- | --- |
+| B1 | **PASS** | `集成（B1 生产装配）`：`decision.messages.length=2`，第二条 `source.kind='companion-recall'`、以 `[相关记忆]` 开头且含「周报」；状态板 `[状态板]\n- 周报周五交。`；core「你是珞然」；`/状态` 含「人格卡：珞然 v1（内置默认）」 |
+| B2 | **PASS** | a) `DSH_HOME=<tmp>` + 相对 `persona.json`（`集成（文件卡相对路径）`：四处同源、`/状态` 为绝对路径）；b) 未设置 `DSH_HOME`（`集成（B2 未设置 DSH_HOME）`，`personaDeps={env:{},homedir:<tmp>}`）→ 读 `<tmp>/.dsh/persona.json`，人格段与 `/状态` 生效，旧位置 `<tmp>/persona.json` 诱饵不生效、0 warn |
+| B3 | **PASS** | `集成（失败兜底）`：坏 JSON + `proactiveDailyCap:5`/`quietEnd:'07:30'` → apply 不抛、1 加载 warn + 1 内置卡冲突 warn、`/状态` 失败行、pre-step 返回 messages、闲聊照常投递 1 次 |
+| B4 | **PASS** | 新增 `集成（B4 JSON 错误消息形状矩阵）` 5/5 子用例（裸 token / BOM / 占位符 / YAML / 单引号 JSON）：均 fallback、恰 1 条 warn（meta 仅 `path`/`reason`）、`JSON.stringify(warns)` 与 `/状态` 均不含哨兵、无控制字符、单行、`/状态` 复用同一 reason |
+| B5 | **PASS** | `docs/deploy-v0412.md` 78 行：`DSH_HOME=/opt/dsh-companion-home` → `/opt/dsh-companion-home/persona.json`；未设置 `DSH_HOME` → `~/.dsh/persona.json`（明确不是 `~/persona.json`）；`/status` 核对显示解析后绝对路径 |
+
+### 发布门（round A/B/C）
+
+- 命令 `node scripts/probe/run-headless.mjs --plugin --timeout 180000` → **exit 0**；日志 `.data/plugin-gate.log`。
+- round A：`exit=1 schedulerStarted=true didNotActivate=false`（`MISSING_CREDENTIAL`，插件已在错误前激活）。
+- round B：`exit=1 schedulerStarted=true didNotActivate=false recallCrash=false firstReneedAt=1793953235`（非空）。
+- round C：`credentials=missing … consolidations=0 tokenEvents=1 maxTokensIn=0 … verdict=skip`；按 v0.4.11 口径 **SKIP，不计 PASS**。
+
+### 遗留问题
+
+| 级别 | 事项 | 说明 |
+| --- | --- | --- |
+| low | round C 未执行 | 本机无模型凭据 `verdict=skip`；需有凭据环境复跑，确认 `consolidations ≥ 1` 且 tokenMeter 非零。 |
+| low | 仓库无 `eval-boundary.md` | 沿用 v1 记录；B5 清单已写明部署时追加「配置变更」条，正式记录在发布环境完成。 |

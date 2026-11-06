@@ -35,6 +35,8 @@ python3 -m json.tool /opt/dsh-companion-home/persona.json >/dev/null && echo ok
 
 只写要覆盖的字段；没写的沿用内置默认，数组整体替换。字段表见 `persona.example.md`。`version` 每次改卡加一，便于 `/status` 核对。
 
+未设置 `DSH_HOME` 时，相对路径回退到 `~/.dsh`：卡应放 `~/.dsh/persona.json`（不是 `~/persona.json`），下面的绝对路径据此调整。
+
 ## 3. 配置 cardPath
 
 编辑插件配置（`config.yml`），只加这一项：
@@ -44,7 +46,7 @@ persona:
   cardPath: persona.json
 ```
 
-相对路径按 `DSH_HOME` 解析（这里即 `/opt/dsh-companion-home/persona.json`）；也可写绝对路径。不要新增其它键。
+相对路径按 `DSH_HOME` 解析（这里即 `/opt/dsh-companion-home/persona.json`）；未设置 `DSH_HOME` 时按 `~/.dsh` 解析（即 `~/.dsh/persona.json`）。也可写绝对路径。不要新增其它键。
 
 ## 4. 与宿主模型变更合并成一次重启
 
@@ -53,7 +55,7 @@ persona:
 ## 5. 重启后核对
 
 1. 发 `/status`，确认出现：
-   `人格卡：<name> v<version>（/opt/dsh-companion-home/persona.json）`
+   `人格卡：<name> v<version>（<解析后的绝对路径：$DSH_HOME/persona.json 或 ~/.dsh/persona.json>）`
    若显示 `加载失败，已用内置：<原因>`，按原因修文件后重启；失败不会中断对话。
 2. 新开一个会话问「你叫什么」，回答应是卡里的 `name`，称呼应是 `address`。
 3. 再发一条普通消息，确认召回与状态板正常（人格段与它们同时装配）。
