@@ -9,9 +9,18 @@
  */
 
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { isAbsolute, resolve as resolvePath } from 'node:path';
 
 /** 敏感对象键，深合并时直接忽略，避免原型污染。 */
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+/** 人格卡来源状态（v0.4.12）：内置默认 / 用户卡文件 / 加载失败兜底。 */
+export const CARD_STATUS = Object.freeze({
+  BUILTIN: 'builtin',
+  FILE: 'file',
+  FALLBACK: 'fallback',
+});
 
 /**
  * 默认人格卡。
@@ -71,6 +80,17 @@ export function loadCard(path) {
     throw err;
   }
 
+  return parseCardSource(source, path);
+}
+
+/**
+ * 解析 + 合并 + 校验一份人格卡 JSON 文本，返回深度冻结的卡。
+ * loadCard() 与 loadPersonaCard() 共用同一套语义（数组整体替换、必填字段校验）。
+ * @param {string} source 文件内容
+ * @param {string} [path] 仅用于错误消息
+ * @returns {Readonly<object>}
+ */
+function parseCardSource(source, path = '') {
   let parsed;
   try {
     parsed = JSON.parse(source);
@@ -91,6 +111,153 @@ export function loadCard(path) {
   const merged = mergeInto(DEFAULT_CARD, parsed);
   validateCard(merged);
   return deepFreeze(merged);
+}
+
+/**
+ * 解析 DSH 主目录：`DSH_HOME`（trim 后非空）优先，否则 `~/.dsh`。
+ * deps 可注入 env/homedir，便于测试；生产路径不读全局单例。
+ *
+ * @param {{env?: Record<string, string|undefined>, homedir?: string|(() => string)}} [deps]
+ * @returns {string}
+ */
+export function resolveDshHome(deps = {}) {
+  const env = deps.env ?? process.env;
+  const fromEnv = typeof env?.DSH_HOME === 'string' ? env.DSH_HOME.trim() : '';
+  if (fromEnv !== '') return fromEnv;
+
+  const injected = deps.homedir;
+  const home = typeof injected === 'function' ? injected() : injected;
+  if (typeof home === 'string' && home.trim() !== '') return home.trim();
+  return homedir();
+}
+
+/**
+ * 把配置里的人格卡路径解析成绝对路径（v0.4.12）。
+ *
+ * 规则：`null`/`undefined`/trim 后空串 → null（表示用内置卡）；绝对路径原样使用；
+ * 相对路径相对 DSH_HOME（`DSH_HOME` 否则 `~/.dsh`）解析。
+ *
+ * @param {string|null|undefined} cardPath 配置值 persona.cardPath
+ * @param {{env?: Record<string, string|undefined>, homedir?: string|(() => string)}} [deps]
+ * @returns {string|null}
+ */
+export function resolveCardPath(cardPath, deps = {}) {
+  if (cardPath === null || cardPath === undefined) return null;
+  if (typeof cardPath !== 'string') {
+    throw new TypeError('resolveCardPath(cardPath): cardPath must be a string or null');
+  }
+  const trimmed = cardPath.trim();
+  if (trimmed === '') return null;
+  if (isAbsolute(trimmed)) return trimmed;
+  return resolvePath(resolveDshHome(deps), trimmed);
+}
+
+/**
+ * 启动时加载一次人格卡，任何失败都回落内置卡（v0.4.12）。
+ *
+ * 与 loadCard() 的区别（关键）：loadCard 对 ENOENT **静默**返回默认卡，调用方
+ * 无法区分「用户没配卡」与「配了但文件丢了」。这里直接读文件并自己区分：
+ * - 文件不存在 / 不是普通文件 / 无权限 / 其它读取错误；
+ * - JSON 非法、必填字段缺失（validateCard 抛错）。
+ * 以上全部 → status='fallback' + 内置卡 + 原因（含解析后路径，不含卡正文）。
+ *
+ * @param {string|null|undefined} cardPath 配置值 persona.cardPath
+ * @param {{env?: Record<string, string|undefined>, homedir?: string|(() => string)}} [deps]
+ * @returns {Readonly<{card: Readonly<object>, status: 'builtin'|'file'|'fallback',
+ *   path: string|null, reason: string|null}>}
+ */
+export function loadPersonaCard(cardPath, deps = {}) {
+  const resolved = resolveCardPath(cardPath, deps);
+  if (resolved === null) {
+    return Object.freeze({
+      card: cloneFrozen(DEFAULT_CARD),
+      status: CARD_STATUS.BUILTIN,
+      path: null,
+      reason: null,
+    });
+  }
+
+  let source;
+  try {
+    source = readFileSync(resolved, 'utf8');
+  } catch (err) {
+    return Object.freeze({
+      card: cloneFrozen(DEFAULT_CARD),
+      status: CARD_STATUS.FALLBACK,
+      path: resolved,
+      reason: describeReadError(err, resolved),
+    });
+  }
+
+  try {
+    return Object.freeze({
+      card: parseCardSource(source, resolved),
+      status: CARD_STATUS.FILE,
+      path: resolved,
+      reason: null,
+    });
+  } catch (err) {
+    return Object.freeze({
+      card: cloneFrozen(DEFAULT_CARD),
+      status: CARD_STATUS.FALLBACK,
+      path: resolved,
+      reason: describeParseError(err, resolved),
+    });
+  }
+}
+
+/**
+ * 人格卡 `proactive.*` 与配置 `proactiveDailyCap/quietStart/quietEnd` 的重复项
+ * （v0.4.12）。本版行为以**配置**为准，这里只找出两边不一致的字段用于 warn；
+ * `chatPerDay` 在配置里没有对应键，不参与比较。
+ *
+ * @param {Record<string, any>} card
+ * @param {Record<string, any>} [config]
+ * @returns {Array<{cardField: string, configField: string}>}
+ */
+export function personaProactiveConflicts(card, config = {}) {
+  const proactive = card?.proactive;
+  const conflicts = [];
+  if (proactive === null || typeof proactive !== 'object') return conflicts;
+  const pairs = [
+    ['dailyCap', 'proactiveDailyCap'],
+    ['quietStart', 'quietStart'],
+    ['quietEnd', 'quietEnd'],
+  ];
+  for (const [cardField, configField] of pairs) {
+    if (!Object.hasOwn(proactive, cardField)) continue;
+    if (config === null || config === undefined || !Object.hasOwn(config, configField)) continue;
+    if (proactive[cardField] !== config[configField]) {
+      conflicts.push({ cardField, configField });
+    }
+  }
+  return conflicts;
+}
+
+/**
+ * 读取失败的展示原因：带错误码与解析后路径（不含文件正文）。
+ * @param {any} err
+ * @param {string} resolved
+ * @returns {string}
+ */
+function describeReadError(err, resolved) {
+  const code = typeof err?.code === 'string' ? err.code : '';
+  if (code === 'ENOENT' || code === 'ENOTDIR') return `文件不存在（${code}）：${resolved}`;
+  if (code === 'EISDIR') return `不是普通文件（EISDIR）：${resolved}`;
+  if (code === 'EACCES' || code === 'EPERM') return `没有读取权限（${code}）：${resolved}`;
+  return `读取失败${code === '' ? '' : `（${code}）`}：${resolved}`;
+}
+
+/**
+ * 解析/校验失败的展示原因：错误消息已含路径时不再重复，超长截断。
+ * @param {any} err
+ * @param {string} resolved
+ * @returns {string}
+ */
+function describeParseError(err, resolved) {
+  const message = err instanceof Error ? err.message : String(err);
+  const text = message.length > 160 ? `${message.slice(0, 160)}…` : message;
+  return text.includes(resolved) ? text : `${text}（${resolved}）`;
 }
 
 /**

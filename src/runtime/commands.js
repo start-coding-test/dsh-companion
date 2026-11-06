@@ -135,6 +135,7 @@ export function handleCommand({
   pendingCompactions,
   threadAgentPreset,
   timing,
+  persona,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -174,6 +175,7 @@ export function handleCommand({
       pendingCompactions,
       threadAgentPreset,
       timing,
+      persona,
     }),
   };
 }
@@ -525,7 +527,7 @@ function formatGiB(value) {
   return String(Math.round(n * 100) / 100);
 }
 
-/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] @param {{threadsSupported?: boolean, mainSession?: {id?: string|null, binding?: string}, threadAgentPreset?: string|null}} [options] */
+/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] @param {{threadsSupported?: boolean, mainSession?: {id?: string|null, binding?: string}, threadAgentPreset?: string|null, persona?: {name?: string, version?: number, status?: string, path?: string|null, reason?: string|null}}} [options] */
 function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   const stats = store.stats();
   const tables = [
@@ -580,8 +582,43 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   lines.push(threadPreset === null
     ? '线程 preset：宿主默认'
     : `线程 preset：${threadPreset}（配置：thread.agentPreset）`);
+  // v0.4.12：人格卡来源（内置默认 / 文件路径 / 加载失败原因）；只在接线层传入时输出，
+  // 旧调用方（单测/其它宿主）不传则整行省略，输出格式不变。
+  const personaLine = formatPersonaLine(options.persona);
+  if (personaLine !== null) lines.push(personaLine);
   lines.push(`水位 ${scope}：${watermark}`, `最近 job：${jobText}`, failureText);
   return lines.join('\n');
+}
+
+/**
+ * v0.4.12：人格卡来源行。
+ *
+ * 格式：`人格卡：<name> v<version>（<路径> | 内置默认 | 加载失败，已用内置：<原因>）`
+ * 加载失败的原因已含解析后路径与错误码，这里不再重复；卡正文永不进 /状态。
+ *
+ * @param {{name?: unknown, version?: unknown, status?: unknown, path?: unknown, reason?: unknown}} [persona]
+ * @returns {string|null} 未传 persona 时返回 null（不输出该行）
+ */
+function formatPersonaLine(persona) {
+  if (persona === null || persona === undefined || typeof persona !== 'object') return null;
+  const name = typeof persona.name === 'string' && persona.name.trim() !== ''
+    ? persona.name.trim()
+    : '未知';
+  const version = Number.isInteger(persona.version) && persona.version > 0 ? ` v${persona.version}` : '';
+  let source;
+  if (persona.status === 'fallback') {
+    const reason = typeof persona.reason === 'string' && persona.reason.trim() !== ''
+      ? persona.reason.trim()
+      : '原因未知';
+    source = `加载失败，已用内置：${reason}`;
+  } else if (persona.status === 'file') {
+    source = typeof persona.path === 'string' && persona.path.trim() !== ''
+      ? persona.path.trim()
+      : '路径未知';
+  } else {
+    source = '内置默认';
+  }
+  return `人格卡：${name}${version}（${source}）`;
 }
 
 /**

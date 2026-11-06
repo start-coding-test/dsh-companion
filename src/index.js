@@ -53,7 +53,7 @@ import {
 import { exportAll } from './memory/export.js';
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections } from './persona/sections.js';
-import { DEFAULT_CARD } from './persona/card.js';
+import { CARD_STATUS, loadPersonaCard, personaProactiveConflicts } from './persona/card.js';
 import {
   buildChatPrompt,
   chatEligibility,
@@ -386,6 +386,8 @@ export function apply(ctx, rawConfig, hooks = {}) {
   }
   const metrics = createMetrics({ clock: platform.now });
   const state = createWiringState({ platform, store, config, metrics, embedder, seats });
+  // v0.4.12：人格卡只在 apply 时加载一次（不做热加载）；失败回落内置卡并 warn。
+  applyPersonaCard(state);
   // V3-H2：先把上次进程崩溃时残留的 delivering 提醒收回 pending，避免永久卡住。
   recoverReminderDeliveries(state);
   if (embedder !== null && embedder.kind === 'remote') {
@@ -437,7 +439,7 @@ export function apply(ctx, rawConfig, hooks = {}) {
     }
     publishOnThreadUnarchive(platform, store);
 
-    registerSections(platform, store, track);
+    registerSections(platform, store, track, state.card);
     // V7-H1 审计：pre-step 是事件钩子注册（只能在 apply 阶段完成），能力位来自
     // Context 事件 API 而非晚挂载 service，故保留 apply 时判断。
     if (platform.capabilities.preStep) {
@@ -528,6 +530,10 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     store,
     config,
     metrics,
+    /** v0.4.12：启动时加载一次的人格卡（applyPersonaCard 填充），人格段/跟进/闲聊共用。 */
+    card: null,
+    /** v0.4.12：人格卡加载来源 {card,status,path,reason}；/状态 展示用。 */
+    cardSource: null,
     /** W4：当前 embedder（关闭向量时为 null）；local/remote 由注入 loader/fetch 构造。 */
     embedder,
     /** W4：本进程已回填的向量条数（/状态 展示）。 */
@@ -642,6 +648,64 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
   };
 }
 
+/**
+ * 启动时加载一次人格卡（v0.4.12），结果放进 state.card / state.cardSource。
+ *
+ * 加载失败绝不阻断 apply：回落到内置卡，写一条 warn（含解析后路径与原因，
+ * 不含卡正文）；/状态 会显示「加载失败，已用内置：<原因>」。改卡需重启。
+ *
+ * @param {object} state
+ */
+function applyPersonaCard(state) {
+  const { platform, config } = state;
+  const loaded = loadPersonaCard(config.persona?.cardPath ?? null);
+  state.card = loaded.card;
+  state.cardSource = loaded;
+
+  if (loaded.status === CARD_STATUS.FALLBACK) {
+    platform.log('warn', '[dsh-companion] persona card load failed; using built-in card', {
+      path: loaded.path,
+      reason: loaded.reason,
+    });
+    return;
+  }
+  if (loaded.status !== CARD_STATUS.FILE) return;
+
+  // 本版 proactive 行为以配置为准（不改行为），两边不一致时只 warn 提醒去重。
+  const conflicts = personaProactiveConflicts(loaded.card, config);
+  if (conflicts.length > 0) {
+    platform.log('warn', '[dsh-companion] persona card proactive settings conflict with config; config wins', {
+      path: loaded.path,
+      fields: conflicts.map((item) => `proactive.${item.cardField}≠${item.configField}`),
+    });
+  }
+  // chatPerDay 在配置里没有对应键，只做一次 debug 说明（不告警）。
+  if (Object.hasOwn(loaded.card.proactive ?? {}, 'chatPerDay')) {
+    platform.log('debug', '[dsh-companion] persona card proactive.chatPerDay has no config counterpart; card value kept', {
+      path: loaded.path,
+      chatPerDay: loaded.card.proactive.chatPerDay,
+    });
+  }
+}
+
+/**
+ * /状态 用的人格卡来源快照；state 未加载过卡（旧调用方）时返回 undefined，
+ * 命令层据此不输出「人格卡」行，保持旧输出格式不变。
+ * @param {object} [state]
+ * @returns {{name: string, version: number, status: string, path: string|null, reason: string|null}|undefined}
+ */
+function personaStatus(state) {
+  if (state?.card === null || state?.card === undefined) return undefined;
+  if (state.cardSource === null || state.cardSource === undefined) return undefined;
+  return {
+    name: state.card.name,
+    version: state.card.version,
+    status: state.cardSource.status,
+    path: state.cardSource.path,
+    reason: state.cardSource.reason,
+  };
+}
+
 // ----------------------------------------------------------- 人格段 / 命令
 
 /**
@@ -649,12 +713,13 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
  * @param {object} platform
  * @param {Store} store
  * @param {(disposer: Function) => void} track
+ * @param {Readonly<object>} card 启动时加载一次的人格卡（state.card）
  */
-function registerSections(platform, store, track) {
+function registerSections(platform, store, track, card) {
   // V7-H1 审计：systemPrompt 是声明的 inject，cordis 在 apply 前就绪；段注册
   // 也只能在 apply 阶段完成，故保留 apply 时判断（不存在晚挂载后补注册的路径）。
   if (!platform.capabilities.systemPrompt) return;
-  for (const section of buildSections(DEFAULT_CARD)) {
+  for (const section of buildSections(card)) {
     track(platform.section(section));
   }
   track(platform.section({
@@ -766,6 +831,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
               compactWarnMs: config.timing?.compactWarnMs,
               consolidateWarnMs: config.timing?.consolidateWarnMs,
             },
+            // v0.4.12：/状态 展示人格卡来源（内置默认 / 文件路径 / 加载失败原因）。
+            persona: personaStatus(state),
           });
         } catch (error) {
           return {
@@ -3704,7 +3771,7 @@ function withDeliveryFailure(store, reply) {
  * @returns {number} 本次入队条数
  */
 function runCommitmentFollowups(state) {
-  const { store, platform, proactive, config, metrics } = state;
+  const { store, platform, proactive, config, metrics, card } = state;
   const now = platform.now();
   const timeZone = config.timezone;
   let rows;
@@ -3738,7 +3805,7 @@ function runCommitmentFollowups(state) {
     proactive?.enqueue({
       kind: 'reminder',
       // C5-H1a：承诺跟进同样是插件主动投递，正文带提醒前缀，requestId 按天稳定。
-      text: `${REMINDER_TEXT_PREFIX}${followUpText({ card: DEFAULT_CARD, reminder: row, overdueDays })}`,
+      text: `${REMINDER_TEXT_PREFIX}${followUpText({ card, reminder: row, overdueDays })}`,
       dedupeKey: `commitment:${row.id}:${dayKey}`,
       requestId: `companion-commitment:${row.id}:${dayKey}`,
       at: now,
@@ -3773,7 +3840,7 @@ function runCommitmentFollowups(state) {
  * @returns {Promise<{queued: boolean, reason?: string, sentences?: number}>}
  */
 async function runLightChat(state) {
-  const { store, platform, config, metrics } = state;
+  const { store, platform, config, metrics, card } = state;
   const now = platform.now();
   const timeZone = config.timezone;
   const dayKey = zonedDayKey(now, timeZone);
@@ -3836,7 +3903,7 @@ async function runLightChat(state) {
 
     let raw;
     try {
-      raw = await llm({ card: DEFAULT_CARD, recentTopics, recallSummary, messageCount: 8 });
+      raw = await llm({ card, recentTopics, recallSummary, messageCount: 8 });
     } catch (error) {
       platform.log('warn', '[dsh-companion] light chat generation failed', {
         message: error instanceof Error ? error.message : String(error),
@@ -3845,7 +3912,7 @@ async function runLightChat(state) {
     }
 
     const normalized = normalizeChatText(typeof raw === 'string' ? raw : raw?.text, {
-      bannedPhrases: DEFAULT_CARD.bannedPhrases,
+      bannedPhrases: card.bannedPhrases,
     });
     if (!normalized.ok) {
       platform.log('debug', '[dsh-companion] light chat rejected', {

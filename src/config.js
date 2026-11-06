@@ -151,6 +151,20 @@ Object.defineProperty(DEFAULT_VALUES, 'timing', {
   configurable: false,
 });
 
+// v0.4.12：人格卡文件路径。默认 null（用内置卡）；相对路径相对 DSH_HOME
+// （`DSH_HOME` 否则 ~/.dsh）解析。只在 apply 时加载一次，改卡需重启。
+// 该节同样不参与 16 键安装自检（与 vector/recall/session/consolidation/thread/timing 一致）。
+const PERSONA_DEFAULTS = Object.freeze({
+  cardPath: null,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'persona', {
+  value: PERSONA_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -571,6 +585,39 @@ export function normalizeTiming(raw, warnings = []) {
 }
 
 /**
+ * 校验 persona 配置（v0.4.12）：人格卡文件路径。
+ *
+ * `cardPath` 缺省为 null（用内置卡）；非空字符串按 DSH_HOME 相对路径解析
+ * （解析规则见 persona/card.js 的 resolveCardPath），trim 后空串归一为 null，
+ * 其余非字符串 fail-fast。该路径只在 apply 时加载一次，改卡需重启。
+ *
+ * 该节默认不参与 Object.keys(DEFAULTS) 的 16 键安装自检（与 vector/recall/
+ * session/consolidation/thread/timing 一致）。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{cardPath: string|null}>}
+ */
+export function normalizePersona(raw, warnings = []) {
+  const defaults = DEFAULTS.persona;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('persona', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['cardPath']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "persona.${key}" ignored`);
+  }
+  const value = raw.cardPath === undefined ? defaults.cardPath : raw.cardPath;
+  if (value === null) return defaults;
+  if (typeof value !== 'string') {
+    throw new ConfigError('persona.cardPath', `must be a string or null, got ${JSON.stringify(value)}`);
+  }
+  const cardPath = value.trim() === '' ? null : value.trim();
+  return Object.freeze({ cardPath });
+}
+
+/**
  * 合并默认值并校验配置；未知字段只产生 warning，不阻断。
  * @param {Record<string, unknown>} [raw]
  * @returns {Readonly<Record<string, unknown>>} 冻结后的配置（含 warnings 数组）
@@ -645,6 +692,7 @@ export function normalizeConfig(raw = {}) {
   cfg.consolidation = normalizeConsolidation(input.consolidation, warnings);
   cfg.thread = normalizeThread(input.thread, warnings);
   cfg.timing = normalizeTiming(input.timing, warnings);
+  cfg.persona = normalizePersona(input.persona, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

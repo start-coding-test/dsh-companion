@@ -8,8 +8,6 @@
  * 3) 长度上限：safety ≤250 字、core ≤600 字、protocol ≤400 字（按 Unicode 码点计）。
  */
 
-import { DEFAULT_CARD } from './card.js';
-
 const MAX_SAFETY = 250;
 const MAX_CORE = 600;
 const MAX_PROTOCOL = 400;
@@ -44,14 +42,24 @@ const PROTOCOL_TEXT = [
 
 /**
  * 渲染 system 三段（order 80/90/150）。返回顺序固定，便于直接注册。
- * @param {object} [card] 人格卡（默认 DEFAULT_CARD）
+ *
+ * v0.4.12：人格卡必须显式传入（运行时由 apply 加载一次后放进 state.card）。
+ * 不再静默回退内置默认卡——否则用户配了 persona.cardPath 却漏接线时，人格段
+ * 会无声地继续用内置卡，问题要到线上才暴露。
+ *
+ * @param {object} card 人格卡（loadPersonaCard/loadCard 的返回值）
  * @returns {ReadonlyArray<{name:string, order:number, text:string}>}
  */
-export function buildSections(card = DEFAULT_CARD) {
-  const current = card ?? DEFAULT_CARD;
+export function buildSections(card) {
+  if (card === null || card === undefined || typeof card !== 'object') {
+    throw new TypeError(
+      'buildSections(card): card is required (got '
+      + `${card === null ? 'null' : typeof card}); load the persona card before rendering sections`,
+    );
+  }
   const sections = [
     { name: 'persona:safety', order: 80, text: clamp(SAFETY_TEXT, MAX_SAFETY) },
-    { name: 'persona:core', order: 90, text: clamp(coreText(current), MAX_CORE) },
+    { name: 'persona:core', order: 90, text: clamp(coreText(card), MAX_CORE) },
     { name: 'persona:protocol', order: 150, text: clamp(PROTOCOL_TEXT, MAX_PROTOCOL) },
   ];
   return Object.freeze(sections.map((section) => Object.freeze(section)));

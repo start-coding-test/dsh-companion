@@ -222,8 +222,18 @@ describe('buildSections', () => {
     assert.throws(() => { sections[0].text = '替换'; }, TypeError);
   });
 
-  test('不传卡时使用默认卡', () => {
-    assert.deepEqual(buildSections(), buildSections(DEFAULT_CARD));
+  test('不传卡时抛清晰 TypeError（v0.4.12 起必须显式传入）', () => {
+    assert.throws(() => buildSections(), {
+      name: 'TypeError',
+      message: /buildSections\(card\): card is required/,
+    });
+    assert.throws(() => buildSections(null), TypeError);
+    assert.throws(() => buildSections(undefined), TypeError);
+    assert.throws(() => buildSections('珞然'), TypeError);
+    // 显式传入内置卡仍渲染三段，与旧的「默认卡」行为等价。
+    const sections = buildSections(DEFAULT_CARD);
+    assert.equal(sections.length, 3);
+    assert.ok(sections[1].text.includes(DEFAULT_CARD.name));
   });
 });
 
