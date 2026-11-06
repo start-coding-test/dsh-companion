@@ -667,25 +667,54 @@ function applyPersonaCard(state) {
       path: loaded.path,
       reason: loaded.reason,
     });
-    return;
+    // 不 return：兜底用的也是内置卡，proactive 同名字段同样会被配置覆盖，继续比较。
   }
-  if (loaded.status !== CARD_STATUS.FILE) return;
 
   // 本版 proactive 行为以配置为准（不改行为），两边不一致时只 warn 提醒去重。
+  // 内置卡也参与比较：内置 proactive 值等于默认配置，只有用户改了配置才会不一致，
+  // 此时正需要提醒「卡里的同名字段被配置覆盖」。
   const conflicts = personaProactiveConflicts(loaded.card, config);
-  if (conflicts.length > 0) {
-    platform.log('warn', '[dsh-companion] persona card proactive settings conflict with config; config wins', {
-      path: loaded.path,
-      fields: conflicts.map((item) => `proactive.${item.cardField}≠${item.configField}`),
-    });
-  }
+  if (conflicts.length > 0) logProactiveConflicts(platform, config, loaded, conflicts);
+
   // chatPerDay 在配置里没有对应键，只做一次 debug 说明（不告警）。
-  if (Object.hasOwn(loaded.card.proactive ?? {}, 'chatPerDay')) {
+  if (loaded.status === CARD_STATUS.FILE && Object.hasOwn(loaded.card.proactive ?? {}, 'chatPerDay')) {
     platform.log('debug', '[dsh-companion] persona card proactive.chatPerDay has no config counterpart; card value kept', {
       path: loaded.path,
       chatPerDay: loaded.card.proactive.chatPerDay,
     });
   }
+}
+
+/**
+ * proactive 冲突告警（v0.4.12）。
+ *
+ * 文件卡沿用既有英文事件文案（meta 带解析后路径与字段）；内置卡/兜底卡用中文
+ * 说明并带上两边取值——只有用户改过配置才会触发，用于提醒卡里的 proactive
+ * 同名字段会被配置覆盖（本版以配置为准，行为不变）。
+ *
+ * @param {object} platform
+ * @param {object} config 归一化后的配置（含 proactiveDailyCap/quietStart/quietEnd）
+ * @param {{card: object, status: string, path: string|null}} loaded
+ * @param {Array<{cardField: string, configField: string}>} conflicts
+ */
+function logProactiveConflicts(platform, config, loaded, conflicts) {
+  const fields = conflicts.map((item) => `proactive.${item.cardField}≠${item.configField}`);
+  if (loaded.status === CARD_STATUS.FILE) {
+    platform.log('warn', '[dsh-companion] persona card proactive settings conflict with config; config wins', {
+      path: loaded.path,
+      fields,
+    });
+    return;
+  }
+  const details = conflicts.map((item) => (
+    `proactive.${item.cardField}=${String(loaded.card.proactive[item.cardField])}`
+    + ` 与配置 ${item.configField}=${String(config[item.configField])} 不一致`
+  ));
+  platform.log('warn', `[dsh-companion] 人格卡（内置默认）的 ${details.join('；')}，以配置为准`, {
+    path: loaded.path,
+    fields,
+    source: loaded.status,
+  });
 }
 
 /**
