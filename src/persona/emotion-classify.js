@@ -113,8 +113,10 @@ function segments(text) {
  * @returns {boolean}
  */
 function isNegated(segment, index) {
-  const before = segment.slice(Math.max(0, index - 5), index);
-  return NEGATION.test(before);
+  const window = segment.slice(Math.max(0, index - 5), index);
+  // 「不过」「不但」「不仅」是转折/递进连词，不是否定：「谢谢你，不过你好烦」仍是指责。
+  const stripped = window.replace(/(?:不过|不但|不仅|不管|不论|不光)/gu, '');
+  return NEGATION.test(stripped);
 }
 
 /**
@@ -136,6 +138,19 @@ function objectBefore(segment, index) {
   consider(THIRD_MARKERS, 'third');
   consider(THING_MARKERS, 'thing');
   return best.kind;
+}
+
+/**
+ * 同一句里是否还有「对她的正面」（感谢/关心/安抚）：与对她的负面并存时说明分不出来。
+ *
+ * @param {string} segment
+ * @returns {boolean}
+ */
+function hasHerPositive(segment) {
+  return THANKS_PATTERN.test(segment)
+    || THANKS_HARDWORK.test(segment)
+    || CARE_PATTERN.test(segment)
+    || COMFORT_PATTERN.test(segment);
 }
 
 /**
@@ -232,6 +247,9 @@ function classifySegment(segment, extraHer) {
   // 2) 明确敌意句式（「烦不烦」要排除「不烦不烦」）。
   if (hostile(segment)) {
     const hits = HOSTILE_PATTERNS.filter((pattern) => pattern.test(segment)).length;
+    if (hasHerPositive(segment)) {
+      return { type: 'conflict', confidence: 0.45, reason: 'ambiguous' };
+    }
     return { type: 'conflict', confidence: confidenceOf(0.78, hits), reason: 'hostile' };
   }
 
@@ -242,6 +260,10 @@ function classifySegment(segment, extraHer) {
       return { type: 'care', confidence: 0.7, reason: 'negated-insult' };
     }
     const mild = MILD_CUES.includes(insult.cue);
+    if (hasHerPositive(segment)) {
+      // 同一句既有对她的负面又有对她的正面：分不出来，降置信度只记审计。
+      return { type: 'blame', confidence: 0.45, reason: 'ambiguous' };
+    }
     return {
       type: 'blame',
       confidence: mild ? 0.62 : 0.74,
