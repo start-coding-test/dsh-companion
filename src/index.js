@@ -707,11 +707,13 @@ function applyPersonaCard(state, hooks = {}) {
     });
   }
 
-  // 导入期诊断（如 CCv2/v3 的 character_book 被忽略）；不含书内容。
+  // 导入期诊断（如 CCv2/v3 的 character_book 被忽略、模板占位符被降级）；
+  // detail 只放名字/字段名，不含正文。
   for (const warning of loaded.warnings ?? []) {
     platform.log('warn', '[dsh-companion] persona card import warning', {
       code: warning.code,
       path: loaded.path,
+      detail: warning.detail,
     });
   }
 }
@@ -785,6 +787,10 @@ function registerSections(platform, store, track, card) {
   track(platform.section({
     name: 'persona:state_board',
     order: 160,
+    // V50-M2：状态板正文来自记忆（可能被用户写入含 `{{…}}` 的文本）。宿主的
+    // interpolate() 对未注册变量是**整轮抛错**，不是忽略；显式关闭插值，
+    // 让状态板永远按字面量进入 system prompt。
+    interpolate: false,
     text: () => {
       const published = store.getBoard(SCOPE);
       return published === null || published === undefined ? '' : boardSection(published).text;

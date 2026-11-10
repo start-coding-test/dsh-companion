@@ -118,7 +118,9 @@ export function buildSectionsWithDiagnostics(card) {
 export function boardSection(text) {
   const body = String(text ?? '').trim();
   const rendered = body === '' ? '' : `[状态板]\n${body}`;
-  return Object.freeze({ name: 'persona:state_board', order: 160, text: rendered });
+  // V50-M2：状态板正文来自记忆，可能含用户写入的 `{{…}}`。宿主对未注册变量是
+  // 整轮抛错（dsh-system-prompt/lib/index.js:160-184），所以这里同样关闭插值。
+  return Object.freeze({ name: 'persona:state_board', order: 160, text: rendered, interpolate: false });
 }
 
 /**

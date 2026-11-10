@@ -254,6 +254,8 @@ describe('boardSection', () => {
     const section = boardSection('用户在做桌宠；今天有 2 个待办。');
     assert.equal(section.name, 'persona:state_board');
     assert.equal(section.order, 160);
+    // V50-M2：宿主插值对未注册 {{x}} 整轮抛错，状态板必须关闭插值。
+    assert.equal(section.interpolate, false);
     assert.ok(section.text.startsWith('[状态板]'));
     assert.ok(section.text.includes('用户在做桌宠'));
     assert.ok(Object.isFrozen(section));
