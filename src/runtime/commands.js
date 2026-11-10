@@ -16,6 +16,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { describeAssembly, displaySectionName } from '../persona/assembly-record.js';
 
 import { forgetMemory } from '../memory/forget.js';
 import { describe } from '../persona/emotion.js';
@@ -141,6 +142,7 @@ export function handleCommand({
   persona,
   shadow,
   emotion,
+  assembly,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -183,6 +185,8 @@ export function handleCommand({
       persona,
       shadow,
       emotion,
+      // V50-L3：最近一次装配（只含字数与短哈希，见 persona/assembly-record.js）。
+      assembly,
       now: toMillis(now),
     }),
   };
@@ -600,6 +604,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // P3-c：情绪状态行。只在接线层传入 options.emotion 时输出，旧调用方格式不变。
   const emotionLine = formatEmotionLine(store, scope, options.emotion, options.now, timeZone);
   if (emotionLine !== null) lines.push(emotionLine);
+  // V50-L3：最近一次装配（时间/遮蔽/段字数与短哈希/本轮情绪句）；不传则整行省略。
+  const assemblyLine = formatAssemblyLine(options.assembly, options.now, timeZone);
+  if (assemblyLine !== null) lines.push(assemblyLine);
   lines.push(`水位 ${scope}：${watermark}`, `最近 job：${jobText}`, failureText);
   return lines.join('\n');
 }
@@ -649,6 +656,39 @@ function formatShadowLine(shadow) {
   if (shadow.mode === 'rewrite') return '部署人设：已替换（人格卡身份）';
   if (shadow.mode === 'takeover') return '部署人设：已接管';
   return null;
+}
+
+/**
+ * V50-L3：最近一次装配。
+ *
+ * 只展示可验证的元数据：时间、遮蔽模式、prefix 是否真的被改写、各段字数与短哈希、
+ * 本轮情绪句。卡正文、段正文一律不进这一行——记录层也从不保存它们。
+ *
+ * @param {object|undefined} assembly 装配记录（createAssemblyRecord 产出的对象）
+ * @param {number} now
+ * @param {string} timeZone
+ * @returns {string|null} 未传或尚无记录时返回 null
+ */
+function formatAssemblyLine(assembly, now, timeZone) {
+  const snapshot = describeAssembly(assembly);
+  if (snapshot === null) return null;
+  const at = snapshot.sectionsAt ?? snapshot.shadowAt ?? snapshot.emotionAt;
+  const when = at === null ? '时间未知' : formatRelativeTimeCn(at, now, timeZone);
+  const parts = [`最近一次装配：${when === '' ? '时间未知' : when}`];
+  const mode = snapshot.shadowMode === 'rewrite'
+    ? '已替换（rewrite）'
+    : snapshot.shadowMode === 'takeover' ? '已接管（takeover）' : '宿主默认';
+  parts.push(`部署人设 ${mode}`, snapshot.shadowRewritten ? 'prefix 已改写' : 'prefix 未改写');
+  if (snapshot.sections.length > 0) {
+    const segments = snapshot.sections.map((section) => {
+      const name = displaySectionName(section?.name);
+      const hash = typeof section?.hash === 'string' && section.hash !== '' ? section.hash : '—';
+      return `${name} ${section?.chars ?? 0}/${hash}`;
+    });
+    parts.push(`段 ${segments.join('、')}`);
+  }
+  if (snapshot.emotionText !== '') parts.push(`情绪句「${snapshot.emotionText}」`);
+  return parts.join('；');
 }
 
 /** P3-c：情绪事件类型 → /状态 里的中文标签；白名单之外（ambient）不展示。 */

@@ -131,11 +131,14 @@ export function applyDeploymentShadow(sections, options = {}) {
  * 被吞掉并只 warn 一次，然后返回 next() 的原值，绝不阻断装配。
  *
  * @param {{mode: 'off'|'rewrite'|'takeover', personaText?: string,
- *          warn?: (message: string, meta?: object) => void}} options
+ *          warn?: (message: string, meta?: object) => void,
+ *          onApplied?: (info: {mode: string, rewritten: boolean}) => void}} options
+ *   `onApplied` 只在**真的改动了**装配结果时调用（V50-L3 的 `/状态` 装配记录用）：
+ *   它不参与装配决策，抛错也吞掉，避免排障信息反过来打断对话。
  * @returns {(assembly: object, context: object, next: Function) => Promise<object>}
  */
 export function createAssembleHandler(options = {}) {
-  const { mode, personaText = '', warn = () => {} } = options;
+  const { mode, personaText = '', warn = () => {}, onApplied = null } = options;
   const warned = new Set();
   /** 去重后的告警：同一原因在进程生命周期内最多一条。 */
   const warnOnce = (message, meta = {}) => {
@@ -164,6 +167,13 @@ export function createAssembleHandler(options = {}) {
       if (!Array.isArray(sections)) return resolved;
       const transformed = applyDeploymentShadow(sections, { mode, personaText, warn: warnOnce });
       if (transformed === sections) return resolved;
+      if (typeof onApplied === 'function') {
+        try {
+          onApplied({ mode, rewritten: mode === 'rewrite' });
+        } catch {
+          // 装配记录失败不影响装配本身。
+        }
+      }
       return { ...resolved, sections: transformed };
     } catch (error) {
       warnOnce('[dsh-companion] deployment persona shadow failed; host persona left unchanged', {

@@ -406,12 +406,19 @@ test('集成（v0.4.12 等价）：未配置卡时人格三段 SHA-256 一致，
     assert.equal(lines[emotionIndex], '情绪：未启用');
     // P2（v0.4.13）：默认 off 也显式说明「宿主默认」，排障时不必猜配置。
     assert.equal(lines[8], '部署人设：宿主默认');
-    assert.equal(lines.length, V0412_STATUS_LINES.length + 3, '/状态 应只多人格卡、部署人设与情绪三行');
+    // V50-L3：装配记录紧随情绪行；未启用情绪时只有段/遮蔽信息，没有情绪句。
+    const assemblyIndex = lines.findIndex((line) => line.startsWith('最近一次装配：'));
+    assert.equal(assemblyIndex, 10, '装配记录行插在情绪行之后、水位数之前');
+    assert.match(lines[assemblyIndex], /部署人设 宿主默认；prefix 未改写/u);
+    assert.match(lines[assemblyIndex], /段 safety \d+\/[0-9a-f]{8}、core \d+\/[0-9a-f]{8}、protocol \d+\/[0-9a-f]{8}/u);
+    assert.equal(lines[assemblyIndex].includes('情绪句'), false, '情绪未启用时不该有情绪句');
+    assert.equal(lines.length, V0412_STATUS_LINES.length + 4, '/状态 应只多人格卡、部署人设、情绪与装配记录四行');
 
     const withoutInjected = lines.filter(
       (line) => !line.startsWith('人格卡：')
         && !line.startsWith('部署人设：')
-        && !line.startsWith('情绪：'),
+        && !line.startsWith('情绪：')
+        && !line.startsWith('最近一次装配：'),
     );
     assert.match(withoutInjected[0], V0412_STATUS_HEAD);
     assert.equal(withoutInjected[0], V0412_STATUS_LINES[0]);

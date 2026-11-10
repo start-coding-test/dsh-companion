@@ -54,6 +54,12 @@ import { exportAll } from './memory/export.js';
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections, buildSectionsWithDiagnostics } from './persona/sections.js';
 import { CARD_STATUS, DEFAULT_CARD, loadPersonaCard, personaProactiveConflicts, renderTemplate } from './persona/card.js';
+import {
+  createAssemblyRecord,
+  recordEmotionText,
+  recordSections,
+  recordShadow,
+} from './persona/assembly-record.js';
 import { createAssembleHandler } from './persona/shadow.js';
 import {
   EMOTION_PROMPT_PREFIX,
@@ -452,7 +458,7 @@ export function apply(ctx, rawConfig, hooks = {}) {
     }
     publishOnThreadUnarchive(platform, store);
 
-    registerSections(platform, store, track, state.card);
+    registerSections(platform, store, track, state.card, state.assembly);
     // V50-M3：情绪句改走宿主动态 context（order 320，避开宿主已用的 100-210）。
     // 仅在卡上启用情绪时注册；宿主缺 context() 时只 warn 一次并降级为不注入，
     // 默认（情绪关闭）路径完全不注册、不读不写库。
@@ -472,7 +478,7 @@ export function apply(ctx, rawConfig, hooks = {}) {
     }
     // P2（v0.5.0）：遮蔽宿主默认人设。off 时连监听器都不注册，默认路径与旧版
     // 完全一致；失败只 warn，不挡装配。
-    state.shadowMode = registerDeploymentShadow(platform, config, track, state.card);
+    state.shadowMode = registerDeploymentShadow(platform, config, track, state.card, state.assembly);
     // V7-H1 审计：pre-step 是事件钩子注册（只能在 apply 阶段完成），能力位来自
     // Context 事件 API 而非晚挂载 service，故保留 apply 时判断。
     if (platform.capabilities.preStep) {
@@ -569,6 +575,8 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     cardSource: null,
     /** P2（v0.5.0）：实际生效的遮蔽模式；/状态 展示用。注册失败时回落 'off'。 */
     shadowMode: 'off',
+    /** V50-L3：最近一次装配的只读记录（仅在内存里，只存字数与短哈希）。 */
+    assembly: createAssemblyRecord(),
     /** W4：当前 embedder（关闭向量时为 null）；local/remote 由注入 loader/fetch 构造。 */
     embedder,
     /** W4：本进程已回填的向量条数（/状态 展示）。 */
@@ -805,11 +813,12 @@ function personaStatus(state) {
  * @param {(disposer: Function) => void} track
  * @param {Readonly<object>} card 启动时加载一次的人格卡（state.card）
  */
-function registerSections(platform, store, track, card) {
+function registerSections(platform, store, track, card, record) {
   // V7-H1 审计：systemPrompt 是声明的 inject，cordis 在 apply 前就绪；段注册
   // 也只能在 apply 阶段完成，故保留 apply 时判断（不存在晚挂载后补注册的路径）。
   if (!platform.capabilities.systemPrompt) return;
-  for (const section of buildSections(card)) {
+  const sections = buildSections(card);
+  for (const section of sections) {
     track(platform.section(section));
   }
   track(platform.section({
@@ -824,6 +833,8 @@ function registerSections(platform, store, track, card) {
       return published === null || published === undefined ? '' : boardSection(published).text;
     },
   }));
+  // V50-L3：只记静态段；状态板是动态段（text 为函数），按设计跳过。
+  recordSections(record, sections, typeof platform.now === 'function' ? platform.now() : null);
 }
 
 /**
@@ -838,7 +849,7 @@ function registerSections(platform, store, track, card) {
  * @param {Readonly<object>} card 启动时加载一次的人格卡（state.card）
  * @returns {'off'|'rewrite'|'takeover'} 实际生效的模式（注册失败回落 'off'）
  */
-function registerDeploymentShadow(platform, config, track, card) {
+function registerDeploymentShadow(platform, config, track, card, record) {
   const mode = config.persona?.shadowDeployment ?? 'off';
   if (mode === 'off') return 'off';
   if (typeof platform.onAssemble !== 'function') {
@@ -856,6 +867,7 @@ function registerDeploymentShadow(platform, config, track, card) {
     mode,
     personaText,
     warn: (message, meta) => platform.log('warn', message, meta),
+    onApplied: (info) => recordShadow(record, { ...info, nowMs: platform.now() }),
   });
   const disposer = platform.onAssemble(handler);
   if (typeof disposer !== 'function') {
@@ -974,6 +986,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             shadow: { mode: state.shadowMode },
             // P3-c：/状态 展示情绪状态；未启用时命令层只输出「情绪：未启用」。
             emotion: { enabled: state.card?.emotion?.enabled === true },
+      // V50-L3：最近一次装配（字数与短哈希，不含正文）。
+      assembly: state.assembly,
           });
         } catch (error) {
           return {
@@ -2809,7 +2823,12 @@ function emotionContextText(state, context) {
   }
   if (identity?.kind === 'subagent') return '';
   const scope = identity?.scope ?? SCOPE;
-  return state?.emotionTextByScope?.get(scope) ?? '';
+  const text = state?.emotionTextByScope?.get(scope) ?? '';
+  // V50-L3：本轮真正会被投影出去的那句，记在内存里供 /状态 显示。
+  if (text !== '') {
+    recordEmotionText(state.assembly, text, typeof state?.platform?.now === 'function' ? state.platform.now() : null);
+  }
+  return text;
 }
 
 /**
