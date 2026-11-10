@@ -117,3 +117,24 @@ persona:
 
 `off` 在 `apply` 阶段就不注册监听器，行为与 v0.4.12 一致。配置在 `apply` 时读取，改完需重启
 宿主（或重载 profile）；本插件没有热加载。若要彻底移除，删除该子键同样按 `off` 处理。
+
+## 不处理的段：`harness:identity`（V50-L1）
+
+`takeover` 只摘掉 `deployment:persona-prefix` 与**空**的 `deployment:persona-suffix`，
+**不会**动 `harness:identity`（order **-1000**，原文 `You are an AI agent powered by DeepSeek
+Harness.`）。这是刻意取舍：
+
+- 它是宿主对自己「是什么」的声明，不是人设。摘掉它不会让角色更像人，只会让模型误判自己
+  的运行环境与工具契约；
+- 宿主里唯一能顶掉它的机制是 `complete` 段，而 `complete` 在装配后会把**所有**其它段压成
+  唯一一段（`dsh-system-prompt/lib/index.js:383-384,401-410`），工具声明与 runtime context
+  都会一起消失，属于自毁；
+- 因此本插件对这一段的策略是「保留」，`/状态` 的「部署人设：已接管（takeover）」也只在
+  prefix/suffix 语义上成立。若将来要做，正确做法是让宿主的 `standard` 预设少挂
+  `@deepseek-ai/dsh-persona`，而不是插件绕过去改。
+
+## 已知限制
+
+- 子会话（fork）若 header 只有 `parentSession`、没有 `origin`/`delegationDepth`，会被
+  `classifySession` 归为 main，照样被遮蔽（`src/persona/shadow.js` 的 `classifySession` 调用点）。
+- `off` 时 `/状态` 仍输出「部署人设：宿主默认」一行，便于排障；旧调用方不传则不输出。
