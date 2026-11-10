@@ -120,6 +120,9 @@ persona:
 四段注册时都带 `interpolate: false`（v0.5.1）：段文本是卡内容渲染后的产物，宿主不再对它们
 做 `{{...}}` 插值，详见 §4。
 
+`persona:state_board` 是唯一例外：它的文本来自记忆里的状态板，不是卡内容，所以既不做
+占位符降级也不剥注释；它同样带 `interpolate: false`，宿主不会把它当提示词变量解析。
+
 ## 7. 完整示例
 
 `examples/persona-lan.json` 是一张可直接用的「温柔大姐姐」卡：把

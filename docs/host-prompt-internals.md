@@ -58,7 +58,7 @@
 | 目标 | 位置 |
 | --- | --- |
 | 注册段 | `src/index.js` `registerSections`（`persona:safety/core/voice/protocol`、`persona:state_board`） |
-| 注册上下文 | `src/index.js` `registerEmotionContext`（`companion-emotion`，order **320**，`interpolate: false`） |
+| 注册上下文 | `src/index.js:459-472`（`companion-emotion`，order **320**，`interpolate: false`，`text` 为函数） |
 | `system-prompt/assemble` 监听 | `src/platform/adapter.js:438` `onAssemble`；`src/index.js:806-835` |
 | pre-step | `src/index.js:1367` `runPreStep` |
 

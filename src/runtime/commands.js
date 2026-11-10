@@ -672,7 +672,11 @@ function formatShadowLine(shadow) {
 function formatAssemblyLine(assembly, now, timeZone) {
   const snapshot = describeAssembly(assembly);
   if (snapshot === null) return null;
-  const at = snapshot.sectionsAt ?? snapshot.shadowAt ?? snapshot.emotionAt;
+  // 取三者里最新的一次：装配（静态段）发生在 apply，遮蔽与情绪句每轮都可能更新，
+  // 只按顺序短路会让刚发生的改写显示成「1 小时前」。
+  const stamps = [snapshot.sectionsAt, snapshot.shadowAt, snapshot.emotionAt]
+    .filter((value) => typeof value === 'number' && Number.isFinite(value));
+  const at = stamps.length > 0 ? Math.max(...stamps) : null;
   const when = at === null ? '时间未知' : formatRelativeTimeCn(at, now, timeZone);
   const parts = [`最近一次装配：${when === '' ? '时间未知' : when}`];
   const mode = snapshot.shadowMode === 'rewrite'

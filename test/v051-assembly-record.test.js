@@ -198,6 +198,23 @@ describe('装配记录（/状态 集成）', () => {
     }
   });
 
+  test('装配时间取最新一次：后发生的改写不会被旧 apply 时间盖住', () => {
+    const store = Store.open(join(dir, 'fresh.db'));
+    try {
+      const record = createAssemblyRecord();
+      recordSections(record, [{ name: 'persona:core', text: '你是岚。' }], NOW - 3_600_000);
+      recordShadow(record, { mode: 'rewrite', rewritten: true, nowMs: NOW - 30_000 });
+
+      const { reply } = handleCommand({ text: '/状态', store, now: NOW, assembly: record });
+      const line = assemblyLineOf(reply);
+      assert.ok(line);
+      assert.match(line, /最近一次装配：刚刚/u);
+      assert.doesNotMatch(line, /1 小时前/u, '旧 apply 时间不得压过更新的一次改写');
+    } finally {
+      store.close();
+    }
+  });
+
   test('没有记录时不输出该行（旧调用方格式不变）', () => {
     const store = Store.open(join(dir, 'legacy.db'));
     try {

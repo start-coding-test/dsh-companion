@@ -4,7 +4,7 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.5.1 已发布**（2026-11-11，tag `v0.5.1`）。`node --test` 全绿：1162 个用例 / 28 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.5.1 已发布**（2026-11-11，tag `v0.5.1`）。`node --test` 全绿：1164 个用例 / 33 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
 
 ## v0.5.1 变更摘要
 
@@ -13,7 +13,7 @@
 - **卡里的模板占位符与注释（V50-M2 / V50-L2）**：酒馆卡残留的 `{{random:…}}` / `{{time}}` 等一律降级为 `{random:…}` / `{time}`，HTML 注释在渲染前剥离；插件所有段统一 `interpolate: false`，避免宿主把卡文本当提示词变量插值导致整轮注入失败。
 - **情绪句改走 `systemPrompt.context`（V50-M3）**：文本不变时宿主不再重复注入，情绪关闭或无该能力时不注册；旧快照只被 supersede、平台不删，已写进 `docs/emotion-injection.md`。
 - **`/状态` 增「最近一次装配」（V50-L3）**：时间、部署人设状态、prefix 是否改写、各段字数与 8 位短哈希；只存内存、只记哈希不存正文。
-- **一致性**：情绪关闭且卡里没有占位符与注释时，`persona:*` 三段与闲聊提示词与 v0.5.0 **逐字节一致**（独立 worktree 对比三个哈希全等）。schema 仍 **v14**。完整条目见 [CHANGELOG](CHANGELOG.md)（0.5.1 段），证据见 [docs/host-prompt-internals.md](docs/host-prompt-internals.md)、[docs/emotion-injection.md](docs/emotion-injection.md)。
+- **一致性**：情绪关闭且卡里没有占位符与注释时，`persona:*` 三段与闲聊提示词与 v0.5.0 **逐字节一致**（独立 worktree 对比：三段 section 与两段闲聊提示词逐字节相等，长度 202/246/189）。schema 仍 **v14**。完整条目见 [CHANGELOG](CHANGELOG.md)（0.5.1 段），证据见 [docs/host-prompt-internals.md](docs/host-prompt-internals.md)、[docs/emotion-injection.md](docs/emotion-injection.md)。
 
 ## v0.5.0 变更摘要
 

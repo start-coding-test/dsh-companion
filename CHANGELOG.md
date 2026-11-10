@@ -4,7 +4,7 @@
 
 ## [0.5.1] - 2026-11-11
 
-按用户 v0.5.1 清单修三条必修（V50-H1 节律漂移、V50-M1 规则不区分对象、V50-M2 卡内残留占位符）与情绪注入方式（V50-M3），并补三条低优先项（V50-L1 文档、V50-L2 注释剥离、V50-L3 装配记录）。**schema 仍为 v14**，记忆 / 提醒 / 线程行为未改，零新增运行时依赖。发版门：默认、`TZ=UTC`、`TZ=America/New_York` 三时区 **1162 个用例 / 28 个套件**通过；`plugin-gate` round A/B PASS（round C 无凭据 SKIP）；情绪关闭且卡里没有 `{{x}}` 与 HTML 注释时，`persona:*` 三段与闲聊提示词与 v0.5.0 **逐字节一致**（独立 worktree 对比，`total` / `chatA` / `chatB` 三个哈希全等）。
+按用户 v0.5.1 清单修三条必修（V50-H1 节律漂移、V50-M1 规则不区分对象、V50-M2 卡内残留占位符）与情绪注入方式（V50-M3），并补三条低优先项（V50-L1 文档、V50-L2 注释剥离、V50-L3 装配记录）。**schema 仍为 v14**，记忆 / 提醒 / 线程行为未改，零新增运行时依赖。发版门：默认、`TZ=UTC`、`TZ=America/New_York` 三时区 **1164 个用例 / 33 个套件**通过；`plugin-gate` round A/B PASS（round C 无凭据 SKIP）；情绪关闭且卡里没有 `{{x}}` 与 HTML 注释时，`persona:*` 三段与闲聊提示词与 v0.5.0 **逐字节一致**（独立 worktree 对比：三段 section 与两段闲聊提示词的组合哈希全等，长度 202/246/189）。
 
 ### Added
 
@@ -21,6 +21,8 @@
 - **导入期 warning 的 detail 不进日志**（`c2ff0c1`）：现在 `template_placeholder_downgraded` / `html_comment_unterminated` 的 detail（占位符名、字段名）随 warn 输出，仍不含正文。
 - **`/状态` 的事件标签缺 blame / vent**（合并期）：`EMOTION_EVENT_LABELS` 补「指责」「倾诉」。
 - **`isInjectedMessage` 未跳过 runtime-context**（`3b44121`）：补齐后 `lastUserText` 不会把情绪上下文段当成用户输入。
+- **「最近一次装配」的时间取错来源**（复审 L-1）：原先按 `sectionsAt ?? shadowAt ?? emotionAt` 短路，apply 时间会压过更晚发生的改写，刚发生遮蔽却显示「1 小时前」；现在取三者最新值。
+- **`name` / `address` 漏清洗**（复审 L-2）：这两个身份字段不在 `CARD_TEXT_FIELDS` 里，卡里写 `<!-- … -->` 会原样进人格段与闲聊提示词；现已与其它文本字段一致地剥注释、降级占位符。
 
 ### Changed
 
@@ -30,7 +32,7 @@
 ### Tests
 
 - 新增 `test/v051-template.test.js`（19 例，含复刻宿主插值的 mock）、`test/emotion-v051.test.js`（14 例：H1 三条验收、M1 分类、12 类可达性）、`test/emotion-report.test.js`、`test/emotion-context.test.js`（7 例）、`test/v051-assembly-record.test.js`（8 例）、`test/v051-status-labels.test.js`；`test/platform.test.js` +2。
-- 合计 **1162** 用例 / **28** 套件，三时区通过。
+- 合计 **1164** 用例 / **33** 套件，三时区通过（复审 L-1 / L-2 的回归各 1 例在此计入）。
 
 ## [0.5.0] - 2026-11-10
 

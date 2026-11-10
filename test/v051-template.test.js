@@ -359,6 +359,25 @@ describe('V50-L2 卡文本 HTML 注释', () => {
     assert.ok(!prompt.includes('-->'));
   });
 
+  test('name / address 也剥注释（复审 L-2：身份字段曾漏清洗）', () => {
+    const source = JSON.stringify({
+      name: '岚<!-- 备注：不要进提示词 -->',
+      address: '你<!--x-->',
+      description: '正文',
+      chatIdentity: '你是{{char}}，称呼对方为「{{user}}」。',
+      tone: {},
+    });
+    const { card } = parseCardSourceDetailed(source);
+    assert.equal(card.name, '岚');
+    assert.equal(card.address, '你');
+
+    const joined = buildSections(card).map((section) => section.text).join('\n');
+    assert.ok(!joined.includes('<!--'), '身份字段的注释不得漏进人格段');
+    assert.ok(!joined.includes('-->'));
+    assert.equal(renderTemplate(card.chatIdentity, card), '你是岚，称呼对方为「你」。');
+    assert.equal(buildChatPrompt({ card }).includes('<!--'), false);
+  });
+
   test('未闭合注释：原样保留 + 一条 warning（detail 只放字段名）', () => {
     const source = JSON.stringify({
       name: '注释卡',

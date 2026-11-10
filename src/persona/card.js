@@ -409,10 +409,12 @@ function normalizeCardSource(parsed) {
 
 /** 参与渲染的卡文本字段（v0.5.1 V50-L2：加载期统一剥 HTML 注释）。 */
 const CARD_TEXT_FIELDS = Object.freeze([
+  'address',
   'chatIdentity',
   'description',
   'first_mes',
   'mes_example',
+  'name',
   'personality',
   'post_history_instructions',
   'scenario',

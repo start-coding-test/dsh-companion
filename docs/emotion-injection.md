@@ -163,8 +163,8 @@ recall 结果合并成 `inject`。`emotionMessage()` 已删除；`EMOTION_SOURCE
 
 ### 3.5 runtime-context 不再被当作用户输入
 
-宿主快照的 `source.kind` 是 `runtime-context`。`src/index.js:164` 新增
-`RUNTIME_CONTEXT_SOURCE_KIND`，并让 `isInjectedMessage()`（`src/index.js:3018`
+宿主快照的 `source.kind` 是 `runtime-context`。`src/index.js:170` 新增
+`RUNTIME_CONTEXT_SOURCE_KIND`，并让 `isInjectedMessage()`（`src/index.js:3043`
 起）识别它。`textRows()` / `lastUserText()` 因此会跳过快照，取到真正的用户文本；
 `hasRealUserInput()` 原本就已有同一判断。
 
@@ -194,8 +194,8 @@ recall 结果合并成 `inject`。`emotionMessage()` 已删除；`EMOTION_SOURCE
   一次 + provider 文本」，默认用例额外断言 `ctx.contexts.length === 0` 且没有
   `systemPrompt.context` 调用。
 - 全套测试在默认时区、`TZ=UTC`、`TZ=America/New_York` 下均为
-  **1120 tests / 28 suites / 1120 pass / 0 fail**（旧基线 1111；新增 7 个情绪用例、
-  2 个 platform 能力面用例并调整旧断言后为 1120）。
+  **1164 tests / 33 suites / 1164 pass / 0 fail**（旧基线 1111；v0.5.1 新增 7 个情绪
+  上下文用例、2 个 platform 能力面用例，其余用例来自 H1 / M1 / M2 / L3 的补充）。
 
 ## 6. 对召回注入（injectRecall）的评估
 
