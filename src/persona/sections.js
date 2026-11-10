@@ -185,23 +185,21 @@ function toneTail(card, tone) {
 function voiceText(card) {
   const tone = card.tone ?? {};
   const voice = text(tone, 'voice', '');
-  if (voice.trim() !== '') {
-    return [
-      '[说话方式]',
-      '（模仿口吻，不照抄内容）',
-      render(card, voice).trim(),
-    ].join('\n');
-  }
   const example = text(card, 'mes_example', '');
+  const parts = [];
+  // 两段都非空时**都要进**：v0.4.13 早期实现只取 tone.voice，卡里同时写了
+  // 说话方式与示例对话时示例会被静默丢弃（v0.5.0 修）。
+  if (voice.trim() !== '') parts.push(render(card, voice).trim());
   if (example.trim() !== '') {
     const body = example.replace(/<START>/gu, '\n').trim();
-    return [
-      '[说话方式]',
-      '（模仿口吻，不照抄内容）',
-      render(card, body),
-    ].join('\n');
+    parts.push(render(card, body));
   }
-  return null;
+  if (parts.length === 0) return null;
+  return [
+    '[说话方式]',
+    '（模仿口吻，不照抄内容）',
+    ...parts,
+  ].join('\n');
 }
 
 /**
