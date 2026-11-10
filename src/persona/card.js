@@ -90,10 +90,16 @@ export const MEMORY_CITATION_MODES = Object.freeze(['explicit', 'natural']);
 const EMOTION_BASELINE_KEYS = Object.freeze(['pleasure', 'arousal', 'dominance', 'energy']);
 
 /**
- * 渲染卡里的模板占位符：`{{char}}` → name，`{{user}}` → address。
+ * 渲染卡里的模板占位符（v0.5.1）：
+ * 1. 先剥 HTML 注释（`<!-- ... -->`，兜底卡加载后运行期拼进来的文本）；
+ * 2. `{{char}}` → name，`{{user}}` → address；
+ * 3. 其余 `{{...}}` 一律降级成单花括号 `{...}`（`{{time}}` → `{time}`），保证输出里
+ *    **没有** `{{`：宿主 dsh-system-prompt 的插值器遇到未注册变量会整轮抛错，
+ *    未知占位符不能原样进提示词（V50-M2）。
  *
  * 只做一次替换（不递归），非字符串原样返回；生产卡已校验，这里对部分字段缺失的
- * 旧调用方保持宽松（缺失按空串处理）。
+ * 旧调用方保持宽松（缺失按空串处理）。内置卡只含 `{{char}}`/`{{user}}`，输出与
+ * v0.5.0 逐字节一致。
  *
  * @param {string} text
  * @param {{name?: string, address?: string}} context
@@ -103,7 +109,70 @@ export function renderTemplate(text, context) {
   if (typeof text !== 'string') return text;
   const name = typeof context?.name === 'string' ? context.name : '';
   const address = typeof context?.address === 'string' ? context.address : '';
-  return text.split('{{char}}').join(name).split('{{user}}').join(address);
+  const body = stripHtmlComments(text);
+  const substituted = body.split('{{char}}').join(name).split('{{user}}').join(address);
+  return downgradePlaceholders(substituted);
+}
+
+/** `{{...}}` 里不含花括号（与宿主 GROUP_AT 同口径）；配合 replace 使用，无 lastIndex 状态。 */
+const PAIRED_PLACEHOLDER_PATTERN = /\{\{([^{}]*)\}\}/gu;
+
+/**
+ * 把残留的 `{{...}}` 降级成 `{...}`（v0.5.1 V50-M2）。
+ *
+ * 分组口径与宿主 `GROUP_AT`（`/^\{\{([^{}]*)\}\}/`）一致，保证「宿主会认出来的」
+ * 引用一定先被降级；随后极端的半截 `{{`（宿主当成普通散文）也逐字符兜底成 `{`，
+ * 让「输出里没有 `{{`」成为硬保证，而不是依赖宿主的具体解析细节。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+function downgradePlaceholders(text) {
+  if (typeof text !== 'string' || !text.includes('{{')) return text;
+  const paired = text.replace(PAIRED_PLACEHOLDER_PATTERN, (_match, inner) => `{${inner}}`);
+  return paired.includes('{{') ? paired.split('{{').join('{') : paired;
+}
+
+/**
+ * 剥离 HTML 注释（v0.5.1 V50-L2）：`<!-- ... -->` 非贪婪、跨行、可多处。
+ *
+ * 未闭合的 `<!--` 保守原样保留（不吞掉后续正文）；需要诊断时用
+ * stripHtmlCommentsDetailed()。
+ *
+ * @param {string} text
+ * @returns {string}
+ */
+export function stripHtmlComments(text) {
+  return stripHtmlCommentsDetailed(text).text;
+}
+
+/**
+ * stripHtmlComments() 的带诊断版本：`unterminated` 为 true 表示存在未闭合的
+ * `<!--`（此时整段原样返回，不做半截剥离）。
+ *
+ * @param {string} text
+ * @returns {{text: string, unterminated: boolean}}
+ */
+function stripHtmlCommentsDetailed(text) {
+  if (typeof text !== 'string' || !text.includes('<!--')) {
+    return { text, unterminated: false };
+  }
+  let out = '';
+  let index = 0;
+  let open = text.indexOf('<!--');
+  while (open >= 0) {
+    // 注释紧贴正文时直接拼接（`a<!--x-->b` → `ab`），不额外插入分隔符。
+    out += text.slice(index, open);
+    const close = text.indexOf('-->', open + 4);
+    if (close < 0) {
+      // 未闭合：保守原样保留，宁可留下注释也不吞掉后面的正文。
+      return { text, unterminated: true };
+    }
+    index = close + 3;
+    open = text.indexOf('<!--', index);
+  }
+  out += text.slice(index);
+  return { text: out, unterminated: false };
 }
 
 /**
@@ -149,12 +218,17 @@ export function parseCardSource(source, path = '') {
 }
 
 /**
- * 同 parseCardSource()，但额外返回导入期诊断（v0.5.0 P1：CCv2/v3 的
- * `character_book` 被忽略时给出一条 warning，不进渲染文本）。
+ * 同 parseCardSource()，但额外返回导入期诊断（都不含卡正文）：
+ * - v0.5.0 P1：CCv2/v3 的 `character_book` 被忽略 → `{code:'character_book_ignored'}`；
+ * - v0.5.1 V50-L2：文本字段里有未闭合的 `<!--` →
+ *   `{code:'html_comment_unterminated', detail:[字段路径...]}`（整段保守原样保留）；
+ * - v0.5.1 V50-M2：卡里用了会被降级的模板占位符（`{{time}}`、`{{random:a,b}}` 等）→
+ *   `{code:'template_placeholder_downgraded', detail:[占位符名字...]}`。
  *
  * @param {string} source
  * @param {string} [path]
- * @returns {Readonly<{card: Readonly<object>, warnings: ReadonlyArray<{code: string}>}>}
+ * @returns {Readonly<{card: Readonly<object>,
+ *   warnings: ReadonlyArray<{code: string, detail?: ReadonlyArray<string>}>}>}
  */
 export function parseCardSourceDetailed(source, path = '') {
   let parsed;
@@ -173,6 +247,9 @@ export function parseCardSourceDetailed(source, path = '') {
   }
 
   const { input, warnings } = normalizeCardSource(parsed);
+  // v0.5.1：加载期净化文本字段（剥 HTML 注释 + 指出会被降级的模板占位符），
+  // 让卡里的注释/占位符在进入渲染之前就被处理，而不是带进上下文。
+  const cardInput = sanitizeCardText(input, warnings);
   if (!isCcCardSource(parsed)) {
     // 原生卡：必填字段必须在卡文件里显式给出；其余字段才走默认值深合并。
     requireText(parsed, 'name');
@@ -182,10 +259,10 @@ export function parseCardSourceDetailed(source, path = '') {
     }
   } else {
     // CCv2/v3：其它字段缺失用默认值，但 name 仍必须非空（不能静默变成内置名）。
-    requireText(input, 'name');
+    requireText(cardInput, 'name');
   }
 
-  const merged = mergeInto(DEFAULT_CARD, input);
+  const merged = mergeInto(DEFAULT_CARD, cardInput);
   // P3-c：emotion 的运行期归一化。校验函数仍对直接调用保持严格（P1 契约），
   // 但卡文件里的非法值不再让整张卡加载失败：回落默认值并记一条 warning。
   const normalized = normalizeCardEmotion(merged.emotion);
@@ -328,6 +405,103 @@ function normalizeCardSource(parsed) {
     warnings.push({ code: 'character_book_ignored' });
   }
   return { input: mapped, warnings };
+}
+
+/** 参与渲染的卡文本字段（v0.5.1 V50-L2：加载期统一剥 HTML 注释）。 */
+const CARD_TEXT_FIELDS = Object.freeze([
+  'chatIdentity',
+  'description',
+  'first_mes',
+  'mes_example',
+  'personality',
+  'post_history_instructions',
+  'scenario',
+]);
+
+/** tone 下的文本字段（同样剥注释）。 */
+const CARD_TONE_TEXT_FIELDS = Object.freeze(['notes', 'structure', 'style', 'voice', 'warmth']);
+
+/** 字符串数组字段（逐项剥注释；非字符串项原样保留，交给校验报错）。 */
+const CARD_TEXT_LIST_FIELDS = Object.freeze(['bannedPhrases', 'taboos', 'values']);
+
+/** 渲染期唯一保留的占位符；其余 `{{...}}` 会被降级成 `{...}`。 */
+const SUPPORTED_PLACEHOLDERS = Object.freeze(['{{char}}', '{{user}}']);
+
+/** warning.detail 里占位符名字的长度上限（防止把一整段正文当名字写进日志）。 */
+const PLACEHOLDER_NAME_MAX = 60;
+
+/**
+ * 加载期文本净化（v0.5.1，V50-L2 + V50-M2）：
+ * - 剥掉 HTML 注释；存在未闭合的 `<!--` 时该字段整段保守保留，并记一条
+ *   `html_comment_unterminated`（detail 是字段路径，不是正文）；
+ * - 收集会被降级的模板占位符名字，记一条 `template_placeholder_downgraded`
+ *   （detail 只有名字，不含正文——warning 会进日志，不能泄漏卡内容）。
+ *
+ * 不修改入参：返回浅拷贝，只替换涉及的字符串字段/数组/tone 对象。
+ *
+ * @param {Record<string, any>} input
+ * @param {Array<{code: string, detail?: ReadonlyArray<string>}>} warnings 收集器
+ * @returns {Record<string, any>}
+ */
+function sanitizeCardText(input, warnings) {
+  if (!isPlainObject(input)) return input;
+  const out = { ...input };
+  const unterminated = [];
+  const placeholders = [];
+
+  const clean = (value, field) => {
+    const stripped = stripHtmlCommentsDetailed(value);
+    if (stripped.unterminated) unterminated.push(field);
+    collectDowngradedPlaceholders(stripped.text, placeholders);
+    return stripped.text;
+  };
+
+  for (const field of CARD_TEXT_FIELDS) {
+    if (typeof out[field] === 'string') out[field] = clean(out[field], field);
+  }
+  if (isPlainObject(out.tone)) {
+    const tone = { ...out.tone };
+    for (const field of CARD_TONE_TEXT_FIELDS) {
+      if (typeof tone[field] === 'string') {
+        tone[field] = clean(tone[field], `tone.${field}`);
+      }
+    }
+    out.tone = tone;
+  }
+  for (const field of CARD_TEXT_LIST_FIELDS) {
+    if (!Array.isArray(out[field])) continue;
+    out[field] = out[field].map((item) => (typeof item === 'string'
+      ? clean(item, field)
+      : item));
+  }
+
+  if (unterminated.length > 0) {
+    warnings.push({ code: 'html_comment_unterminated', detail: Object.freeze(unterminated) });
+  }
+  if (placeholders.length > 0) {
+    warnings.push({ code: 'template_placeholder_downgraded', detail: Object.freeze(placeholders) });
+  }
+  return out;
+}
+
+/**
+ * 收集会被 renderTemplate() 降级的占位符名字（去重、保序、带上限）。
+ * `{{char}}`/`{{user}}` 会被正常替换，不算降级。
+ *
+ * @param {string} text
+ * @param {string[]} into
+ */
+function collectDowngradedPlaceholders(text, into) {
+  if (typeof text !== 'string' || !text.includes('{{')) return;
+  const pattern = /\{\{([^{}]*)\}\}/g;
+  for (let match = pattern.exec(text); match !== null; match = pattern.exec(text)) {
+    if (SUPPORTED_PLACEHOLDERS.includes(match[0])) continue;
+    const chars = [...match[1]];
+    const label = chars.length > PLACEHOLDER_NAME_MAX
+      ? `${chars.slice(0, PLACEHOLDER_NAME_MAX - 1).join('')}…`
+      : match[1];
+    if (!into.includes(label)) into.push(label);
+  }
 }
 
 /**
