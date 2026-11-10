@@ -710,6 +710,8 @@ const EMOTION_EVENT_LABELS = Object.freeze({
   // V50-M1：指向她的负面话 / 用户自述疲惫，分开标注。
   blame: '指责',
   vent: '倾诉',
+  // v0.5.2：用户在担心「是不是惹到她了」——她收到的是被在意。
+  reassure: '被在意',
 });
 
 /**
