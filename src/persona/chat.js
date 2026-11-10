@@ -116,6 +116,8 @@ export function buildChatPrompt({
   const identity = typeof card.chatIdentity === 'string' && card.chatIdentity.trim() !== ''
     ? card.chatIdentity
     : DEFAULT_CARD.chatIdentity;
+  // 用户卡的人设要点：内置卡与默认文案相同时**不输出**，保证 v0.4.12 的闲聊提示词逐字节不变。
+  const description = describeLine(card, { name, address });
   const example = chatExample(card.mes_example, { name, address });
   const emotion = typeof emotionLine === 'string' && emotionLine.trim() !== ''
     ? `你此刻：${emotionLine}`
@@ -128,6 +130,7 @@ export function buildChatPrompt({
 
   return [
     renderTemplate(identity, { name, address }),
+    description,
     `语气：${style}、${warmth}、${structure}。`,
     example === '' ? '' : `口吻参考（模仿语气，不照抄内容）：${example}`,
     '写一条主动的轻量闲聊：像熟悉的朋友顺口说几句，不要汇报工作，不要列清单。',
@@ -137,6 +140,29 @@ export function buildChatPrompt({
     recallSummary === '' ? '相关记忆：无。' : `相关记忆（可自然化用，不要逐条复述）：\n${recallSummary}`,
     emotion,
   ].filter((line) => line !== '').join('\n');
+}
+
+/** 人设要点最多取 200 个码点。 */
+const CHAT_DESCRIPTION_MAX = 200;
+
+/**
+ * 用户卡的人设要点行；内置卡（描述与内置默认一致）返回空串，保证闲聊提示词逐字节不变。
+ *
+ * @param {object} card
+ * @param {{name: string, address: string}} context
+ * @returns {string}
+ */
+function describeLine(card, context) {
+  const raw = typeof card.description === 'string' ? card.description.trim() : '';
+  if (raw === '') return '';
+  const builtin = renderTemplate(DEFAULT_CARD.description, context).trim();
+  if (renderTemplate(raw, context).trim() === builtin) return '';
+  const rendered = renderTemplate(raw, context).replace(/\s*\n\s*/gu, ' ').trim();
+  const chars = [...rendered];
+  const body = chars.length > CHAT_DESCRIPTION_MAX
+    ? chars.slice(0, CHAT_DESCRIPTION_MAX).join('')
+    : rendered;
+  return `人设要点：${body}`;
 }
 
 /** 闲聊口吻参考最多取 300 个码点。 */

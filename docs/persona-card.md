@@ -27,7 +27,7 @@ persona:
 | `name` | 是 | 角色名，非空字符串 |
 | `address` | 是 | 对用户的称呼，非空字符串（常用「你」） |
 | `version` | 否 | 整数，`/状态` 里显示 |
-| `description` | 否 | 身份 / 背景 / 形象，进 `persona:core` |
+| `description` | 否 | 身份 / 背景 / 形象，进 `persona:core`；用户卡还会以「人设要点」进闲聊提示词（内置卡不追加） |
 | `personality` | 否 | 性格要点，进 `persona:core` |
 | `scenario` | 否 | 关系与场景，进 `persona:core` |
 | `mes_example` | 否 | 示例对话；`<START>` 当分隔符（替换为空行），进 `persona:voice` |
