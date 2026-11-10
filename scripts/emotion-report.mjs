@@ -226,7 +226,9 @@ export async function analyzeGoldenWithAppraiser(records, appraise) {
       results.push({
         type: 'none',
         confidence: 0,
-        error: error instanceof Error ? error.message : String(error),
+        error: typeof error?.code === 'string'
+          ? error.code
+          : (error instanceof Error ? error.message : String(error)),
       });
     }
   }
@@ -249,6 +251,8 @@ function buildConfusionReport(records, results, thresholds) {
   /** @type {Map<string, number>} */
   const predictedCounts = new Map(LABELS.map((label) => [label, 0]));
   const failures = [];
+  /** @type {Map<string, number>} 判定失败按原因分类（invalid / timeout / error / budget …） */
+  const errorKinds = new Map();
   let correct = 0;
   let blameFalsePositives = 0;
   let neutralTotal = 0;
@@ -259,7 +263,13 @@ function buildConfusionReport(records, results, thresholds) {
     const record = records[index];
     const expected = record.type;
     const result = results[index];
-    if (result.error !== undefined) errors += 1;
+    if (result.error !== undefined) {
+      errors += 1;
+      const kind = typeof result.error === 'string'
+        ? result.error
+        : (typeof result.error?.code === 'string' ? result.error.code : 'error');
+      errorKinds.set(kind, (errorKinds.get(kind) ?? 0) + 1);
+    }
     const predicted = result.type;
     support.set(expected, (support.get(expected) ?? 0) + 1);
     predictedCounts.set(predicted, (predictedCounts.get(predicted) ?? 0) + 1);
@@ -314,6 +324,7 @@ function buildConfusionReport(records, results, thresholds) {
     neutral: { total: neutralTotal, triggered: neutralTriggered, rate: neutralRate },
     failures,
     errors,
+    errorKinds: [...errorKinds.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])),
     thresholds,
     passed: checks.accuracy && checks.blameFalsePositives
       && checks.neutralFalseTriggerRate && checks.noErrors,
@@ -385,7 +396,10 @@ export function renderConfusion(report, source = '') {
     + `（门槛 ≤ ${percent(report.thresholds.neutralFalseTriggerRate)}，`
     + `${report.checks.neutralFalseTriggerRate ? '通过' : '未通过'}）`);
   if (report.errors > 0) {
-    lines.push(`判定失败：${report.errors} 句（判定器报错按 none 计入，门槛要求 0 句）`);
+    const kinds = Array.isArray(report.errorKinds) && report.errorKinds.length > 0
+      ? `，按原因：${report.errorKinds.map(([kind, count]) => `${kind} ${count}`).join('，')}`
+      : '';
+    lines.push(`判定失败：${report.errors} 句${kinds}（判定器报错按 none 计入，门槛要求 0 句）`);
   }
   lines.push(`结论：${report.passed ? '通过（退出码 0）' : '未通过（退出码 1）'}`);
 

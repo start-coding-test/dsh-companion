@@ -716,7 +716,11 @@ function formatAppraiserLine(appraiser) {
   if (mode === '规则' || stats === null || typeof stats !== 'object' || (stats.total ?? 0) === 0) {
     return `判定器：${mode}（近 24h 无判定）`;
   }
-  const parts = [`模型 ${stats.llm ?? 0}`, `规则兜底 ${stats.fallback ?? 0}`];
+  const llm = stats.llm ?? 0;
+  const fallback = stats.fallback ?? 0;
+  const total = llm + fallback;
+  const share = (count) => `${Math.round((count / Math.max(total, 1)) * 100)}%`;
+  const parts = [`模型 ${llm}（${share(llm)}）`, `规则兜底 ${fallback}（${share(fallback)}）`];
   if (Number.isFinite(stats.avgMs)) parts.push(`平均 ${stats.avgMs}ms`);
   if (Number.isFinite(stats.p95Ms)) parts.push(`p95 ${stats.p95Ms}ms`);
   const error = typeof stats.lastError?.code === 'string' ? stats.lastError.code : null;

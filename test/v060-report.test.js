@@ -89,6 +89,7 @@ test('analyzeGoldenWithAppraiser：按 LLM 门槛判定，失败条数单列并�
     return { type: verdicts[text], confidence: 0.9 };
   });
   assert.equal(broken.errors, 1);
+  assert.deepEqual(broken.errorKinds, [['boom', 1]]);
   assert.equal(broken.checks.noErrors, false);
   assert.equal(broken.passed, false);
 });
@@ -134,8 +135,8 @@ test('/状态：模型模式展示来源占比、延迟与 p95、最近失败', 
     lastError: { at: 1_700_000_000_000, code: 'timeout' },
   });
   assert.match(reply, /判定器：模型/u);
-  assert.match(reply, /近 24h 模型 7/u);
-  assert.match(reply, /规则兜底 3/u);
+  assert.match(reply, /近 24h 模型 7（70%）/u);
+  assert.match(reply, /规则兜底 3（30%）/u);
   assert.match(reply, /平均 412ms/u);
   assert.match(reply, /p95 900ms/u);
   assert.match(reply, /最近失败 timeout/u);
