@@ -52,7 +52,7 @@ import {
 } from './memory/govern.js';
 import { exportAll } from './memory/export.js';
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
-import { boardSection, buildSections } from './persona/sections.js';
+import { boardSection, buildSections, buildSectionsWithDiagnostics } from './persona/sections.js';
 import { CARD_STATUS, loadPersonaCard, personaProactiveConflicts } from './persona/card.js';
 import {
   buildChatPrompt,
@@ -683,6 +683,23 @@ function applyPersonaCard(state, hooks = {}) {
     platform.log('debug', '[dsh-companion] persona card proactive.chatPerDay has no config counterpart; card value kept', {
       path: loaded.path,
       chatPerDay: loaded.card.proactive.chatPerDay,
+    });
+  }
+
+  // v0.4.13（P1）：段被截断不静默——每条一条 warn，只带段名与码点数，不带正文。
+  for (const warning of buildSectionsWithDiagnostics(loaded.card).warnings) {
+    platform.log('warn', '[dsh-companion] persona section truncated; text clipped to limit', {
+      section: warning.section,
+      chars: warning.chars,
+      max: warning.max,
+    });
+  }
+
+  // 导入期诊断（如 CCv2/v3 的 character_book 被忽略）；不含书内容。
+  for (const warning of loaded.warnings ?? []) {
+    platform.log('warn', '[dsh-companion] persona card import warning', {
+      code: warning.code,
+      path: loaded.path,
     });
   }
 }

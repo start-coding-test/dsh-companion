@@ -10,6 +10,7 @@
  */
 
 import { DEFAULT_TIMEZONE, zonedDayKey } from '../time.js';
+import { DEFAULT_CARD, renderTemplate } from './card.js';
 
 export const CHAT_MIN_SENTENCES = 5;
 export const CHAT_MAX_SENTENCES = 10;
@@ -88,8 +89,13 @@ export function chatEligibility({
 /**
  * 构造闲聊提示词。
  *
+ * v0.4.13（P1）：
+ * - 第 1 行来自 `card.chatIdentity`（缺省与 v0.4.12 逐字节一致）；
+ * - `mes_example` 非空时在「语气」行之后加一行口吻参考（第一段，≤300 码点）；
+ * - `emotionLine` 为非空字符串时在末尾追加 `你此刻：<...>`（只留钩子，不实现情绪）。
+ *
  * @param {{card?: object, recentTopics?: Array<{title?: string, summary?: string}>,
- *          recallSummary?: string, messageCount?: number}} input
+ *          recallSummary?: string, messageCount?: number, emotionLine?: string}} input
  * @returns {string}
  */
 export function buildChatPrompt({
@@ -97,6 +103,7 @@ export function buildChatPrompt({
   recentTopics = [],
   recallSummary = '',
   messageCount = CHAT_MAX_SENTENCES - 2,
+  emotionLine = '',
 } = {}) {
   const name = typeof card.name === 'string' && card.name.trim() !== '' ? card.name.trim() : '珞然';
   const address = typeof card.address === 'string' && card.address.trim() !== ''
@@ -106,6 +113,13 @@ export function buildChatPrompt({
   const warmth = card.tone?.warmth ?? '温和';
   const structure = card.tone?.structure ?? '先结论';
   const banned = Array.isArray(card.bannedPhrases) ? card.bannedPhrases.join('、') : '';
+  const identity = typeof card.chatIdentity === 'string' && card.chatIdentity.trim() !== ''
+    ? card.chatIdentity
+    : DEFAULT_CARD.chatIdentity;
+  const example = chatExample(card.mes_example, { name, address });
+  const emotion = typeof emotionLine === 'string' && emotionLine.trim() !== ''
+    ? `你此刻：${emotionLine}`
+    : '';
   const topics = recentTopics
     .map((topic) => [topic?.title, topic?.summary].filter((value) => typeof value === 'string' && value.trim() !== '').join('：'))
     .filter((value) => value !== '')
@@ -113,14 +127,38 @@ export function buildChatPrompt({
   const count = Math.min(CHAT_MAX_SENTENCES, Math.max(CHAT_MIN_SENTENCES, Number(messageCount) || 8));
 
   return [
-    `你是用户的私人助手${name}，称呼用户为「${address}」。`,
+    renderTemplate(identity, { name, address }),
     `语气：${style}、${warmth}、${structure}。`,
+    example === '' ? '' : `口吻参考（模仿语气，不照抄内容）：${example}`,
     '写一条主动的轻量闲聊：像熟悉的朋友顺口说几句，不要汇报工作，不要列清单。',
     `硬性要求：正好 ${count} 个完整句子；只输出正文；不要提问、不要要求用户回应、不要用问号；不要提「根据记忆」「系统」等字眼；不要重复隐私细节。`,
     banned === '' ? '' : `禁用表达：${banned}。`,
     topics.length === 0 ? '最近话题：无。' : `最近话题：\n- ${topics.join('\n- ')}`,
     recallSummary === '' ? '相关记忆：无。' : `相关记忆（可自然化用，不要逐条复述）：\n${recallSummary}`,
+    emotion,
   ].filter((line) => line !== '').join('\n');
+}
+
+/** 闲聊口吻参考最多取 300 个码点。 */
+const CHAT_EXAMPLE_MAX = 300;
+
+/**
+ * 取 `mes_example` 的第一段（`<START>` 视为段落分隔），渲染占位符后截到 300 码点。
+ * @param {unknown} mesExample
+ * @param {{name: string, address: string}} context
+ * @returns {string}
+ */
+function chatExample(mesExample, context) {
+  if (typeof mesExample !== 'string' || mesExample.trim() === '') return '';
+  const paragraph = mesExample
+    .replace(/<START>/gu, '\n\n')
+    .split(/\n[ \t]*\n/u)
+    .map((chunk) => chunk.trim())
+    .find((chunk) => chunk !== '') ?? '';
+  if (paragraph === '') return '';
+  const rendered = renderTemplate(paragraph, context);
+  const chars = [...rendered];
+  return chars.length > CHAT_EXAMPLE_MAX ? chars.slice(0, CHAT_EXAMPLE_MAX).join('') : rendered;
 }
 
 /**

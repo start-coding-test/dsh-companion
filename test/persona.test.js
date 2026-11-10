@@ -30,7 +30,13 @@ describe('DEFAULT_CARD', () => {
   test('默认值与用户拍板一致', () => {
     assert.equal(DEFAULT_CARD.name, '珞然');
     assert.equal(DEFAULT_CARD.address, '你');
-    assert.deepEqual(DEFAULT_CARD.tone, { style: '简洁', warmth: '温和', structure: '先结论' });
+    assert.deepEqual(DEFAULT_CARD.tone, {
+      style: '简洁',
+      warmth: '温和',
+      structure: '先结论',
+      notes: '不堆铺垫，不夸张感叹，不用亲密称呼',
+      voice: '',
+    });
     assert.deepEqual(DEFAULT_CARD.relation, { butler: 0.7, friend: 0.3 });
     assert.deepEqual(DEFAULT_CARD.proactive, {
       dailyCap: 3,
@@ -95,7 +101,13 @@ describe('loadCard', () => {
     const card = loadCard(path);
     assert.equal(card.name, '阿岩');
     assert.equal(card.address, '您');
-    assert.deepEqual(card.tone, { style: '直接', warmth: '温和', structure: '先结论' });
+    assert.deepEqual(card.tone, {
+      style: '直接',
+      warmth: '温和',
+      structure: '先结论',
+      notes: '不堆铺垫，不夸张感叹，不用亲密称呼',
+      voice: '',
+    });
     assert.deepEqual(card.values, ['守时：说好的时间一定到']);
     assert.equal(card.version, 7);
     // 未覆盖字段保留默认值
