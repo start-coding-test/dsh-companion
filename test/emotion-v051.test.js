@@ -255,12 +255,12 @@ const TRIGGERS = Object.freeze({
   care: ['你怎么了', '别太累，注意身体'],
   share: ['我刚做了饭', '我跟你说个事'],
   thanks: ['谢谢你', '感谢你一直陪我'],
-  complain: ['好烦啊', '压力好大'],
+  reassure: ['你是不是很烦我', '我烦你了吗'],
   cold: ['随便', '行吧'],
   reunion: ['好久不见', '这段时间你去哪了'],
   goodnight: ['晚安', '我先睡了'],
   conflict: ['你错了', '别管我'],
-  blame: ['你好烦', '珞然真讨厌'],
+  blame: ['你好烦', '你真讨厌'],
   vent: ['今天加班好累', '我最近压力大'],
   comfort: ['抱抱', '别难过，我在'],
 });
@@ -289,6 +289,6 @@ test('规则可达性：常见中性句不触发任何事件类型', () => {
     }
   }
   for (const sentence of NEUTRAL) {
-    assert.deepEqual(classify(sentence), { type: 'share', confidence: 0 }, sentence);
+    assert.deepEqual(classify(sentence), { type: 'none', confidence: 0 }, sentence);
   }
 });

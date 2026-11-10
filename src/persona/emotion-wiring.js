@@ -47,6 +47,29 @@ const AMBIENT_EVENT_TYPE = 'ambient';
 const DIMENSIONS = Object.freeze(['pleasure', 'arousal', 'dominance', 'energy']);
 
 /**
+ * 低于这个置信度表示「分不出来」：事件仍记一条审计，但不改状态（V52 规则 4）。
+ */
+export const AMBIGUOUS_CONFIDENCE = 0.5;
+
+/**
+ * 读最近的同类事件供重复递减使用；store 不支持时返回空数组（不阻断本轮）。
+ *
+ * @param {object} store
+ * @param {string} scope
+ * @returns {Array<{at:number,type:string}>}
+ */
+function readHistory(store, scope) {
+  if (typeof store.listEmotionEvents !== 'function') return [];
+  try {
+    const rows = store.listEmotionEvents(scope, 20);
+    if (!Array.isArray(rows)) return [];
+    return rows.filter((row) => row !== null && typeof row === 'object');
+  } catch {
+    return [];
+  }
+}
+
+/**
  * 分类置信度 → applyEvent 的 intensity。
  *
  * 选择：`0.5 + confidence`，夹到 [0.5, 1.5]。理由：
@@ -129,10 +152,20 @@ export function runEmotionTurn(input = {}) {
   // 仅用于 ambient 审计（不参与状态计算）。
   const baselineDecayed = decay(reference, { baseline, halfLifeHours, nowMs: now });
 
-  const classified = classify(typeof text === 'string' ? text : '');
+  // V52：名字来自人格卡（不写死），作为「她」的称呼参与对象判定。
+  const classified = classify(typeof text === 'string' ? text : '', { name: card?.name });
   let state = decayed;
   let event = null;
-  if (classified.confidence > 0) {
+  if (classified.confidence > 0 && classified.confidence < AMBIGUOUS_CONFIDENCE) {
+    // 分不出来（例如同一句既有对她的负面又有对她的正面）：只记录、不加增量。
+    event = {
+      at: now,
+      type: classified.type,
+      deltas: { pleasure: 0, arousal: 0, dominance: 0, energy: 0 },
+    };
+  } else if (classified.confidence > 0) {
+    // V51-L1：最近的同类事件用于「10 分钟内重复递减」，读不到就当没有历史。
+    const history = readHistory(store, scope);
     // hour=16 是节律全零的中性时刻：目标值已含环境项，这里只叠加事件固有增量。
     const applied = applyEvent(decayed, {
       type: classified.type,
@@ -141,6 +174,7 @@ export function runEmotionTurn(input = {}) {
       hour: 16,
       minute: 0,
       baseline,
+      history,
     });
     state = applied.state;
     event = applied.event;

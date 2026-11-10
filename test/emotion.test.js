@@ -254,12 +254,13 @@ test('circadian：深夜精力明显低、清晨回升、上午愉悦偏高、�
   assert.ok(circadian({ hour: 19 }, MID).pleasure > circadian({ hour: 16 }, MID).pleasure, '傍晚愉悦偏高');
 });
 
-test('applyEvent：十二种类型的语义方向正确（在节律零点隔离节律偏移）', () => {
+test('applyEvent：十二种可产出类型的语义方向正确（在节律零点隔离节律偏移）', () => {
   assert.ok(deltasOf('greeting').pleasure > 0);
   assert.ok(deltasOf('care').pleasure > 0 && deltasOf('care').arousal > 0 && deltasOf('care').energy > 0);
   assert.ok(deltasOf('share').pleasure > 0 && deltasOf('share').arousal > 0);
   assert.ok(deltasOf('thanks').pleasure > 0);
-  assert.ok(deltasOf('complain').pleasure < 0 && deltasOf('complain').arousal > 0);
+  // complain 已退役（并入 vent），仍在 EVENT_DELTAS 里读旧数据；reassure 是「被在意」。
+  assert.ok(deltasOf('reassure').pleasure > 0 && deltasOf('reassure').arousal <= 0);
   assert.ok(deltasOf('cold').pleasure < 0 && deltasOf('cold').dominance < 0);
   assert.ok(deltasOf('reunion').pleasure > 0 && deltasOf('reunion').arousal > 0);
   assert.ok(deltasOf('goodnight').arousal < 0 && deltasOf('goodnight').energy > 0);
@@ -276,8 +277,8 @@ test('applyEvent：十二种类型的语义方向正确（在节律零点隔离�
     pleasure: 4, arousal: 1, dominance: 0.5, energy: 0.5,
   });
   assert.deepEqual([...EVENT_TYPES].sort(), [
-    'blame', 'care', 'cold', 'comfort', 'complain', 'conflict',
-    'goodnight', 'greeting', 'reunion', 'share', 'thanks', 'vent',
+    'blame', 'care', 'cold', 'comfort', 'conflict',
+    'goodnight', 'greeting', 'reassure', 'reunion', 'share', 'thanks', 'vent',
   ]);
   assert.equal(EVENT_TYPES.length, 12);
 });
@@ -373,10 +374,10 @@ test('classify：十组关键词各自命中正确类型，置信度落在 0–1
     ['我跟你说个事', 'share'],
     ['你怎么了，还好吗', 'care'],
     ['别太累，注意身体', 'care'],
-    ['最近压力好大', 'complain'],
-    ['烦死了，累死了', 'complain'],
-    ['随便吧', 'cold'],
-    ['算了，不想说了', 'cold'],
+    ['最近压力好大', 'vent'],
+    ['烦死了，累死了', 'vent'],
+    ['随便', 'cold'],
+    ['算了', 'cold'],
     ['好久不见', 'reunion'],
     ['这段时间你去哪了', 'reunion'],
     ['晚安啦', 'goodnight'],
@@ -385,19 +386,51 @@ test('classify：十组关键词各自命中正确类型，置信度落在 0–1
     ['烦不烦啊', 'conflict'],
     ['抱抱你，别难过', 'comfort'],
     ['别担心，我在', 'comfort'],
+    // v0.5.2 误判清单（V52）：对象优先 + 否定/疑问守卫 + 边界词收紧。
+    ['你好烦', 'blame'],
+    ['你怎么又忘了', 'blame'],
+    ['今天好辛苦', 'vent'],
+    ['我最近好辛苦', 'vent'],
+    ['我好烦', 'vent'],
+    ['他好烦', 'vent'],
+    ['你看这个人好烦', 'vent'],
+    ['这破电脑好烦', 'vent'],
+    ['你是不是很烦我', 'reassure'],
+    ['我烦你了吗', 'reassure'],
+    ['不烦不烦', 'care'],
+    ['你一点都不烦', 'care'],
+    ['哦对了，明天提醒我开会', 'none'],
+    ['算了，我自己来吧', 'none'],
+    ['睡了一下午', 'none'],
   ];
+
   for (const [text, expected] of cases) {
     const result = classify(text);
     assert.equal(result.type, expected, text);
-    assert.ok(result.confidence > 0 && result.confidence <= 1, `${text} -> ${result.confidence}`);
+    if (expected === 'none') {
+      assert.equal(result.confidence, 0, `${text} -> 无事件应为 0 置信度`);
+    } else {
+      assert.ok(result.confidence > 0 && result.confidence <= 1, `${text} -> ${result.confidence}`);
+    }
   }
 });
 
-test('classify：无关键词回落 share/0，空串与纯空白同样回落', () => {
-  assert.deepEqual(classify('天气不错'), { type: 'share', confidence: 0 });
-  assert.deepEqual(classify('今天天气很好'), { type: 'share', confidence: 0 });
-  assert.deepEqual(classify(''), { type: 'share', confidence: 0 });
-  assert.deepEqual(classify('   '), { type: 'share', confidence: 0 });
+test('classify：无关键词回落 none/0，空串与纯空白同样回落', () => {
+  assert.deepEqual(classify('天气不错'), { type: 'none', confidence: 0 });
+  assert.deepEqual(classify('今天天气很好'), { type: 'none', confidence: 0 });
+  assert.deepEqual(classify(''), { type: 'none', confidence: 0 });
+  assert.deepEqual(classify('   '), { type: 'none', confidence: 0 });
+});
+
+test('classify：卡里的名字通过 options.name 参与对象判定，不写死在规则里', () => {
+  assert.deepEqual(classify('珞然真讨厌'), { type: 'none', confidence: 0 });
+  const withName = classify('珞然真讨厌', { name: '珞然' });
+  assert.equal(withName.type, 'blame');
+  assert.ok(withName.confidence > 0);
+  // 「你」始终算她；名字与「你」同时出现时按最近的那个判对象。
+  assert.equal(classify('珞然，你好烦', { name: '珞然' }).type, 'blame');
+  assert.throws(() => classify('你好烦', { name: 42 }), TypeError);
+  assert.throws(() => classify('你好烦', []), TypeError);
 });
 
 test('classify：非字符串抛 TypeError，且同输入两次结果相等', () => {

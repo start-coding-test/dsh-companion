@@ -6,12 +6,18 @@
  *    调用方传入；本模块不读时钟、不读环境变量、不写文件、不用随机数。
  * 2) 状态形如 { pleasure, arousal, dominance, energy, updatedAt }，四维取值 0–100，
  *    updatedAt 是毫秒时间戳。
- * 3) 零依赖：不 import 任何模块（含 node: 内置）。
+ * 3) 零依赖：只 import 同目录下的纯函数模块（v0.5.2 起分类器拆到 emotion-classify.js），
+ *    不 import 任何 node: 内置模块。
  *
  * 接线方（后续卡片）负责：从存储读状态、决定 baseline、提供 nowMs 与本地小时。
  */
 
 /** 四维顺序固定，便于遍历与快照比对。 */
+import { classify } from './emotion-classify.js';
+
+// 对外仍从本模块导出分类器：接线方长期 `import { classify } from "./emotion.js"`。
+export { classify };
+
 const DIMENSIONS = Object.freeze(['pleasure', 'arousal', 'dominance', 'energy']);
 
 const VALUE_MIN = 0;
@@ -42,12 +48,13 @@ export const DEFAULT_BASELINE = Object.freeze({
 });
 
 /** 事件类型白名单（顺序即文档顺序）。 */
+// `complain` 已在 v0.5.2 退役（并入 vent）：仍保留在 EVENT_DELTAS 里读旧数据，
+// 但不再属于分类器可产出的类型集合。
 export const EVENT_TYPES = Object.freeze([
   'greeting',
   'care',
   'share',
   'thanks',
-  'complain',
   'cold',
   'reunion',
   'goodnight',
@@ -55,6 +62,7 @@ export const EVENT_TYPES = Object.freeze([
   'blame',
   'vent',
   'comfort',
+  'reassure',
 ]);
 
 /**
@@ -79,6 +87,8 @@ const EVENT_DELTAS = Object.freeze({
   conflict: Object.freeze({ pleasure: -6, arousal: 4, dominance: -4, energy: -1 }),
   // 冲着她来的负面话：愉悦明显掉、唤醒略升、精力略降（不迁怒状态句）。
   blame: Object.freeze({ pleasure: -6.4, arousal: 1.5, dominance: -1, energy: -1 }),
+  // 用户在担心「是不是惹到她了」：她收到的是被在意，轻轻回暖而不是被指责。
+  reassure: Object.freeze({ pleasure: 2, arousal: -1, dominance: 0.5, energy: 0.5 }),
   // 用户自述疲惫：只小幅压愉悦，掌控/精力不下沉（避免把诉苦读成对她的不满）。
   vent: Object.freeze({ pleasure: -1.5, arousal: -0.5, dominance: 0.5, energy: 0 }),
   comfort: Object.freeze({ pleasure: 5, arousal: -2, dominance: 1, energy: -1 }),
@@ -153,77 +163,6 @@ const CIRCADIAN_POINTS = Object.freeze({
 });
 
 /**
- * 中文关键词规则：顺序即优先级（更「硬」的信号在前）。
- * 置信度只由命中规则的基线与命中次数决定，确定性可复算。
- */
-const CLASSIFY_RULES = Object.freeze([
-  {
-    type: 'conflict',
-    base: 0.78,
-    pattern: /(?:你错了|别管我|烦不烦|闭嘴|少管我|你根本不懂|不想跟你说话|你听不懂|别说了)/,
-  },
-  {
-    type: 'goodnight',
-    base: 0.8,
-    pattern: /(?:晚安|准备睡了|要去睡了|睡了|睡啦|先睡|明天见)/,
-  },
-  {
-    type: 'thanks',
-    base: 0.75,
-    pattern: /(?:谢谢|谢啦|感谢|多谢|辛苦)/,
-  },
-  {
-    type: 'cold',
-    base: 0.62,
-    pattern: /(?:随便|算了|不想说|呵呵|哦|行吧)/,
-  },
-  {
-    type: 'care',
-    base: 0.72,
-    pattern: /(?:你怎么了|你怎么啦|还好吗|注意身体|别太累|别熬夜|早点休息|多喝|照顾好自己|没事吧|要不要紧)/,
-  },
-  {
-    // 指向她的负面话：第二人称 / 她的名字 + 负面词。排在 complain 之前，
-    // 才能把「你好烦」（冲她）与「今天加班好累」（用户诉苦）分开。
-    type: 'blame',
-    base: 0.74,
-    pattern: /(?:你|您|珞然)[^。！？!?，,]{0,6}(?:烦|讨厌|笨|没用|闭嘴|失望|恶心|受不了|滚(?:开|蛋|出去|吧|啊|！|!|$))/,
-  },
-  {
-    // 用户自述疲惫/委屈：第一人称或「今天/最近」+ 疲惫词，且不是在问她累不累。
-    // 「你也不容易」是体谅，不含负面词，因此混合句仍落到 vent。
-    type: 'vent',
-    base: 0.68,
-    pattern: /^(?!.*(?:你|您)[^。！？!?，,]{0,4}(?:累不累|累吗|还好吗))(?:我|俺|今天|最近|这周|这几天|这阵子)[^。！？!?]{0,12}(?:累|加班|难受|委屈|压力大|撑不住|扛不住|好辛苦|想哭)/,
-  },
-  {
-    type: 'complain',
-    base: 0.66,
-    pattern: /(?:烦|累死|气死|难受|压力|崩溃|郁闷|好累|太累|心累|不开心|堵得慌)/,
-  },
-  {
-    type: 'reunion',
-    base: 0.74,
-    pattern: /(?:好久不见|好久没|很久没|这段时间|多少年没)/,
-  },
-  {
-    type: 'greeting',
-    base: 0.7,
-    pattern: /(?:早安|早上好|早啊|早呀|晚上好|午安|在吗|在不在|嗨|哈喽|你好|hello|hi(?=\b|[！!，,。\s]))|(?:^早(?:上)?[！!。，,~～\s]*$)/i,
-  },
-  {
-    type: 'comfort',
-    base: 0.7,
-    pattern: /(?:抱抱|抱一下|别难过|我在|陪着你|会好的|别担心|有我在)/,
-  },
-  {
-    type: 'share',
-    base: 0.64,
-    pattern: /(?:给你说|我跟你说|和你说|我刚|今天.{0,8}(?:做|干)了?什么|今天发生|分享一个|说个事)/,
-  },
-]);
-
-/**
  * describe 的 12 种表述：pleasure 四档 × energy 三档。
  * 硬约束：不含任何阿拉伯数字、不含四维状态名、不超过 40 码点。
  */
@@ -259,6 +198,15 @@ export const VENT_SENTENCES = Object.freeze([
   '现在心软下来，先问问累在哪，别急着讲道理',
   '现在有点心疼，先接住这份累，陪着就好',
 ]);
+
+/** reassure 的专属表述：被在意、心软下来，不指责也不得意。 */
+export const REASSURE_SENTENCES = Object.freeze([
+  '被这么小心地问一句，心里软了下来，想让他放心',
+  '有点想笑，其实没生气，想好好跟他说一句没事',
+  '心口松了一下，想认真告诉他：没有烦，也不会烦',
+  '被在意着，气消了大半，只想把话说柔和些',
+]);
+
 
 /** 分档边界（写死，勿改）：pleasure ≥65 不错 / 45–64 平稳 / 35–44 有点闷 / <35 低落。 */
 const PLEASURE_BANDS = Object.freeze([65, 45, 35]);
@@ -529,6 +477,33 @@ function utcClock(nowMs) {
 }
 
 /**
+ * 事件增量的递减因子（V51-L1）：
+ * - 离边界越近推得越轻：往上推乘 (100−x)/50，往下推乘 x/50，最大 1；
+ * - 10 分钟内同类事件第 k 次再乘 0.7^(k−1)。
+ * 单次事件在基线上（50 分附近）因子为 1，与 v0.5.1 的增量保持不变。
+ *
+ * @param {object|undefined} history 最近的 {at,type} 列表（可省略）
+ * @param {string} type
+ * @param {number} nowMs
+ * @returns {number}
+ */
+function repeatDecay(history, type, nowMs) {
+  if (history === undefined || history === null) return 1;
+  if (!Array.isArray(history)) {
+    throw new TypeError(`applyEvent(state, options): options.history must be an array (got ${typeof history})`);
+  }
+  let repeats = 0;
+  for (const item of history) {
+    if (item === null || typeof item !== 'object') continue;
+    if (item.type !== type) continue;
+    if (!Number.isFinite(item.at)) continue;
+    const gap = nowMs - item.at;
+    if (gap >= 0 && gap < 10 * MINUTE_MS) repeats += 1;
+  }
+  return 0.7 ** repeats;
+}
+
+/**
  * 施加一次对话事件：事件固有增量（按 intensity 缩放并夹到单维上限）+ 当前节律偏移，
  * 叠加到状态后整体夹到 0–100。
  *
@@ -540,7 +515,7 @@ function utcClock(nowMs) {
  * hour/minute 可显式传入本地时刻；缺省按 nowMs 的 UTC 时刻计算（纯函数不读时区）。
  *
  * @param {object} state
- * @param {object} options {type, intensity?, nowMs, hour?, minute?, baseline?}
+ * @param {object} options {type, intensity?, nowMs, hour?, minute?, baseline?, history?}
  * @returns {{state:object, event:{at:number,type:string,deltas:object}}}
  */
 export function applyEvent(state, options) {
@@ -580,11 +555,19 @@ export function applyEvent(state, options) {
   const rhythm = circadian(clock);
   const rule = EVENT_DELTAS[type];
 
+  const repeatFactor = repeatDecay(opts.history, type, opts.nowMs);
   const next = {};
   const deltas = {};
   for (const dim of DIMENSIONS) {
     const cap = MAX_EVENT_DELTA[dim];
-    const intrinsic = clamp(rule[dim] * level, -cap, cap);
+    const raw = rule[dim] * level;
+    // 距离缩放：越高越难再往上推，越低越难再往下推（不改变语义方向）。
+    const room = raw > 0
+      ? Math.min(1, (VALUE_MAX - current[dim]) / 50)
+      : raw < 0
+        ? Math.min(1, current[dim] / 50)
+        : 1;
+    const intrinsic = clamp(raw * room * repeatFactor, -cap, cap);
     const target = clamp(current[dim] + intrinsic + rhythm[dim], VALUE_MIN, VALUE_MAX);
     next[dim] = target;
     deltas[dim] = round2(target - current[dim]);
@@ -652,30 +635,6 @@ function countMatches(pattern, text) {
 }
 
 /**
- * 中文关键词分类（不调模型、无随机）。规则按优先级顺序匹配，首个命中即返回；
- * 命中次数越多置信度略高（上限 0.95）。都不匹配 → share / 0（低置信度，调用方可跳过）。
- *
- * @param {string} text
- * @returns {{type:string, confidence:number}}
- */
-export function classify(text) {
-  if (typeof text !== 'string') {
-    throw new TypeError(`classify(text): text must be a string (got ${typeof text})`);
-  }
-  const trimmed = text.trim();
-  if (trimmed === '') return { type: 'share', confidence: 0 };
-
-  for (const rule of CLASSIFY_RULES) {
-    const hits = countMatches(rule.pattern, trimmed);
-    if (hits > 0) {
-      const confidence = round2(Math.min(0.95, rule.base + 0.08 * (hits - 1)));
-      return { type: rule.type, confidence };
-    }
-  }
-  return { type: 'share', confidence: 0 };
-}
-
-/**
  * 四维分档下标（0 为最高档）。
  * @param {number} value
  * @param {ReadonlyArray<number>} bands 递减的档位下界
@@ -711,6 +670,7 @@ export function describe(state, context) {
     }
     if (context.eventType === 'blame') return BLAME_SENTENCES[pleasureTier % BLAME_SENTENCES.length];
     if (context.eventType === 'vent') return VENT_SENTENCES[pleasureTier % VENT_SENTENCES.length];
+    if (context.eventType === 'reassure') return REASSURE_SENTENCES[pleasureTier % REASSURE_SENTENCES.length];
   }
   return DESCRIBE_SENTENCES[pleasureTier * 3 + energyTier];
 }

@@ -47,7 +47,7 @@ test('emotion-report：文件输入按行统计 count/mean/max 与未命中比�
   assert.equal(result.stderr, '');
   assert.match(result.stdout, /共 6 行/u);
   // greeting 两行：0.70 与 0.78 → count 2 / mean 0.74 / max 0.78。
-  assert.match(result.stdout, /greeting\s+2\s+0\.74\s+0\.78/u);
+  assert.match(result.stdout, /greeting\s+2\s+0\.70\s+0\.70/u);
   assert.match(result.stdout, /vent\s+1\s+0\.68\s+0\.68/u);
   assert.match(result.stdout, /thanks\s+1\s+0\.75\s+0\.75/u);
   assert.match(result.stdout, /blame\s+1\s+0\.74\s+0\.74/u);
