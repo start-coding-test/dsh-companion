@@ -276,6 +276,14 @@ export function createAdapter(ctx, opts = {}) {
     get systemPrompt() {
       return typeof declaredService('systemPrompt')?.section === 'function';
     },
+    /**
+     * V50-M3：动态 system prompt context 是否可用。旧宿主只有 section()，
+     * 缺 context() 时情绪句降级为不注入（见 src/index.js 的注册处）。
+     * @returns {boolean}
+     */
+    get systemPromptContext() {
+      return typeof declaredService('systemPrompt')?.context === 'function';
+    },
     get preStep() {
       return typeof ctx.on === 'function';
     },
@@ -378,6 +386,21 @@ export function createAdapter(ctx, opts = {}) {
       throw unavailable('no-system-prompt', 'ctx.systemPrompt.section()');
     }
     return impl.section(section);
+  }
+
+  /**
+   * 注册动态 system prompt context（V50-M3），返回 Cordis disposer。
+   * 条目形状由宿主 `dsh-system-prompt` 定义：
+   * `{ name, order, text: string|Function, required?, interpolate? }`。
+   * @param {{ name: string, order: number, text: string|Function, required?: boolean, interpolate?: boolean }} entry
+   * @returns {Function}
+   */
+  function context(entry) {
+    const impl = declaredService('systemPrompt');
+    if (typeof impl?.context !== 'function') {
+      throw unavailable('no-system-prompt', 'ctx.systemPrompt.context()');
+    }
+    return impl.context(entry);
   }
 
   /**
@@ -917,6 +940,7 @@ export function createAdapter(ctx, opts = {}) {
     cwd,
     log,
     section,
+    context,
     onPreStep,
     onAssemble,
     onTurnStopping,

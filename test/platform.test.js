@@ -62,6 +62,37 @@ test('section 原样转发并返回平台 disposer', () => {
   assert.equal(ctx.sections[0].disposed, true);
 });
 
+test('context 原样转发并返回平台 disposer（V50-M3）', () => {
+  const ctx = new FakeCtx();
+  const adapter = createAdapter(ctx);
+  const entry = {
+    name: 'companion-emotion',
+    order: 320,
+    interpolate: false,
+    text: () => '你此刻：…',
+  };
+  const disposer = adapter.context(entry);
+
+  assert.equal(adapter.capabilities.systemPromptContext, true);
+  assert.equal(ctx.callsOf('systemPrompt.context').length, 1);
+  assert.equal(ctx.callsOf('systemPrompt.context')[0].args[0], entry);
+  assert.equal(typeof disposer, 'function');
+  assert.equal(ctx.contexts[0].disposed, false);
+  disposer();
+  assert.equal(ctx.contexts[0].disposed, true);
+});
+
+test('systemPrompt 只有 section 时 context 抛 PlatformError(no-system-prompt)', () => {
+  const ctx = new FakeCtx();
+  delete ctx.systemPrompt.context;
+  const adapter = createAdapter(ctx);
+  assert.equal(adapter.capabilities.systemPromptContext, false);
+  assert.throws(
+    () => adapter.context({ name: 'x', order: 1, text: 'x' }),
+    (error) => error instanceof PlatformError && error.code === 'no-system-prompt',
+  );
+});
+
 test('onPreStep 注入：追加到进入批次并保留决策字段', async () => {
   const ctx = new FakeCtx();
   const adapter = createAdapter(ctx);
@@ -332,6 +363,7 @@ test('capabilities 反映宿主能力', () => {
   const full = createAdapter(new FakeCtx());
   assert.deepEqual({ ...full.capabilities }, {
     systemPrompt: true,
+    systemPromptContext: true,
     preStep: true,
     turnStopping: true,
     timer: true,

@@ -158,6 +158,12 @@ const RECALL_BUDGET_TOKENS = 2050;
 const RECALL_SOURCE_KIND = 'companion-recall';
 
 /**
+ * 宿主运行时上下文快照的 source.kind（`RuntimeContextProjection` 生成）。
+ * 它也是 user/message，但不是用户发言：转录与 lastUserText 必须排除。
+ */
+const RUNTIME_CONTEXT_SOURCE_KIND = 'runtime-context';
+
+/**
  * V7-H1：线程/任务类工具。
  *
  * 能力只能在**调用时**判断：sessionController 由宿主在 apply 之后才挂载
@@ -447,6 +453,23 @@ export function apply(ctx, rawConfig, hooks = {}) {
     publishOnThreadUnarchive(platform, store);
 
     registerSections(platform, store, track, state.card);
+    // V50-M3：情绪句改走宿主动态 context（order 320，避开宿主已用的 100-210）。
+    // 仅在卡上启用情绪时注册；宿主缺 context() 时只 warn 一次并降级为不注入，
+    // 默认（情绪关闭）路径完全不注册、不读不写库。
+    if (state.card?.emotion?.enabled === true) {
+      try {
+        track(platform.context({
+          name: 'companion-emotion',
+          order: 320,
+          interpolate: false,
+          text: (context) => emotionContextText(state, context),
+        }));
+      } catch (error) {
+        platform.log('warn', '[dsh-companion] emotion context unavailable; emotion line disabled', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
     // P2（v0.5.0）：遮蔽宿主默认人设。off 时连监听器都不注册，默认路径与旧版
     // 完全一致；失败只 warn，不挡装配。
     state.shadowMode = registerDeploymentShadow(platform, config, track, state.card);
@@ -612,6 +635,11 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     /** H3：每个 scope 各自的转录，切换会话时恢复，避免跨会话串味。 */
     transcriptByScope: new Map(),
     transcriptScope: SCOPE,
+    /**
+     * V50-M3：每个 scope 最近一次算好的情绪句（`你此刻：…`）。由 systemPrompt.context
+     * 在装配时读取，不再造 user 消息；未算过/已关闭时没有值。
+     */
+    emotionTextByScope: new Map(),
     lastHumanAt: null,
     tokens: 0,
     overCount: 0,
@@ -1146,31 +1174,42 @@ function recoverReminderDeliveries(state) {
  * @returns {{kind:'main'|'thread'|'subagent', scope:string|null, sessionId:string|null}}
  */
 function routeSession(state, payload) {
+  if (state === null || typeof state !== 'object') {
+    return { kind: 'main', scope: SCOPE, sessionId: null, legacy: true };
+  }
   if (payload?.agent === null || payload?.agent === undefined) {
     state.currentSession = { kind: 'main', scope: SCOPE, sessionId: null, legacy: true };
     state.currentScope = SCOPE;
     return state.currentSession;
   }
-  const identity = classifySession(payload.agent, {
-    store: state.store,
-    logger: (level, message, meta) => state.platform.log(level, message, meta),
-    binding: mainBindingOf(state.config),
-    hasUserInput: hasRealUserInput(payload.messages),
-  });
+  let identity;
+  try {
+    identity = classifySession(payload.agent, {
+      store: state.store,
+      logger: (level, message, meta) => state.platform.log(level, message, meta),
+      binding: mainBindingOf(state.config),
+      hasUserInput: hasRealUserInput(payload.messages),
+    });
+  } catch (error) {
+    state.platform?.log?.('warn', '[dsh-companion] session routing failed; fallback to main', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    identity = { kind: 'main', scope: SCOPE, sessionId: null, legacy: true };
+  }
   state.currentSession = identity;
   if (typeof identity.mainSessionId === 'string' && identity.mainSessionId !== '') {
     state.mainSessionId = identity.mainSessionId;
   }
   if (identity.kind === 'subagent') {
     state.currentScope = null;
-    state.metrics.inc('subagentSkips');
-    state.platform.log('debug', '[dsh-companion] subagent session skipped', {
+    state.metrics?.inc?.('subagentSkips');
+    state.platform?.log?.('debug', '[dsh-companion] subagent session skipped', {
       sessionId: identity.sessionId,
     });
     return identity;
   }
   state.currentScope = identity.scope ?? SCOPE;
-  state.platform.log('debug', '[dsh-companion] session routed', {
+  state.platform?.log?.('debug', '[dsh-companion] session routed', {
     kind: identity.kind,
     scope: state.currentScope,
     sessionId: identity.sessionId,
@@ -1444,9 +1483,10 @@ async function runPreStep(state, payload) {
 
   const hint = injectCommandHint(state, payload, messages, turnKey);
   const privacy = injectPrivacyHint(state, payload, messages, turnKey);
-  const emotion = injectEmotion(state, payload, messages, turnKey, scope);
+  // V50-M3：情绪只算不注入，结果由 systemPrompt.context 在装配时取用。
+  injectEmotion(state, payload, messages, turnKey, scope);
   const injection = await injectRecall(state, payload, messages, turnKey, scope);
-  const hints = [hint, privacy, ...(emotion?.inject ?? []), ...(injection?.inject ?? [])]
+  const hints = [hint, privacy, ...(injection?.inject ?? [])]
     .filter((item) => item !== null);
   if (hints.length === 0) return injection;
   return { ...(injection ?? {}), inject: hints };
@@ -2691,9 +2731,10 @@ async function maybeCompact(state, payload, scope = SCOPE) {
 }
 
 /**
- * P3-c 情绪注入：读库 → 衰减/节律/安静时段 → 分类事件 → 落库 → 描述，
- * 同一 turn 只注入一次。卡上 `emotion.enabled !== true` 时直接返回 null，
- * 不读也不写库，保证默认路径与接入前完全一致。
+ * P3-c 情绪计算：读库 → 衰减/节律/安静时段 → 分类事件 → 落库 → 描述，把结果
+ * 暂存到 state.emotionTextByScope，由 systemPrompt.context 在装配时读取；不再
+ * 造 user 消息。同一 turn 只算一次。卡上 `emotion.enabled !== true` 时清空该
+ * scope 的旧句并返回 null，不读也不写库，保证默认路径与接入前完全一致。
  *
  * 写入失败的 warn 口径与 injectRecall 一致：只记录，不影响本轮对话。
  *
@@ -2702,10 +2743,13 @@ async function maybeCompact(state, payload, scope = SCOPE) {
  * @param {unknown[]} messages
  * @param {string|null} turnKey
  * @param {string} [scope]
- * @returns {{inject: object[]}|null}
+ * @returns {null}
  */
 function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
-  if (state.card?.emotion?.enabled !== true) return null;
+  if (state.card?.emotion?.enabled !== true) {
+    state.emotionTextByScope?.delete(scope);
+    return null;
+  }
 
   const { platform, config, store } = state;
   const key = `emotion:${sessionIdOf(payload) ?? scope}:${turnKey ?? `step:${String(payload?.step ?? 'unknown')}`}`;
@@ -2732,7 +2776,8 @@ function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
       scope,
       text,
     });
-    return { inject: [emotionMessage(`${EMOTION_PROMPT_PREFIX}${result.line}`)] };
+    state.emotionTextByScope?.set(scope, `${EMOTION_PROMPT_PREFIX}${result.line}`);
+    return null;
   } catch (error) {
     platform.log('warn', '[dsh-companion] emotion injection failed', {
       message: error instanceof Error ? error.message : String(error),
@@ -2742,23 +2787,29 @@ function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
 }
 
 /**
- * 构造情绪注入消息：形状与 recallMessage 同构（完整平台消息）。
- * source.kind='companion-emotion' 供转录/巩固/主会话绑定排除。
+ * V50-M3：systemPrompt.context provider。
  *
- * @param {string} text 渲染好的 `你此刻：…` 文本
- * @returns {{id: string, role: 'user', content: object[], source: object}}
+ * 宿主每次装配/请求前调用；子代理返回空串（宿主会过滤空 section），其它会话按
+ * routeSession 解析 scope 后取 injectEmotion 暂存的最近一句。路由失败按主会话
+ * 兜底并返回空串，provider 本身绝不抛错。
+ *
+ * @param {object} state
+ * @param {{agent?: object}|null|undefined} context
+ * @returns {string}
  */
-function emotionMessage(text) {
-  return {
-    id: randomUUID(),
-    role: 'user',
-    content: [{ type: 'text', text }],
-    source: {
-      kind: EMOTION_SOURCE_KIND,
-      form: 'snapshot',
-      sections: [{ name: 'emotion', text }],
-    },
-  };
+function emotionContextText(state, context) {
+  let identity;
+  try {
+    identity = routeSession(state, { agent: context?.agent });
+  } catch (error) {
+    state?.platform?.log?.('warn', '[dsh-companion] emotion context routing failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return '';
+  }
+  if (identity?.kind === 'subagent') return '';
+  const scope = identity?.scope ?? SCOPE;
+  return state?.emotionTextByScope?.get(scope) ?? '';
 }
 
 /**
@@ -2977,6 +3028,7 @@ function isInjectedMessage(message) {
     || kind === EMOTION_SOURCE_KIND
     || kind === COMMAND_HINT_SOURCE_KIND
     || kind === PRIVACY_HINT_SOURCE_KIND
+    || kind === RUNTIME_CONTEXT_SOURCE_KIND
     || isCompanionMessage(message);
 }
 

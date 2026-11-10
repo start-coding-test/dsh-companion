@@ -505,6 +505,8 @@ test('pre-step：默认未启用 → 不注入 companion-emotion，情绪表零�
     const injected = (decision?.messages ?? [])
       .filter((item) => item?.source?.kind === EMOTION_SOURCE_KIND);
     assert.equal(injected.length, 0, '默认路径不得注入情绪消息');
+    assert.equal(ctx.contexts.length, 0, '默认路径不得注册情绪 context');
+    assert.equal(ctx.callsOf('systemPrompt.context').length, 0);
     assert.equal(temp.store.getEmotionState('main'), null);
     assert.equal(temp.store.countEmotionEvents('main'), 0);
   } finally {
@@ -512,7 +514,7 @@ test('pre-step：默认未启用 → 不注入 companion-emotion，情绪表零�
   }
 });
 
-test('pre-step：启用后注入「你此刻：」文本（无数字/花括号），同一 turn 只注入一次', async (t) => {
+test('pre-step：启用后注册 context，provider 返回「你此刻：」文本（无数字/花括号），同一 turn 只算一次', async (t) => {
   const temp = makeTempStore({ t });
   const home = mkdtempSync(join(tmpdir(), 'dsh-companion-emotion-home-'));
   useTempDshHome(t, home);
@@ -526,46 +528,49 @@ test('pre-step：启用后注入「你此刻：」文本（无数字/花括号�
   const payload = turnPayload(session, 'turn-enabled', [message]);
   const handle = applyCordis(strictCtx(ctx), { dbPath: temp.dbPath, persona: { cardPath } });
   try {
+    assert.equal(ctx.callsOf('systemPrompt.context').length, 1, '启用后必须注册一次 context');
+    assert.equal(ctx.contexts.length, 1);
+    const entry = ctx.contexts[0].context;
+    assert.equal(entry.name, 'companion-emotion');
+    assert.equal(entry.order, 320);
+    assert.equal(entry.interpolate, false);
+
     const decision = await ctx.dispatch('agent/pre-step', payload, {
       kind: 'enter',
       messages: payload.messages,
     });
     const injected = (decision?.messages ?? [])
       .filter((item) => item?.source?.kind === EMOTION_SOURCE_KIND);
-    assert.equal(injected.length, 1);
-    const text = injected[0].content[0].text;
-    assert.ok(text.startsWith(EMOTION_PROMPT_PREFIX), `实际注入：${text}`);
-    assert.doesNotMatch(text, /[0-9]/u, '注入文本不得含阿拉伯数字');
-    assert.doesNotMatch(text, /[{}]/u, '注入文本不得含花括号');
-    assert.equal(injected[0].source.sections?.[0]?.name, 'emotion');
+    assert.equal(injected.length, 0, '不得再注入 companion-emotion 消息');
+
+    const text = entry.text({ agent: payload.agent });
+    assert.ok(text.startsWith(EMOTION_PROMPT_PREFIX), `实际文本：${text}`);
+    assert.doesNotMatch(text, /[0-9]/u, '情绪文本不得含阿拉伯数字');
+    assert.doesNotMatch(text, /[{}]/u, '情绪文本不得含花括号');
 
     const saved = temp.store.getEmotionState('main');
     assert.ok(saved, '启用后必须落库');
     assert.equal(saved.updatedAt, TEST_NOW);
     assert.equal(temp.store.countEmotionEvents('main'), 1);
 
-    // 同一 turn 的下一步：即使回灌了注入消息，也不再注入/写入。
+    // 同一 turn 的下一步：不重算、不再写库；provider 文本保持不变。
     const secondPayload = {
       ...payload,
       step: 2,
-      messages: [message, injected[0]],
+      messages: [message],
     };
-    const second = await ctx.dispatch('agent/pre-step', secondPayload, {
+    await ctx.dispatch('agent/pre-step', secondPayload, {
       kind: 'enter',
       messages: secondPayload.messages,
     });
-    const secondInjected = (second?.messages ?? [])
-      .filter((item) => item?.source?.kind === EMOTION_SOURCE_KIND);
-    // adapter 会把 payload 里已有的消息合并进 decision，所以这里只能断言「没有新增」。
-    assert.equal(secondInjected.length, 1, '同一 turn 不应追加第二条情绪消息');
-    assert.equal(secondInjected[0].id, injected[0].id);
+    assert.equal(entry.text({ agent: secondPayload.agent }), text, '同一 turn 不得重算');
     assert.equal(temp.store.countEmotionEvents('main'), 1);
   } finally {
     handle.dispose();
   }
 });
 
-test('pre-step：6 小时前的状态经注入后四维向基线走一半，事件表新增一行', async (t) => {
+test('pre-step：6 小时前的状态经计算后四维向基线走一半，事件表新增一行', async (t) => {
   const temp = makeTempStore({ t });
   const home = mkdtempSync(join(tmpdir(), 'dsh-companion-emotion-home-'));
   useTempDshHome(t, home);
@@ -597,9 +602,13 @@ test('pre-step：6 小时前的状态经注入后四维向基线走一半，事�
       kind: 'enter',
       messages: payload.messages,
     });
-    const injected = (decision?.messages ?? [])
-      .filter((item) => item?.source?.kind === EMOTION_SOURCE_KIND);
-    assert.equal(injected.length, 1);
+    assert.equal(
+      (decision?.messages ?? []).filter((item) => item?.source?.kind === EMOTION_SOURCE_KIND).length,
+      0,
+      '不得再注入 companion-emotion 消息',
+    );
+    const text = ctx.contexts[0].context.text({ agent: payload.agent });
+    assert.ok(text.startsWith(EMOTION_PROMPT_PREFIX), `实际文本：${text}`);
 
     const saved = temp.store.getEmotionState('main');
     const expected = { pleasure: 65, arousal: 35, dominance: 65, energy: 35 };
@@ -641,6 +650,12 @@ test('pre-step：子代理会话不注入、不写情绪状态', async (t) => {
     const injected = (decision?.messages ?? [])
       .filter((item) => item?.source?.kind === EMOTION_SOURCE_KIND);
     assert.equal(injected.length, 0, '子代理不应注入情绪消息');
+    assert.equal(ctx.contexts.length, 1, '启用时 context 仍只注册一次');
+    assert.equal(
+      ctx.contexts[0].context.text({ agent: payload.agent }),
+      '',
+      '子代理的 provider 必须返回空串',
+    );
     assert.equal(temp.store.getEmotionState('main'), null);
     assert.equal(temp.store.countEmotionEvents('main'), 0);
   } finally {
