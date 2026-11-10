@@ -27,8 +27,8 @@
 ### Tests
 
 - 新增 `test/v060-appraise.test.js`（14 例：严格解析、消息拼装与脱敏、队列单飞 / 覆盖 / 超时 / 预算、统计、落库、llm 接线、非法 JSON 兜底、`enabled=false` 零调用）与 `test/v060-report.test.js`（7 例：模型判定器请求、失败形态、门槛与失败条数、参数解析、`/状态` 三态）。
-- 新增 `test/v060-fixes.test.js`（3 例：斜杠命令零判定、intensity 影响增量、多余键拒绝）。
-- 合计 **1208** 用例 / **33** 套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过。
+- 新增 `test/v060-fixes.test.js`（4 例：斜杠命令（含未知命令）零判定、intensity 影响增量、多余键拒绝、同一事件只入账一次）。
+- 合计 **1209** 用例 / **33** 套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过。
 
 ## [0.5.2] - 2026-11-11
 

@@ -192,6 +192,19 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **S-M1 W5 把「被注入」当「被需要」、未排除同会话即时召回**：v0.4.1 修复，commit `39addbb`。`reneed_kind` 增加 `used`（复述重叠 ≥0.6 升级，保留首次时间/档位）；新增 `same_context`（Δt<6h 或来源 episode 仍在 surface），统计排除。schema v8。v0.4.2 的 S2-M1 进一步改为用上时单独记录，见上。
 - **L-2 确认词长度上限**：v0.4.1 修复，同 commit `39addbb`。`isConfirmation` 去标点/空白后超过 `CONFIRM_MAX_CHARS=10` 直接不算确认。
 
+### D-14 v0.6 复审 r2-L3：`dispose()` 等待在途判定最多 `appraiseTimeoutMs`
+
+- **现状**：为让被覆盖句的规则兜底也能落库（r1-L3），队列在 `dispose()` 时发起一次
+  `drain()`，且超时定时器不再 `unref`（r1-L2）。副作用是裸进程退出前可能等到
+  `emotion.appraiseTimeoutMs`（默认 8000ms）才结束；实测 500ms 配置下 507ms 退出，
+  期间不写库。
+- **影响**：只影响一次性进程（headless 脚本、CLI）的退出时间，不影响常驻会话；
+  判定结果不会被写进已关闭的插件实例（`apply` 回调有 `state.disposed` 守卫）。
+- **建议排期**：不阻塞发版。后续可给队列加 `cancel()`（`AbortController` 传给
+  `platform.complete`），`dispose()` 先取消再 drain，把最坏等待压到一次请求中止的时间。
+- **验收方式**：`test/v060-fixes.test.js` 的 L8 用例覆盖「同一事件只入账一次」；
+  取消能力落地后补「dispose 期间不发新请求、在途请求被中止」用例。
+
 ## 6. 关联文档
 
 - [README](../README.md)：配置表、v0.4.2 变更摘要、已知限制

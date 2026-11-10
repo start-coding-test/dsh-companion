@@ -66,7 +66,7 @@ function userMessage(text) {
 }
 
 /** 起一个插件实例，跑一轮 pre-step，返回该轮落库的第一条非 ambient 事件（可能为 null）。 */
-async function runTurn(t, { verdict, text = '你怎么又忘了', expectEvent = true }) {
+async function runTurn(t, { verdict, text = '你怎么又忘了', extraTexts = [], expectEvent = true }) {
   const temp = makeTempStore();
   const home = mkdtempSync(join(tmpdir(), 'dsh-companion-v060b-'));
   useTempDshHome(t, home);
@@ -91,6 +91,9 @@ async function runTurn(t, { verdict, text = '你怎么又忘了', expectEvent = 
   });
 
   await ctx.dispatch('agent/pre-step', turnPayload(session, [userMessage(text)]), { kind: 'enter', messages: [] });
+  for (const extra of extraTexts) {
+    await ctx.dispatch('agent/pre-step', turnPayload(session, [userMessage(extra)]), { kind: 'enter', messages: [] });
+  }
   const events = expectEvent
     ? await pollUntil(
       () => {
@@ -108,10 +111,23 @@ test('M1 回归：斜杠命令不判定（不发请求、不写事件）', async
   const run = await runTurn(t, {
     verdict: { target: 'her', type: 'blame', intensity: 0.8, confidence: 0.9 },
     text: '/状态',
+    extraTexts: ['/foo', '/记忆 列表'],
     expectEvent: false,
   });
   assert.equal(run.requests(), 0, '斜杠命令不得触发模型判定');
   assert.equal(run.temp.store.countEmotionEvents('main'), 0, '斜杠命令不得写情绪事件');
+});
+
+test('L8 回归：一轮普通消息只入账一次（不重复记事件）', async (t) => {
+  const run = await runTurn(t, {
+    verdict: { target: 'her', type: 'blame', intensity: 0.8, confidence: 0.9 },
+    text: '你怎么又忘了',
+  });
+  // 等后台落库稳定，再断言「只入账一次」。
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  const llmRows = run.temp.store.listEmotionEvents('main', 50).filter((row) => row.note === 'llm');
+  assert.equal(llmRows.length, 1, '同一事件只应入账一次');
+  assert.equal(run.requests(), 1, '同一轮只应发一次判定请求');
 });
 
 test('M2 回归：模型 intensity 小则增量小、大则增量大（同一 confidence）', async (t) => {
