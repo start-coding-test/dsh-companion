@@ -663,6 +663,9 @@ const EMOTION_EVENT_LABELS = Object.freeze({
   goodnight: '晚安',
   conflict: '冲突',
   comfort: '安慰',
+  // V50-M1：指向她的负面话 / 用户自述疲惫，分开标注。
+  blame: '指责',
+  vent: '倾诉',
 });
 
 /**
