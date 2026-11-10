@@ -24,12 +24,61 @@ greeting            2        0.74        0.78
 ```
 
 - 每一行是一条独立输入；空行/纯空白行跳过。
-- `未命中` 指分类置信度为 0（`classify` 回落 `share/0`），不等同于 `share` 关键词命中。
+- `未命中` 指分类置信度为 0（`classify` 回落 `none/0`），不等同于某个关键词类型命中。
 - 只读：不打开 `~/.dsh` 数据库、不写文件，输出全部走 stdout。
 - 退出码：`0` 成功；`1` 文件读取失败；`2` 用法错误。
+
+## 混淆矩阵与门槛
+
+`test/fixtures/emotion-golden.jsonl` 是人工标注集：207 行，每行
+`{"text": "...", "type": "..."}`，`type` 取 `EVENT_TYPES` 的 12 类之一或 `none`
+（无事件）。**标注集是新标注的，规则没有针对它调过参**；标签按「人读到这句话会怎么
+理解」写，不迁就当前实现，所以错例会如实留在统计里，不会为了变绿改标签。
+
+覆盖分布：`none` 68、`vent` 29、`blame` 19、`care` 14、`cold` 10、`goodnight` 10、
+`share` 9、`thanks` 9、`greeting` 8、`reunion` 8、`conflict` 8、`comfort` 8、
+`reassure` 7。用户点名的 19 句历史误判全部在册（当前全部判对，作为回归）。
+
+用法：
+
+```powershell
+node scripts/emotion-report.mjs --confusion test/fixtures/emotion-golden.jsonl
+```
+
+- 矩阵行=标注类型、列=预测类型（含 `none`），只列出现过的标签。
+- 汇总：总体准确率、每类 precision/recall、`blame` 误报数（标注不是 `blame` 却判
+  `blame`）、中性句误触发率（标注 `none` 却判出非 `none`）。
+- 退出码：达标 `0`，未达标 `1`，用法错误 `2`。同输入同输出，不写库、不联网。
+
+发版门槛（`test/emotion-golden.test.js` 断言，失败时打印前 10 个错例）：
+
+| 指标 | 门槛 | 0.5.1 实测 |
+| --- | --- | --- |
+| 总体准确率 | ≥ 85% | **179/207 = 86.47%** |
+| `blame` 误报 | ≤ 2 句 | **0 句** |
+| 中性句误触发率 | ≤ 10% | **2/68 = 2.94%** |
+
+每类 recall：`blame` 0.474（9/19）、`care` 0.571（8/14）、`reassure` 0.714、
+`share` 0.778、`vent` 0.828、`cold` 0.900、`none` 0.971，其余 1.000；
+precision 除 `care` 0.727、`none` 0.733、`vent` 0.960 外均为 1.000。
+
+当前 28 条错例集中在规则缺口，未在本任务中修改 `src/`：
+
+- `blame` 漏判（9 条）：`我讨厌你`、`你太让我失望了`、`你让我很失望`、`你答应我的事又忘了`
+  等——`objectBefore` 只看 cue 左侧且被中间的「我」抢走宾语；`你说话真难听`、
+  `你都不回我消息`、`你太过分了`、`我真是受够你了`、`你怎么老是这样` 无 cue。
+- `care` 漏判（5 条）：`你脸色不太好，是不是没睡好`、`今天降温了，记得加衣服`、
+  `你感冒好点了吗`、`要不要我陪你去医院`、`你累不累，要不要歇一会儿`。
+- `share` 漏判（2 条）：`昨天见到老同学了，聊了很久`、`周末去了趟郊区，空气挺好`。
+- `vent` 漏判（5 条）：`加班加到怀疑人生`、`今天被老板骂了`、`这破系统又崩了`、
+  `心情不好`、`开会被领导批评了`。
+- 其它：`你能不能别敷衍我` 被「别」的否定守卫判成 `care`；`别硬撑，难受就说` 判成
+  `vent`；`随便你` 判成 `none` 而非 `cold`；`我是不是说错话了`、`你没生我气吧`
+  未判 `reassure`；两条提醒 `你别忘了带钥匙`、`你明天别迟到` 被判成 `care`（中性误触发）。
 
 ## 实现位置
 
 - 规则与 `EVENT_TYPES`：`src/persona/emotion.js`
 - 脚本：`scripts/emotion-report.mjs`
-- 测试：`test/emotion-report.test.js`
+- 标注集：`test/fixtures/emotion-golden.jsonl`
+- 测试：`test/emotion-report.test.js`、`test/emotion-golden.test.js`
