@@ -254,7 +254,7 @@ test('circadian：深夜精力明显低、清晨回升、上午愉悦偏高、�
   assert.ok(circadian({ hour: 19 }, MID).pleasure > circadian({ hour: 16 }, MID).pleasure, '傍晚愉悦偏高');
 });
 
-test('applyEvent：十种类型的语义方向正确（在节律零点隔离节律偏移）', () => {
+test('applyEvent：十二种类型的语义方向正确（在节律零点隔离节律偏移）', () => {
   assert.ok(deltasOf('greeting').pleasure > 0);
   assert.ok(deltasOf('care').pleasure > 0 && deltasOf('care').arousal > 0 && deltasOf('care').energy > 0);
   assert.ok(deltasOf('share').pleasure > 0 && deltasOf('share').arousal > 0);
@@ -265,11 +265,21 @@ test('applyEvent：十种类型的语义方向正确（在节律零点隔离节�
   assert.ok(deltasOf('goodnight').arousal < 0 && deltasOf('goodnight').energy > 0);
   assert.ok(deltasOf('conflict').pleasure < 0 && deltasOf('conflict').dominance < 0);
   assert.ok(deltasOf('conflict').arousal > 0);
+  // V50-M1：blame 冲她来（愉悦明显下调、唤醒略升、精力略降），
+  // vent 是用户诉苦（愉悦只小幅下调，掌控/精力不下沉）。
+  assert.ok(deltasOf('blame').pleasure <= -6 && deltasOf('blame').pleasure >= -8);
+  assert.ok(deltasOf('blame').arousal > 0 && deltasOf('blame').energy < 0);
+  assert.ok(deltasOf('vent').pleasure < 0 && deltasOf('vent').pleasure > deltasOf('blame').pleasure);
+  assert.ok(deltasOf('vent').dominance >= 0 && deltasOf('vent').energy >= 0);
   assert.ok(deltasOf('comfort').pleasure > 0);
   assert.deepEqual(deltasOf('greeting'), {
     pleasure: 4, arousal: 1, dominance: 0.5, energy: 0.5,
   });
-  assert.deepEqual(EVENT_TYPES.length, 10);
+  assert.deepEqual([...EVENT_TYPES].sort(), [
+    'blame', 'care', 'cold', 'comfort', 'complain', 'conflict',
+    'goodnight', 'greeting', 'reunion', 'share', 'thanks', 'vent',
+  ]);
+  assert.equal(EVENT_TYPES.length, 12);
 });
 
 test('applyEvent：intensity 夹到 0–3，0 与负值不产生事件增量', () => {

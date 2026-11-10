@@ -24,6 +24,7 @@ import {
   applyDeltas,
   createState,
   describe,
+  targetFor,
 } from '../src/persona/emotion.js';
 import {
   EMOTION_PROMPT_PREFIX,
@@ -209,14 +210,30 @@ test('parseCardSourceDetailed：非法 emotion 不再让整张卡加载失败，
 
 // ---------------------------------------------------------------- 接线算法
 
-test('quiet=true：energy 的 deltas 比 quiet=false 少 3，且不越 0–100', () => {
+test('quiet=true：目标 energy 比 quiet=false 少 3，衰减后整体更低且不越 0–100', () => {
   const temp = makeTempStore();
   try {
     const store = temp.store;
     const card = cardWithEmotion();
+    const loudTarget = targetFor({
+      baseline: BASELINE_50, hour: 12, minute: 0, quiet: false,
+    });
+    const quietTarget = targetFor({
+      baseline: BASELINE_50, hour: 12, minute: 0, quiet: true,
+    });
+    assert.equal(
+      quietTarget.energy,
+      loudTarget.energy + QUIET_ENERGY_DELTA,
+      '安静时段只把 energy 目标额外压低 3',
+    );
+    for (const dim of ['pleasure', 'arousal', 'dominance']) {
+      assert.equal(quietTarget[dim], loudTarget[dim], `${dim} 不受安静时段影响`);
+    }
+
+    // 24 小时（4 个半衰期）后状态逼近目标：quiet 的 energy 比 loud 低约 3 * 15/16。
     const seed = () => store.setEmotionState('main', {
       ...BASELINE_50,
-      updatedAt: TEST_NOW,
+      updatedAt: TEST_NOW - 24 * HOUR_MS,
     });
 
     seed();
@@ -244,12 +261,19 @@ test('quiet=true：energy 的 deltas 比 quiet=false 少 3，且不越 0–100',
       text: '',
     });
 
-    assert.equal(
-      quiet.event.deltas.energy,
-      loud.event.deltas.energy + QUIET_ENERGY_DELTA,
-      '安静时段应额外 −3 energy',
+    assert.ok(quiet.state.energy < loud.state.energy);
+    const expectedGap = Math.abs(QUIET_ENERGY_DELTA) * (15 / 16);
+    assert.ok(
+      Math.abs((loud.state.energy - quiet.state.energy) - expectedGap) < 1e-6,
+      `energy gap ${loud.state.energy - quiet.state.energy} != ${expectedGap}`,
     );
-    assert.equal(quiet.state.energy, loud.state.energy - 3);
+    // ambient 审计只记环境项净贡献：quiet 的 energy 贡献比 loud 低 3 * 15/16。
+    assert.equal(loud.event.type, 'ambient');
+    assert.equal(quiet.event.type, 'ambient');
+    assert.ok(
+      Math.abs((loud.event.deltas.energy - quiet.event.deltas.energy) - expectedGap) <= 0.01,
+      `ambient deltas gap ${loud.event.deltas.energy - quiet.event.deltas.energy} != ${expectedGap}`,
+    );
     for (const value of [loud.state.energy, quiet.state.energy]) {
       assert.ok(value >= 0 && value <= 100);
     }
@@ -298,7 +322,7 @@ test('衰减：6 小时前的状态注入后四维各向基线走一半，事件
   }
 });
 
-test('事件命中：晚安文本产生 goodnight 事件，deltas 计入安静时段', () => {
+test('事件命中：晚安文本产生 goodnight 事件，deltas 只含事件固有增量', () => {
   const temp = makeTempStore();
   try {
     const store = temp.store;
@@ -317,7 +341,10 @@ test('事件命中：晚安文本产生 goodnight 事件，deltas 计入安静�
     const [event] = store.listEmotionEvents('main', 1);
     assert.equal(event.type, 'goodnight');
     assert.equal(store.countEmotionEvents('main'), before + 1);
-    assert.ok(result.event.deltas.energy < 0, '安静时段 + 深夜节律应压低 energy');
+    // V50-H1：环境项（深夜节律 + 安静时段）作为目标值压在状态上，
+    // 不再并入事件 deltas；goodnight 自身的 energy 增量为正。
+    assert.ok(result.event.deltas.energy > 0, 'deltas 只应包含 goodnight 固有增量');
+    assert.ok(result.state.energy < BASELINE_50.energy, '安静时段目标应把 energy 整体压低');
   } finally {
     temp.cleanup();
   }
