@@ -89,7 +89,7 @@ export function chatEligibility({
 /**
  * 构造闲聊提示词。
  *
- * v0.4.13（P1）：
+ * v0.5.0（P1）：
  * - 第 1 行来自 `card.chatIdentity`（缺省与 v0.4.12 逐字节一致）；
  * - `mes_example` 非空时在「语气」行之后加一行口吻参考（第一段，≤300 码点）；
  * - `emotionLine` 为非空字符串时在末尾追加 `你此刻：<...>`（只留钩子，不实现情绪）。
@@ -109,10 +109,12 @@ export function buildChatPrompt({
   const address = typeof card.address === 'string' && card.address.trim() !== ''
     ? card.address.trim()
     : '你';
-  const style = card.tone?.style ?? '简洁';
-  const warmth = card.tone?.warmth ?? '温和';
-  const structure = card.tone?.structure ?? '先结论';
-  const banned = Array.isArray(card.bannedPhrases) ? card.bannedPhrases.join('、') : '';
+  const style = renderTemplate(String(card.tone?.style ?? '简洁'), { name, address });
+  const warmth = renderTemplate(String(card.tone?.warmth ?? '温和'), { name, address });
+  const structure = renderTemplate(String(card.tone?.structure ?? '先结论'), { name, address });
+  const banned = Array.isArray(card.bannedPhrases)
+    ? card.bannedPhrases.map((phrase) => renderTemplate(String(phrase), { name, address })).join('、')
+    : '';
   const identity = typeof card.chatIdentity === 'string' && card.chatIdentity.trim() !== ''
     ? card.chatIdentity
     : DEFAULT_CARD.chatIdentity;

@@ -9,7 +9,7 @@
  *    （按 Unicode 码点计）。
  * 4) 截断不静默：buildSectionsWithDiagnostics() 额外返回诊断，生产侧各记一条 warn。
  *
- * v0.4.13（P1）：身份/性格/场景/语气尾句全部来自人格卡；内置卡缺省值与 v0.4.12
+ * v0.5.0（P1）：身份/性格/场景/语气尾句全部来自人格卡；内置卡缺省值与 v0.4.12
  * 逐字节一致（test/fixtures/persona-v0412.json 锁定）。
  */
 
@@ -60,7 +60,7 @@ const PROTOCOL_NATURAL_LINE = '- 日常对话里自然化用记忆，不必逐�
  * 不再静默回退内置默认卡——否则用户配了 persona.cardPath 却漏接线时，人格段
  * 会无声地继续用内置卡，问题要到线上才暴露。
  *
- * v0.4.13：保留旧签名，内部调 buildSectionsWithDiagnostics() 并丢弃 warnings。
+ * v0.5.0：保留旧签名，内部调 buildSectionsWithDiagnostics() 并丢弃 warnings。
  *
  * @param {object} card 人格卡（loadPersonaCard/loadCard 的返回值）
  * @returns {ReadonlyArray<{name:string, order:number, text:string}>}
@@ -70,7 +70,7 @@ export function buildSections(card) {
 }
 
 /**
- * 同 buildSections()，但把截断诊断一并返回（v0.4.13 P1）：
+ * 同 buildSections()，但把截断诊断一并返回（v0.5.0 P1）：
  * `{sections, warnings}`，warning 形如
  * `{code:'section_truncated', section:'persona:core', chars:<原始码点数>, max:<上限>}`。
  * 只含段名/长度，不含正文，可直接进 warn 日志。
@@ -149,7 +149,10 @@ function coreText(card) {
   const scenario = text(card, 'scenario', '');
   if (scenario.trim() !== '') lines.push(`场景：${render(card, scenario)}`);
 
-  lines.push(`语气${tone.style}、${tone.warmth}，${tone.structure}${toneTail(card, tone)}`);
+  // 语气三项也走 render：卡里允许写 {{char}} / {{user}}（v0.5.0 review-v20 M-2）。
+  const renderedTone = [tone.style, tone.warmth, tone.structure]
+    .map((part) => (typeof part === 'string' ? render(card, part) : part));
+  lines.push(`语气${renderedTone[0]}、${renderedTone[1]}，${renderedTone[2]}${toneTail(card, tone)}`);
   lines.push('价值观：');
   lines.push(...values.map((value) => `- ${render(card, String(value))}`));
   // taboos 为空数组时整行省略（V12-L4）。
@@ -175,7 +178,7 @@ function toneTail(card, tone) {
 }
 
 /**
- * 说话方式段（order 95，v0.4.13 P1）：只有 `tone.voice` 或 `mes_example` 非空才注册。
+ * 说话方式段（order 95，v0.5.0 P1）：只有 `tone.voice` 或 `mes_example` 非空才注册。
  * 内置卡两者皆空 → 不注册，system 文本与 v0.4.12 一致。
  *
  * mes_example 按 CCv2 语义把 `<START>` 当示例分隔（替换为空行）后 trim。
@@ -187,7 +190,7 @@ function voiceText(card) {
   const voice = text(tone, 'voice', '');
   const example = text(card, 'mes_example', '');
   const parts = [];
-  // 两段都非空时**都要进**：v0.4.13 早期实现只取 tone.voice，卡里同时写了
+  // 两段都非空时**都要进**：v0.5.0 早期实现只取 tone.voice，卡里同时写了
   // 说话方式与示例对话时示例会被静默丢弃（v0.5.0 修）。
   if (voice.trim() !== '') parts.push(render(card, voice).trim());
   if (example.trim() !== '') {

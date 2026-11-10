@@ -1,5 +1,5 @@
 /**
- * P2（v0.4.13）：遮蔽宿主默认人设。
+ * P2（v0.5.0）：遮蔽宿主默认人设。
  *
  * 宿主 0.4.x 没有 `deployment:persona` 段，人设本体来自全局层注册的
  * `deployment:persona-prefix`（order 0），尾段是 `deployment:persona-suffix`

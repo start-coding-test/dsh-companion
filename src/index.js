@@ -446,7 +446,7 @@ export function apply(ctx, rawConfig, hooks = {}) {
     publishOnThreadUnarchive(platform, store);
 
     registerSections(platform, store, track, state.card);
-    // P2（v0.4.13）：遮蔽宿主默认人设。off 时连监听器都不注册，默认路径与旧版
+    // P2（v0.5.0）：遮蔽宿主默认人设。off 时连监听器都不注册，默认路径与旧版
     // 完全一致；失败只 warn，不挡装配。
     state.shadowMode = registerDeploymentShadow(platform, config, track, state.card);
     // V7-H1 审计：pre-step 是事件钩子注册（只能在 apply 阶段完成），能力位来自
@@ -543,7 +543,7 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     card: null,
     /** v0.4.12：人格卡加载来源 {card,status,path,reason}；/状态 展示用。 */
     cardSource: null,
-    /** P2（v0.4.13）：实际生效的遮蔽模式；/状态 展示用。注册失败时回落 'off'。 */
+    /** P2（v0.5.0）：实际生效的遮蔽模式；/状态 展示用。注册失败时回落 'off'。 */
     shadowMode: 'off',
     /** W4：当前 embedder（关闭向量时为 null）；local/remote 由注入 loader/fetch 构造。 */
     embedder,
@@ -697,7 +697,7 @@ function applyPersonaCard(state, hooks = {}) {
     });
   }
 
-  // v0.4.13（P1）：段被截断不静默——每条一条 warn，只带段名与码点数，不带正文。
+  // v0.5.0（P1）：段被截断不静默——每条一条 warn，只带段名与码点数，不带正文。
   for (const warning of buildSectionsWithDiagnostics(loaded.card).warnings) {
     platform.log('warn', '[dsh-companion] persona section truncated; text clipped to limit', {
       section: warning.section,
@@ -792,7 +792,7 @@ function registerSections(platform, store, track, card) {
 }
 
 /**
- * P2（v0.4.13）：按配置遮蔽宿主默认人设。
+ * P2（v0.5.0）：按配置遮蔽宿主默认人设。
  *
  * 只能走 `system-prompt/assemble` waterfall：宿主 0.4.x 的
  * `deployment:persona-prefix/-suffix` 在全局层注册，同名再注册必抛。
@@ -935,7 +935,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             },
             // v0.4.12：/状态 展示人格卡来源（内置默认 / 文件路径 / 加载失败原因）。
             persona: personaStatus(state),
-            // P2（v0.4.13）：/状态 展示部署人设的遮蔽状态。
+            // P2（v0.5.0）：/状态 展示部署人设的遮蔽状态。
             shadow: { mode: state.shadowMode },
             // P3-c：/状态 展示情绪状态；未启用时命令层只输出「情绪：未启用」。
             emotion: { enabled: state.card?.emotion?.enabled === true },

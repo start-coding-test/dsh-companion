@@ -529,7 +529,7 @@ export function buildConsolidationPrompt(input = {}) {
     : [regionText];
   const body = rows.join('\n');
   return [
-    '你是私人管家的记忆巩固器。把下面这段对话压缩成一条情景记忆与若干长期事实。',
+    '你是记忆巩固器。把下面这段对话压缩成一条情景记忆与若干长期事实。',
     '只输出一个 JSON 对象，不要解释，不要 Markdown 代码块。格式：',
     '{"episode":{"title":"...","summary":"..."},',
     ' "facts":[{"kind":"identity|relation|preference|project|knowledge|other",',

@@ -428,7 +428,7 @@ export function createAdapter(ctx, opts = {}) {
   }
 
   /**
-   * 注册 system-prompt/assemble waterfall 监听器（v0.4.13 P2）。
+   * 注册 system-prompt/assemble waterfall 监听器（v0.5.0 P2）。
    *
    * 与 onPreStep 不同：宿主没有该能力时这里不抛错，返回 null，交由接线层
    * 静默降级（遮蔽失败不能挡住宿主装配）。返回 disposer。

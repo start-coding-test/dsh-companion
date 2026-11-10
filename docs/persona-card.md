@@ -46,9 +46,9 @@ persona:
 `data.description` → `description`，`data.personality` → `personality`，`data.scenario` → `scenario`，
 `data.mes_example` → `mes_example`，`data.first_mes` → `first_mes`，
 `data.post_history_instructions` → `post_history_instructions`，
-`data.name` → `name`，`data.extensions.address`（可选）→ `address`，缺省「你」。
+`data.name` → `name`，`data.address`（可选，优先）或 `data.extensions.address`（可选）→ `address`，缺省「你」。
 
-`{{char}}` / `{{user}}` 在**渲染输出时**替换成 `name` / `address`，卡内原文保留。
+`{{char}}` / `{{user}}` 在**渲染输出时**替换成 `name` / `address`，卡内原文保留；凡进入提示词的字段都走这一步（含 `tone.style` / `tone.warmth` / `tone.structure` / `tone.voice` / `tone.notes` / `values` / `taboos` / `bannedPhrases` / `description` / `personality` / `scenario` / `mes_example` / `chatIdentity`）。
 `character_book` 不读、不打印，只记 `character_book_ignored` warning。
 
 ## 4. 情绪（默认关闭）
@@ -62,7 +62,7 @@ persona:
 ```
 
 - `enabled` 默认 `false`。关闭时**不读也不写**情绪表，注入与 `/状态` 行都保持原样。
-- 四个维度 0–100；`halfLifeHours` 取值 0.5–168（默认 6），按半衰期向 `baseline` 回归。
+- 四个维度 0–100；`halfLifeHours` 取值 0.5–168（默认 6），按半衰期向 `baseline` 回归。`baseline` 缺省继承内置卡 `{50,50,50,60}`；写了但不合法（非对象 / 任一维非 0–100 有限数）时回落**同一组值**并给 `emotion_baseline_invalid` warning。
 - 启用后每轮在**用户消息尾部**注入一句「你此刻：……」——只影响语气，不写进 system，
   也不出现任何数字；它不进记忆、不进摘要。
 - 非法值不会让整张卡加载失败：逐项回落默认并记 warning

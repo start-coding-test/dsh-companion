@@ -1,4 +1,4 @@
-# 遮蔽宿主默认人设（P2，v0.4.13）
+# 遮蔽宿主默认人设（P2，v0.5.0）
 
 本文说明 `persona.shadowDeployment` 的机制、三态语义、影响范围、实测依据与回滚方法。
 宿主取证细节（段名、order、`complete` 语义）见 [persona-deployment-host.md](persona-deployment-host.md)。

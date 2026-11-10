@@ -29,12 +29,16 @@ const MAX_EVENT_DELTA = Object.freeze({
   energy: 6,
 });
 
-/** 缺省基线：略偏正面的闲聊默认值，接线时可整体覆盖。 */
+/**
+ * 缺省基线：与内置人格卡 `emotion.baseline` **保持一致**（{50,50,50,60}），
+ * 避免「缺省继承卡里的值」与「非法值回落 DEFAULT_BASELINE」出现两套默认
+ * （review-v20 L-7）。改动这里必须同步 `DEFAULT_CARD.emotion.baseline`。
+ */
 export const DEFAULT_BASELINE = Object.freeze({
-  pleasure: 55,
-  arousal: 45,
+  pleasure: 50,
+  arousal: 50,
   dominance: 50,
-  energy: 50,
+  energy: 60,
 });
 
 /** 事件类型白名单（顺序即文档顺序）。 */

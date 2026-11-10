@@ -4,12 +4,12 @@
 
 ## [0.5.0] - 2026-11-10
 
-按用户「人格 v2」清单实现四项：P1 身份由人格卡驱动、P2 遮蔽宿主默认人设、P3 情绪状态、P4 语气细节。**内置卡且未启用情绪时，`persona:*` 三段与闲聊提示词与 v0.4.12 逐字节一致**（基线 `test/fixtures/persona-v0412.json`，另有独立 worktree 对比复核）。schema 升到 **v14**（新增情绪两表），记忆 / 提醒 / 线程行为未改，零新增运行时依赖。本次发布 **1103 个用例 / 28 个套件**，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过；发布门 round A/B PASS，round C 无模型凭据 **SKIP（不计 PASS）**。
+按用户「人格 v2」清单实现四项：P1 身份由人格卡驱动、P2 遮蔽宿主默认人设、P3 情绪状态、P4 语气细节。**内置卡且未启用情绪时，`persona:*` 三段与闲聊提示词与 v0.4.12 逐字节一致**（基线 `test/fixtures/persona-v0412.json`，另有独立 worktree 对比复核）。schema 升到 **v14**（新增情绪两表），记忆 / 提醒 / 线程行为未改，零新增运行时依赖。本次发布 **1109 个用例 / 28 个套件**，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过；发布门 round A/B PASS，round C 无模型凭据 **SKIP（不计 PASS）**。
 
 ### Added
 
 - **P1 人格卡 v2**（`0c228cf`）：`DEFAULT_CARD` 增加 `description` / `personality` / `scenario` / `tone.notes` / `tone.voice` / `mes_example` / `first_mes` / `post_history_instructions` / `memoryCitation` / `chatIdentity` / `emotion`。直接加载 `spec=chara_card_v2` / `chara_card_v3` 的 JSON（映射 `data.*`，`{{char}}` / `{{user}}` 只在**渲染输出**替换为 `name` / `address`）；`character_book` 忽略并给 `character_book_ignored` warning；`address` 缺省「你」、`version` 缺省 1。`persona:core` 放身份 / 性格 / 关系，新增 `persona:voice`（order 95）放说话方式与 `mes_example`，顶部注明「模仿口吻，不照抄内容」；core 上限 600→**1200**、voice **1200**，超长按码点截断并返回 `{code:'section_truncated',section,chars,max}` 诊断（`buildSectionsWithDiagnostics`），截断内容不进日志；`taboos` 为空数组时整行省略「禁区」。闲聊首句改由 `chatIdentity` 承载；非内置卡时在身份行后插「人设要点：…」（≤200 码点、压成一行）。
-- **P2 遮蔽宿主默认人设**（`34c32cb`）：新增非枚举配置 `persona.shadowDeployment`（`'off'` 默认 / `'rewrite'` / `'takeover'`，`true` 等同 `'rewrite'`，非法值抛 `ConfigError('persona.shadowDeployment')`）。宿主 0.4.x 没有 `deployment:persona`，只有 `deployment:persona-prefix`（order 0）与 `deployment:persona-suffix`（10200），全局层同名注册必抛，因此经 `system-prompt/assemble` waterfall 改写：`rewrite` 只替换 prefix 的 `text`（保留位置），`takeover` 摘掉 prefix 与空 suffix（非空 suffix 保守保留并 warn）；两者都只处理主会话（子代理按 `classifySession` 放行）、返回新数组、异常一律返回 `next()` 原值。`off` 时**不注册监听**。`/状态` 新增「部署人设：宿主默认 | 已遮蔽（rewrite）/ 已接管（takeover）」。
+- **P2 遮蔽宿主默认人设**（`34c32cb`）：新增非枚举配置 `persona.shadowDeployment`（`'off'` 默认 / `'rewrite'` / `'takeover'`，`true` 等同 `'rewrite'`，非法值抛 `ConfigError('persona.shadowDeployment')`）。宿主 0.4.x 没有 `deployment:persona`，只有 `deployment:persona-prefix`（order 0）与 `deployment:persona-suffix`（10200），全局层同名注册必抛，因此经 `system-prompt/assemble` waterfall 改写：`rewrite` 只替换 prefix 的 `text`（保留位置），`takeover` 摘掉 prefix 与空 suffix（非空 suffix 保守保留并 warn）；两者都只处理主会话（子代理按 `classifySession` 放行）、返回新数组、异常一律返回 `next()` 原值。`off` 时**不注册监听**。`/状态` 新增一行：`off` → 「部署人设：宿主默认」，`rewrite` → 「部署人设：已替换（人格卡身份）」，`takeover` → 「部署人设：已接管」。
 - **P3 情绪状态**（`d843e93` + `7a51cb3` + `a990af3`）：新增 `src/persona/emotion.js`（纯函数：`decay` / `circadian` / `applyEvent` / `classify` / `describe`，不读 `Date.now`、不用随机）+ `src/persona/emotion-wiring.js`（读库 → 衰减 → 节律 → 安静时段 → 分类 → 落库 → 注入）。**默认关闭**，卡里 `emotion.enabled=true` 才启用，关闭时**不读不写库**。规则评估：中文情绪词典 + 10 类事件（`greeting` / `care` / `share` / `thanks` / `complain` / `cold` / `reunion` / `goodnight` / `conflict` / `comfort`），单维 PAD 变化 ≤8、精力 ≤6；半衰期默认 6h 回归基线，安静时段额外 `-3`。注入是独立 user 消息（`source.kind='companion-emotion'`），文本「你此刻：…」**不含数字**、不进 system、同一 turn 只一条。schema **v14** 新增 `emotion_state`（每 scope 一行）与 `emotion_events`（每 scope 保留 50 条），重启不丢；「忘掉」重置两表，`purge` 按截止时间清事件并重置状态（审计只记条数），导出 / 导入含 `emotion:{state,events}`。
 - **P4 语气细节**（`85cb05e`）：`memoryCitation: 'explicit' | 'natural'`，`natural` 时协议行换成「日常自然化用，用户问起或需要核对事实时再说出处」；闲聊提示词使用卡里的 `description`（非内置卡）与第一组 `mes_example`；情绪启用时在末尾追加当前状态句。
 - **示例与文档**：`examples/persona-lan.json`（「岚」，温柔大姐姐，含 `description` / `scenario` / `mes_example` / `emotion`）、`docs/persona-card.md`（字段表、CCv2/v3 映射、上限与截断、`/状态` 三态）、`docs/persona-shadow.md`（宿主段名证据、三态语义、已知限制）、`docs/deploy-v050.md`（备份、配置、重启、核对、回滚、迁移自检）。
@@ -25,8 +25,8 @@
 
 ### Tests
 
-- 新增 `test/persona-card.test.js` / `test/chat-card.test.js` / `test/persona-voice.test.js` / `test/emotion.test.js` / `test/emotion-store.test.js` / `test/emotion-wiring.test.js` / `test/persona-shadow.test.js` 与 `test/e2e/persona-card.test.js`（内置卡逐行等值 v0.4.11，情绪行与部署行按新增断言）。
-- 合计 **1103** 用例 / **28** 套件，三时区通过。
+- 新增 `test/persona-card.test.js` / `test/chat-card.test.js` / `test/persona-voice.test.js` / `test/emotion.test.js` / `test/emotion-store.test.js` / `test/emotion-wiring.test.js` / `test/persona-shadow.test.js` 与 `test/e2e/persona-card.test.js`（内置卡逐行等值 v0.4.12（与 v0.4.11 相同），情绪行与部署行按新增断言）。
+- 合计 **1109** 用例 / **28** 套件，三时区通过。
 
 ## [0.4.12] - 2026-11-06
 

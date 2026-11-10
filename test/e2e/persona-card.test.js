@@ -1,7 +1,7 @@
 /**
  * v0.4.12 人格卡集成回归（t4）：在**生产接线**（apply 驱动、真实 Store / 临时库 /
  * 临时 DSH_HOME）上验证 `persona.cardPath` 的四个使用点同源、单次加载、兜底与
- * v0.4.11 等价性。
+ * v0.4.12 等价性（渲染输出与 v0.4.11 相同）。
  *
  * 覆盖：
  *   1) 相对路径文件卡：同一次运行里人格段 / `/状态` 行 / 闲聊 llm 入参 / 承诺跟进
@@ -9,7 +9,7 @@
  *      （证明只读一次，不是各处各读一次）；
  *   2) 运行期改卡不生效、不重复 warn；重启（重新 apply）才重读，坏文件恰一条
  *      warn 并回落内置卡，修好后重启恢复；
- *   3) 未配置卡时与 v0.4.11 等价：人格三段文本 SHA-256 与 08493eb 基线一致，
+ *   3) 未配置卡时与 v0.4.12 等价（同 v0.4.11）：人格三段文本 SHA-256 与 08493eb 基线一致，
  *      `/状态` 只多「人格卡」一行、其余行逐行不变；
  *   4) B1 生产装配：状态板段 + 召回注入 + 人格段 + `/状态` 行在一轮 pre-step 中
  *      同时可见；
@@ -95,21 +95,21 @@ const BAD_JSON_SHAPES = Object.freeze([
 ]);
 
 /**
- * v0.4.11（08493eb）内置卡三段文本的 SHA-256。
+ * v0.4.12（6eedde9）/ v0.4.11（08493eb）内置卡三段文本的 SHA-256（两者相同，采集于 08493eb）。
  * 采集方式：`git worktree add .data/v0411-base 08493eb` 后用同一 FakeCtx 脚本
  * 跑 `buildSections(DEFAULT_CARD)` 取安全/核心/协议三段。
  */
-const V0411_SECTION_SHA256 = Object.freeze({
+const V0412_SECTION_SHA256 = Object.freeze({
   'persona:safety': 'f6674ce158a44b29d07deebc12393974292b66ac873992fca03d4d1ccd0f1a27',
   'persona:core': '2c2bf0d51048619223580470c27e1ec3ecc3a7c76f9bb57a104a46e82b73d928',
   'persona:protocol': '3583cacf66261008fcc8b91207a8f945dd79de558c61c1d40ec4f48bbc9bc38b',
 });
 
 /**
- * v0.4.11（08493eb）同一 FakeCtx / 空库 / TEST_NOW 下 `/状态` 的 14 行输出。
+ * v0.4.12（6eedde9）同一 FakeCtx / 空库 / TEST_NOW 下 `/状态` 的 14 行输出（与 v0.4.11 相同，采集于 08493eb）。
  * 第一行含与本机进程内存有关的 `RSS ok <n>MB`，比较时单独用正则；其余逐行相等。
  */
-const V0411_STATUS_LINES = Object.freeze([
+const V0412_STATUS_LINES = Object.freeze([
   '状态：entities 0 / episodes 0 / facts 0 / reminders 0 / state_board 0 / state_board_rev 1 / threads 0 / consolidations 0 / memory_events 0 / fts 0/0 / tokens 本轮 入 0 出 0（超预算 0 次）｜今日 0/3000000｜RSS ok 0MB｜向量：关',
   'RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB',
   '压缩：宿主已开启（compaction-basic 已启用）',
@@ -126,7 +126,7 @@ const V0411_STATUS_LINES = Object.freeze([
   '巩固：无可用模型',
 ]);
 
-const V0411_STATUS_HEAD = /^状态：entities 0 \/ episodes 0 \/ facts 0 \/ reminders 0 \/ state_board 0 \/ state_board_rev 1 \/ threads 0 \/ consolidations 0 \/ memory_events 0 \/ fts 0\/0 \/ tokens 本轮 入 0 出 0（超预算 0 次）｜今日 0\/3000000｜RSS ok \d+MB｜向量：关$/u;
+const V0412_STATUS_HEAD = /^状态：entities 0 \/ episodes 0 \/ facts 0 \/ reminders 0 \/ state_board 0 \/ state_board_rev 1 \/ threads 0 \/ consolidations 0 \/ memory_events 0 \/ fts 0\/0 \/ tokens 本轮 入 0 出 0（超预算 0 次）｜今日 0\/3000000｜RSS ok \d+MB｜向量：关$/u;
 
 const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
@@ -378,21 +378,21 @@ test('集成（重启语义）：运行期改卡不生效且不重复 warn；重
 });
 
 // ---------------------------------------------------------------------------
-// 3) 未配置卡：人格三段与 v0.4.11 逐字节相同；/状态 只多一行
+// 3) 未配置卡：人格三段与 v0.4.12 逐字节相同；/状态 只多几行
 // ---------------------------------------------------------------------------
 
-test('集成（v0.4.11 等价）：未配置卡时人格三段 SHA-256 一致，/状态 除新增三行外逐行不变', () => {
+test('集成（v0.4.12 等价）：未配置卡时人格三段 SHA-256 一致，/状态 除新增三行外逐行不变', () => {
   const temp = makeTempStore();
   const ctx = makePluginCtx();
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
-    for (const [name, expected] of Object.entries(V0411_SECTION_SHA256)) {
+    for (const [name, expected] of Object.entries(V0412_SECTION_SHA256)) {
       const text = sectionOf(ctx, name);
       assert.equal(typeof text, 'string', `${name} 必须是静态文本`);
       assert.equal(
         createHash('sha256').update(text).digest('hex'),
         expected,
-        `${name} 与 v0.4.11 基线逐字节不同`,
+        `${name} 与 v0.4.12 基线逐字节不同`,
       );
     }
 
@@ -406,16 +406,16 @@ test('集成（v0.4.11 等价）：未配置卡时人格三段 SHA-256 一致，
     assert.equal(lines[emotionIndex], '情绪：未启用');
     // P2（v0.4.13）：默认 off 也显式说明「宿主默认」，排障时不必猜配置。
     assert.equal(lines[8], '部署人设：宿主默认');
-    assert.equal(lines.length, V0411_STATUS_LINES.length + 3, '/状态 应只多人格卡、部署人设与情绪三行');
+    assert.equal(lines.length, V0412_STATUS_LINES.length + 3, '/状态 应只多人格卡、部署人设与情绪三行');
 
     const withoutInjected = lines.filter(
       (line) => !line.startsWith('人格卡：')
         && !line.startsWith('部署人设：')
         && !line.startsWith('情绪：'),
     );
-    assert.match(withoutInjected[0], V0411_STATUS_HEAD);
-    assert.equal(withoutInjected[0], V0411_STATUS_LINES[0]);
-    assert.deepEqual(withoutInjected.slice(1), V0411_STATUS_LINES.slice(1));
+    assert.match(withoutInjected[0], V0412_STATUS_HEAD);
+    assert.equal(withoutInjected[0], V0412_STATUS_LINES[0]);
+    assert.deepEqual(withoutInjected.slice(1), V0412_STATUS_LINES.slice(1));
     assert.equal(loadFailureWarns(ctx).length, 0);
   } finally {
     handle.dispose();

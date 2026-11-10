@@ -136,7 +136,7 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 
 - **现状**：`src/persona/card.js` 的 `loadCard()` 自 v0.4.12 起标 `@deprecated`（review-v18 L-1），生产接线改用 `loadPersonaCard()`；但 `loadCard()` 保留旧语义——文件不存在时静默返回内置卡，不写 warn、也不区分「没配卡」与「配了但文件丢了」。当前 `src/` 内无调用方，仅旧测试/外部引用可能使用。
 - **影响**：若后续代码误用 `loadCard()` 加载用户卡，路径写错或文件丢失会被静默吞掉，表现为「改了卡不生效」且无任何告警。
-- **建议排期**：v0.4.13 清理调用方并让其与 `loadPersonaCard()` 行为对齐（ENOENT 也走 fallback 状态 + warn，或直接删除导出）。
+- **建议排期**：后续版本清理调用方并让其与 `loadPersonaCard()` 行为对齐（ENOENT 也走 fallback 状态 + warn，或直接删除导出）。
 - **验收方式**：`git grep -n loadCard -- src` 无调用；单测覆盖 ENOENT 的成功/失败分支与 `loadPersonaCard()` 一致；`/状态` 与 warn 口径不变。
 
 ### D-12 P2：宿主段名再改版时，人设遮蔽只 warn 不报错（按设计降级）

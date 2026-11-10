@@ -86,7 +86,7 @@
 
 ### `/记忆 导出 [md|json]`
 
-把活跃事实、情景、提醒、线程与状态板导出到 `.data/export/memory-YYYY-MM-DD-HHmmss.<fmt>`（缺省 `json`，文件名为 UTC 秒级时间戳；同一秒内重复导出自动追加 `-2`、`-3`，不覆盖已有文件），并在回复里给出各表条数与路径：
+把活跃事实、情景、提醒、线程、状态板与情绪（开启时：当前状态 + 每个作用域最近 50 条事件）导出到 `.data/export/memory-YYYY-MM-DD-HHmmss.<fmt>`（缺省 `json`，文件名为 UTC 秒级时间戳；同一秒内重复导出自动追加 `-2`、`-3`，不覆盖已有文件），并在回复里给出各表条数与路径：
 
 ```text
 /记忆 导出 md
@@ -394,7 +394,7 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 
 ## 导出、恢复与加密
 
-导出覆盖 facts / episodes / reminders / threads / 状态板；文件里的 `version` 恒为 1，`scope` 记录导出所用作用域。
+导出覆盖 facts / episodes / reminders / threads / 状态板；情绪启用时另含 `emotion.state` 与 `emotion.events`（每作用域最近 50 条，敏感 `note` 置 null 并计入 `warnings`）。文件里的 `version` 恒为 1，`scope` 记录导出所用作用域。
 
 ### 导出
 
@@ -420,8 +420,8 @@ import { importAll } from './src/memory/export.js';
 importAll({ store, file: '.data/export/memory-2026-11-04-091233.json', mode: 'fresh' });
 ```
 
-- `fresh`：目标库五张表必须为空（`Store.open` 建出的空状态板占位行不算），适合新机器或重建。
-- `merge`：按主键跳过已存在的行（facts.id / threads.key / reminders.id 等），不覆盖本地已有内容。
+- `fresh`：目标库五张表必须为空（`Store.open` 建出的空状态板占位行不算；情绪两表有条目也算非空），适合新机器或重建。
+- `merge`：按主键跳过已存在的行（facts.id / threads.key / reminders.id 等），不覆盖本地已有内容；**情绪段例外**——`emotion.state` 按作用域 upsert 覆盖，`emotion.events` 追加后每作用域只留最近 50 条（返回 `emotionImported.state / events / trimmed`）。
 - 整个导入在单事务内，任一行失败整体回滚；导出集中缺失的引用（`consolidation_id` / `source_episode_id` / `superseded_by`）置 null；恢复后逐行重建 facts / episodes FTS。
 
 ### 加密（单条事实）
@@ -778,11 +778,11 @@ persona:
 内置卡也参与比较：内置 proactive 值等于默认配置，只有你改过 `proactiveDailyCap` /
 `quietStart` / `quietEnd` 才会触发；此时使用内置卡看到这条提示属正常（提醒字段重复），
 可忽略。`proactive.chatPerDay` 在配置里没有对应键，文件卡只记一条 debug 说明、不告警
-（内置卡不记）。卡的 proactive 与配置的合并方案留到 v0.4.13。
+（内置卡不记）。卡的 proactive 与配置的合并方案留到后续版本。
 
 完整 JSON 示例与复制模板见 [persona.example.md](../persona.example.md)。
 
-### 遮蔽宿主人设（P2，v0.4.13）
+### 遮蔽宿主人设（P2，v0.5.0）
 
 宿主 0.4.x 的默认人设来自全局层 `deployment:persona-prefix`（人设本体）与
 `deployment:persona-suffix`（收尾）。插件以 profile 行挂载，**不能**注册同名段；唯一入口是

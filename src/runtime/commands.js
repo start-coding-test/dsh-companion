@@ -594,7 +594,7 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // 旧调用方（单测/其它宿主）不传则整行省略，输出格式不变。
   const personaLine = formatPersonaLine(options.persona);
   if (personaLine !== null) lines.push(personaLine);
-  // P2（v0.4.13）：部署人设遮蔽状态；只在接线层传入 options.shadow 时输出。
+  // P2（v0.5.0）：部署人设遮蔽状态；只在接线层传入 options.shadow 时输出。
   const shadowLine = formatShadowLine(options.shadow);
   if (shadowLine !== null) lines.push(shadowLine);
   // P3-c：情绪状态行。只在接线层传入 options.emotion 时输出，旧调用方格式不变。
@@ -636,7 +636,7 @@ function formatPersonaLine(persona) {
 }
 
 /**
- * P2（v0.4.13）：部署人设遮蔽状态行。
+ * P2（v0.5.0）：部署人设遮蔽状态行。
  *
  * 只反映实际注册结果（接线层注册失败按 'off' 传），不读配置原文。
  *

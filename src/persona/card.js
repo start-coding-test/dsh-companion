@@ -27,7 +27,7 @@ export const CARD_STATUS = Object.freeze({
 /**
  * 默认人格卡。
  *
- * v0.4.13（P1）起身份由卡驱动：description / personality / scenario 进 core 段，
+ * v0.5.0（P1）起身份由卡驱动：description / personality / scenario 进 core 段，
  * tone.notes 取代原先写死在 sections.js 的尾句，chatIdentity 取代 chat.js 的
  * 硬编码开场白；mes_example / first_mes / post_history_instructions / memoryCitation
  * 与 emotion 只做**存储 + 结构校验**（emotion 逻辑由其它任务卡实现）。
@@ -83,7 +83,7 @@ export const DEFAULT_CARD = deepFreeze({
   version: 1,
 });
 
-/** memoryCitation 的两个合法取值（v0.4.13 P1）。 */
+/** memoryCitation 的两个合法取值（v0.5.0 P1）。 */
 export const MEMORY_CITATION_MODES = Object.freeze(['explicit', 'natural']);
 
 /** emotion.baseline 的四个维度（结构校验用；不实现情绪逻辑）。 */
@@ -149,7 +149,7 @@ export function parseCardSource(source, path = '') {
 }
 
 /**
- * 同 parseCardSource()，但额外返回导入期诊断（v0.4.13 P1：CCv2/v3 的
+ * 同 parseCardSource()，但额外返回导入期诊断（v0.5.0 P1：CCv2/v3 的
  * `character_book` 被忽略时给出一条 warning，不进渲染文本）。
  *
  * @param {string} source
@@ -288,7 +288,7 @@ function isCcCardSource(parsed) {
 }
 
 /**
- * 归一化卡来源（v0.4.13 P1）：
+ * 归一化卡来源（v0.5.0 P1）：
  * - 原生卡：原样返回；
  * - `spec` 为 `chara_card_v2` / `chara_card_v3` 且顶层有 `data` 对象：把 CCv2/v3
  *   字段映射到本卡结构。缺失字段不报错（合并时用默认值），`address` 缺失用 `你`，
@@ -314,9 +314,13 @@ function normalizeCardSource(parsed) {
   ]) {
     if (Object.hasOwn(data, key)) mapped[key] = data[key];
   }
-  mapped.address = typeof data.address === 'string' && data.address.trim() !== ''
+  // CCv2/v3 的 `data.address` 不是规范字段，酒馆卡习惯把它放 `data.extensions.address`；
+  // 两者都接受，`data.address` 优先（显式写在顶层时以它为准）。
+  const extensions = data.extensions !== null && typeof data.extensions === 'object' ? data.extensions : {};
+  const address = typeof data.address === 'string' && data.address.trim() !== ''
     ? data.address
-    : '你';
+    : (typeof extensions.address === 'string' ? extensions.address : '');
+  mapped.address = address.trim() !== '' ? address : '你';
   mapped.version = Number.isInteger(data.version) && data.version >= 1 ? data.version : 1;
 
   const warnings = [];
@@ -377,7 +381,7 @@ export function resolveCardPath(cardPath, deps = {}) {
  * - JSON 非法、必填字段缺失（validateCard 抛错）。
  * 以上全部 → status='fallback' + 内置卡 + 原因（含解析后路径，不含卡正文）。
  *
- * v0.4.13（P1）：新增 `warnings`（导入期诊断，如 CCv2/v3 的 `character_book_ignored`），
+ * v0.5.0（P1）：新增 `warnings`（导入期诊断，如 CCv2/v3 的 `character_book_ignored`），
  * 由 index.js 在 apply 时各记一条 warn；不含卡正文。
  *
  * @param {string|null|undefined} cardPath 配置值 persona.cardPath
@@ -562,7 +566,7 @@ function sanitizeParseReason(message) {
 /**
  * 校验人格卡字段；失败抛 TypeError（含字段名/字段路径）。
  *
- * v0.4.13（P1）新增字段全部**可选**：卡里没写就不校验（合并后由默认值补齐）；
+ * v0.5.0（P1）新增字段全部**可选**：卡里没写就不校验（合并后由默认值补齐）；
  * 写了就必须是对的类型，避免把数字/对象渲染进 system 段。
  * @param {Record<string, any>} card
  */
@@ -603,7 +607,7 @@ export function validateCard(card) {
 }
 
 /**
- * 字段存在时必须是字符串（v0.4.13 P1）。空串合法（表示「不渲染这一段」）。
+ * 字段存在时必须是字符串（v0.5.0 P1）。空串合法（表示「不渲染这一段」）。
  * @param {Record<string, any>} holder
  * @param {string} key
  * @param {string} [prefix]
@@ -616,7 +620,7 @@ function optionalString(holder, key, prefix = '') {
 }
 
 /**
- * emotion 结构校验（v0.4.13 P1）。
+ * emotion 结构校验（v0.5.0 P1）。
  *
  * 本卡**只校验 + 透传**，不实现情绪演化逻辑（由另一张任务卡实现）。字段存在时：
  * `enabled` 布尔；`baseline` 四维数在 0–100；`halfLifeHours` 在 (0, 168]。

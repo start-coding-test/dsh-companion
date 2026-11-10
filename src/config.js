@@ -154,7 +154,7 @@ Object.defineProperty(DEFAULT_VALUES, 'timing', {
 
 // v0.4.12：人格卡文件路径。默认 null（用内置卡）；相对路径相对 DSH_HOME
 // （`DSH_HOME` 否则 ~/.dsh）解析。只在 apply 时加载一次，改卡需重启。
-// v0.4.13 P2：shadowDeployment 三态，默认 'off'（完全不注册 assemble 监听）。
+// v0.5.0 P2：shadowDeployment 三态，默认 'off'（完全不注册 assemble 监听）。
 // 该节同样不参与 16 键安装自检（与 vector/recall/session/consolidation/thread/timing 一致）。
 const PERSONA_DEFAULTS = Object.freeze({
   cardPath: null,
