@@ -44,7 +44,7 @@ const THING_MARKERS = Object.freeze([
 ]);
 
 /** 冲着她说的负面词（只有对象是她时才成立）。 */
-const INSULT_CUES = Object.freeze(['烦', '讨厌', '笨', '没用', '失望', '恶心', '受不了', '闭嘴', '滚', '敷衍', '冷淡', '凶', '骂', '吵', '闹', '忘', '迟到', '骗', '不理我']);
+const INSULT_CUES = Object.freeze(['烦', '讨厌', '笨', '没用', '失望', '恶心', '受不了', '闭嘴', '滚', '敷衍', '冷淡', '凶', '骂', '吵', '闹', '忘', '迟到', '骗', '不理我', '不回我', '难听', '过分', '受够']);
 
 /** 柔和一点的指责词：同样的对象判定，但置信度更低（「你怎么又忘了」）。 */
 const MILD_CUES = Object.freeze(['忘', '迟到', '敷衍', '冷淡']);
@@ -65,7 +65,7 @@ const HOSTILE_PATTERNS = Object.freeze([
 /** 用户自述或转述的负面状态（对象不是她时归 vent）。 */
 const STATE_CUES = Object.freeze([
   '累', '辛苦', '烦', '压力', '难受', '委屈', '撑不住', '扛不住',
-  '崩溃', '郁闷', '不开心', '气死', '想哭', '烦死', '疲惫', '焦虑', '心累',
+  '崩溃', '郁闷', '不开心', '气死', '想哭', '烦死', '疲惫', '焦虑', '心累', '骂', '崩', '受够', '心情不好', '怀疑人生', '批评',
 ]);
 
 const NEGATION = /(?:不|没|别|甭|无)/u;
@@ -80,20 +80,23 @@ const SOOTHING_NEGATION = /(?:不烦不烦|不累不累|一点都不烦|一点�
 const REASSURE_QUESTION = /(?:是不是|会不会|有没有|是不是有点|是不是很)[^。！？!?]{0,8}(?:烦|讨厌|嫌|生气)/u;
 const REASSURE_SELF_QUESTION = /我[^。！？!?]{0,4}(?:烦|讨厌|嫌|惹)你[^。！？!?]{0,4}(?:吗|吧|么|\?|？)/u;
 
+/** 「我是不是说错话了」「你没生我气吧」：不确定自己有没有冒犯她。 */
+const REASSURE_DOUBT = /(?:是不是|会不会)(?:说错|做错|做过头|冒犯)|生我(?:的)?气/u;
+
 const THANKS_PATTERN = /(?:谢谢|谢啦|谢了|感谢|多谢)/u;
 const THANKS_HARDWORK = /(?:辛苦你|您辛苦|你辛苦了|辛苦啦)/u;
 
 /** 冷淡的短句核（去标点后 ≤4 码点才生效）。`嗯`/`好` 这类应答不算冷淡。 */
-const COLD_CORE = /^(?:哦+|哦哦|行吧|好吧|随便|算了|呵呵|切)$/u;
+const COLD_CORE = /^(?:哦+|哦哦|行吧|好吧|随便|随便你|算了|呵呵|切)$/u;
 
-const CARE_PATTERN = /(?:你怎么了|你怎么啦|还好吗|没事吧|要不要紧|注意身体|别太累|别熬夜|早点休息|多喝|照顾好自己)/u;
+const CARE_PATTERN = /(?:你怎么了|你怎么啦|还好吗|没事吧|要不要紧|注意身体|别太累|别熬夜|早点休息|多喝|照顾好自己|记得(?:加衣|多穿|穿暖|喝水|吃饭)|好点了吗|感冒|要不要我|要不要歇|脸色|没睡好|累不累)/u;
 const COMFORT_PATTERN = /(?:抱抱|抱一下|我在|陪着你|别难过|别担心|会好的)/u;
 
 const REUNION_PATTERN = /(?:好久不见|好久没|很久没|多少年没|这段时间你去|这段时间去哪|这阵子去哪)/u;
 
 const GREETING_PATTERN = /(?:早安|早上好|早啊|早呀|晚上好|午安|在吗|在不在|嗨|哈喽|hello|hi(?=\b|[！!，,。\s]))|(?:^你好(?:啊|呀)?(?=$|[！!，,。？?~～\s]))|(?:^早(?:上)?[！!。，,~～\s]*$)/iu;
 
-const SHARE_PATTERN = /(?:我跟你说|给你说|跟你说|我刚|分享|说个事|今天[^。！？!?]{0,6}(?:去|做|吃|买|见|玩))/u;
+const SHARE_PATTERN = /(?:我跟你说|给你说|跟你说|我刚|分享|说个事|(?:昨天|前天|周末|上周|前几天|今天)[^。！？!?]{0,8}(?:去|见|吃|做|聊|买|看|逛|剪|走)了)/u;
 
 const PUNCT = /[，,。．.！!？?；;：:、~～…\-—\s]/gu;
 
@@ -164,6 +167,8 @@ function firstCue(segment, cues) {
   for (const cue of cues) {
     const index = segment.indexOf(cue);
     if (index < 0) continue;
+    // 「麻烦你了」不是指责：`麻烦` 里的 `烦` 只是词的一部分。
+    if (cue === '烦' && segment[index - 1] === '麻') continue;
     if (found === null || index < found.index) found = { cue, index };
   }
   return found;
@@ -236,12 +241,30 @@ function classifySegment(segment, extraHer) {
     consider(SELF_MARKERS, 'self');
     consider(THIRD_MARKERS, 'third');
     consider(THING_MARKERS, 'thing');
+    if (best.kind !== 'her' && best.kind !== 'third' && best.kind !== 'thing') {
+      // 句首的「你」是主语时，后面的「我」往往只是宾语（「你太让我失望了」）。
+      let herAt = -1;
+      for (const marker of herMarkers) {
+        const at = segment.lastIndexOf(marker, index - 1);
+        if (at >= 0 && (herAt < 0 || at < herAt)) herAt = at;
+      }
+      if (herAt >= 0 && herAt <= 2) {
+        const otherAfter = THIRD_MARKERS.concat(THING_MARKERS).some((marker) => {
+          const at = segment.lastIndexOf(marker, index - 1);
+          return at > herAt;
+        });
+        if (!otherAfter) return 'her';
+      }
+    }
     return best.kind;
   };
 
   // 1) 用户在担心自己惹到她：疑问式安抚优先。
   if (REASSURE_QUESTION.test(segment) || REASSURE_SELF_QUESTION.test(segment)) {
     return { type: 'reassure', confidence: 0.7, reason: 'reassure-question' };
+  }
+  if (REASSURE_DOUBT.test(segment)) {
+    return { type: 'reassure', confidence: 0.68, reason: 'reassure-doubt' };
   }
 
   // 2) 明确敌意句式（「烦不烦」要排除「不烦不烦」）。
@@ -253,12 +276,14 @@ function classifySegment(segment, extraHer) {
     return { type: 'conflict', confidence: confidenceOf(0.78, hits), reason: 'hostile' };
   }
 
-  // 3) 她 + 负面词；被否定时翻转成安抚。
+  // 3) 她 + 负面词；被否定时不算指责（「你别忘了带钥匙」是提醒，不产生事件；
+  //    真正的安抚句由下面的 SOOTHING_NEGATION 识别）。
+  //    「你怎么老是这样」没有负面词，但语气是指责，按轻度 blame 处理。
+  if (/(?:你|您)(?:怎么|总是|老是|又)?老是这样/u.test(segment)) {
+    return { type: 'blame', confidence: 0.62, reason: 'mild-blame' };
+  }
   const insult = herInsultWith(segment, hasHer);
-  if (insult !== null) {
-    if (insult.negated || SOOTHING_NEGATION.test(segment)) {
-      return { type: 'care', confidence: 0.7, reason: 'negated-insult' };
-    }
+  if (insult !== null && !insult.negated) {
     const mild = MILD_CUES.includes(insult.cue);
     if (hasHerPositive(segment)) {
       // 同一句既有对她的负面又有对她的正面：分不出来，降置信度只记审计。
@@ -321,8 +346,13 @@ function classifySegment(segment, extraHer) {
 function herInsultWith(segment, objectAt) {
   const cue = firstCue(segment, INSULT_CUES);
   if (cue === null) return null;
-  if (objectAt(cue.index) !== 'her') return null;
-  return { ...cue, negated: isNegated(segment, cue.index) };
+  const afterCue = segment.slice(cue.index + cue.cue.length, cue.index + cue.cue.length + 4);
+  // 「我讨厌你」：宾语在她后面，也算冲着她。
+  const herIsObject = objectAt(cue.index) === 'her' || /^[，,、\s]{0,2}你/u.test(afterCue);
+  if (!herIsObject) return null;
+  // 「你能不能别敷衍我」是要求她别再这样，不是「她不敷衍」这种否定陈述。
+  const demandToHer = /^[，,、\s]{0,2}我/u.test(afterCue);
+  return { ...cue, negated: !demandToHer && isNegated(segment, cue.index) };
 }
 
 /**
