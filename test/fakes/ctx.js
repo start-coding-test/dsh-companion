@@ -1,11 +1,11 @@
 /**
  * FakeCtx：适配层的测试替身。
  *
- * - 覆盖适配层用到的 11 个平台面：now、logger、systemPrompt.section、on、
- *   interval、compaction.compactRegion、sessionController.create、
- *   sessionController.resolveAgent、sessionController.prompt、
- *   sessionController.cancel、workspaceRegistry.archiveSession、
- *   tokenMeter.measure。
+ * - 覆盖适配层用到的 12 个平台面：now、logger、systemPrompt.section、
+ *   systemPrompt.context、on、interval、compaction.compactRegion、
+ *   sessionController.create、sessionController.resolveAgent、
+ *   sessionController.prompt、sessionController.cancel、
+ *   workspaceRegistry.archiveSession、tokenMeter.measure。
  * - 手动时钟：构造参数 now（毫秒）指定起点，advance(ms) 推进。
  * - 调用记录：calls 数组，元素为 { method, args, at }。
  * - 失败注入：构造参数 fail 或 fail(key, error) 注入，key 使用点号路径，
@@ -42,6 +42,7 @@ export class FakeCtx {
     this.listeners = new Map();
     this.timers = [];
     this.sections = [];
+    this.contexts = [];
     this.agents = [];
     this.sessions = new Map();
     // task_run 用：deferIdle=true 时 agent.whenIdle() 挂起，直到 releaseIdle(id)。
@@ -74,6 +75,24 @@ export class FakeCtx {
           };
           this.sections.push({
             section,
+            disposer,
+            get disposed() {
+              return disposed;
+            },
+          });
+          return disposer;
+        },
+        // V50-M3：动态 system prompt context（宿主 0.5.x 的
+        // `systemPrompt.context(entry)`）。测试可直接读 this.contexts 调 text()。
+        context: (entry) => {
+          this._record('systemPrompt.context', [entry]);
+          this._failAt('systemPrompt.context');
+          let disposed = false;
+          const disposer = () => {
+            disposed = true;
+          };
+          this.contexts.push({
+            context: entry,
             disposer,
             get disposed() {
               return disposed;

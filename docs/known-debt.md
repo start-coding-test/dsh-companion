@@ -155,6 +155,24 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **验收方式**：构造 `sections` 不含两个宿主段的 assembly，断言只 warn 一次、原引用返回、
   装配不抛；在真实宿主升级后按探针输出核对 `assembly.sections` 是否仍含两个段名。
 
+### D-13 V50-M3：召回注入（`injectRecall`）仍走自建 user 消息，本版不迁移
+
+- **现状**：V50-M3 已把情绪句迁到 `systemPrompt.context`，但 `injectRecall`
+  （`src/index.js:2818` 起）仍每轮构造 `source.kind='companion-recall'` 的 user 消息。
+  评估后本版**不迁移**，理由有三：召回文本几乎每轮都随查询与预算变化，宿主
+  runtime-context 投影的「同文本才去重」几乎不会命中；召回必须紧跟本轮用户消息
+  才能表达「回答这句话时参考这些事实」，放进统一快照会改变位置与优先级；迁移收益
+  只出现在用户连续重复同一查询且召回完全一致的极少数场景，风险大于收益。完整论证见
+  [emotion-injection.md](emotion-injection.md) 第 6 节。
+- **影响**：召回仍会在历史里追加 user 消息，`lastUserText` / `hasRealUserInput` /
+  转录仍依赖 `companion-recall` 的 kind 与前缀排除；这与情绪句迁移后的形态不一致，
+  但当前行为已通过既有测试，未出现功能回归。
+- **建议排期**：本版不做。只有宿主 context 机制支持「按位置注入」或「每轮刷新但不落
+  历史」时再评估；若未来迁移，先补召回位置与去重收益的实测，再动主路径。
+- **验收方式**：本版以「默认与启用路径的召回测试全绿、`injectRecall` 未被改动」为准；
+  后续若迁移，需证明重复查询时快照数下降、且召回仍位于本轮用户消息之后，并保留
+  `companion-recall` 旧转录排除至少一个版本。
+
 ## 5. 已关闭（本轮修复）
 
 - **V9-M1 episode 落库前仍保留凭据原文**：v0.4.10 修复，commit `a4fe4e0`，字段级兜底口径由 `6e1ade8` 补齐。`consolidate` 写 episode 前对 `title` / `summary` / `evidence` / `mood_evidence` 与 `topics` / `entities` 逐字段脱敏，只把凭据值换成 `[凭据已省略]`、保留「路由器密码 …」这类上下文（不是整段丢弃）；`store.insertEpisode` 再做一次防御性值级脱敏（含 `topics_json` 字符串形态），`fts_episodes` 由主表投影故自动无明文。跨会话召回、注入、状态板与 JSON 导出经 `test/e2e/v0910-privacy.test.js` 验证均无明文；巩固提示词同时要求「不得复述密码、口令、token、卡号等凭据值」。
@@ -180,5 +198,6 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - [使用手册](usage.md)：执行槽、向量召回、外部压缩与水位重锚、FAQ
 - [Embedding 可插拔](embedding.md)：三实现、超时/单飞/回填、隐私例外
 - [S0 标定流程](s0-calibration.md)：`first_used_*` / `first_reneed_*` 埋点与两周评测
+- [情绪句注入](emotion-injection.md)：V50-M3、宿主 context 投影去重、召回迁移评估
 - [Gate 0 探针说明](gate0-probe.md)、[H1–H3 探针](h1-h3-probe.md)：已关闭结论与待实测项
 - [安装自检与校准](calibration.md)：RSS 三档公式与 4G 示例
