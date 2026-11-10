@@ -81,7 +81,7 @@ pre-step
 - `/状态` 新增一行：
 
   ```
-  判定器：模型（近 24h 模型 7，规则兜底 3，平均 412ms，p95 900ms，最近失败 timeout）
+  判定器：模型（近 24h 模型 7（70%），规则兜底 3（30%），平均 412ms，p95 900ms，最近失败 timeout）
   判定器：规则（近 24h 无判定）
   ```
 
@@ -108,7 +108,7 @@ node scripts/emotion-report.mjs --input test/fixtures/emotion-golden.jsonl --app
 ```
 
 模型门槛（评审方留出集口径）：准确率 ≥ 80%、`blame` 误报 = 0、中性误触发 ≤ 2/13、
-判定失败 = 0。`golden` 只做回归参考，不计入发版门。
+判定失败 = 0（失败按原因分列：`invalid` / `timeout` / `error` …）。`golden` 只做回归参考，不计入发版门。
 
 环境变量也可用通用名：`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL`。
 
