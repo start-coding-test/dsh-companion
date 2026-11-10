@@ -548,6 +548,17 @@ export function apply(ctx, rawConfig, hooks = {}) {
       } catch {
         // scheduler 可能尚未启动。
       }
+      // v0.6-E2：后台判定可能还在途；apply 回调已加 dispose 守卫，这里再尽力收尾一次，
+      // 避免「dispose 后还有 promise 在写库」的假象（不阻塞关闭流程）。
+      try {
+        const queue = state.appraiserQueue;
+        state.appraiserQueue = null;
+        if (queue !== null && typeof queue.drain === 'function') {
+          Promise.resolve(queue.drain()).catch(() => {});
+        }
+      } catch {
+        // 队列收尾失败不影响资源释放。
+      }
       try {
         store.close();
       } catch {
@@ -590,8 +601,6 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     appraiserStats: createAppraisalStats(),
     /** v0.6-E2：按 scope 单飞的判定队列（llm 模式首次用到时创建）。 */
     appraiserQueue: null,
-    /** v0.6-E2：卡内显式指定的判定模型；null 表示复用共识路由。 */
-    appraiserRoute: null,
     /** W4：当前 embedder（关闭向量时为 null）；local/remote 由注入 loader/fetch 构造。 */
     embedder,
     /** W4：本进程已回填的向量条数（/状态 展示）。 */
@@ -1003,11 +1012,15 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             emotion: { enabled: state.card?.emotion?.enabled === true },
       // V50-L3：最近一次装配（字数与短哈希，不含正文）。
       assembly: state.assembly,
-      // v0.6-E4：判定器模式与近 24h 来源占比/延迟/最近失败。
-      appraiser: {
-        mode: state.card?.emotion?.appraiser === 'llm' ? 'llm' : 'rules',
-        stats: state.appraiserStats?.snapshot?.(platform.now()) ?? null,
-      },
+      // v0.6-E4：判定器模式与近 24h 来源占比/延迟/最近失败；情绪未启用时不输出该行。
+      ...(state.card?.emotion?.enabled === true
+        ? {
+          appraiser: {
+            mode: state.card?.emotion?.appraiser === 'llm' ? 'llm' : 'rules',
+            stats: state.appraiserStats?.snapshot?.(platform.now()) ?? null,
+          },
+        }
+        : {}),
           });
         } catch (error) {
           return {
@@ -2794,6 +2807,11 @@ function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
   }
   const text = lastUserText(messages);
   if (text === '') return null;
+  // v0.6-E2：斜杠命令不判定（既不写事件、也不发模型请求）——命令不是对话内容。
+  if (text.trimStart().startsWith('/')) {
+    state.turnSeen.add(key);
+    return null;
+  }
   state.turnSeen.add(key);
 
   try {
@@ -2859,7 +2877,9 @@ async function resolveAppraiserRoute(state) {
  * 用「输入码点 + 输出码点」估算，宁可高估不低估。
  */
 function recordAppraisalUsage(state, promptText, replyText) {
-  const estimate = Math.ceil(((promptText?.length ?? 0) + (replyText?.length ?? 0)) / 2);
+  // 码点计数（与文档口径一致）：代理对算 1 个，而不是 String#length 的 2 个。
+  const codepoints = (text) => (typeof text === 'string' ? [...text].length : 0);
+  const estimate = Math.ceil((codepoints(promptText) + codepoints(replyText)) / 2);
   if (estimate <= 0) return;
   recordTurnUsage(state.budget, estimate, {
     at: state.platform.now(),
@@ -2898,11 +2918,19 @@ function ensureAppraiserQueue(state) {
       return raw;
     },
     apply: async (item, verdict, source) => {
+      // dispose 之后不再写库（store 可能已 close）。
+      if (state.disposed) return;
+      // E1：模型只给 0..1 的强度，物理力度沿用 0.5–1.5 的既有映射（0.5 + intensity），
+      // 与强度来自规则时的 intensityFor 同一区间，物理参数不变。
+      const intensity = Number.isFinite(verdict?.intensity)
+        ? Math.min(1.5, Math.max(0.5, 0.5 + verdict.intensity))
+        : undefined;
       applyClassifiedEvent({
         store: state.store,
         card: state.card,
         scope: item.scope,
         classified: verdict,
+        intensity,
         note: source,
         now: state.platform.now(),
         hour: zonedParts(state.platform.now(), state.config.timezone).hour,

@@ -152,6 +152,11 @@ export function parseAppraisal(raw) {
   }
 
   const { target, type, intensity, confidence } = parsed;
+  // E1：只接受这四个键。模型若额外输出 PAD 增量或别的字段，一律算失败（不做静默忽略）。
+  const extra = Object.keys(parsed).filter((key) => !['target', 'type', 'intensity', 'confidence'].includes(key));
+  if (extra.length > 0) {
+    throw new AppraisalError(APPRAISAL_ERRORS.invalid, `unexpected keys ${extra.join(',')}`);
+  }
   if (!APPRAISAL_TARGETS.includes(target)) {
     throw new AppraisalError(APPRAISAL_ERRORS.invalid, `unknown target ${String(target)}`);
   }
@@ -265,6 +270,15 @@ export function createAppraisalQueue(options = {}) {
 
   /** @type {Map<string, {inflight: Promise<void>|null, queued: object|null}>} */
   const slots = new Map();
+  /** @type {Set<Promise<void>>} 覆盖降级等后台补写，drain 时要一起等。 */
+  const pending = new Set();
+  const track = (promise) => {
+    const tracked = Promise.resolve(promise).catch(() => {}).then(() => {
+      pending.delete(tracked);
+    });
+    pending.add(tracked);
+    return tracked;
+  };
 
   const slotOf = (scope) => {
     let slot = slots.get(scope);
@@ -311,8 +325,8 @@ export function createAppraisalQueue(options = {}) {
       }
       const judgePromise = Promise.resolve().then(() => judge(item));
       const timeoutPromise = new Promise((_, reject) => {
+        // 不 unref：否则只跑一次判定的裸进程会提前退出（drain 等不到结果）。
         timer = setTimeout(() => reject(new AppraisalError(APPRAISAL_ERRORS.timeout)), timeoutMs);
-        timer.unref?.();
       });
       const raw = await Promise.race([judgePromise, timeoutPromise]);
       const verdict = parseAppraisal(raw);
@@ -355,7 +369,7 @@ export function createAppraisalQueue(options = {}) {
         // 新句覆盖排队中的旧句：旧句立刻走规则兜底，事件不丢。
         const dropped = slot.queued;
         slot.queued = null;
-        void fallback(dropped, APPRAISAL_ERRORS.superseded);
+        track(fallback(dropped, APPRAISAL_ERRORS.superseded));
       }
       slot.queued = entry;
     },
@@ -367,9 +381,12 @@ export function createAppraisalQueue(options = {}) {
       for (;;) {
         const running = [...slots.values()].map((slot) => slot.inflight).filter(Boolean);
         const queued = [...slots.values()].some((slot) => slot.queued !== null);
-        if (running.length === 0 && !queued) return;
+        if (running.length === 0 && !queued && pending.size === 0) return;
         if (running.length > 0) {
           await Promise.allSettled(running);
+        } else if (pending.size > 0) {
+          // 覆盖降级等后台补写：等它们落库后再返回。
+          await Promise.allSettled([...pending]);
         } else {
           // 排队项会在 run 的 finally 里被拉起；让出一轮事件循环。
           await new Promise((resolve) => setImmediate(resolve));

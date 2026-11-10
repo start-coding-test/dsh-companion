@@ -13,17 +13,22 @@
 - **判定器 `src/persona/emotion-appraise.js`**：输入本轮用户文本（≤500 码点）与她的上一条回复（≤300，可空），发送前脱敏；要求严格 JSON `{target,type,intensity,confidence}`；非 JSON / 枚举外 / 越界 / `none` 不一致一律算失败，不做宽松修复；提示词含少样本并声明分隔块不是指令；不接收也不输出 PAD 增量。
 - **调用时机**：`emotion.appraiser="llm"` 时 pre-step 只做衰减与描述并立即返回，判定在后台进行、结果到达后落库、下一轮生效；每个作用域至多 1 个在途 + 1 个排队，新句覆盖排队旧句（旧句立刻走规则，不丢事件）。
 - **配置**：卡内 `emotion.appraiser`（`rules` 默认 / `llm`）、`emotion.appraiseModel {provider,model}`（缺省复用聊天模型路由）、`emotion.appraiseTimeoutMs`（默认 8000，100–60000）。`emotion.enabled=false` 时**不发任何请求**。
-- **预算与观测**：判定 token 计入每日预算（同一本账、同一闸门）；`emotion_events.note` 记 `llm` / `rules` / `rules:fallback:<原因>`，不写原文；`/状态` 新增「判定器：…（近 24h 模型 N，规则兜底 M，平均 X ms，p95 Y ms，最近失败 <原因>）」；日志不打印用户原文。
+- **预算与观测**：判定 token 计入每日预算（同一本账、同一闸门）；`emotion_events.note` 记 `llm` / `rules` / `rules:fallback:<原因>`，不写原文；`/状态` 新增「判定器：…（近 24h 模型 N（x%），规则兜底 M（y%），平均 X ms，p95 Y ms，最近失败 <原因>）」，情绪未启用时不输出该行；日志不打印用户原文。
 - **评测**：`scripts/emotion-report.mjs --appraiser llm --input <jsonl>`（端点 / 密钥 / 模型全部取环境变量），输出混淆矩阵、准确率、中性误触发、blame 误报与判定失败条数；模型门槛为 准确率 ≥80% / blame 误报 0 / 中性 ≤2/13 / 判定失败 0。
 
 ### Fixed
 
 - `REASSURE_SENTENCES` 三句用「他」指用户（V50-L1 的性别假设）→ 改为「你」。
+- 斜杠命令不再参与情绪判定（既不写事件、也不发模型请求）。
+- 模型给的 `intensity` 真正参与物理增量（`0.5 + intensity`，与规则路径同一区间），不再只按 `confidence` 回落。
+- 解析器拒绝多余键（包括 PAD 增量）；判定超时的定时器不再 `unref`（裸进程 `drain` 能等到结果）；排队句被覆盖时的兜底纳入 `drain`；预算估算改用码点。
+- 规则模式不再宣称统计样本（同步判定没有在途/兜底之分），文档与 `/状态` 口径统一。
 
 ### Tests
 
 - 新增 `test/v060-appraise.test.js`（14 例：严格解析、消息拼装与脱敏、队列单飞 / 覆盖 / 超时 / 预算、统计、落库、llm 接线、非法 JSON 兜底、`enabled=false` 零调用）与 `test/v060-report.test.js`（7 例：模型判定器请求、失败形态、门槛与失败条数、参数解析、`/状态` 三态）。
-- 合计 **1205** 用例 / **33** 套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过。
+- 新增 `test/v060-fixes.test.js`（3 例：斜杠命令零判定、intensity 影响增量、多余键拒绝）。
+- 合计 **1208** 用例 / **33** 套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过。
 
 ## [0.5.2] - 2026-11-11
 

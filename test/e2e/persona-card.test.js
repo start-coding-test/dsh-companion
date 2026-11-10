@@ -412,11 +412,10 @@ test('集成（v0.4.12 等价）：未配置卡时人格三段 SHA-256 一致，
     assert.match(lines[assemblyIndex], /部署人设 宿主默认；prefix 未改写/u);
     assert.match(lines[assemblyIndex], /段 safety \d+\/[0-9a-f]{8}、core \d+\/[0-9a-f]{8}、protocol \d+\/[0-9a-f]{8}/u);
     assert.equal(lines[assemblyIndex].includes('情绪句'), false, '情绪未启用时不该有情绪句');
-    // v0.6-E4：判定器行紧随装配记录（默认规则模式、24h 无判定）。
+    // v0.6-E4：判定器行只在情绪启用时出现；内置卡情绪未启用，所以这里必须是「没有」。
     const appraiserIndex = lines.findIndex((line) => line.startsWith('判定器：'));
-    assert.equal(appraiserIndex, 11, '判定器行插在装配记录之后、水位数之前');
-    assert.equal(lines[appraiserIndex], '判定器：规则（近 24h 无判定）');
-    assert.equal(lines.length, V0412_STATUS_LINES.length + 5, '/状态 应只多人格卡、部署人设、情绪、装配记录与判定器五行');
+    assert.equal(appraiserIndex, -1, '情绪未启用时不该有判定器行');
+    assert.equal(lines.length, V0412_STATUS_LINES.length + 4, '/状态 应只多人格卡、部署人设、情绪与装配记录四行');
 
     const withoutInjected = lines.filter(
       (line) => !line.startsWith('人格卡：')
