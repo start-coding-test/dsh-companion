@@ -64,6 +64,7 @@ import {
   buildChatPrompt,
   chatEligibility,
   normalizeChatText,
+  renderBannedPhrases,
 } from './persona/chat.js';
 import {
   COMMITMENT_FOLLOWUP_REASON,
@@ -4099,7 +4100,7 @@ async function runLightChat(state) {
     }
 
     const normalized = normalizeChatText(typeof raw === 'string' ? raw : raw?.text, {
-      bannedPhrases: card.bannedPhrases,
+      bannedPhrases: renderBannedPhrases(card),
     });
     if (!normalized.ok) {
       platform.log('debug', '[dsh-companion] light chat rejected', {

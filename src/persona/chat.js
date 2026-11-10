@@ -98,6 +98,29 @@ export function chatEligibility({
  *          recallSummary?: string, messageCount?: number, emotionLine?: string}} input
  * @returns {string}
  */
+/** 卡的称呼上下文：name/address 缺省时分别回落「珞然」与「你」。 */
+function identityOf(card) {
+  const name = typeof card?.name === 'string' && card.name.trim() !== '' ? card.name.trim() : '珞然';
+  const address = typeof card?.address === 'string' && card.address.trim() !== ''
+    ? card.address.trim()
+    : '你';
+  return { name, address };
+}
+
+/**
+ * 渲染违禁表达：非字符串项直接丢弃（L-9），渲染结果同时用于提示词与输出过滤（M-4）。
+ *
+ * @param {object} [card]
+ * @returns {string[]}
+ */
+export function renderBannedPhrases(card = {}) {
+  const context = identityOf(card);
+  return (Array.isArray(card?.bannedPhrases) ? card.bannedPhrases : [])
+    .filter((phrase) => typeof phrase === 'string' && phrase.trim() !== '')
+    .map((phrase) => renderTemplate(phrase.trim(), context).trim())
+    .filter((phrase) => phrase !== '');
+}
+
 export function buildChatPrompt({
   card = {},
   recentTopics = [],
@@ -105,16 +128,11 @@ export function buildChatPrompt({
   messageCount = CHAT_MAX_SENTENCES - 2,
   emotionLine = '',
 } = {}) {
-  const name = typeof card.name === 'string' && card.name.trim() !== '' ? card.name.trim() : '珞然';
-  const address = typeof card.address === 'string' && card.address.trim() !== ''
-    ? card.address.trim()
-    : '你';
+  const { name, address } = identityOf(card);
   const style = renderTemplate(String(card.tone?.style ?? '简洁'), { name, address });
   const warmth = renderTemplate(String(card.tone?.warmth ?? '温和'), { name, address });
   const structure = renderTemplate(String(card.tone?.structure ?? '先结论'), { name, address });
-  const banned = Array.isArray(card.bannedPhrases)
-    ? card.bannedPhrases.map((phrase) => renderTemplate(String(phrase), { name, address })).join('、')
-    : '';
+  const banned = renderBannedPhrases(card).join('、');
   const identity = typeof card.chatIdentity === 'string' && card.chatIdentity.trim() !== ''
     ? card.chatIdentity
     : DEFAULT_CARD.chatIdentity;

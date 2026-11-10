@@ -11,7 +11,7 @@ import test from 'node:test';
 
 import { DEFAULT_CARD, parseCardSourceDetailed } from '../src/persona/card.js';
 import { buildSections } from '../src/persona/sections.js';
-import { buildChatPrompt } from '../src/persona/chat.js';
+import { buildChatPrompt, normalizeChatText, renderBannedPhrases } from '../src/persona/chat.js';
 import { DEFAULT_BASELINE } from '../src/persona/emotion.js';
 import { buildConsolidationPrompt } from '../src/memory/consolidate.js';
 
@@ -111,4 +111,41 @@ test('L-7：DEFAULT_BASELINE 与内置卡 emotion.baseline 一致，非法基线
     emotion: { enabled: true },
   }));
   assert.deepEqual(omitted.card.emotion.baseline, DEFAULT_BASELINE);
+});
+
+test('M-4：违禁表达按渲染后短语过滤模型输出', () => {
+  const parsed = parseCardSourceDetailed(JSON.stringify({
+    name: '岚',
+    address: '老板',
+    tone: { style: '简洁', warmth: '温和', structure: '先结论' },
+    bannedPhrases: ['叫{{user}}老大'],
+  }));
+  const card = parsed.card;
+  const prompt = buildChatPrompt({ card, recentTopics: [], recallSummary: '', messageCount: 6 });
+  assert.ok(prompt.includes('叫老板老大'), '提示词里应出现渲染后的违禁表达');
+  assert.ok(!prompt.includes('{{user}}'), '提示词不应残留占位符');
+
+  const phrases = renderBannedPhrases(card);
+  assert.deepEqual(phrases, ['叫老板老大']);
+  const blocked = normalizeChatText('叫老板老大。今天风挺大，窗户关好。早点休息。', { bannedPhrases: phrases });
+  assert.equal(blocked.ok, false);
+  assert.equal(blocked.reason, 'banned_phrase');
+
+  // 未渲染的原始短语不应命中（模型只会复述渲染后的文本）。
+  const raw = normalizeChatText('叫老板老大。今天风挺大。窗户关好。早点休息。明天见。', { bannedPhrases: ['叫{{user}}老大'] });
+  assert.notEqual(raw.reason, 'banned_phrase');
+});
+
+test('L-9：非字符串违禁项被丢弃，不产生 null/undefined 文案', () => {
+  const parsed = parseCardSourceDetailed(JSON.stringify({
+    name: '岚',
+    address: '你',
+    tone: { style: '简洁', warmth: '温和', structure: '先结论' },
+  }));
+  const card = { ...parsed.card, bannedPhrases: [null, undefined, 42, '叫老板老大'] };
+  const phrases = renderBannedPhrases(card);
+  assert.deepEqual(phrases, ['叫老板老大']);
+  const prompt = buildChatPrompt({ card, recentTopics: [], recallSummary: '', messageCount: 6 });
+  assert.ok(!prompt.includes('null'));
+  assert.ok(!prompt.includes('undefined'));
 });
