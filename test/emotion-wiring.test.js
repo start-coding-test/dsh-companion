@@ -174,10 +174,14 @@ test('normalizeCardEmotion：合法值原样保留；非法值逐项回落并给
     baseline: { ...BASELINE_50 },
     halfLifeHours: 24,
   });
+  // v0.6：三个判定器键由规范化补默认（默认 rules，行为与 v0.5.2 一致）。
   assert.deepEqual(valid.emotion, {
     enabled: true,
     baseline: { ...BASELINE_50 },
     halfLifeHours: 24,
+    appraiser: 'rules',
+    appraiseModel: null,
+    appraiseTimeoutMs: 8000,
   });
   assert.deepEqual(valid.warnings, []);
 

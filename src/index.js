@@ -64,8 +64,17 @@ import { createAssembleHandler } from './persona/shadow.js';
 import {
   EMOTION_PROMPT_PREFIX,
   EMOTION_SOURCE_KIND,
+  applyClassifiedEvent,
   runEmotionTurn,
 } from './persona/emotion-wiring.js';
+import {
+  APPRAISAL_ERRORS,
+  AppraisalError,
+  buildAppraisalMessages,
+  createAppraisalQueue,
+  createAppraisalStats,
+} from './persona/emotion-appraise.js';
+import { classify as classifyEmotion } from './persona/emotion-classify.js';
 import {
   buildChatPrompt,
   chatEligibility,
@@ -577,6 +586,12 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     shadowMode: 'off',
     /** V50-L3：最近一次装配的只读记录（仅在内存里，只存字数与短哈希）。 */
     assembly: createAssemblyRecord(),
+    /** v0.6-E4：判定器来源占比与延迟统计（24h 滑动窗口，只存元数据）。 */
+    appraiserStats: createAppraisalStats(),
+    /** v0.6-E2：按 scope 单飞的判定队列（llm 模式首次用到时创建）。 */
+    appraiserQueue: null,
+    /** v0.6-E2：卡内显式指定的判定模型；null 表示复用共识路由。 */
+    appraiserRoute: null,
     /** W4：当前 embedder（关闭向量时为 null）；local/remote 由注入 loader/fetch 构造。 */
     embedder,
     /** W4：本进程已回填的向量条数（/状态 展示）。 */
@@ -988,6 +1003,11 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             emotion: { enabled: state.card?.emotion?.enabled === true },
       // V50-L3：最近一次装配（字数与短哈希，不含正文）。
       assembly: state.assembly,
+      // v0.6-E4：判定器模式与近 24h 来源占比/延迟/最近失败。
+      appraiser: {
+        mode: state.card?.emotion?.appraiser === 'llm' ? 'llm' : 'rules',
+        stats: state.appraiserStats?.snapshot?.(platform.now()) ?? null,
+      },
           });
         } catch (error) {
           return {
@@ -2779,6 +2799,11 @@ function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
   try {
     const now = platform.now();
     const parts = zonedParts(now, config.timezone);
+    const quiet = isQuietAt(new Date(now), config);
+    const llmMode = state.card?.emotion?.appraiser === 'llm';
+
+    // v0.6-E2：llm 模式下 pre-step 只做「衰减 + 描述」，立刻返回不等模型；
+    // 判定在后台进行，结果到达后由 applyClassifiedEvent 单独落库，下一轮生效。
     const result = runEmotionTurn({
       store,
       card: state.card,
@@ -2786,17 +2811,132 @@ function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
       now,
       hour: parts.hour,
       minute: parts.minute,
-      quiet: isQuietAt(new Date(now), config),
+      quiet,
       scope,
       text,
+      skipEvent: llmMode,
+      note: llmMode ? undefined : 'rules',
     });
     state.emotionTextByScope?.set(scope, `${EMOTION_PROMPT_PREFIX}${result.line}`);
+    if (llmMode) {
+      submitAppraisal(state, {
+        scope,
+        text,
+        lastReply: lastAssistantText(state.transcriptByScope?.get(scope) ?? []),
+        now,
+        hour: parts.hour,
+        minute: parts.minute,
+        quiet,
+      });
+    }
     return null;
   } catch (error) {
     platform.log('warn', '[dsh-companion] emotion injection failed', {
       message: error instanceof Error ? error.message : String(error),
     });
     return null;
+  }
+}
+
+
+/**
+ * 判定模型路由：卡内显式 {provider, model} 优先，否则复用共识模型解析。
+ * @param {object} state
+ * @returns {Promise<{provider: string, model: string, source: string}|null>}
+ */
+async function resolveAppraiserRoute(state) {
+  const configured = state.card?.emotion?.appraiseModel ?? null;
+  if (configured !== null && typeof configured.provider === 'string' && typeof configured.model === 'string') {
+    return { provider: configured.provider, model: configured.model, source: 'card' };
+  }
+  const route = await resolveLlmRoute(state);
+  if (route === null || typeof route.provider !== 'string') return null;
+  return route;
+}
+
+/**
+ * 判定 token 计入每日预算（与 recordTurnUsage 同一本账，v0.6-E4）。
+ * 用「输入码点 + 输出码点」估算，宁可高估不低估。
+ */
+function recordAppraisalUsage(state, promptText, replyText) {
+  const estimate = Math.ceil(((promptText?.length ?? 0) + (replyText?.length ?? 0)) / 2);
+  if (estimate <= 0) return;
+  recordTurnUsage(state.budget, estimate, {
+    at: state.platform.now(),
+    timezone: state.config.timezone,
+  });
+  refreshBudget(state);
+}
+
+/**
+ * 惰性创建判定队列（每 scope 至多 1 在途 + 1 排队）。
+ * @param {object} state
+ * @returns {object}
+ */
+function ensureAppraiserQueue(state) {
+  if (state.appraiserQueue !== null) return state.appraiserQueue;
+  const timeoutMs = state.card?.emotion?.appraiseTimeoutMs ?? 8000;
+  state.appraiserQueue = createAppraisalQueue({
+    timeoutMs,
+    classifyRules: (text) => classifyRulesOnly(state, text),
+    canCall: () => state.disposed !== true && state.budgetTripped !== true,
+    now: () => state.platform.now(),
+    log: (level, message, meta) => state.platform.log(level, message, meta),
+    onSample: (sample) => {
+      state.appraiserStats?.record?.(sample);
+    },
+    judge: async (item) => {
+      const route = await resolveAppraiserRoute(state);
+      if (route === null) throw new AppraisalError(APPRAISAL_ERRORS.nollm);
+      const messages = buildAppraisalMessages({
+        text: item.text,
+        lastReply: item.lastReply,
+        cardName: state.card?.name,
+      });
+      const raw = await state.platform.complete({ provider: route.provider, model: route.model, messages });
+      recordAppraisalUsage(state, JSON.stringify(messages), raw);
+      return raw;
+    },
+    apply: async (item, verdict, source) => {
+      applyClassifiedEvent({
+        store: state.store,
+        card: state.card,
+        scope: item.scope,
+        classified: verdict,
+        note: source,
+        now: state.platform.now(),
+        hour: zonedParts(state.platform.now(), state.config.timezone).hour,
+        minute: zonedParts(state.platform.now(), state.config.timezone).minute,
+        quiet: isQuietAt(new Date(state.platform.now()), state.config),
+      });
+    },
+  });
+  return state.appraiserQueue;
+}
+
+/**
+ * 规则兜底入口（复用 v0.5.2 分类器，不看卡名以外的上下文）。
+ * @param {object} state
+ * @param {string} text
+ * @returns {{type: string, confidence: number}}
+ */
+function classifyRulesOnly(state, text) {
+  return classifyEmotion(typeof text === 'string' ? text : '', { name: state.card?.name });
+}
+
+/**
+ * 提交一次后台判定；队列不可用时静默放弃（本轮已按规则写入衰减）。
+ * @param {object} state
+ * @param {{scope: string, text: string, lastReply: string, now: number, hour: number, minute: number, quiet: boolean}} item
+ */
+function submitAppraisal(state, item) {
+  if (state.disposed) return;
+  try {
+    ensureAppraiserQueue(state).submit(item);
+  } catch (error) {
+    state.platform.log('warn', '[dsh-companion] emotion appraise enqueue failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
   }
 }
 

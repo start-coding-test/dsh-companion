@@ -143,6 +143,7 @@ export function handleCommand({
   shadow,
   emotion,
   assembly,
+  appraiser,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -187,6 +188,8 @@ export function handleCommand({
       emotion,
       // V50-L3：最近一次装配（只含字数与短哈希，见 persona/assembly-record.js）。
       assembly,
+      // v0.6-E4：判定器模式与近 24h 统计（只含元数据）。
+      appraiser,
       now: toMillis(now),
     }),
   };
@@ -607,6 +610,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // V50-L3：最近一次装配（时间/遮蔽/段字数与短哈希/本轮情绪句）；不传则整行省略。
   const assemblyLine = formatAssemblyLine(options.assembly, options.now, timeZone);
   if (assemblyLine !== null) lines.push(assemblyLine);
+  // v0.6-E4：判定器（规则 / 模型）、近 24h 来源占比、平均与 p95 延迟、最近一次失败。
+  const appraiserLine = formatAppraiserLine(options.appraiser);
+  if (appraiserLine !== null) lines.push(appraiserLine);
   lines.push(`水位 ${scope}：${watermark}`, `最近 job：${jobText}`, failureText);
   return lines.join('\n');
 }
@@ -696,6 +702,28 @@ function formatAssemblyLine(assembly, now, timeZone) {
 }
 
 /** P3-c：情绪事件类型 → /状态 里的中文标签；白名单之外（ambient）不展示。 */
+/**
+ * v0.6-E4：判定器状态行。只输出模式、24h 计数、延迟与失败码，不含任何文本。
+ *
+ * @param {{mode?: string, stats?: {llm?: number, rules?: number, fallback?: number, total?: number,
+ *   avgMs?: number|null, p95Ms?: number|null, lastError?: {at: number, code: string}|null}}|null|undefined} appraiser
+ * @returns {string|null}
+ */
+function formatAppraiserLine(appraiser) {
+  if (appraiser === null || typeof appraiser !== 'object') return null;
+  const mode = appraiser.mode === 'llm' ? '模型' : '规则';
+  const stats = appraiser.stats;
+  if (mode === '规则' || stats === null || typeof stats !== 'object' || (stats.total ?? 0) === 0) {
+    return `判定器：${mode}（近 24h 无判定）`;
+  }
+  const parts = [`模型 ${stats.llm ?? 0}`, `规则兜底 ${stats.fallback ?? 0}`];
+  if (Number.isFinite(stats.avgMs)) parts.push(`平均 ${stats.avgMs}ms`);
+  if (Number.isFinite(stats.p95Ms)) parts.push(`p95 ${stats.p95Ms}ms`);
+  const error = typeof stats.lastError?.code === 'string' ? stats.lastError.code : null;
+  const tail = error === null ? '' : `，最近失败 ${error}`;
+  return `判定器：${mode}（近 24h ${parts.join('，')}${tail}）`;
+}
+
 const EMOTION_EVENT_LABELS = Object.freeze({
   greeting: '问候',
   care: '关心',

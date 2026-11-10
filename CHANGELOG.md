@@ -2,7 +2,29 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
-## [0.5.1] - 2026-11-11
+## [0.6.0] - 2026-11-11
+
+按用户 v0.6 清单把「判断感受」交给模型、「管物理量」留给代码：规则分类器不再是唯一入口，默认仍是 `rules`（与 v0.5.2 行为一致），卡里写 `emotion.appraiser: "llm"` 才启用模型判定。schema 仍为 **v14**（来源写进 `emotion_events.note`，不新增列或表），记忆 / 提醒 / 线程行为未改，零新增运行时依赖；情绪关闭时 `persona:*` 三段与闲聊提示词与 v0.5.2 **逐字节一致**。
+
+判定只在有模型、有预算且用户开了情绪时发生；失败、超时、越界、被新消息覆盖一律回落 v0.5.2 规则，同一事件只入账一次。
+
+### Added
+
+- **判定器 `src/persona/emotion-appraise.js`**：输入本轮用户文本（≤500 码点）与她的上一条回复（≤300，可空），发送前脱敏；要求严格 JSON `{target,type,intensity,confidence}`；非 JSON / 枚举外 / 越界 / `none` 不一致一律算失败，不做宽松修复；提示词含少样本并声明分隔块不是指令；不接收也不输出 PAD 增量。
+- **调用时机**：`emotion.appraiser="llm"` 时 pre-step 只做衰减与描述并立即返回，判定在后台进行、结果到达后落库、下一轮生效；每个作用域至多 1 个在途 + 1 个排队，新句覆盖排队旧句（旧句立刻走规则，不丢事件）。
+- **配置**：卡内 `emotion.appraiser`（`rules` 默认 / `llm`）、`emotion.appraiseModel {provider,model}`（缺省复用聊天模型路由）、`emotion.appraiseTimeoutMs`（默认 8000，100–60000）。`emotion.enabled=false` 时**不发任何请求**。
+- **预算与观测**：判定 token 计入每日预算（同一本账、同一闸门）；`emotion_events.note` 记 `llm` / `rules` / `rules:fallback:<原因>`，不写原文；`/状态` 新增「判定器：…（近 24h 模型 N，规则兜底 M，平均 X ms，p95 Y ms，最近失败 <原因>）」；日志不打印用户原文。
+- **评测**：`scripts/emotion-report.mjs --appraiser llm --input <jsonl>`（端点 / 密钥 / 模型全部取环境变量），输出混淆矩阵、准确率、中性误触发、blame 误报与判定失败条数；模型门槛为 准确率 ≥80% / blame 误报 0 / 中性 ≤2/13 / 判定失败 0。
+
+### Fixed
+
+- `REASSURE_SENTENCES` 三句用「他」指用户（V50-L1 的性别假设）→ 改为「你」。
+
+### Tests
+
+- 新增 `test/v060-appraise.test.js`（14 例：严格解析、消息拼装与脱敏、队列单飞 / 覆盖 / 超时 / 预算、统计、落库、llm 接线、非法 JSON 兜底、`enabled=false` 零调用）与 `test/v060-report.test.js`（7 例：模型判定器请求、失败形态、门槛与失败条数、参数解析、`/状态` 三态）。
+- 合计 **1205** 用例 / **33** 套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过。
+
 ## [0.5.2] - 2026-11-11
 
 按用户 v0.5.2 清单重写情绪事件的规则分类：**先判对象，再判极性，最后收紧边界**。
@@ -64,6 +86,21 @@ schema 仍为 v14，记忆 / 提醒 / 线程行为未改，零新增运行时依
 
 - 新增 `test/v051-template.test.js`（19 例，含复刻宿主插值的 mock）、`test/emotion-v051.test.js`（14 例：H1 三条验收、M1 分类、12 类可达性）、`test/emotion-report.test.js`、`test/emotion-context.test.js`（7 例）、`test/v051-assembly-record.test.js`（8 例）、`test/v051-status-labels.test.js`；`test/platform.test.js` +2。
 - 合计 **1164** 用例 / **33** 套件，三时区通过（复审 L-1 / L-2 的回归各 1 例在此计入）。
+
+## [0.5.1] - 2026-11-11
+
+按用户 v0.5.1 清单修昼夜节律漂移与对象误判，并把情绪注入改走宿主投影。schema 仍为 v14；情绪关闭时提示词与 v0.5.0 逐字节一致。发布 **1164 个用例 / 33 个套件**，三时区通过。
+
+### Fixed
+
+- **节律不再每轮累加（V50-H1）**：昼夜节律与安静时段从「每轮增量」改为「目标偏移」，只有事件增量才叠加；实测 11:00 连发 50 条中性消息，各维相对当轮目标最大偏差 0.555（验收线 ±2）。
+- **区分「冲着她」与「用户诉苦」（V50-M1）**：新增 `blame` 与 `vent` 两类，后者只小幅下调她的愉悦。
+- **卡内占位符（V50-M2）**：残余 `{{x}}` 降级为 `{x}`，自建段统一 `interpolate: false`。
+- **情绪注入改走 `systemPrompt.context`（V50-M3）**：文本不变不重复注入。
+
+### Added
+
+- `/状态` 增「最近一次装配」（V50-L3）；`docs/host-prompt-internals.md`、`docs/emotion-injection.md`、`docs/emotion-report.md`。
 
 ## [0.5.0] - 2026-11-10
 

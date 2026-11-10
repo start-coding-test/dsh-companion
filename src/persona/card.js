@@ -13,6 +13,7 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 
 import { DEFAULT_BASELINE } from './emotion.js';
+import { APPRAISAL_TIMEOUT_DEFAULT as APPRAISE_TIMEOUT_DEFAULT } from './emotion-appraise.js';
 
 /** 敏感对象键，深合并时直接忽略，避免原型污染。 */
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -79,6 +80,9 @@ export const DEFAULT_CARD = deepFreeze({
     enabled: false,
     baseline: { pleasure: 50, arousal: 50, dominance: 50, energy: 60 },
     halfLifeHours: 6,
+    appraiser: 'rules',
+    appraiseModel: null,
+    appraiseTimeoutMs: APPRAISE_TIMEOUT_DEFAULT,
   },
   version: 1,
 });
@@ -299,6 +303,9 @@ export function normalizeCardEmotion(emotion) {
         enabled: false,
         baseline: { ...DEFAULT_BASELINE },
         halfLifeHours: EMOTION_HALF_LIFE_DEFAULT,
+        appraiser: 'rules',
+        appraiseModel: null,
+        appraiseTimeoutMs: APPRAISE_TIMEOUT_DEFAULT,
       },
       warnings: [{ code: 'emotion_invalid' }],
     };
@@ -325,6 +332,38 @@ export function normalizeCardEmotion(emotion) {
   } else if (!isValidHalfLife(emotion.halfLifeHours)) {
     normalized.halfLifeHours = EMOTION_HALF_LIFE_DEFAULT;
     warnings.push({ code: 'emotion_half_life_invalid' });
+  }
+
+  // v0.6-E3：判定器模式与路由。默认 'rules'，行为与 v0.5.2 完全一致。
+  if (emotion.appraiser === undefined) {
+    normalized.appraiser = 'rules';
+  } else if (emotion.appraiser !== 'rules' && emotion.appraiser !== 'llm') {
+    normalized.appraiser = 'rules';
+    warnings.push({ code: 'emotion_appraiser_invalid' });
+  }
+
+  if (emotion.appraiseModel === undefined || emotion.appraiseModel === null) {
+    normalized.appraiseModel = null;
+  } else if (!isPlainObject(emotion.appraiseModel)
+    || typeof emotion.appraiseModel.provider !== 'string' || emotion.appraiseModel.provider.trim() === ''
+    || typeof emotion.appraiseModel.model !== 'string' || emotion.appraiseModel.model.trim() === '') {
+    normalized.appraiseModel = null;
+    warnings.push({ code: 'emotion_appraise_model_invalid' });
+  } else {
+    normalized.appraiseModel = {
+      provider: emotion.appraiseModel.provider.trim(),
+      model: emotion.appraiseModel.model.trim(),
+    };
+  }
+
+  if (emotion.appraiseTimeoutMs === undefined) {
+    normalized.appraiseTimeoutMs = APPRAISE_TIMEOUT_DEFAULT;
+  } else if (typeof emotion.appraiseTimeoutMs !== 'number'
+    || !Number.isFinite(emotion.appraiseTimeoutMs)
+    || emotion.appraiseTimeoutMs < 100
+    || emotion.appraiseTimeoutMs > 60000) {
+    normalized.appraiseTimeoutMs = APPRAISE_TIMEOUT_DEFAULT;
+    warnings.push({ code: 'emotion_appraise_timeout_invalid' });
   }
 
   return { emotion: normalized, warnings };

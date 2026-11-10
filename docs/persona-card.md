@@ -131,6 +131,32 @@ persona:
 
 标注集与混淆矩阵见 [`docs/emotion-report.md`](emotion-report.md)。
 
+### 5.2 判定器（v0.6）
+
+上面那套规则是**默认**判定器。想让模型判断「这句话让她有什么感受」，在卡里写：
+
+```json
+"emotion": {
+  "enabled": true,
+  "appraiser": "llm",
+  "appraiseModel": { "provider": "deepseek-official", "model": "deepseek-chat" },
+  "appraiseTimeoutMs": 8000
+}
+```
+
+- `appraiser`：`"rules"`（默认，行为与 v0.5.2 完全一致）或 `"llm"`。非法值记
+  `emotion_appraiser_invalid` 并回落 `rules`。
+- `appraiseModel`：`{ provider, model }`，缺省复用聊天模型路由；写错记
+  `emotion_appraise_model_invalid` 并回落 `null`。
+- `appraiseTimeoutMs`：100–60000，默认 8000；越界回落默认并记
+  `emotion_appraise_timeout_invalid`。
+- 模型只输出 `{target, type, intensity, confidence}`，**不给四维增量**；衰减、节律、
+  边界与写库仍由代码做。判定在后台进行，结果下一轮生效，不阻塞对话。
+- 失败（非 JSON、枚举外、超时、预算拒绝、被新句覆盖）一律回落到上面那套规则，
+  `emotion_events.note` 记 `rules:fallback:<原因>`；`/状态` 有一行「判定器」统计近 24 小时。
+
+完整契约、兜底矩阵与评测命令见 [`docs/emotion-appraiser.md`](emotion-appraiser.md)。
+
 ## 6. 长度与截断
 
 | 段 | order | 上限（码点） | 内容 |

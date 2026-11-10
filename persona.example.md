@@ -151,7 +151,10 @@
       "dominance": 50,
       "energy": 60
     },
-    "halfLifeHours": 6
+    "halfLifeHours": 6,
+    "appraiser": "rules",
+    "appraiseModel": null,
+    "appraiseTimeoutMs": 8000
   },
   "version": 1
 }

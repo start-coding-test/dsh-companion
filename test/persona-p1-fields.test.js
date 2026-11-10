@@ -229,6 +229,9 @@ describe('emotion 结构校验（只校验 + 透传，不实现逻辑）', () =>
       enabled: false,
       baseline: { pleasure: 50, arousal: 50, dominance: 50, energy: 60 },
       halfLifeHours: 6,
+      appraiser: 'rules',
+      appraiseModel: null,
+      appraiseTimeoutMs: 8000,
     });
   });
 
@@ -239,7 +242,13 @@ describe('emotion 结构校验（只校验 + 透传，不实现逻辑）', () =>
       halfLifeHours: 24,
     };
     const card = parseCardSource(JSON.stringify({ ...withCard(), emotion }));
-    assert.deepEqual(card.emotion, emotion);
+    // v0.6：判定器三键由规范化补默认值（与 v0.5.2 行为一致：默认走规则）。
+    assert.deepEqual(card.emotion, {
+      ...emotion,
+      appraiser: 'rules',
+      appraiseModel: null,
+      appraiseTimeoutMs: 8000,
+    });
   });
 
   test('emotion 非法类型/越界/超上限分别抛 TypeError', () => {

@@ -69,3 +69,20 @@ node scripts/emotion-report.mjs --confusion test/fixtures/emotion-golden.jsonl
 - 脚本：`scripts/emotion-report.mjs`
 - 标注集：`test/fixtures/emotion-golden.jsonl`
 - 测试：`test/emotion-report.test.js`、`test/emotion-golden.test.js`
+
+## 模型判定器（v0.6）
+
+```powershell
+$env:EMOTION_APPRAISE_BASE_URL = "https://api.example.com/v1"
+$env:EMOTION_APPRAISE_API_KEY  = "<key>"
+$env:EMOTION_APPRAISE_MODEL    = "<model>"
+node scripts/emotion-report.mjs --input test/fixtures/emotion-golden.jsonl --appraiser llm
+```
+
+- 走 OpenAI 兼容的 `POST {base}/chat/completions`（`temperature=0`、`max_tokens=200`），
+  消息用与插件相同的 `buildAppraisalMessages`，解析用同一套严格 `parseAppraisal`。
+- 缺环境变量时退出码 2；单条判定失败**按 `none` 计**并计入 `errors` 列，
+  `noErrors` 不满足即整轮不过。
+- 门槛（`THRESHOLDS_LLM`）：准确率 ≥ **80%**、`blame` 误报 = **0**、中性误触发 ≤ **2/13**、
+  判定失败 = 0。规则模式的 `THRESHOLDS`（85% / 2 / 10%）不变。
+- `golden`（207 句）是样本内回归参考，**不是**发版门；发版门由评审方在留出集上跑。

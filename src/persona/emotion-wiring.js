@@ -118,6 +118,8 @@ export function runEmotionTurn(input = {}) {
     quiet = false,
     scope = 'main',
     text = '',
+    note,
+    skipEvent = false,
   } = input;
   void config;
 
@@ -153,7 +155,11 @@ export function runEmotionTurn(input = {}) {
   const baselineDecayed = decay(reference, { baseline, halfLifeHours, nowMs: now });
 
   // V52：名字来自人格卡（不写死），作为「她」的称呼参与对象判定。
-  const classified = classify(typeof text === 'string' ? text : '', { name: card?.name });
+  // v0.6-E2：llm 模式下 pre-step 不等判定，只做衰减与描述（skipEvent=true），
+  // 事件由后台判定回来后走 applyClassifiedEvent 单独落库，避免同一事件入账两次。
+  const classified = skipEvent
+    ? { type: 'none', confidence: 0 }
+    : classify(typeof text === 'string' ? text : '', { name: card?.name });
   let state = decayed;
   let event = null;
   if (classified.confidence > 0 && classified.confidence < AMBIGUOUS_CONFIDENCE) {
@@ -210,6 +216,7 @@ export function runEmotionTurn(input = {}) {
         at: event.at,
         type: event.type,
         deltas: event.deltas,
+        ...(typeof note === 'string' && note !== '' ? { note } : {}),
       });
     }
   }
@@ -219,6 +226,137 @@ export function runEmotionTurn(input = {}) {
     event,
     // V50-M1：把本轮事件类型交给 describe，blame / vent 用各自的专属句；
     // 其余类型（含 ambient）与不传第二参时完全一致。
+    line: describe(state, event === null ? undefined : { eventType: event.type }),
+    changed,
+  };
+}
+
+/**
+ * 把一次「已经判定好」的情绪事件落库（v0.6-E2 的后台判定路径）。
+ *
+ * 与 runEmotionTurn 的区别：不调用规则分类器，直接采用传入的
+ * `{type, confidence}`；仍做「朝当前目标衰减 → 叠加事件 → 写库 → 描述」，
+ * 因此晚到的判定会按到达时刻正确衰减，不会把时间倒流。
+ *
+ * @param {object} input
+ * @param {object} input.store
+ * @param {object} [input.card]
+ * @param {string} [input.scope='main']
+ * @param {{type: string, confidence: number}} input.classified
+ * @param {number} [input.intensity] 省略时按 intensityFor(confidence) 计算
+ * @param {string} [input.note] 来源标记（llm / rules / rules:fallback:<原因>）
+ * @param {number} input.now
+ * @param {number} input.hour
+ * @param {number} input.minute
+ * @param {boolean} [input.quiet]
+ * @returns {{state: object, event: object|null, line: string, changed: boolean}}
+ */
+export function applyClassifiedEvent(input = {}) {
+  const {
+    store,
+    card,
+    scope = 'main',
+    classified,
+    intensity,
+    note,
+    now,
+    hour,
+    minute,
+    quiet = false,
+  } = input;
+
+  if (!store || typeof store.getEmotionState !== 'function'
+    || typeof store.setEmotionState !== 'function'
+    || typeof store.appendEmotionEvent !== 'function') {
+    throw new TypeError('[emotion-wiring] store must provide emotion state/event methods');
+  }
+  if (!Number.isFinite(now)) {
+    throw new TypeError('[emotion-wiring] now must be a finite millisecond timestamp');
+  }
+  if (!Number.isFinite(hour) || !Number.isFinite(minute)) {
+    throw new TypeError('[emotion-wiring] hour and minute must be finite numbers');
+  }
+  if (classified === null || typeof classified !== 'object'
+    || typeof classified.type !== 'string'
+    || !Number.isFinite(classified.confidence)) {
+    throw new TypeError('[emotion-wiring] classified must be {type, confidence}');
+  }
+
+  const emotion = card?.emotion ?? {};
+  const baseline = emotion.baseline ?? DEFAULT_BASELINE;
+  const halfLifeHours = emotion.halfLifeHours ?? 6;
+  const target = targetFor({ baseline, hour, minute, quiet: quiet === true });
+
+  const stored = store.getEmotionState(scope);
+  const reference = stored ?? createState({ nowMs: now, baseline });
+  const seed = stored ?? createState({ nowMs: now, baseline: target });
+  const decayed = decay(seed, { baseline, target, halfLifeHours, nowMs: now });
+
+  let state = decayed;
+  let event = null;
+
+  if (classified.type === 'none' || classified.confidence <= 0) {
+    // 判不出事件：只记一条零增量审计，状态不动（口径与 v0.5.2 的模糊档一致）。
+    if (typeof note === 'string' && note !== '') {
+      store.appendEmotionEvent(scope, {
+        at: now,
+        type: 'none',
+        deltas: { pleasure: 0, arousal: 0, dominance: 0, energy: 0 },
+        note,
+      });
+    }
+  } else if (classified.confidence < AMBIGUOUS_CONFIDENCE) {
+    store.appendEmotionEvent(scope, {
+      at: now,
+      type: classified.type,
+      deltas: { pleasure: 0, arousal: 0, dominance: 0, energy: 0 },
+      ...(typeof note === 'string' && note !== '' ? { note } : {}),
+    });
+    event = {
+      at: now,
+      type: classified.type,
+      deltas: { pleasure: 0, arousal: 0, dominance: 0, energy: 0 },
+    };
+  } else {
+    const history = readHistory(store, scope);
+    const applied = applyEvent(decayed, {
+      type: classified.type,
+      intensity: Number.isFinite(intensity) ? intensity : intensityFor(classified.confidence),
+      nowMs: now,
+      hour: 16,
+      minute: 0,
+      baseline,
+      history,
+    });
+    state = applied.state;
+    const deltas = {};
+    for (const dim of DIMENSIONS) deltas[dim] = round2(state[dim] - decayed[dim]);
+    event = { at: applied.event.at, type: applied.event.type, deltas };
+    store.appendEmotionEvent(scope, {
+      at: event.at,
+      type: event.type,
+      deltas,
+      ...(typeof note === 'string' && note !== '' ? { note } : {}),
+    });
+  }
+
+  let changed = false;
+  for (const dim of DIMENSIONS) {
+    if (Math.abs(state[dim] - reference[dim]) > SIGNIFICANT_DELTA) changed = true;
+  }
+
+  store.setEmotionState(scope, {
+    pleasure: state.pleasure,
+    arousal: state.arousal,
+    dominance: state.dominance,
+    energy: state.energy,
+    updatedAt: state.updatedAt,
+    lastEventAt: event === null ? undefined : event.at,
+  });
+
+  return {
+    state,
+    event,
     line: describe(state, event === null ? undefined : { eventType: event.type }),
     changed,
   };

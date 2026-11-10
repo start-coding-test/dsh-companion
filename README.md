@@ -4,7 +4,17 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.5.2 已发布**（2026-11-11，tag `v0.5.2`）。`node --test` 全绿：1184 个用例 / 33 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.6.0 已发布**（2026-11-11，tag `v0.6.0`）。`node --test` 全绿：1205 个用例 / 33 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+
+## v0.6.0 变更摘要
+
+- **判定交给模型、物理量留给代码**：卡里 `emotion.appraiser: "llm"` 时，情绪事件由一次严格的 JSON 判定产生（`{target,type,intensity,confidence}`），代码只负责衰减、节律、写库与那句话。默认仍是 `rules`，行为与 v0.5.2 一致。
+- **不阻塞对话**：pre-step 只做衰减与描述就返回，判定在后台进行，结果下一轮生效；每个作用域最多 1 个在途 + 1 个排队，新句覆盖旧句。
+- **失败有兜底**：非 JSON、枚举外、越界、超时、预算拒绝、没有模型，全回落 v0.5.2 规则；同一事件只入账一次。
+- **可观测**：`emotion_events.note` 记 `llm` / `rules` / `rules:fallback:<原因>`，`/状态` 增「判定器」行（来源占比、平均与 p95 延迟、最近失败）。
+- **评测**：`node scripts/emotion-report.mjs --appraiser llm --input test/fixtures/emotion-golden.jsonl`（端点 / 密钥 / 模型取环境变量），模型门槛 准确率 ≥80% / blame 误报 0 / 中性 ≤2/13 / 判定失败 0。
+
+
 
 ## v0.5.2 变更摘要
 

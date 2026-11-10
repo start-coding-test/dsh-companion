@@ -8,6 +8,7 @@
  *   node scripts/emotion-report.mjs <文本文件>
  *   node scripts/emotion-report.mjs -                      # 从 stdin 读文本
  *   node scripts/emotion-report.mjs --confusion <golden.jsonl|->
+ *   node scripts/emotion-report.mjs --input <golden.jsonl> --appraiser llm
  *   node scripts/emotion-report.mjs <golden.jsonl>         # 自动识别 JSONL
  *
  * 只读：不打开数据库、不写任何文件，结果全部走 stdout。
@@ -19,6 +20,7 @@ import { stdin } from 'node:process';
 import { pathToFileURL } from 'node:url';
 
 import { EVENT_TYPES, classify } from '../src/persona/emotion.js';
+import { buildAppraisalMessages, parseAppraisal } from '../src/persona/emotion-appraise.js';
 
 /** 发版门（与 test/emotion-golden.test.js 共用）。 */
 export const THRESHOLDS = Object.freeze({
@@ -30,6 +32,13 @@ export const THRESHOLDS = Object.freeze({
   neutralFalseTriggerRate: 0.1,
 });
 
+/** 模型判定器的门槛（评审方留出集口径：准确率 ≥80%、blame 误报 = 0、中性误触发 ≤2/13）。 */
+export const THRESHOLDS_LLM = Object.freeze({
+  accuracy: 0.8,
+  blameFalsePositives: 0,
+  neutralFalseTriggerRate: 2 / 13,
+});
+
 /** 混淆矩阵的固定标签顺序：12 个事件类型 + none。 */
 const LABELS = Object.freeze([...EVENT_TYPES, 'none']);
 const LABEL_SET = new Set(LABELS);
@@ -38,6 +47,8 @@ const USAGE = [
   '用法：',
   '  node scripts/emotion-report.mjs <文本文件|->                 按行统计类型分布',
   '  node scripts/emotion-report.mjs --confusion <golden.jsonl|->  混淆矩阵与门槛',
+  '  node scripts/emotion-report.mjs --input <golden.jsonl> --appraiser llm',
+  '                                            模型判定器（环境变量提供端点、密钥、模型）',
   '  JSONL（每行 {"text": "...", "type": "..."}）会自动按混淆矩阵模式处理。',
 ].join('\n');
 
@@ -182,9 +193,52 @@ export function looksLikeGolden(text) {
  *   checks:{accuracy:boolean,blameFalsePositives:boolean,neutralFalseTriggerRate:boolean}
  * }}
  */
+/**
+ * 规则分类器逐条判定后出报告（与 test/emotion-golden.test.js 共用）。
+ * @param {Array<{text:string, type:string}>} records
+ */
 export function analyzeGolden(records) {
+  return buildConfusionReport(
+    records,
+    records.map((record) => classify(record.text)),
+    THRESHOLDS,
+  );
+}
+
+/**
+ * 逐条用异步判定器（模型或 mock）判定后出报告。
+ * 判定失败记为 error（按 none 计入矩阵），并在报告里单列条数。
+ *
+ * @param {Array<{text:string, type:string}>} records
+ * @param {(text:string) => Promise<{type:string, confidence:number, reason?:string}>} appraise
+ */
+export async function analyzeGoldenWithAppraiser(records, appraise) {
+  if (typeof appraise !== 'function') {
+    throw new TypeError('analyzeGoldenWithAppraiser(records, appraise): appraise must be a function');
+  }
+  if (!Array.isArray(records) || records.length === 0) throw new Error('标注集为空');
+  const results = [];
+  for (const record of records) {
+    try {
+      const verdict = await appraise(record.text);
+      results.push({ type: verdict.type, confidence: verdict.confidence });
+    } catch (error) {
+      results.push({
+        type: 'none',
+        confidence: 0,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return buildConfusionReport(records, results, THRESHOLDS_LLM);
+}
+
+function buildConfusionReport(records, results, thresholds) {
   if (!Array.isArray(records)) {
-    throw new TypeError('analyzeGolden(records): records must be an array');
+    throw new TypeError('buildConfusionReport(records, results, thresholds): records must be an array');
+  }
+  if (!Array.isArray(results) || results.length !== records.length) {
+    throw new TypeError('buildConfusionReport(records, results, thresholds): results length mismatch');
   }
   if (records.length === 0) throw new Error('标注集为空');
 
@@ -199,10 +253,13 @@ export function analyzeGolden(records) {
   let blameFalsePositives = 0;
   let neutralTotal = 0;
   let neutralTriggered = 0;
+  let errors = 0;
 
-  for (const record of records) {
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index];
     const expected = record.type;
-    const result = classify(record.text);
+    const result = results[index];
+    if (result.error !== undefined) errors += 1;
     const predicted = result.type;
     support.set(expected, (support.get(expected) ?? 0) + 1);
     predictedCounts.set(predicted, (predictedCounts.get(predicted) ?? 0) + 1);
@@ -241,9 +298,10 @@ export function analyzeGolden(records) {
   });
 
   const checks = {
-    accuracy: accuracy >= THRESHOLDS.accuracy,
-    blameFalsePositives: blameFalsePositives <= THRESHOLDS.blameFalsePositives,
-    neutralFalseTriggerRate: neutralRate <= THRESHOLDS.neutralFalseTriggerRate,
+    accuracy: accuracy >= thresholds.accuracy,
+    blameFalsePositives: blameFalsePositives <= thresholds.blameFalsePositives,
+    neutralFalseTriggerRate: neutralRate <= thresholds.neutralFalseTriggerRate,
+    noErrors: errors === 0,
   };
   return {
     total: records.length,
@@ -255,7 +313,10 @@ export function analyzeGolden(records) {
     blameFalsePositives,
     neutral: { total: neutralTotal, triggered: neutralTriggered, rate: neutralRate },
     failures,
-    passed: checks.accuracy && checks.blameFalsePositives && checks.neutralFalseTriggerRate,
+    errors,
+    thresholds,
+    passed: checks.accuracy && checks.blameFalsePositives
+      && checks.neutralFalseTriggerRate && checks.noErrors,
     checks,
   };
 }
@@ -317,12 +378,15 @@ export function renderConfusion(report, source = '') {
 
   lines.push('');
   lines.push(`总体准确率：${report.correct}/${report.total} = ${percent(report.accuracy)}`
-    + `（门槛 ≥ ${percent(THRESHOLDS.accuracy)}，${report.checks.accuracy ? '通过' : '未通过'}）`);
+    + `（门槛 ≥ ${percent(report.thresholds.accuracy)}，${report.checks.accuracy ? '通过' : '未通过'}）`);
   lines.push(`blame 误报：${report.blameFalsePositives} 句`
-    + `（门槛 ≤ ${THRESHOLDS.blameFalsePositives}，${report.checks.blameFalsePositives ? '通过' : '未通过'}）`);
+    + `（门槛 ≤ ${report.thresholds.blameFalsePositives}，${report.checks.blameFalsePositives ? '通过' : '未通过'}）`);
   lines.push(`中性句误触发率：${report.neutral.triggered}/${report.neutral.total} = ${percent(report.neutral.rate)}`
-    + `（门槛 ≤ ${percent(THRESHOLDS.neutralFalseTriggerRate)}，`
+    + `（门槛 ≤ ${percent(report.thresholds.neutralFalseTriggerRate)}，`
     + `${report.checks.neutralFalseTriggerRate ? '通过' : '未通过'}）`);
+  if (report.errors > 0) {
+    lines.push(`判定失败：${report.errors} 句（判定器报错按 none 计入，门槛要求 0 句）`);
+  }
   lines.push(`结论：${report.passed ? '通过（退出码 0）' : '未通过（退出码 1）'}`);
 
   if (report.failures.length > 0) {
@@ -380,6 +444,129 @@ async function readInput(arg) {
   return readFile(arg, 'utf8');
 }
 
+
+/** 判定器环境变量的候选名（先专用、再通用 OpenAI 兼容名）。 */
+const APPRAISE_ENV = Object.freeze({
+  baseUrl: Object.freeze(['EMOTION_APPRAISE_BASE_URL', 'OPENAI_BASE_URL']),
+  apiKey: Object.freeze(['EMOTION_APPRAISE_API_KEY', 'OPENAI_API_KEY']),
+  model: Object.freeze(['EMOTION_APPRAISE_MODEL', 'OPENAI_MODEL']),
+});
+
+/** @param {readonly string[]} names @param {Record<string, string | undefined>} env */
+function readEnv(names, env) {
+  for (const name of names) {
+    const value = env[name];
+    if (typeof value === 'string' && value.trim() !== '') return value.trim();
+  }
+  return '';
+}
+
+/**
+ * 用 OpenAI 兼容端点做判定（只读：不写库、不落盘）。
+ * 端点、密钥、模型全部从环境变量取，命令行不接受明文密钥。
+ *
+ * @param {Record<string, string | undefined>} [env]
+ * @param {typeof fetch} [fetchImpl]
+ * @returns {(text:string) => Promise<{type:string, confidence:number}>}
+ */
+export function createLlmJudge(env = process.env, fetchImpl = fetch) {
+  const baseUrl = readEnv(APPRAISE_ENV.baseUrl, env).replace(/\/+$/u, '');
+  const apiKey = readEnv(APPRAISE_ENV.apiKey, env);
+  const model = readEnv(APPRAISE_ENV.model, env);
+  if (baseUrl === '' || apiKey === '' || model === '') {
+    const missing = [
+      baseUrl === '' ? APPRAISE_ENV.baseUrl.join('|') : '',
+      apiKey === '' ? APPRAISE_ENV.apiKey.join('|') : '',
+      model === '' ? APPRAISE_ENV.model.join('|') : '',
+    ].filter((name) => name !== '').join('、');
+    throw new Error(`缺少环境变量：${missing}`);
+  }
+  return async (text) => {
+    const messages = buildAppraisalMessages({ text, lastReply: '', cardName: '' });
+    const response = await fetchImpl(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify({ model, messages, temperature: 0, max_tokens: 200 }),
+    });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const raw = data?.choices?.[0]?.message?.content;
+    const verdict = parseAppraisal(raw);
+    return { type: verdict.type, confidence: verdict.confidence };
+  };
+}
+
+/**
+ * 解析命令行参数。
+ * @param {string[]} args
+ * @returns {{mode:'auto'|'confusion'|'llm', input:string}}
+ */
+export function parseArgs(args) {
+  let confusion = false;
+  let appraiser = 'rules';
+  let input = '';
+  for (let index = 0; index < args.length; index += 1) {
+    const arg = args[index];
+    if (arg === '--confusion') {
+      confusion = true;
+      continue;
+    }
+    if (arg === '--input') {
+      const value = args[index + 1];
+      if (value === undefined) throw new Error('--input 需要一个文件路径');
+      input = value;
+      index += 1;
+      continue;
+    }
+    if (arg === '--appraiser') {
+      const value = args[index + 1];
+      if (value !== 'rules' && value !== 'llm') throw new Error('--appraiser 只能是 rules 或 llm');
+      appraiser = value;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith('-') && arg !== '-') throw new Error(`未知参数：${arg}`);
+    if (input !== '') throw new Error('只能给一个输入文件');
+    input = arg;
+  }
+  if (input === '') throw new Error('缺少输入文件');
+  if (appraiser === 'llm') return { mode: 'llm', input };
+  return { mode: confusion ? 'confusion' : 'auto', input };
+}
+
+/**
+ * 运行模型判定器模式。
+ * @param {string} sourceFile
+ * @param {Record<string,string|undefined>} env
+ * @returns {Promise<number>} 退出码
+ */
+async function runLlm(sourceFile, env) {
+  let text;
+  try {
+    text = await readInput(sourceFile);
+  } catch (error) {
+    process.stderr.write(`读取失败：${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+  let records;
+  try {
+    records = parseGolden(text);
+  } catch (error) {
+    process.stderr.write(`标注集无效：${error instanceof Error ? error.message : String(error)}\n`);
+    return 1;
+  }
+  let judge;
+  try {
+    judge = createLlmJudge(env);
+  } catch (error) {
+    process.stderr.write(`判定器不可用：${error instanceof Error ? error.message : String(error)}\n`);
+    return 2;
+  }
+  const report = await analyzeGoldenWithAppraiser(records, judge);
+  process.stdout.write(renderConfusion(report, `${sourceFile === '-' ? 'stdin' : sourceFile}，模型判定`));
+  return report.passed ? 0 : 1;
+}
+
 /**
  * 运行混淆矩阵模式。
  * @param {string} sourceFile 文件路径或 '-'
@@ -414,32 +601,32 @@ async function main() {
     process.exitCode = 2;
     return;
   }
-  if (args[0] === '--confusion') {
-    const target = args[1];
-    if (target === undefined) {
-      process.stderr.write(`${USAGE}\n`);
-      process.exitCode = 2;
-      return;
-    }
-    process.exitCode = await runConfusion(target, true);
-    return;
-  }
-  if (args.length > 1) {
-    process.stderr.write(`${USAGE}\n`);
+  let parsedArgs;
+  try {
+    parsedArgs = parseArgs(args);
+  } catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n${USAGE}\n`);
     process.exitCode = 2;
     return;
   }
-  const arg = args[0];
+  if (parsedArgs.mode === 'llm') {
+    process.exitCode = await runLlm(parsedArgs.input, process.env);
+    return;
+  }
+  if (parsedArgs.mode === 'confusion') {
+    process.exitCode = await runConfusion(parsedArgs.input, true);
+    return;
+  }
   let text;
   try {
-    text = await readInput(arg);
+    text = await readInput(parsedArgs.input);
   } catch (error) {
     process.stderr.write(`读取失败：${error instanceof Error ? error.message : String(error)}\n`);
     process.exitCode = 1;
     return;
   }
   if (looksLikeGolden(text)) {
-    process.exitCode = await runConfusion(arg, false);
+    process.exitCode = await runConfusion(parsedArgs.input, false);
     return;
   }
   process.stdout.write(render(analyze(text)));
