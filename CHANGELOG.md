@@ -4,7 +4,7 @@
 
 ## [0.5.0] - 2026-11-10
 
-按用户「人格 v2」清单实现四项：P1 身份由人格卡驱动、P2 遮蔽宿主默认人设、P3 情绪状态、P4 语气细节。**内置卡且未启用情绪时，`persona:*` 三段与闲聊提示词与 v0.4.12 逐字节一致**（基线 `test/fixtures/persona-v0412.json`，另有独立 worktree 对比复核）。schema 升到 **v14**（新增情绪两表），记忆 / 提醒 / 线程行为未改，零新增运行时依赖。本次发布 **1109 个用例 / 28 个套件**，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过；发布门 round A/B PASS，round C 无模型凭据 **SKIP（不计 PASS）**。
+按用户「人格 v2」清单实现四项：P1 身份由人格卡驱动、P2 遮蔽宿主默认人设、P3 情绪状态、P4 语气细节。**内置卡且未启用情绪时，`persona:*` 三段与闲聊提示词与 v0.4.12 逐字节一致**（基线 `test/fixtures/persona-v0412.json`，另有独立 worktree 对比复核）。schema 升到 **v14**（新增情绪两表），记忆 / 提醒 / 线程行为未改，零新增运行时依赖。本次发布 **1111 个用例 / 28 个套件**，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过；发布门 round A/B PASS，round C 无模型凭据 **SKIP（不计 PASS）**。
 
 ### Added
 
@@ -16,6 +16,7 @@
 
 ### Fixed
 
+- **违禁表达的输出过滤漏渲染**（`2a89403`，复审 r2 的 M-4）：`bannedPhrases` 里的 `{{char}}` / `{{user}}` 之前在提示词渲染、输出过滤仍用原短语，模型说出渲染后的违禁语也拦不住；现在提示词与过滤共用 `renderBannedPhrases`，非字符串项直接丢弃（L-9）。
 - **`tone.voice` 与 `mes_example` 同时存在时示例被丢弃**（`2d26cd4`）：`voiceText` 原先在 `tone.voice` 非空时早返回，`mes_example` 静默丢失；改为两段都进（说话方式在前），单字段路径输出不变。
 
 ### Changed
@@ -26,7 +27,7 @@
 ### Tests
 
 - 新增 `test/persona-card.test.js` / `test/chat-card.test.js` / `test/persona-voice.test.js` / `test/emotion.test.js` / `test/emotion-store.test.js` / `test/emotion-wiring.test.js` / `test/persona-shadow.test.js` 与 `test/e2e/persona-card.test.js`（内置卡逐行等值 v0.4.12（与 v0.4.11 相同），情绪行与部署行按新增断言）。
-- 合计 **1109** 用例 / **28** 套件，三时区通过。
+- 合计 **1111** 用例 / **28** 套件，三时区通过（复审 r3 追加 2 例）。
 
 ## [0.4.12] - 2026-11-06
 

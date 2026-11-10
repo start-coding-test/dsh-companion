@@ -86,18 +86,6 @@ export function chatEligibility({
   return { ok: true, reason: 'ok' };
 }
 
-/**
- * 构造闲聊提示词。
- *
- * v0.5.0（P1）：
- * - 第 1 行来自 `card.chatIdentity`（缺省与 v0.4.12 逐字节一致）；
- * - `mes_example` 非空时在「语气」行之后加一行口吻参考（第一段，≤300 码点）；
- * - `emotionLine` 为非空字符串时在末尾追加 `你此刻：<...>`（只留钩子，不实现情绪）。
- *
- * @param {{card?: object, recentTopics?: Array<{title?: string, summary?: string}>,
- *          recallSummary?: string, messageCount?: number, emotionLine?: string}} input
- * @returns {string}
- */
 /** 卡的称呼上下文：name/address 缺省时分别回落「珞然」与「你」。 */
 function identityOf(card) {
   const name = typeof card?.name === 'string' && card.name.trim() !== '' ? card.name.trim() : '珞然';
@@ -121,6 +109,19 @@ export function renderBannedPhrases(card = {}) {
     .filter((phrase) => phrase !== '');
 }
 
+/**
+ * 构造闲聊提示词。
+ *
+ * v0.5.0（P1）：
+ * - 第 1 行来自 `card.chatIdentity`（缺省与 v0.4.12 逐字节一致）；
+ * - 用户卡再加一行「人设要点」（description，≤200 码点；内置卡不输出）；
+ * - `mes_example` 非空时在「语气」行之后加一行口吻参考（第一段，≤300 码点）；
+ * - `emotionLine` 为非空字符串时在末尾追加 `你此刻：<...>`。
+ *
+ * @param {{card?: object, recentTopics?: Array<{title?: string, summary?: string}>,
+ *          recallSummary?: string, messageCount?: number, emotionLine?: string}} input
+ * @returns {string}
+ */
 export function buildChatPrompt({
   card = {},
   recentTopics = [],
