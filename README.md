@@ -4,7 +4,16 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.4.12 已发布**（2026-11-06）。`node --test` 全绿：964 个用例 / 16 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.5.0 已发布**（2026-11-10）。`node --test` 全绿：1103 个用例 / 28 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+
+## v0.5.0 变更摘要
+
+- **P1 身份由人格卡驱动**：人格段不再写死「私人管家」，身份 / 性格 / 关系 / 说话方式全从卡读取；支持直接加载 Character Card V2/V3 的 JSON（`{{char}}` / `{{user}}` 只在渲染输出替换，`character_book` 忽略并 warn）。新增 `persona:voice`（order 95），core / voice 上限各 1200 码点，超长截断并返回诊断；`taboos` 为空时省略「禁区」整行。
+- **P2 遮蔽宿主默认人设**：新增 `persona.shadowDeployment`（`off` 默认 / `rewrite` / `takeover`）。宿主 0.4.x 只有 `deployment:persona-prefix`(order 0) 与 `deployment:persona-suffix`(10200)，只能经 `system-prompt/assemble` 改写；`off` 时不注册监听。`/状态` 增「部署人设」行。
+- **P3 情绪状态（默认关闭）**：卡里 `emotion.enabled=true` 才启用；PAD + 精力纯函数，半衰期默认 6h 回归基线、昼夜节律、安静时段联动；第一版规则评估（中文词典 + 10 类事件）不调模型；每轮注入一句「你此刻：…」（独立 user 消息、不含数字、不进 system）；schema **v14** 两表，重启不丢，「忘掉」重置，导出 / 导入覆盖两表。
+- **P4 语气细节**：`memoryCitation`（`explicit` / `natural`）；闲聊提示词使用卡里的 `description`（非内置卡）与 `mes_example`；情绪启用时带状态句。
+- **一致性**：内置卡 + 情绪关时，`persona:*` 三段与闲聊提示词与 v0.4.12 **逐字节一致**（基线 `test/fixtures/persona-v0412.json`，另有独立 worktree 对比复核）。
+- **范围**：schema v14；记忆 / 提醒 / 线程行为未改；零新增运行时依赖。完整条目见 [CHANGELOG](CHANGELOG.md)（0.5.0 段），字段与部署见 [docs/persona-card.md](docs/persona-card.md)、[docs/persona-shadow.md](docs/persona-shadow.md)、[docs/deploy-v050.md](docs/deploy-v050.md)。
 
 ## v0.4.12 变更摘要
 
