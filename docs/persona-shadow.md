@@ -34,7 +34,7 @@ persona:
 | 值 | 行为 |
 | --- | --- |
 | `off`（默认，也接受 `false`） | **完全不注册** `system-prompt/assemble` 监听器。提示装配路径与旧版本逐字节一致（`/状态` 会多「部署人设：宿主默认」一行）。 |
-| `rewrite`（`true` 等价） | 把 `deployment:persona-prefix` 的 `text` 换成人格卡的 `chatIdentity`（先按卡渲染 `{{char}}` / `{{user}}`）。位置、`interpolate` 等其它属性保留，其余段原样。 |
+| `rewrite`（`true` 等价） | 把 `deployment:persona-prefix` 的 `text` 换成人格卡的 `chatIdentity`（先按卡渲染 `{{char}}` / `{{user}}`）。位置与其它属性保留，但 `interpolate` 强制设为 `false`：替换文本来自人格卡、已按 §4 降级，不能再让宿主插值一遍（v0.5.1，见 [persona-card.md](persona-card.md) §4）。其余段原样。 |
 | `takeover` | 从 assembly 摘掉 `deployment:persona-prefix`，以及 `text` 为空/纯空白的 `deployment:persona-suffix`。非空 suffix 保留并写一次 warn；非字符串 `text` 无法判定为空，按非空保守保留。 |
 
 非法值（`on`、`1`、对象等）在配置归一化阶段 fail-fast：

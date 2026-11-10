@@ -14,7 +14,7 @@ persona:
 
 | 来源 | 形状 | 说明 |
 | --- | --- | --- |
-| 原生卡 | 顶层直接写字段（见 §2） | 支持 `{{char}}` / `{{user}}` 占位符 |
+| 原生卡 | 顶层直接写字段（见 §2） | 支持 `{{char}}` / `{{user}}`；其它占位符降级、HTML 注释剥离（§4） |
 | CCv2 / CCv3 卡 | `{ "spec": "chara_card_v2", "data": { … } }` | 按 §3 映射；`character_book` 忽略并记一条 warning |
 
 原生字段**深合并**（只写要改的子键），**数组整体替换**（`values` / `taboos` / `bannedPhrases`），
@@ -39,7 +39,7 @@ persona:
 | `proactive` | 否 | `{dailyCap, chatPerDay, quietStart, quietEnd}`；与配置重复时**以配置为准**并 warn |
 | `values` / `taboos` / `bannedPhrases` | 否 | 字符串数组；`taboos` 为空时「禁区」整行省略 |
 | `memoryCitation` | 否 | `explicit`（默认，引用记忆说来源与时间）/ `natural`（日常自然化用） |
-| `emotion` | 否 | 见 §4 |
+| `emotion` | 否 | 见 §5 |
 
 ## 3. CCv2 / CCv3 映射
 
@@ -51,7 +51,42 @@ persona:
 `{{char}}` / `{{user}}` 在**渲染输出时**替换成 `name` / `address`，卡内原文保留；凡进入提示词的字段都走这一步（含 `tone.style` / `tone.warmth` / `tone.structure` / `tone.voice` / `tone.notes` / `values` / `taboos` / `bannedPhrases` / `description` / `personality` / `scenario` / `mes_example` / `chatIdentity`）。
 `character_book` 不读、不打印，只记 `character_book_ignored` warning。
 
-## 4. 情绪（默认关闭）
+其余 `{{...}}` 占位符与卡里的 HTML 注释怎么处理，见 §4。
+
+## 4. 模板占位符与 HTML 注释
+
+**只认两个占位符**：`{{char}}` → `name`、`{{user}}` → `address`，在**渲染输出时**替换，
+卡内原文保留。
+
+其余 `{{...}}`（酒馆 / SillyTavern 扩展，例如 `{{random:a,b}}`、`{{time}}`、`{{original}}`、
+`{{model}}`）**不支持**：
+
+- **渲染期降级**：渲染时把残留的 `{{...}}` 改写成单花括号 `{...}`（`{{time}}` → `{time}`、
+  `{{random:a,b}}` → `{random:a,b}`），保证进提示词的文本里没有 `{{`。原因是宿主
+  dsh-system-prompt 的插值器对未注册变量**整轮抛错**（不是忽略），未知占位符原样交出去
+  会让当轮装配直接失败。半截 `{{`（后面没有 `}}`）也会兜底成 `{`。
+- **加载期告警**：卡加载时若发现会被降级的占位符，记一条 `template_placeholder_downgraded`
+  warning；`detail` 里只有占位符**名字**（去重、按出现顺序），不含正文——warning 会进日志，
+  不能把卡内容带出去。
+- **宿主不二次插值**：`persona:*` 段注册时带 `interpolate: false`，宿主原样使用这些文本；
+  `persona.shadowDeployment: rewrite` 替换后的段同样标记为不插值（见 [persona-shadow.md](persona-shadow.md)）。
+
+**HTML 注释**：`<!-- ... -->`（非贪婪、可跨行、可多处）在**卡加载时**从所有文本字段剥离，
+不进上下文。覆盖 `description` / `personality` / `scenario` / `mes_example` / `first_mes` /
+`post_history_instructions` / `chatIdentity`、`tone.*`、`values[]` / `taboos[]` /
+`bannedPhrases[]`。渲染函数里还有一层兜底剥离，防止运行期拼进来的文本带注释。
+
+- 未闭合的 `<!--` **保守原样保留**（宁可留下注释，也不吞掉后面的正文），并记一条
+  `html_comment_unterminated` warning；`detail` 是字段路径（如 `["description"]`）。
+- 注释剥完为空、而该字段本身必填（如 `tone.style`）时，按空字段报错——别把必填内容整段
+  写进注释。
+- 内置卡既没有多余占位符也没有注释，所以 v0.5.1 的渲染输出与 v0.5.0 逐字节一致。
+
+**不支持的酒馆扩展**：`character_book`（世界书）直接忽略，只记 `character_book_ignored`；
+`{{random}}` / `{{pick}}` / `{{time}}` / `{{time_UTC}}` / `{{original}}` 等都不会真的求值，
+只会被降级成字面量 `{random}` / `{pick}` / `{time}` …… 模型看到的是普通文本。
+
+## 5. 情绪（默认关闭）
 
 ```json
 "emotion": {
@@ -70,7 +105,7 @@ persona:
 
 「忘掉」会把该会话的情绪状态与事件一起清掉。
 
-## 5. 长度与截断
+## 6. 长度与截断
 
 | 段 | order | 上限（码点） | 内容 |
 | --- | --- | --- | --- |
@@ -82,14 +117,17 @@ persona:
 超长按码点截断，并写一条 `section_truncated` warning（含段名、实际长度与上限，不含正文），
 在插件日志里能看到。
 
-## 6. 完整示例
+四段注册时都带 `interpolate: false`（v0.5.1）：段文本是卡内容渲染后的产物，宿主不再对它们
+做 `{{...}}` 插值，详见 §4。
+
+## 7. 完整示例
 
 `examples/persona-lan.json` 是一张可直接用的「温柔大姐姐」卡：把
 `description` / `personality` / `scenario` / `mes_example` / `first_mes` /
 `post_history_instructions` / `tone.voice` / `emotion` 都填满了，`memoryCitation` 用 `natural`。
 复制成 `persona.json`、配上 `persona.cardPath` 就能用。
 
-## 7. 出错时
+## 8. 出错时
 
 `/状态` 会显示三种来源之一：
 

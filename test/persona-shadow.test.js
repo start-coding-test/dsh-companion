@@ -195,14 +195,15 @@ test('off 是默认值：不传 persona 也不注册 assemble 监听', (t) => {
 
 // ------------------------------------------------------- rewrite / takeover 纯函数
 
-test('rewrite：只换 prefix.text，位置与其它段引用保留，输入数组未被改', () => {
+test('rewrite：只换 prefix.text 并标记 interpolate:false，位置与其它段引用保留，输入数组未被改', () => {
   const sections = sectionsFixture();
   const snapshot = structuredClone(sections);
   const result = applyDeploymentShadow(sections, { mode: 'rewrite', personaText: 'CARD IDENTITY' });
   assert.notEqual(result, sections);
   assert.equal(result.length, 4);
   assert.equal(result[1].text, 'CARD IDENTITY');
-  assert.deepEqual(result[1], { ...snapshot[1], text: 'CARD IDENTITY' });
+  // v0.5.1 V50-M2：替换文本来自卡、已降级，必须显式标记不插值（其余字段不变）。
+  assert.deepEqual(result[1], { ...snapshot[1], text: 'CARD IDENTITY', interpolate: false });
   assert.equal(result[0], sections[0]);
   assert.equal(result[2], sections[2]);
   assert.equal(result[3], sections[3]);

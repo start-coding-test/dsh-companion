@@ -61,9 +61,10 @@ const PROTOCOL_NATURAL_LINE = '- 日常对话里自然化用记忆，不必逐�
  * 会无声地继续用内置卡，问题要到线上才暴露。
  *
  * v0.5.0：保留旧签名，内部调 buildSectionsWithDiagnostics() 并丢弃 warnings。
+ * v0.5.1：每段带 `interpolate: false`（宿主不再对段文本做 `{{...}}` 插值）。
  *
  * @param {object} card 人格卡（loadPersonaCard/loadCard 的返回值）
- * @returns {ReadonlyArray<{name:string, order:number, text:string}>}
+ * @returns {ReadonlyArray<{name:string, order:number, text:string, interpolate:false}>}
  */
 export function buildSections(card) {
   return buildSectionsWithDiagnostics(card).sections;
@@ -75,8 +76,11 @@ export function buildSections(card) {
  * `{code:'section_truncated', section:'persona:core', chars:<原始码点数>, max:<上限>}`。
  * 只含段名/长度，不含正文，可直接进 warn 日志。
  *
+ * 每段额外带 `interpolate: false`：段文本来自卡内容，不能让宿主再当模板插值一遍。
+ *
  * @param {object} card
- * @returns {Readonly<{sections: ReadonlyArray<{name:string, order:number, text:string}>,
+ * @returns {Readonly<{sections: ReadonlyArray<{name:string, order:number, text:string,
+ *   interpolate:false}>,
  *   warnings: ReadonlyArray<{code:'section_truncated', section:string, chars:number, max:number}>}>}
  */
 export function buildSectionsWithDiagnostics(card) {
@@ -243,12 +247,18 @@ function render(card, value) {
 
 /**
  * 渲染 + 截断一段，并按需收集诊断。
+ *
+ * v0.5.1 V50-M2：每段都带 `interpolate: false`。段文本是卡内容渲染后的产物，可能
+ * 含卡里写的 `{...}`（甚至半截 `{{`）；宿主 dsh-system-prompt 会对没标记的段做
+ * `{{...}}` 插值，遇到未注册变量直接整轮抛错。标成 false 让宿主原样使用这段文本。
+ * 内置卡只含 `{{char}}`/`{{user}}`，渲染后没有 `{{`，标记与否输出逐字节一致。
+ *
  * @param {string} name
  * @param {number} order
  * @param {string} raw
  * @param {number} max
  * @param {Array<object>} warnings
- * @returns {{name:string, order:number, text:string}}
+ * @returns {{name:string, order:number, text:string, interpolate:false}}
  */
 function renderSection(name, order, raw, max, warnings) {
   const chars = [...raw].length;
@@ -256,5 +266,5 @@ function renderSection(name, order, raw, max, warnings) {
   if (chars > max) {
     warnings.push({ code: 'section_truncated', section: name, chars, max });
   }
-  return { name, order, text: clipped };
+  return { name, order, text: clipped, interpolate: false };
 }

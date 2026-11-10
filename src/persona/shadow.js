@@ -47,6 +47,9 @@ export function normalizeShadowMode(value) {
  * 调用方必须传入 `next()` 已解析出的最终 sections；本函数不调用 next、不写日志
  * 以外的副作用。返回原数组引用表示「无需改动」。
  *
+ * v0.5.1 V50-M2：`rewrite` 把替换段标成 `interpolate: false`——替换文本来自人格卡、
+ * 已降级，宿主不能再当模板插值一遍；`takeover` 摘段，不产生新文本，故不涉及。
+ *
  * @param {unknown} sections
  * @param {{mode: 'off'|'rewrite'|'takeover', personaText?: string,
  *          warn?: (message: string, meta?: object) => void}} options
@@ -83,7 +86,10 @@ export function applyDeploymentShadow(sections, options = {}) {
     }
     const next = sections.map((section) => (
       section?.name === DEPLOYMENT_PREFIX_SECTION
-        ? { ...section, text: personaText }
+        // v0.5.1 V50-M2：替换文本来自人格卡、已按 renderTemplate 降级，必须显式
+        // `interpolate: false`；否则宿主会把它再当模板插值一遍，卡里的
+        // `{time}`/半截 `{{` 仍可能让整轮渲染抛错（其余段保持宿主原样）。
+        ? { ...section, text: personaText, interpolate: false }
         : section
     ));
     return next;
