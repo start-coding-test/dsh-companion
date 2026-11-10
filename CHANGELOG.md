@@ -2,6 +2,36 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.5.1] - 2026-11-11
+
+按用户 v0.5.1 清单修三条必修（V50-H1 节律漂移、V50-M1 规则不区分对象、V50-M2 卡内残留占位符）与情绪注入方式（V50-M3），并补三条低优先项（V50-L1 文档、V50-L2 注释剥离、V50-L3 装配记录）。**schema 仍为 v14**，记忆 / 提醒 / 线程行为未改，零新增运行时依赖。发版门：默认、`TZ=UTC`、`TZ=America/New_York` 三时区 **1162 个用例 / 28 个套件**通过；`plugin-gate` round A/B PASS（round C 无凭据 SKIP）；情绪关闭且卡里没有 `{{x}}` 与 HTML 注释时，`persona:*` 三段与闲聊提示词与 v0.5.0 **逐字节一致**（独立 worktree 对比，`total` / `chatA` / `chatB` 三个哈希全等）。
+
+### Added
+
+- **节律与安静时段改为目标偏移，不再每轮累加（V50-H1）**（`0f06812`）：`decay` 新增 `target`，每轮先按 `targetFor({baseline, hour, minute, quiet})` 算出「基线 + 节律 + 安静偏移」再衰减，只有事件增量留在衰减之后叠加；环境项不再写进状态。实测：11:00 连发 50 条中性消息，末轮四维相对当轮目标的最大偏差 **0.555**（验收线 ±2）；跨日 72 小时每小时一条，全程 pleasure 48–51.49 / arousal 46.85–50.00 / dominance 47.85–50.49 / energy 38.12–48.96，不贴 0 也不贴 100；02:00 安静时段连发 30 条「嗯」，energy 37.65；事件推高后一个半衰期距离 6.250→3.125，误差 0.000。
+- **规则评估区分「冲着她」与「用户诉苦」（V50-M1）**（`0f06812`）：事件类型 10 → **12**，新增 `blame`（含「你」+ 负面词，base 0.74，pleasure −7.9）与 `vent`（用户自述疲惫 / 委屈，base 0.68，pleasure −1.77 且 dominance / energy 不下沉）；`describe` 为两类各配状态句（「现在心里被扎了一下，先稳住，别赌气，话少一点」 / 「现在有点心疼，先接住这份累，陪着就好」）。混合句「今天加班好累，你也不容易」判 vent；「你这几天累不累」仍是 share。
+- **可达性与只读统计脚本**（`0f06812`）：12 类事件各配「至少一句触发」与「常见中性句不触发」两组测试；新增 `scripts/emotion-report.mjs`（只读、只写 stdout，退出码 0/1/2）与 `docs/emotion-report.md`，供中期检查在评测库导出上统计各类命中率与置信度分布，不写库。
+- **卡内模板占位符与 HTML 注释（V50-M2 + V50-L2）**（`cac6b01`）：`renderTemplate` 顺序改为「剥离 `<!-- -->` → 替换 `{{char}}` / `{{user}}` → 其余 `{{x}}` 降级为 `{x}`」，半截 `{{` 也拍平成 `{`；未闭合注释整段保留并给 `html_comment_unterminated`。插件自建的所有段（含状态板与 `rewrite` 改写后的 prefix）统一带 `interpolate: false`，避免宿主把卡文本当提示词变量插值（未注册变量会让整轮注入失败）。warning `template_placeholder_downgraded` 的 detail 只列占位符名字与字段名，不含卡正文。
+- **情绪句改经 `systemPrompt.context`（V50-M3）**（`3b44121`）：新增 `capabilities.systemPromptContext` 与 `context(entry)`，情绪启用时注册 `{name:'companion-emotion', order:320, interpolate:false}` 上下文段，文本不变时宿主不再重复注入；无该能力或情绪关闭时**不注册**。已知限制写进 `docs/emotion-injection.md`：平台对 runtime-context 只做 append（旧快照被 supersede 但不删除）。
+- **`/状态` 增加「最近一次装配」（V50-L3）**（`ec8c9b6`）：一行显示最近装配时间、部署人设状态、prefix 是否被改写、各静态段字数与 8 位短哈希，情绪启用时追加最近一句情绪句；只存内存、只记哈希**不存正文**，动态段（`text` 为函数）按设计不记录。实现见 `src/persona/assembly-record.js`。
+
+### Fixed
+
+- **状态板段与 `boardSection()` 漏 `interpolate: false`**（`c2ff0c1`，合并期自查）：前者由 `src/index.js` 自建对象、不走 `renderSection`，后者是冻结对象，两处都补上，否则状态板文本会被宿主插值。
+- **导入期 warning 的 detail 不进日志**（`c2ff0c1`）：现在 `template_placeholder_downgraded` / `html_comment_unterminated` 的 detail（占位符名、字段名）随 warn 输出，仍不含正文。
+- **`/状态` 的事件标签缺 blame / vent**（合并期）：`EMOTION_EVENT_LABELS` 补「指责」「倾诉」。
+- **`isInjectedMessage` 未跳过 runtime-context**（`3b44121`）：补齐后 `lastUserText` 不会把情绪上下文段当成用户输入。
+
+### Changed
+
+- **文档**：新增 `docs/host-prompt-internals.md`（宿主插值与投影去重的源码证据表）、`docs/emotion-injection.md`（注入方式与限制）、`docs/emotion-report.md`；`docs/persona-card.md` 增「模板占位符与 HTML 注释」一节，`docs/persona-shadow.md` 写明「不处理 `harness:identity`」的理由，`docs/usage.md` 增「最近一次装配」小节，`docs/known-debt.md` 记 D-13（召回注入本版不迁移，附理由）。
+- **schema 不变**：仍为 v14，无需迁移。
+
+### Tests
+
+- 新增 `test/v051-template.test.js`（19 例，含复刻宿主插值的 mock）、`test/emotion-v051.test.js`（14 例：H1 三条验收、M1 分类、12 类可达性）、`test/emotion-report.test.js`、`test/emotion-context.test.js`（7 例）、`test/v051-assembly-record.test.js`（8 例）、`test/v051-status-labels.test.js`；`test/platform.test.js` +2。
+- 合计 **1162** 用例 / **28** 套件，三时区通过。
+
 ## [0.5.0] - 2026-11-10
 
 按用户「人格 v2」清单实现四项：P1 身份由人格卡驱动、P2 遮蔽宿主默认人设、P3 情绪状态、P4 语气细节。**内置卡且未启用情绪时，`persona:*` 三段与闲聊提示词与 v0.4.12 逐字节一致**（基线 `test/fixtures/persona-v0412.json`，另有独立 worktree 对比复核）。schema 升到 **v14**（新增情绪两表），记忆 / 提醒 / 线程行为未改，零新增运行时依赖。本次发布 **1111 个用例 / 28 个套件**，默认、`TZ=UTC`、`TZ=America/New_York` 三时区通过；发布门 round A/B PASS，round C 无模型凭据 **SKIP（不计 PASS）**。
