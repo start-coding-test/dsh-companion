@@ -248,3 +248,92 @@ EXIT=0。round A/B 内部 exit=1 但门禁判定 PASS；round C `verdict=skip`�
 - 任务下发时 HEAD 为 1f44d08；复审期间上游追加 0673e96/20d4d01，按 parent 指示改以 20d4d01 为准。20d4d01 的 `/状态` 占比与 E5 `errorKinds` 已实测生效；`test/v060-report.test.js` 的 7 个用例在 20d4d01 通过。
 - 主仓库在复审结束时 HEAD=20d4d01、`git status --porcelain` 为空；本报告只新增 `docs/review-v22.md`，不改 `src/` 与测试。
 - 探针与日志均在仓库外：`D:\test\review-probes\probe-e2.mjs`、`probe-report.mjs`、`probe-intensity.mjs`、`baseline-compare.mjs`、`probe-e2.log`、`probe-report.log`、`gate.log`、`test-*.log`。
+
+## 8. 复审（r2，对象 31f88df）
+
+> 本节是 r2 复审结论，覆盖前文 r1 的 `needs_revision` 判定。前文（§1–§7）保留为 r1 历史记录，不再代表当前代码状态。
+
+- 复审对象：`main` @ **31f88df**（`31f88dff5795c648d2a901685b4f9c5269b8ee9e`，`fix(emotion): slash commands, intensity wiring and r1 review items`），父提交为 r1 报告 `1324408`；工作树干净、未 push。r1 对象为 `20d4d01`。
+- r2 变更：8 个文件、+218/−24，新增 `test/v060-fixes.test.js`（3 例）；`src/index.js`、`src/persona/emotion-appraise.js`、`test/e2e/persona-card.test.js`、README/CHANGELOG/两份 docs。
+- **结论：pass（H 0 / M 0 / L 3）。** r1 的 M1、M2 与 L1–L8 均已修复或按明确口径处理；剩余 3 个 L 不阻塞代码发版，其中 README 的 `v0.6.0` tag 文案必须在发布动作中处理。
+
+### 8.1 r1 问题逐条复验
+
+| r1 项 | r2 修复 | 本次实测（自写探针） | 结果 |
+| --- | --- | --- | --- |
+| M1 斜杠命令被判定 | `src/index.js:2810-2814`：`text.trimStart().startsWith('/')` 早返回，不写事件、不提交判定 | llm 卡 dispatch `/状态` 与未知 `/foo` 各一次：`requests=0`、`countEmotionEvents('main')=0`；enabled=false 时 `/状态` 只有 `情绪：未启用`，无 `判定器：` 行 | 通过 |
+| M2 intensity 未接线 | `src/index.js:2925-2933`：按 `0.5 + verdict.intensity` 夹到 [0.5,1.5] 后传入 `applyClassifiedEvent`；`emotion-wiring.js:322-330` 优先用传入值 | 同 confidence=0.9、type=blame：intensity 0.1 → `{pleasure:-3.84,arousal:0.89,dominance:-0.6,energy:-0.6}`；0.9 → `{pleasure:-8,arousal:2.08,dominance:-1.4,energy:-1.4}`；pleasure 比 2.083（strong > weak×1.5），两条 note 均为 `llm` | 通过 |
+| L1 额外键被接受 | `src/persona/emotion-appraise.js:154-159`：`Object.keys(parsed)` 仅允许四字段，否则 `invalid: unexpected keys ...` | 带 `pleasure=-3` 的 JSON 抛 `AppraisalError`，`code=invalid`，message `invalid: unexpected keys pleasure`；四字段 JSON 仍通过 | 通过 |
+| L2 超时 timer 被 unref | `emotion-appraise.js:327-342`：timeout 定时器不再 `unref`，`finally` 仍 `clearTimeout` | 裸进程（无 keepAlive）timeoutMs=40 + 永不 resolve 的 judge：`await queue.drain()` 正常结束，apply 收到 `rules:fallback:timeout`，不再 EXIT 13 | 通过 |
+| L3 superseded 不被 drain 等待 | `emotion-appraise.js:274-280` 的 `pending` + `track()`，`:372` 纳入 `pending`，`:380-394` 的 `drain()` 等 pending；`src/index.js:551-558` dispose 时 fire-and-forget `drain()`，`:2920-2922` apply 首行 `if (state.disposed) return` | supersede A/B/C 后最终三条事件都在（`B:rules:fallback:superseded`、`A:llm`、`C:llm`），`drain()` 等到了 pending；dispose 时在途慢 judge 下 `appendEmotionEvent`/`setEmotionState` 原型 spy 前后均为 1，等待 800ms 不增加，requests=1，无关闭后写库 | 通过（关闭延迟见 8.3 第 3 项） |
+| L4 `appraiserRoute` 死字段 | `src/index.js` 已删除该字段 | `grep appraiserRoute src` 无结果；仅剩 `resolveAppraiserRoute` 函数 | 通过 |
+| L5 rules 模式统计口径 | 代码仍固定「规则（近 24h 无判定）」；`docs/usage.md:176-179`、`docs/emotion-appraiser.md` 改为「规则模式不统计样本」 | rules 模式即使已有 `note=rules` 事件，`/状态` 仍为 `判定器：规则（近 24h 无判定）`；文档已与行为一致 | 通过（默认 rules 模式不统计为明确取舍） |
+| L6 enabled=false 仍显示判定器行 | `src/index.js:1015-1020`：只有 `emotion.enabled === true` 才把 `appraiser` 传给命令层 | 默认卡 `/状态` 无 `判定器：` 行；llm 启用卡有 | 通过 |
+| L7 预算估算 UTF-16 长度 | `src/index.js:2879-2881` 改为 `[...text].length` 码点计数 | 代码核对；`recordAppraisalUsage` 对 emoji 不再按 2 个 UTF-16 单元计 | 通过 |
+| L8 测试缺口 | 新增 `test/v060-fixes.test.js` 3 例：`/状态` 零请求零事件、strong > weak×1.5、额外键 invalid | 全量 1208 通过；但 `/foo` 与接线层「非 ambient 事件恰好 1 条」仍无显式断言（行为已由本次探针覆盖，残余测试缺口见 8.3） | 部分通过 |
+
+### 8.2 本次亲自跑的探针与数字（31f88df，捆绑 Node 24）
+
+**三时区全量 `node --test`**（日志 `D:\test\review-probes\r2-test-*.log`）：
+
+| TZ | tests | suites | pass | fail | exit | duration_ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| 默认 | 1208 | 33 | 1208 | 0 | 0 | 6537.6093 |
+| `UTC` | 1208 | 33 | 1208 | 0 | 0 | 6670.328 |
+| `America/New_York` | 1208 | 33 | 1208 | 0 | 0 | 6642.4509 |
+
+结果与 r2 预期 1208/1208/0 一致（比 r1 的 1205 多 3 个 `v060-fixes` 用例）。
+
+**逐字节基线**（`baseline-compare-r2.mjs`，OLD=`D:\test\wt-v052`，NEW=主仓库 31f88df）：
+
+| 对象 | v0.5.2 长度 / sha | 31f88df 长度 / sha | 结果 |
+| --- | --- | --- | --- |
+| `JSON.stringify(buildSections(DEFAULT_CARD))` | 861 / `e55e987368a7` | 861 / `e55e987368a7` | 一致 |
+| `buildChatPrompt`（带 recentTopics/recallSummary/messageCount） | 232 / `ecd5a198ec2d` | 232 / `ecd5a198ec2d` | 一致 |
+| `buildChatPrompt`（裸 card） | 186 / `1904ed77a2cf` | 186 / `1904ed77a2cf` | 一致 |
+
+`BASELINE: PASS (3/3 byte-identical)`；`emotion.enabled` 两边均为 false。
+
+**M1 / M2 / L1 / L3 探针**（`probe-r2.mjs`）：
+
+- M1：`/状态`、`/foo` 各 dispatch 一次，`requests=0`、`countEmotionEvents('main')=0`；llm 启用且无样本时实际行 `判定器：模型（近 24h 无判定）`。
+- M2：见 8.1 的 deltas；同 confidence 下强弱强度已能区分，映射符合 `0.5 + intensity`。
+- L1：额外 `pleasure` 键报 `invalid: unexpected keys pleasure`；额外 `arousal` 同理。
+- L3：dispose 前 append=1、state=1；dispose 后 800ms 仍为 1/1；requests=1，无关闭后写库。
+- 队列：裸进程 `drain()` 超时正常；A/B/C 覆盖后 3 条事件齐全。
+
+**关闭延迟（补充探针 `probe-dispose-exit.mjs`）**：appraiseTimeoutMs=500、judge 永不 resolve，dispatch 后 `handle.dispose()`；requests=1，进程在 dispose 后 **507ms** 才退出。原因是 dispose 的 `queue.drain()` 是 fire-and-forget，且 timeout 定时器不再 unref；不写库，但会拖到定时器到期。默认 8000ms 时最坏接近 8s。
+
+**E5 CLI 回归**（`probe-report-r2.mjs`，本地 OpenAI 兼容 mock）：
+
+- `--appraiser llm`：207 请求，准确率 28/207=13.53%、blame 误报 151、中性 55/68=80.88%、`判定失败 41 句，按原因：invalid 41`、exit=1。mock 固定响应，数字只证明管线/门槛/退出码，不代表真实模型质量。
+- 缺 env：exit=2，stderr 列出三个环境变量组。
+- `--appraiser rules`：206/207=99.52%、blame 0、中性 0/68、exit=0。
+
+**门禁**（31f88df 实跑）：
+
+```
+node scripts/probe/run-headless.mjs --plugin --timeout 180000
+...
+plugin-gate: PASS (round A + round B + round C)
+```
+
+EXIT=0；round C `verdict=skip`（无凭据，预期）。日志 `D:\test\review-probes\r2-gate.log`。
+
+### 8.3 剩余 L（不阻塞）
+
+1. **README 宣称已发布，但没有 `v0.6.0` tag。** `README.md:7` 写「v0.6.0 已发布（2026-11-11，tag `v0.6.0`）」，而 `git tag --list` 只有到 `v0.5.2`，`git rev-parse v0.6.0` 失败。发版前创建 tag，或把文案改为「待发布」。这是发布动作/文档问题，不是代码缺陷。
+2. **测试缺口仍在。** `test/v060-fixes.test.js:107-115` 只测 `/状态`，未测未知 `/foo`；成功/兜底接线测试仍没有 `countEmotionEvents('main')===1`（或非 ambient 计数恰好 1）的显式断言。本次探针已独立验证这两条行为，建议后续补上，防止回归。
+3. **dispose 关闭延迟。** dispose 中 `queue.drain()` 不等待（`src/index.js:551-558`），且超时 timer 不再 unref（`emotion-appraise.js:327-329`），进程可能等到最长 `emotion.appraiseTimeoutMs` 才退出；实测 500ms 配置下为 507ms，无写库。建议给队列加 abort/cancel 信号，或在 dispose 时只等待一个短上限。
+
+### 8.4 发版建议
+
+- 代码层面 **可发版**：r1 的两个 M 已修复并有实测证据；H/M 均为 0。
+- 发布动作前处理 README 的 `v0.6.0` tag 事实问题；否则「已发布」与实际仓库状态不一致。
+- 建议随后续小版本补：`/foo` 与单次入账断言、dispose 的队列取消/关闭上限。
+- 真实模型上线前仍应使用真实 key 跑一次 golden；本次 E5 的 llm 数字来自固定 mock，不能作为模型质量结论。
+
+### 8.5 r2 复验范围说明
+
+- 所有 r2 实测均在主仓库 31f88df 上做，探针在仓库外 `D:\test\review-probes\`；未使用仓库内临时脚本，未改 `src/` 或测试。
+- r2 只新增本节到 `docs/review-v22.md`，未修改前文 §1–§7；提交只包含该文件，不 push。
