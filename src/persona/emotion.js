@@ -518,6 +518,41 @@ export function applyEvent(state, options) {
 }
 
 /**
+ * 把四维增量并入状态（P3-c 接线用）：节律与安静时段等环境项统一走这里，
+ * 避免外层手写四维相加导致夹取/舍入口径不一致。
+ *
+ * - 缺失的维度按 0；出现但不是有限数 → TypeError；
+ * - 相加后夹到 0–100 并保留两位小数；
+ * - `updatedAt` 原样保留（环境项不推进状态时钟，由调用方决定）。
+ * - 返回新对象，不修改入参。
+ *
+ * @param {object} state
+ * @param {{pleasure?:number,arousal?:number,dominance?:number,energy?:number}} deltas
+ * @param {object} [baseline] 四维缺失/非法时的回落基线（与 normalizeState 同口径）
+ * @returns {{pleasure:number,arousal:number,dominance:number,energy:number,updatedAt:number}}
+ */
+export function applyDeltas(state, deltas, baseline) {
+  if (deltas === null || typeof deltas !== 'object' || Array.isArray(deltas)) {
+    throw new TypeError(
+      `applyDeltas(state, deltas): deltas must be an object (got ${deltas === null ? 'null' : typeof deltas})`,
+    );
+  }
+  const current = normalizeState(state, baseline);
+  const next = {};
+  for (const dim of DIMENSIONS) {
+    const delta = deltas[dim] === undefined ? 0 : deltas[dim];
+    if (!Number.isFinite(delta)) {
+      throw new TypeError(
+        `applyDeltas(state, deltas): deltas.${dim} must be a finite number (got ${String(deltas[dim])})`,
+      );
+    }
+    next[dim] = round2(clamp(current[dim] + delta, VALUE_MIN, VALUE_MAX));
+  }
+  next.updatedAt = current.updatedAt;
+  return next;
+}
+
+/**
  * 统计正则命中次数（用副本另加 g 标志，不改动规则里的正则）。
  * @param {RegExp} pattern
  * @param {string} text

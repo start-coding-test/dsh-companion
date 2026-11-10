@@ -55,6 +55,11 @@ import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections, buildSectionsWithDiagnostics } from './persona/sections.js';
 import { CARD_STATUS, loadPersonaCard, personaProactiveConflicts } from './persona/card.js';
 import {
+  EMOTION_PROMPT_PREFIX,
+  EMOTION_SOURCE_KIND,
+  runEmotionTurn,
+} from './persona/emotion-wiring.js';
+import {
   buildChatPrompt,
   chatEligibility,
   normalizeChatText,
@@ -881,6 +886,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             },
             // v0.4.12：/状态 展示人格卡来源（内置默认 / 文件路径 / 加载失败原因）。
             persona: personaStatus(state),
+            // P3-c：/状态 展示情绪状态；未启用时命令层只输出「情绪：未启用」。
+            emotion: { enabled: state.card?.emotion?.enabled === true },
           });
         } catch (error) {
           return {
@@ -1005,6 +1012,8 @@ function hasRealUserInput(messages) {
     if (message.role !== 'user') continue;
     const sourceKind = message.source?.kind;
     if (sourceKind === 'runtime-context' || sourceKind === RECALL_SOURCE_KIND) continue;
+    // P3-c：情绪注入也是插件注入，不算用户真实输入。
+    if (sourceKind === EMOTION_SOURCE_KIND) continue;
     // V3-L3：中文命令提示也是插件注入，不算用户真实输入（不会抢占主会话绑定）。
     if (sourceKind === COMMAND_HINT_SOURCE_KIND) continue;
     // V7-M3：凭据提示是插件注入，不算用户真实输入。
@@ -1018,7 +1027,11 @@ function hasRealUserInput(messages) {
       if (block === null || typeof block !== 'object') continue;
       if (block.type !== 'text' || typeof block.text !== 'string') continue;
       const text = block.text.trim();
-      if (text === '' || text.startsWith(RECALL_MARKER)) continue;
+      if (
+        text === ''
+        || text.startsWith(RECALL_MARKER)
+        || text.startsWith(EMOTION_PROMPT_PREFIX)
+      ) continue;
       return true;
     }
   }
@@ -1373,8 +1386,10 @@ async function runPreStep(state, payload) {
 
   const hint = injectCommandHint(state, payload, messages, turnKey);
   const privacy = injectPrivacyHint(state, payload, messages, turnKey);
+  const emotion = injectEmotion(state, payload, messages, turnKey, scope);
   const injection = await injectRecall(state, payload, messages, turnKey, scope);
-  const hints = [hint, privacy, ...(injection?.inject ?? [])].filter((item) => item !== null);
+  const hints = [hint, privacy, ...(emotion?.inject ?? []), ...(injection?.inject ?? [])]
+    .filter((item) => item !== null);
   if (hints.length === 0) return injection;
   return { ...(injection ?? {}), inject: hints };
 }
@@ -2618,6 +2633,77 @@ async function maybeCompact(state, payload, scope = SCOPE) {
 }
 
 /**
+ * P3-c 情绪注入：读库 → 衰减/节律/安静时段 → 分类事件 → 落库 → 描述，
+ * 同一 turn 只注入一次。卡上 `emotion.enabled !== true` 时直接返回 null，
+ * 不读也不写库，保证默认路径与接入前完全一致。
+ *
+ * 写入失败的 warn 口径与 injectRecall 一致：只记录，不影响本轮对话。
+ *
+ * @param {object} state
+ * @param {object} payload
+ * @param {unknown[]} messages
+ * @param {string|null} turnKey
+ * @param {string} [scope]
+ * @returns {{inject: object[]}|null}
+ */
+function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
+  if (state.card?.emotion?.enabled !== true) return null;
+
+  const { platform, config, store } = state;
+  const key = `emotion:${sessionIdOf(payload) ?? scope}:${turnKey ?? `step:${String(payload?.step ?? 'unknown')}`}`;
+  if (state.turnSeen.has(key)) return null;
+  if (isToolTail(messages)) {
+    state.turnSeen.add(key);
+    return null;
+  }
+  const text = lastUserText(messages);
+  if (text === '') return null;
+  state.turnSeen.add(key);
+
+  try {
+    const now = platform.now();
+    const parts = zonedParts(now, config.timezone);
+    const result = runEmotionTurn({
+      store,
+      card: state.card,
+      config,
+      now,
+      hour: parts.hour,
+      minute: parts.minute,
+      quiet: isQuietAt(new Date(now), config),
+      scope,
+      text,
+    });
+    return { inject: [emotionMessage(`${EMOTION_PROMPT_PREFIX}${result.line}`)] };
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] emotion injection failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
+/**
+ * 构造情绪注入消息：形状与 recallMessage 同构（完整平台消息）。
+ * source.kind='companion-emotion' 供转录/巩固/主会话绑定排除。
+ *
+ * @param {string} text 渲染好的 `你此刻：…` 文本
+ * @returns {{id: string, role: 'user', content: object[], source: object}}
+ */
+function emotionMessage(text) {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: {
+      kind: EMOTION_SOURCE_KIND,
+      form: 'snapshot',
+      sections: [{ name: 'emotion', text }],
+    },
+  };
+}
+
+/**
  * 召回注入：经 assemble 做预算裁切，同一 turn 只注入一次；末条是工具结果时跳过。
  * @param {object} state
  * @param {object} payload
@@ -2830,6 +2916,7 @@ function isInjectedMessage(message) {
   if (message === null || typeof message !== 'object') return false;
   const kind = message.source?.kind;
   return kind === RECALL_SOURCE_KIND
+    || kind === EMOTION_SOURCE_KIND
     || kind === COMMAND_HINT_SOURCE_KIND
     || kind === PRIVACY_HINT_SOURCE_KIND
     || isCompanionMessage(message);
@@ -2880,6 +2967,7 @@ function isRecallRecord(record) {
   if (record?.role !== 'user' || typeof record.text !== 'string') return false;
   const text = record.text.trimStart();
   return text.startsWith(RECALL_MARKER)
+    || text.startsWith(EMOTION_PROMPT_PREFIX)
     || text.startsWith(COMMAND_HINT_TEXT_PREFIX)
     || text.startsWith(PRIVACY_HINT_TEXT_PREFIX);
 }
@@ -4245,7 +4333,12 @@ function lastUserText(messages) {
     const text = row.text.trim();
     // C5-H1a：主动投递的提醒正文没有 source 可查，按正文前缀兜底排除，
     // 避免它被当成召回查询（lastUserText）或交互日记录的唯一输入。
-    if (text === '' || text.startsWith(RECALL_MARKER) || text.startsWith(REMINDER_TEXT_PREFIX)) continue;
+    if (
+      text === ''
+      || text.startsWith(RECALL_MARKER)
+      || text.startsWith(EMOTION_PROMPT_PREFIX)
+      || text.startsWith(REMINDER_TEXT_PREFIX)
+    ) continue;
     return text;
   }
   return '';
@@ -4319,7 +4412,11 @@ function captureTranscript(state, messages) {
   for (const row of textRows(messages)) {
     if (row.role !== 'user' && row.role !== 'assistant') continue;
     const text = row.text.trim();
-    if (text === '' || text.startsWith(RECALL_MARKER)) continue;
+    if (
+      text === ''
+      || text.startsWith(RECALL_MARKER)
+      || text.startsWith(EMOTION_PROMPT_PREFIX)
+    ) continue;
     rows.push({ role: row.role, text });
   }
   const tail = rows.slice(-TRANSCRIPT_MAX_MESSAGES);

@@ -18,6 +18,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { forgetMemory } from '../memory/forget.js';
+import { describe } from '../persona/emotion.js';
 import { DAILY_TOKEN_LIMIT } from './budget.js';
 import { formatTimingLines } from './timing.js';
 import {
@@ -136,6 +137,7 @@ export function handleCommand({
   threadAgentPreset,
   timing,
   persona,
+  emotion,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -176,6 +178,8 @@ export function handleCommand({
       threadAgentPreset,
       timing,
       persona,
+      emotion,
+      now: toMillis(now),
     }),
   };
 }
@@ -586,6 +590,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // 旧调用方（单测/其它宿主）不传则整行省略，输出格式不变。
   const personaLine = formatPersonaLine(options.persona);
   if (personaLine !== null) lines.push(personaLine);
+  // P3-c：情绪状态行。只在接线层传入 options.emotion 时输出，旧调用方格式不变。
+  const emotionLine = formatEmotionLine(store, scope, options.emotion, options.now, timeZone);
+  if (emotionLine !== null) lines.push(emotionLine);
   lines.push(`水位 ${scope}：${watermark}`, `最近 job：${jobText}`, failureText);
   return lines.join('\n');
 }
@@ -619,6 +626,107 @@ function formatPersonaLine(persona) {
     source = '内置默认';
   }
   return `人格卡：${name}${version}（${source}）`;
+}
+
+/** P3-c：情绪事件类型 → /状态 里的中文标签；白名单之外（ambient）不展示。 */
+const EMOTION_EVENT_LABELS = Object.freeze({
+  greeting: '问候',
+  care: '关心',
+  share: '分享',
+  thanks: '谢谢',
+  complain: '抱怨',
+  cold: '冷淡',
+  reunion: '重逢',
+  goodnight: '晚安',
+  conflict: '冲突',
+  comfort: '安慰',
+});
+
+/**
+ * P3-c：情绪状态行。
+ *
+ * - 未传 options.emotion（旧调用方）→ null，整行省略，输出格式不变；
+ * - 未启用 → `情绪：未启用`，**不读库**；
+ * - 启用但还没有状态 → `情绪：未开始`；
+ * - 有状态 → `情绪：<describe>（最近：问候 5 分钟前 / 分享 2 小时前）`，
+ *   最近事件最多 3 条、只展示白名单类型。
+ *
+ * @param {object} store
+ * @param {string} scope
+ * @param {{enabled?: boolean}|undefined} options
+ * @param {number|undefined} now 毫秒时间戳
+ * @param {string} timeZone
+ * @returns {string|null}
+ */
+function formatEmotionLine(store, scope, options, now, timeZone) {
+  if (options === null || options === undefined) return null;
+  if (options.enabled !== true) return '情绪：未启用';
+
+  let state;
+  let events;
+  try {
+    state = store.getEmotionState(scope);
+    events = state === null ? [] : store.listEmotionEvents(scope, 3);
+  } catch {
+    // 情绪只是展示项：读库失败不拖垮 /状态。
+    return '情绪：未开始';
+  }
+  if (state === null) return '情绪：未开始';
+
+  let line = `情绪：${describe(state)}`;
+  const recent = [];
+  for (const event of Array.isArray(events) ? events : []) {
+    const label = EMOTION_EVENT_LABELS[event?.type];
+    if (label === undefined) continue;
+    const when = formatRelativeTimeCn(event.at, now, timeZone);
+    if (when === '') continue;
+    recent.push(`${label} ${when}`);
+    if (recent.length >= 3) break;
+  }
+  if (recent.length > 0) line += `（最近：${recent.join(' / ')}）`;
+  return line;
+}
+
+/**
+ * P3-c：中文相对时间（复用现有 zonedDayKey 做日历日判定，不新增依赖）。
+ *
+ * 口径：<1 分钟「刚刚」；<1 小时「N 分钟前」；<24 小时「N 小时前」；
+ * 配置时区的日历日差 1 天「昨天」；再早「N 天前」。未来时间按「刚刚」；
+ * 非法入参返回空串（调用方跳过）。
+ *
+ * @param {number|Date} value 事件时间
+ * @param {number|Date} now 当前时间
+ * @param {string} [timeZone=DEFAULT_TIMEZONE]
+ * @returns {string}
+ */
+export function formatRelativeTimeCn(value, now, timeZone = DEFAULT_TIMEZONE) {
+  if (!isValidTimeZone(timeZone)) return '';
+  const rawAt = value instanceof Date ? value.getTime() : Number(value);
+  const rawNow = now instanceof Date ? now.getTime() : Number(now);
+  if (!Number.isFinite(rawAt) || !Number.isFinite(rawNow)) return '';
+  const at = toMillis(rawAt);
+  const current = toMillis(rawNow);
+  if (!Number.isFinite(at) || !Number.isFinite(current)) return '';
+  const diff = current - at;
+  if (diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+
+  const days = zonedDayNumberAt(current, timeZone) - zonedDayNumberAt(at, timeZone);
+  if (days === 1) return '昨天';
+  if (days > 1) return `${days} 天前`;
+  return `${Math.floor(diff / 3_600_000)} 小时前`;
+}
+
+/**
+ * 配置时区下的「日历日序号」，用于跨时区/跨 DST 的昨天判定。
+ * @param {number} ms
+ * @param {string} timeZone
+ * @returns {number}
+ */
+function zonedDayNumberAt(ms, timeZone) {
+  const [year, month, day] = zonedDayKey(ms, timeZone).split('-').map(Number);
+  return Math.round(Date.UTC(year, month - 1, day) / 86_400_000);
 }
 
 /**
