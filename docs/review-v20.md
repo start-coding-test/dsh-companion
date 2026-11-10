@@ -588,3 +588,125 @@ sections=True chatCtx=True chatBare=True
 - 旧 §1–§6 未改动，旧段里的行号/结论保留为 r1 时点证据；以本节为准。
 - 提交信息：`docs(review): v0.5.0 复审 r2`；不 push。
 - 复审对象 `1e152be` 的父为 r1 报告提交 `91928dc`；r2 修复 diff 为 21 files, +199/−72，已逐文件检查，未发现隐藏的源码逻辑改动。
+
+## 8. 复审（r3，对象 2a89403）
+
+### 8.1 结论
+
+- 复审对象：`2a89403`（`fix(persona): filter rendered banned phrases (M-4/L-9)`，父 `51576ba`），`git diff --stat 51576ba..2a89403` = 3 files, +65/−9；复审开始时工作树干净。
+- **结论：pass；H=0，M=0，L=1。**
+- M-4、L-9 均已按独立复现关闭；无新的 H/M。唯一新增 L 是 `buildChatPrompt` 原 JSDoc 在插入 `identityOf()` 后挂到了错误函数上，属注释位置问题，不影响运行，不阻塞发布。
+- 旧 §1–§7 原样保留；本节为最终结论。复审只追加本文件，未改 `src/` 或既有测试，未 push。
+
+### 8.2 M-4 / L-9 关闭情况
+
+| 编号 | r2 问题 | r3 状态 | 独立证据 |
+| --- | --- | --- | --- |
+| M-4 | 提示词渲染了 `bannedPhrases`，但输出过滤仍用原始短语 | ✅ 关闭 | `src/persona/chat.js:110-122` 新增 `renderBannedPhrases(card)`；`src/index.js:4100-4103` 过滤改为 `bannedPhrases: renderBannedPhrases(card)`；独立探针确认 prompt 与过滤是同一份渲染结果 |
+| L-9 | 未校验卡的 `bannedPhrases:[null]/[undefined]` 会被 `String()` 变成 `"null"/"undefined"` | ✅ 关闭 | `renderBannedPhrases` 只保留字符串项；`[null, undefined, 42, '叫{{user}}老大']` → `['叫老板老大']`；提示词不再出现 null/undefined |
+
+#### M-4 最小复现（r2 曾返回 `ok:true`）
+
+```js
+// 卡：name=岚, address=老板, bannedPhrases=['叫{{user}}老大']
+const prompt = buildChatPrompt({ card, recentTopics: [], recallSummary: '', messageCount: 6 });
+// 禁用表达：叫老板老大。
+const out = '叫老板老大。今天天气不错。中午吃了面。下午把桌子收拾了。晚上准备早点休息。明天要早起。';
+normalizeChatText(out, { bannedPhrases: renderBannedPhrases(card) });
+// => { ok: false, reason: 'banned_phrase' }
+normalizeChatText(out, { bannedPhrases: card.bannedPhrases });
+// => { ok: true, reason: 'ok' }   （原始占位符不命中，符合预期）
+```
+
+独立探针实际输出：
+
+```text
+promptA: 禁用表达：叫老板老大。
+promptB: 禁用表达：叫先生老大。   # 只改 address，提示词与过滤同时变化
+phrasesA: ["叫老板老大"]
+phrasesB: ["叫先生老大"]
+rawResult: {"ok":true,...,"reason":"ok"}
+renderedResult: {"ok":false,"text":"","sentences":0,"reason":"banned_phrase"}
+mixed: ["叫老板老大"]
+empty: []
+emptyHasBannedLine: false
+--- r3 probe PASS ---
+```
+
+说明：
+- 提示词行来自 `renderBannedPhrases(card)`，过滤入参也是 `renderBannedPhrases(card)`；改 `address` 后两者同时变，不是两份独立拼接。
+- `bannedPhrases: []` 时提示词不再出现「禁用表达」行，过滤收到空数组；与 r2 之前的行为一致。
+- 原始占位符短语 `叫{{user}}老大` 不会命中「叫老板老大」，这是正确的：模型只会复述提示词里渲染后的文本；r3 的输出过滤使用渲染后数组，故能命中。
+
+### 8.3 逐字节基线与三时区回归
+
+逐字节基线（`dump.mjs`，v0.4.12 worktree `6eedde9` vs r3 HEAD）：
+
+```text
+sections=True chatCtx=True chatBare=True
+sections  41bb0145b4b9d0f1  41bb0145b4b9d0f1
+chatCtx   ecd5a198ec2d6184  ecd5a198ec2d6184
+chatBare  1904ed77a2cf9445  1904ed77a2cf9445
+```
+
+左右分别为 base/head（sections 数组 JSON / chat 文本的 SHA-256 前 16 位）；相等，说明内置卡 + `bannedPhrases` 空数组/默认值的闲聊提示词仍与 v0.4.12 逐字节一致。
+
+三时区全量（捆绑 Node v24.21.0，HEAD `2a89403`）：
+
+```text
+# 默认
+ℹ tests 1111
+ℹ suites 28
+ℹ pass 1111
+ℹ fail 0
+ℹ duration_ms 6856.2806
+
+# TZ=UTC
+ℹ tests 1111
+ℹ suites 28
+ℹ pass 1111
+ℹ fail 0
+ℹ duration_ms 6760.8082
+
+# TZ=America/New_York
+ℹ tests 1111
+ℹ suites 28
+ℹ pass 1111
+ℹ fail 0
+ℹ duration_ms 6688.2336
+```
+
+日志：`D:\test\agent-plugin\.probe-v20\r3-tz-default.log`、`r3-tz-UTC.log`、`r3-tz-NY.log`。`functional.mjs` 也仍 PASS（默认路径、启用情绪、重启、遮蔽、配置 16 键）。
+
+### 8.4 新 L-10：JSDoc 挂错函数（非阻塞）
+
+`src/persona/chat.js:89-100` 原本是 `buildChatPrompt` 的 JSDoc；r3 在 JSDoc 与函数之间插入了 `identityOf()`（`:101-108`），导致这段 JSDoc 现在挂在 `identityOf` 上，而 `buildChatPrompt`（`:124`）没有注释。运行无影响，但会误导后续维护者。建议把这段 JSDoc 移到 `buildChatPrompt` 正上方，或给 `identityOf` 单独写一行注释。这是唯一的 r3 新增 L，不改变 pass 结论。
+
+### 8.5 复跑命令
+
+```powershell
+$NODE = 'C:\Users\93488\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe'
+cd D:\test\agent-plugin\dsh-companion
+
+# 三时区
+& $NODE --test 2>&1 | Tee-Object D:\test\agent-plugin\.probe-v20\r3-tz-default.log
+$env:TZ='UTC'; & $NODE --test 2>&1 | Tee-Object D:\test\agent-plugin\.probe-v20\r3-tz-UTC.log
+$env:TZ='America/New_York'; & $NODE --test 2>&1 | Tee-Object D:\test\agent-plugin\.probe-v20\r3-tz-NY.log
+Remove-Item Env:TZ
+
+# M-4 / L-9 独立探针
+& $NODE D:\test\agent-plugin\.probe-v20\r3-probe.mjs
+
+# 逐字节基线
+& $NODE D:\test\agent-plugin\.probe-v20\dump.mjs D:\test\agent-plugin\.probe-v20\wt-v0412 | Out-File -Encoding utf8 D:\test\agent-plugin\.probe-v20\r3-base.json
+& $NODE D:\test\agent-plugin\.probe-v20\dump.mjs . | Out-File -Encoding utf8 D:\test\agent-plugin\.probe-v20\r3-head.json
+
+# 功能回归
+& $NODE D:\test\agent-plugin\.probe-v20\functional.mjs
+```
+
+### 8.6 工作区与提交
+
+- r3 复审只追加 `docs/review-v20.md` 的 §8；未改 `src/`、`test/`、`CHANGELOG.md`、`README.md`。
+- 提交信息：`docs(review): v0.5.0 复审 r3`；不 push。
+- `51576ba..2a89403` 为 3 files, +65/−9：`src/persona/chat.js`、`src/index.js`、`test/persona-v20-regression.test.js`；已逐文件检查，未发现其它源码改动。
