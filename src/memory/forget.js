@@ -168,6 +168,13 @@ function finishForget({ store, kind, row, id, scope, at, immediate, consolidatio
     result.purgeAt = at;
     result.purgedRows = purged;
   }
+  // P3-c：「忘掉」是整条记忆路径，完成后同步清空该 scope 的情绪状态与事件。
+  // 失败只 warn，不阻断遗忘本身。
+  try {
+    if (typeof store.resetEmotion === 'function') store.resetEmotion(scope);
+  } catch (error) {
+    warn('[forget] emotion reset failed', error);
+  }
   return result;
 }
 

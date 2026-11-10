@@ -381,7 +381,7 @@ test('集成（重启语义）：运行期改卡不生效且不重复 warn；重
 // 3) 未配置卡：人格三段与 v0.4.11 逐字节相同；/状态 只多一行
 // ---------------------------------------------------------------------------
 
-test('集成（v0.4.11 等价）：未配置卡时人格三段 SHA-256 一致，/状态 除人格卡行外逐行不变', () => {
+test('集成（v0.4.11 等价）：未配置卡时人格三段 SHA-256 一致，/状态 除人格卡/情绪行外逐行不变', () => {
   const temp = makeTempStore();
   const ctx = makePluginCtx();
   const handle = apply(ctx, { dbPath: temp.dbPath });
@@ -400,12 +400,18 @@ test('集成（v0.4.11 等价）：未配置卡时人格三段 SHA-256 一致，
     const personaIndex = lines.findIndex((line) => line.startsWith('人格卡：'));
     assert.equal(personaIndex, 7, '人格卡行应插在线程 preset 与水位数之间');
     assert.equal(lines[personaIndex], '人格卡：珞然 v1（内置默认）');
-    assert.equal(lines.length, V0411_STATUS_LINES.length + 1, '/状态 只应多一行');
+    // P3-c：情绪行紧随人格卡行；未启用卡只显示「未启用」，不读写情绪表。
+    const emotionIndex = lines.findIndex((line) => line.startsWith('情绪：'));
+    assert.equal(emotionIndex, 8, '情绪行应紧随人格卡行');
+    assert.equal(lines[emotionIndex], '情绪：未启用');
+    assert.equal(lines.length, V0411_STATUS_LINES.length + 2, '/状态 应只多人格卡与情绪两行');
 
-    const withoutPersona = lines.filter((line) => !line.startsWith('人格卡：'));
-    assert.match(withoutPersona[0], V0411_STATUS_HEAD);
-    assert.equal(withoutPersona[0], V0411_STATUS_LINES[0]);
-    assert.deepEqual(withoutPersona.slice(1), V0411_STATUS_LINES.slice(1));
+    const withoutInjected = lines.filter(
+      (line) => !line.startsWith('人格卡：') && !line.startsWith('情绪：'),
+    );
+    assert.match(withoutInjected[0], V0411_STATUS_HEAD);
+    assert.equal(withoutInjected[0], V0411_STATUS_LINES[0]);
+    assert.deepEqual(withoutInjected.slice(1), V0411_STATUS_LINES.slice(1));
     assert.equal(loadFailureWarns(ctx).length, 0);
   } finally {
     handle.dispose();

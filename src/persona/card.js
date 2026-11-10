@@ -12,6 +12,8 @@ import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 
+import { DEFAULT_BASELINE } from './emotion.js';
+
 /** 敏感对象键，深合并时直接忽略，避免原型污染。 */
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
@@ -184,11 +186,94 @@ export function parseCardSourceDetailed(source, path = '') {
   }
 
   const merged = mergeInto(DEFAULT_CARD, input);
+  // P3-c：emotion 的运行期归一化。校验函数仍对直接调用保持严格（P1 契约），
+  // 但卡文件里的非法值不再让整张卡加载失败：回落默认值并记一条 warning。
+  const normalized = normalizeCardEmotion(merged.emotion);
+  merged.emotion = normalized.emotion;
+  warnings.push(...normalized.warnings);
   validateCard(merged);
   return Object.freeze({
     card: deepFreeze(merged),
     warnings: Object.freeze(warnings.map((warning) => Object.freeze(warning))),
   });
+}
+
+/** emotion.halfLifeHours 的允许区间（含端点）；区间外回落 6。 */
+const EMOTION_HALF_LIFE_MIN = 0.5;
+const EMOTION_HALF_LIFE_MAX = 168;
+const EMOTION_HALF_LIFE_DEFAULT = 6;
+
+/**
+ * 归一化 `card.emotion`（P3-c），供 `parseCardSourceDetailed` 在 validateCard
+ * 之前调用。合法值原样保留（含未知键），非法值逐项回落默认并给出 warning：
+ * - `enabled` 非布尔 → false；
+ * - `baseline` 非对象/任维非 0–100 有限数 → `DEFAULT_BASELINE`；
+ * - `halfLifeHours` 非 `[0.5, 168]` 有限数 → 6；
+ * - `emotion` 本身非对象 → 整块默认值。
+ *
+ * @param {any} emotion
+ * @returns {{emotion: object, warnings: Array<{code: string}>}}
+ */
+export function normalizeCardEmotion(emotion) {
+  const warnings = [];
+  if (emotion === null || typeof emotion !== 'object' || Array.isArray(emotion)) {
+    return {
+      emotion: {
+        enabled: false,
+        baseline: { ...DEFAULT_BASELINE },
+        halfLifeHours: EMOTION_HALF_LIFE_DEFAULT,
+      },
+      warnings: [{ code: 'emotion_invalid' }],
+    };
+  }
+
+  const normalized = { ...emotion };
+
+  if (emotion.enabled === undefined) {
+    normalized.enabled = false;
+  } else if (typeof emotion.enabled !== 'boolean') {
+    normalized.enabled = false;
+    warnings.push({ code: 'emotion_enabled_invalid' });
+  }
+
+  if (emotion.baseline === undefined) {
+    normalized.baseline = { ...DEFAULT_BASELINE };
+  } else if (!isValidBaseline(emotion.baseline)) {
+    normalized.baseline = { ...DEFAULT_BASELINE };
+    warnings.push({ code: 'emotion_baseline_invalid' });
+  }
+
+  if (emotion.halfLifeHours === undefined) {
+    normalized.halfLifeHours = EMOTION_HALF_LIFE_DEFAULT;
+  } else if (!isValidHalfLife(emotion.halfLifeHours)) {
+    normalized.halfLifeHours = EMOTION_HALF_LIFE_DEFAULT;
+    warnings.push({ code: 'emotion_half_life_invalid' });
+  }
+
+  return { emotion: normalized, warnings };
+}
+
+/**
+ * @param {any} baseline
+ * @returns {boolean}
+ */
+function isValidBaseline(baseline) {
+  if (!isPlainObject(baseline)) return false;
+  return EMOTION_BASELINE_KEYS.every((key) => {
+    const value = baseline[key];
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100;
+  });
+}
+
+/**
+ * @param {any} value
+ * @returns {boolean}
+ */
+function isValidHalfLife(value) {
+  return typeof value === 'number'
+    && Number.isFinite(value)
+    && value >= EMOTION_HALF_LIFE_MIN
+    && value <= EMOTION_HALF_LIFE_MAX;
 }
 
 /**
