@@ -177,7 +177,7 @@ test('V10-L1：v12 旧库升级到 v13 时脱敏 episodes 六字段并重建 FTS
 
   const store = Store.open(file);
   try {
-    assert.equal(store.getMeta('schema_version'), '13');
+    assert.equal(store.getMeta('schema_version'), '14');
     assert.notEqual(store.getMeta(SCRUB_MARKER), null, 'scrub 成功后应写标记');
 
     const sensitive = store.getEpisode(SENSITIVE_LEGACY_ROW.id);
@@ -266,7 +266,7 @@ test('V10-L1：二次打开无变化、不新增第二条 scrub 事件', (t) => 
 
   const second = Store.open(file);
   try {
-    assert.equal(second.getMeta('schema_version'), '13');
+    assert.equal(second.getMeta('schema_version'), '14');
     assert.deepEqual(
       second.db.prepare('SELECT * FROM episodes ORDER BY rowid ASC').all(),
       snapshot.rows,
@@ -290,7 +290,7 @@ test('V10-L1：新建空库不写 scrub 标记、不写 scrub 事件', (t) => {
     assert.equal(store.getMeta(SCRUB_MARKER), null);
     assert.equal(store.listEvents({ action: SCRUB_ACTION }).length, 0);
     assert.equal(store.listEvents().length, 0);
-    assert.equal(store.getMeta('schema_version'), '13');
+    assert.equal(store.getMeta('schema_version'), '14');
   } finally {
     store.close();
   }

@@ -20,6 +20,7 @@ import { join } from 'node:path';
 
 import { toBigrams } from './bigram.js';
 import { isSensitiveText } from './govern.js';
+import { EMOTION_EVENT_RETENTION } from './store.js';
 
 /** 本插件导出文件格式版本。 */
 export const EXPORT_VERSION = 1;
@@ -83,7 +84,7 @@ export function formatStamp(now = Date.now()) {
  * 导出该常量，因此这里仅作为 schema_meta 缺失时的兜底；正常情况下导出应
  * 读取数据库里的实际版本，而不是猜。
  */
-const CURRENT_SCHEMA_VERSION = '13';
+const CURRENT_SCHEMA_VERSION = '14';
 
 /**
  * 读取导出 payload 应写入的 schema_version：优先 store.getMeta，
@@ -247,11 +248,98 @@ function readBoard(store, scope) {
 }
 
 /**
+ * P3-b：导出用的情绪状态行（毫秒时间戳，camelCase 与 Store 方法一致）。
+ * @param {object} row
+ * @returns {object}
+ */
+function exportEmotionState(row) {
+  return {
+    scope: String(row.scope),
+    pleasure: Number(row.pleasure),
+    arousal: Number(row.arousal),
+    dominance: Number(row.dominance),
+    energy: Number(row.energy),
+    updatedAt: Number(row.updated_at),
+    lastEventAt: row.last_event_at === null || row.last_event_at === undefined
+      ? null
+      : Number(row.last_event_at),
+  };
+}
+
+/**
+ * P3-b：导出用的情绪事件行。id 不导出（AUTOINCREMENT 主键是源库本地值，
+ * 跨库合并时只会冲突）；顺序按 at/type 还原，导入侧追加后重排即可。
+ * `note` 命中敏感词时整条置 null，并由调用方记 warning（不导出半截脱敏文本）。
+ * @param {object} row
+ * @returns {{row: object, redacted: boolean}}
+ */
+function exportEmotionEvent(row) {
+  let note = row.note === null || row.note === undefined ? null : String(row.note);
+  const redacted = note !== null && isSensitiveText(note);
+  if (redacted) note = null;
+  let deltas;
+  try {
+    deltas = JSON.parse(row.deltas_json);
+  } catch {
+    deltas = {};
+  }
+  if (deltas === null || typeof deltas !== 'object' || Array.isArray(deltas)) deltas = {};
+  return {
+    row: {
+      scope: String(row.scope),
+      at: Number(row.at),
+      type: String(row.type),
+      deltas,
+      note,
+    },
+    redacted,
+  };
+}
+
+/**
+ * P3-b：读取情绪导出集。state 全量；events 每 scope 最近
+ * {@link EMOTION_EVENT_RETENTION} 条，按 at ASC, id ASC 输出（导入按此顺序追加）。
+ * 与 facts/episodes 一样，导出不改变源库。
+ * @param {import('./store.js').Store} store
+ * @returns {{state: object[], events: object[], redactedNotes: number}}
+ */
+function readEmotion(store) {
+  const state = store.db
+    .prepare('SELECT * FROM emotion_state ORDER BY scope ASC')
+    .all()
+    .map((row) => exportEmotionState(row));
+
+  const scopes = store.db
+    .prepare('SELECT DISTINCT scope FROM emotion_events ORDER BY scope ASC')
+    .all()
+    .map((row) => String(row.scope));
+  const events = [];
+  let redactedNotes = 0;
+  const latest = store.db.prepare(
+    `SELECT * FROM emotion_events
+      WHERE scope = ?
+      ORDER BY at DESC, id DESC
+      LIMIT ?`,
+  );
+  for (const scope of scopes) {
+    const rows = latest.all(scope, EMOTION_EVENT_RETENTION).reverse();
+    for (const row of rows) {
+      const exported = exportEmotionEvent(row);
+      if (exported.redacted) redactedNotes += 1;
+      events.push(exported.row);
+    }
+  }
+  return { state, events, redactedNotes };
+}
+
+/**
  * 收集导出数据（纯读，不写库）。
  * @param {import('./store.js').Store} store
  * @param {{scope?: string}} [options]
  * @returns {{facts: object[], episodes: object[], reminders: object[],
- *            threads: object[], state_board: object|null, counts: object}}
+ *            threads: object[], state_board: object|null,
+ *            emotion: {state: object[], events: object[]},
+ *            warnings: string[], counts: object}}
  */
 /**
  * 状态板是渲染文本，不是 facts 行；导出时把未导出的敏感/墓碑事实正文
@@ -282,6 +370,7 @@ export function collectExportData(store, { scope = 'main' } = {}) {
   const reminders = readReminders(store, scope);
   const threads = readThreads(store);
   const board = readBoard(store, scope);
+  const emotion = readEmotion(store);
   const keptFactIds = new Set(facts.map((row) => row.id));
   const excludedStatements = store.db
     .prepare("SELECT id, statement FROM facts WHERE scope = ? AND statement IS NOT NULL AND statement <> ''")
@@ -296,6 +385,10 @@ export function collectExportData(store, { scope = 'main' } = {}) {
       rendered: scrubBoard(board.rendered, excludedStatements),
       updated_at: board.updated_at,
     };
+  const warnings = [];
+  if (emotion.redactedNotes > 0) {
+    warnings.push(`[export] ${emotion.redactedNotes} 条情绪事件的 note 含敏感内容，已置空导出`);
+  }
 
   return {
     facts,
@@ -303,6 +396,8 @@ export function collectExportData(store, { scope = 'main' } = {}) {
     reminders,
     threads,
     state_board: stateBoard,
+    emotion: { state: emotion.state, events: emotion.events },
+    warnings,
     counts: {
       facts: facts.length,
       episodes: episodes.length,
@@ -360,6 +455,18 @@ function renderMarkdown(data) {
   if (data.data.threads.length === 0) lines.push('（无）');
   lines.push('');
 
+  lines.push(`## 情绪 emotion（state ${data.data.emotion?.state?.length ?? 0} / events ${data.data.emotion?.events?.length ?? 0}）`, '');
+  for (const state of data.data.emotion?.state ?? []) {
+    lines.push(`- ${state.scope} · pleasure=${state.pleasure} arousal=${state.arousal} dominance=${state.dominance} energy=${state.energy} · updated_at=${new Date(state.updatedAt).toISOString()}`);
+  }
+  for (const event of data.data.emotion?.events ?? []) {
+    lines.push(`- ${new Date(event.at).toISOString()} · ${event.scope} · ${event.type}`);
+  }
+  if ((data.data.emotion?.state?.length ?? 0) === 0 && (data.data.emotion?.events?.length ?? 0) === 0) {
+    lines.push('（无）');
+  }
+  lines.push('');
+
   lines.push(`## 状态板 state_board（revision ${data.data.state_board?.revision ?? 0}）`, '');
   lines.push(data.data.state_board?.rendered ?? '');
   lines.push('');
@@ -373,7 +480,7 @@ function renderMarkdown(data) {
  * @param {{store: import('./store.js').Store, scope?: string, format?: 'md'|'json',
  *          dir?: string, now?: number|Date}} input
  * @returns {{path: string, format: string, exported_at: string, scope: string,
- *            counts: object, bytes: number}}
+ *            counts: object, warnings: string[], bytes: number}}
  */
 export function exportAll({ store, scope = 'main', format = 'json', dir, now = Date.now() } = {}) {
   if (format !== 'json' && format !== 'md') {
@@ -395,6 +502,7 @@ export function exportAll({ store, scope = 'main', format = 'json', dir, now = D
       reminders: collected.reminders,
       threads: collected.threads,
       state_board: collected.state_board,
+      emotion: collected.emotion,
     },
   };
 
@@ -409,6 +517,7 @@ export function exportAll({ store, scope = 'main', format = 'json', dir, now = D
     exported_at: exportedAt,
     scope,
     counts: collected.counts,
+    warnings: collected.warnings,
     bytes: Buffer.byteLength(body, 'utf8'),
   };
 }
@@ -420,7 +529,10 @@ export function exportAll({ store, scope = 'main', format = 'json', dir, now = D
  * @returns {boolean}
  */
 function isTargetEmpty(store, scope) {
-  for (const table of ['facts', 'episodes', 'reminders', 'threads', 'state_board']) {
+  for (const table of [
+    'facts', 'episodes', 'reminders', 'threads', 'state_board',
+    'emotion_state', 'emotion_events',
+  ]) {
     const row = store.db.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get();
     if (Number(row?.n ?? 0) > 0) return false;
   }
@@ -473,6 +585,104 @@ function rowExists(store, table, pk, value) {
 }
 
 /**
+ * P3-b：导入用的情绪状态行。接受导出时的 camelCase，也兼容 snake_case；
+ * 毫秒时间戳原样保留，不做秒/毫秒换算。
+ * @param {object} raw
+ * @param {string} fallbackScope
+ * @returns {object}
+ */
+function toEmotionStateRow(raw, fallbackScope) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('[export] emotion.state 中存在非法行');
+  }
+  const scope = typeof raw.scope === 'string' && raw.scope !== '' ? raw.scope : fallbackScope;
+  const pick = (camel, snake) => (raw[camel] !== undefined ? raw[camel] : raw[snake]);
+  const finite = (camel, snake) => {
+    const value = pick(camel, snake);
+    if (value === null || value === undefined) {
+      throw new Error(`[export] emotion.state.${camel} 缺失`);
+    }
+    const number = Number(value);
+    if (!Number.isFinite(number)) {
+      throw new Error(`[export] emotion.state.${camel} 必须是有限数`);
+    }
+    return number;
+  };
+  const lastRaw = pick('lastEventAt', 'last_event_at');
+  let lastEventAt = null;
+  if (lastRaw !== null && lastRaw !== undefined) {
+    lastEventAt = Number(lastRaw);
+    if (!Number.isFinite(lastEventAt)) {
+      throw new Error('[export] emotion.state.lastEventAt 必须是有限数或 null');
+    }
+  }
+  return {
+    scope,
+    pleasure: finite('pleasure', 'pleasure'),
+    arousal: finite('arousal', 'arousal'),
+    dominance: finite('dominance', 'dominance'),
+    energy: finite('energy', 'energy'),
+    updatedAt: finite('updatedAt', 'updated_at'),
+    lastEventAt,
+  };
+}
+
+/**
+ * P3-b：导入用的情绪事件行。deltas 接受对象或 JSON 字符串（兼容手写文件）。
+ * @param {object} raw
+ * @param {string} fallbackScope
+ * @returns {object}
+ */
+function toEmotionEventRow(raw, fallbackScope) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new Error('[export] emotion.events 中存在非法行');
+  }
+  const scope = typeof raw.scope === 'string' && raw.scope !== '' ? raw.scope : fallbackScope;
+  const at = Number(raw.at);
+  if (raw.at === null || raw.at === undefined || !Number.isFinite(at)) {
+    throw new Error('[export] emotion.events.at 必须是毫秒数');
+  }
+  if (typeof raw.type !== 'string' || raw.type === '') {
+    throw new Error('[export] emotion.events.type 必须是非空字符串');
+  }
+  let deltas = raw.deltas ?? raw.deltas_json;
+  if (typeof deltas === 'string') {
+    try {
+      deltas = JSON.parse(deltas);
+    } catch {
+      throw new Error('[export] emotion.events.deltas 必须是 JSON 对象');
+    }
+  }
+  if (deltas === null || typeof deltas !== 'object' || Array.isArray(deltas)) {
+    throw new Error('[export] emotion.events.deltas 必须是对象');
+  }
+  const note = raw.note === null || raw.note === undefined ? null : String(raw.note);
+  return { scope, at: Math.trunc(at), type: raw.type, deltas, note };
+}
+
+/**
+ * P3-b：导入后把某 scope 的事件截断到最近 {@link EMOTION_EVENT_RETENTION} 条。
+ * @param {import('./store.js').Store} store
+ * @param {string} scope
+ * @returns {number} 被截断删除的条数
+ */
+function trimEmotionScope(store, scope) {
+  const info = store.db
+    .prepare(
+      `DELETE FROM emotion_events
+        WHERE scope = ?
+          AND id NOT IN (
+            SELECT id FROM emotion_events
+             WHERE scope = ?
+             ORDER BY at DESC, id DESC
+             LIMIT ?
+          )`,
+    )
+    .run(scope, scope, EMOTION_EVENT_RETENTION);
+  return Number(info.changes);
+}
+
+/**
  * @param {import('./store.js').Store} store
  * @param {string} id
  */
@@ -514,6 +724,7 @@ function rebuildEpisodeFts(store, id) {
  * @param {{store: import('./store.js').Store, file: string,
  *          mode?: 'fresh'|'merge'}} input
  * @returns {{ok: true, mode: string, path: string, imported: object,
+ *            emotionImported: {state: number, events: number, trimmed: number},
  *            skipped: number, skippedByTable: object, counts: object}}
  */
 export function importAll({ store, file, mode = 'fresh' } = {}) {
@@ -545,6 +756,19 @@ export function importAll({ store, file, mode = 'fresh' } = {}) {
   for (const key of ['facts', 'episodes', 'reminders', 'threads']) {
     if (!Array.isArray(data[key])) throw new Error(`[export] 导出文件 data.${key} 必须是数组`);
   }
+  // P3-b：emotion 是 v14 新增段；旧导出文件没有该字段时按空处理（不阻断导入）。
+  const emotion = data.emotion === undefined || data.emotion === null
+    ? { state: [], events: [] }
+    : data.emotion;
+  if (typeof emotion !== 'object' || Array.isArray(emotion)) {
+    throw new Error('[export] 导出文件 data.emotion 必须是对象');
+  }
+  for (const key of ['state', 'events']) {
+    if (emotion[key] === undefined) emotion[key] = [];
+    if (!Array.isArray(emotion[key])) {
+      throw new Error(`[export] 导出文件 data.emotion.${key} 必须是数组`);
+    }
+  }
 
   if (mode === 'fresh' && !isTargetEmpty(store, scope)) {
     throw new Error('[export] fresh 模式要求目标记忆库为空；请先使用新库或改用 merge 模式');
@@ -552,6 +776,7 @@ export function importAll({ store, file, mode = 'fresh' } = {}) {
 
   const imported = { facts: 0, episodes: 0, reminders: 0, threads: 0, state_board: 0 };
   const skippedByTable = { facts: 0, episodes: 0, reminders: 0, threads: 0, state_board: 0 };
+  const emotionImported = { state: 0, events: 0, trimmed: 0 };
 
   const run = () => {
     const skipIfExists = (table, pk, value) => {
@@ -622,6 +847,46 @@ export function importAll({ store, file, mode = 'fresh' } = {}) {
         imported.state_board += 1;
       }
     }
+
+    // P3-b：先追加事件（at 已是毫秒，不做换算），再按 scope 截断到最近 50 条；
+    // 最后覆盖 emotion_state，保证导出时的 lastEventAt 原样还原（不被追加动作改写）。
+    const touchedScopes = new Set();
+    for (const raw of emotion.events) {
+      const row = toEmotionEventRow(raw, scope);
+      store.db.prepare(
+        `INSERT INTO emotion_events (scope, at, type, deltas_json, note)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(row.scope, row.at, row.type, JSON.stringify(row.deltas), row.note);
+      touchedScopes.add(row.scope);
+      emotionImported.events += 1;
+    }
+    for (const eventScope of touchedScopes) {
+      emotionImported.trimmed += trimEmotionScope(store, eventScope);
+    }
+    for (const raw of emotion.state) {
+      const row = toEmotionStateRow(raw, scope);
+      store.db.prepare(
+        `INSERT INTO emotion_state (
+           scope, pleasure, arousal, dominance, energy, updated_at, last_event_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(scope) DO UPDATE SET
+           pleasure = excluded.pleasure,
+           arousal = excluded.arousal,
+           dominance = excluded.dominance,
+           energy = excluded.energy,
+           updated_at = excluded.updated_at,
+           last_event_at = excluded.last_event_at`,
+      ).run(
+        row.scope,
+        row.pleasure,
+        row.arousal,
+        row.dominance,
+        row.energy,
+        row.updatedAt,
+        row.lastEventAt,
+      );
+      emotionImported.state += 1;
+    }
   };
 
   store.transaction(run);
@@ -631,6 +896,7 @@ export function importAll({ store, file, mode = 'fresh' } = {}) {
     mode,
     path: file,
     imported,
+    emotionImported,
     skipped,
     skippedByTable,
     counts: store.stats(),
