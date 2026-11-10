@@ -381,7 +381,7 @@ test('集成（重启语义）：运行期改卡不生效且不重复 warn；重
 // 3) 未配置卡：人格三段与 v0.4.11 逐字节相同；/状态 只多一行
 // ---------------------------------------------------------------------------
 
-test('集成（v0.4.11 等价）：未配置卡时人格三段 SHA-256 一致，/状态 除人格卡/情绪行外逐行不变', () => {
+test('集成（v0.4.11 等价）：未配置卡时人格三段 SHA-256 一致，/状态 除新增三行外逐行不变', () => {
   const temp = makeTempStore();
   const ctx = makePluginCtx();
   const handle = apply(ctx, { dbPath: temp.dbPath });
@@ -402,12 +402,16 @@ test('集成（v0.4.11 等价）：未配置卡时人格三段 SHA-256 一致，
     assert.equal(lines[personaIndex], '人格卡：珞然 v1（内置默认）');
     // P3-c：情绪行紧随人格卡行；未启用卡只显示「未启用」，不读写情绪表。
     const emotionIndex = lines.findIndex((line) => line.startsWith('情绪：'));
-    assert.equal(emotionIndex, 8, '情绪行应紧随人格卡行');
+    assert.equal(emotionIndex, 9, '部署人设行插在人格卡与情绪行之间');
     assert.equal(lines[emotionIndex], '情绪：未启用');
-    assert.equal(lines.length, V0411_STATUS_LINES.length + 2, '/状态 应只多人格卡与情绪两行');
+    // P2（v0.4.13）：默认 off 也显式说明「宿主默认」，排障时不必猜配置。
+    assert.equal(lines[8], '部署人设：宿主默认');
+    assert.equal(lines.length, V0411_STATUS_LINES.length + 3, '/状态 应只多人格卡、部署人设与情绪三行');
 
     const withoutInjected = lines.filter(
-      (line) => !line.startsWith('人格卡：') && !line.startsWith('情绪：'),
+      (line) => !line.startsWith('人格卡：')
+        && !line.startsWith('部署人设：')
+        && !line.startsWith('情绪：'),
     );
     assert.match(withoutInjected[0], V0411_STATUS_HEAD);
     assert.equal(withoutInjected[0], V0411_STATUS_LINES[0]);

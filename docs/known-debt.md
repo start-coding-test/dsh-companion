@@ -139,6 +139,22 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
 - **建议排期**：v0.4.13 清理调用方并让其与 `loadPersonaCard()` 行为对齐（ENOENT 也走 fallback 状态 + warn，或直接删除导出）。
 - **验收方式**：`git grep -n loadCard -- src` 无调用；单测覆盖 ENOENT 的成功/失败分支与 `loadPersonaCard()` 一致；`/状态` 与 warn 口径不变。
 
+### D-12 P2：宿主段名再改版时，人设遮蔽只 warn 不报错（按设计降级）
+
+- **现状**：`persona.shadowDeployment` 的 `rewrite` / `takeover` 依赖宿主 0.4.x 的段名常量
+  `deployment:persona-prefix` / `deployment:persona-suffix`。若宿主再次改版（拆分、改名），
+  `applyDeploymentShadow()` 在最终 assembly 里两个段都找不到时，只写一次
+  `[dsh-companion] deployment persona sections missing; shadow skipped`（meta 含 mode 与缺失段名），
+  然后原样返回 assembly，装配继续；只剩一段时 `rewrite` 写 `rewrite-missing-prefix`，
+  `takeover` 仍按单段处理。`/状态` 仍显示配置的「已替换 / 已接管」，不会动态回退。
+- **影响**：升级宿主后遮蔽可能**静默失效**（仅日志一条 warn），用户以为卡的身份已生效。这正是
+  「遮蔽失败不能挡装配」的取舍：宁可保留宿主默认人设，也不让插件把会话启动搞挂。
+- **建议排期**：不修（与 P2 验收口径一致）。下次宿主大版本升级时，用
+  `docs/persona-shadow.md` 的探针手法复核段名；若确认改名，更新 `src/persona/shadow.js` 的常量与
+  `test/persona-shadow.test.js`，并把缺失段名加入迁移说明。
+- **验收方式**：构造 `sections` 不含两个宿主段的 assembly，断言只 warn 一次、原引用返回、
+  装配不抛；在真实宿主升级后按探针输出核对 `assembly.sections` 是否仍含两个段名。
+
 ## 5. 已关闭（本轮修复）
 
 - **V9-M1 episode 落库前仍保留凭据原文**：v0.4.10 修复，commit `a4fe4e0`，字段级兜底口径由 `6e1ade8` 补齐。`consolidate` 写 episode 前对 `title` / `summary` / `evidence` / `mood_evidence` 与 `topics` / `entities` 逐字段脱敏，只把凭据值换成 `[凭据已省略]`、保留「路由器密码 …」这类上下文（不是整段丢弃）；`store.insertEpisode` 再做一次防御性值级脱敏（含 `topics_json` 字符串形态），`fts_episodes` 由主表投影故自动无明文。跨会话召回、注入、状态板与 JSON 导出经 `test/e2e/v0910-privacy.test.js` 验证均无明文；巩固提示词同时要求「不得复述密码、口令、token、卡号等凭据值」。

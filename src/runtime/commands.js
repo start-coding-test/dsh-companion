@@ -120,6 +120,8 @@ export function commandHintMessage(text) {
  * @param {{lastCompactMs?: number|null, lastConsolidateMs?: number|null,
  *   compactWarnMs?: number, consolidateWarnMs?: number}} [options.timing]
  *   G0-9：最近一次压缩/巩固耗时与阈值；传入时 /状态 追加两行耗时
+ * @param {{mode?: string}} [options.shadow] P2：部署人设遮蔽状态；不传时
+ *   /状态 不输出「部署人设」行（旧调用方格式不变）
  * @returns {{handled: boolean, reply: string}}
  */
 export function handleCommand({
@@ -137,6 +139,7 @@ export function handleCommand({
   threadAgentPreset,
   timing,
   persona,
+  shadow,
   emotion,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
@@ -178,6 +181,7 @@ export function handleCommand({
       threadAgentPreset,
       timing,
       persona,
+      shadow,
       emotion,
       now: toMillis(now),
     }),
@@ -531,7 +535,7 @@ function formatGiB(value) {
   return String(Math.round(n * 100) / 100);
 }
 
-/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] @param {{threadsSupported?: boolean, mainSession?: {id?: string|null, binding?: string}, threadAgentPreset?: string|null, persona?: {name?: string, version?: number, status?: string, path?: string|null, reason?: string|null}}} [options] */
+/** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] @param {{threadsSupported?: boolean, mainSession?: {id?: string|null, binding?: string}, threadAgentPreset?: string|null, persona?: {name?: string, version?: number, status?: string, path?: string|null, reason?: string|null}, shadow?: {mode?: string}, emotion?: object}} [options] */
 function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   const stats = store.stats();
   const tables = [
@@ -590,6 +594,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // 旧调用方（单测/其它宿主）不传则整行省略，输出格式不变。
   const personaLine = formatPersonaLine(options.persona);
   if (personaLine !== null) lines.push(personaLine);
+  // P2（v0.4.13）：部署人设遮蔽状态；只在接线层传入 options.shadow 时输出。
+  const shadowLine = formatShadowLine(options.shadow);
+  if (shadowLine !== null) lines.push(shadowLine);
   // P3-c：情绪状态行。只在接线层传入 options.emotion 时输出，旧调用方格式不变。
   const emotionLine = formatEmotionLine(store, scope, options.emotion, options.now, timeZone);
   if (emotionLine !== null) lines.push(emotionLine);
@@ -626,6 +633,22 @@ function formatPersonaLine(persona) {
     source = '内置默认';
   }
   return `人格卡：${name}${version}（${source}）`;
+}
+
+/**
+ * P2（v0.4.13）：部署人设遮蔽状态行。
+ *
+ * 只反映实际注册结果（接线层注册失败按 'off' 传），不读配置原文。
+ *
+ * @param {{mode?: unknown}} [shadow]
+ * @returns {string|null} 未传 shadow 时返回 null（不输出该行）
+ */
+function formatShadowLine(shadow) {
+  if (shadow === null || shadow === undefined || typeof shadow !== 'object') return null;
+  if (shadow.mode === 'off') return '部署人设：宿主默认';
+  if (shadow.mode === 'rewrite') return '部署人设：已替换（人格卡身份）';
+  if (shadow.mode === 'takeover') return '部署人设：已接管';
+  return null;
 }
 
 /** P3-c：情绪事件类型 → /状态 里的中文标签；白名单之外（ambient）不展示。 */

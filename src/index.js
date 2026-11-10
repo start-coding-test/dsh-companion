@@ -53,7 +53,8 @@ import {
 import { exportAll } from './memory/export.js';
 import { publishBoard, renderBoard, stageBoard } from './memory/state-board.js';
 import { boardSection, buildSections, buildSectionsWithDiagnostics } from './persona/sections.js';
-import { CARD_STATUS, loadPersonaCard, personaProactiveConflicts } from './persona/card.js';
+import { CARD_STATUS, DEFAULT_CARD, loadPersonaCard, personaProactiveConflicts, renderTemplate } from './persona/card.js';
+import { createAssembleHandler } from './persona/shadow.js';
 import {
   EMOTION_PROMPT_PREFIX,
   EMOTION_SOURCE_KIND,
@@ -445,6 +446,9 @@ export function apply(ctx, rawConfig, hooks = {}) {
     publishOnThreadUnarchive(platform, store);
 
     registerSections(platform, store, track, state.card);
+    // P2（v0.4.13）：遮蔽宿主默认人设。off 时连监听器都不注册，默认路径与旧版
+    // 完全一致；失败只 warn，不挡装配。
+    state.shadowMode = registerDeploymentShadow(platform, config, track, state.card);
     // V7-H1 审计：pre-step 是事件钩子注册（只能在 apply 阶段完成），能力位来自
     // Context 事件 API 而非晚挂载 service，故保留 apply 时判断。
     if (platform.capabilities.preStep) {
@@ -539,6 +543,8 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     card: null,
     /** v0.4.12：人格卡加载来源 {card,status,path,reason}；/状态 展示用。 */
     cardSource: null,
+    /** P2（v0.4.13）：实际生效的遮蔽模式；/状态 展示用。注册失败时回落 'off'。 */
+    shadowMode: 'off',
     /** W4：当前 embedder（关闭向量时为 null）；local/remote 由注入 loader/fetch 构造。 */
     embedder,
     /** W4：本进程已回填的向量条数（/状态 展示）。 */
@@ -786,6 +792,49 @@ function registerSections(platform, store, track, card) {
 }
 
 /**
+ * P2（v0.4.13）：按配置遮蔽宿主默认人设。
+ *
+ * 只能走 `system-prompt/assemble` waterfall：宿主 0.4.x 的
+ * `deployment:persona-prefix/-suffix` 在全局层注册，同名再注册必抛。
+ *
+ * @param {object} platform
+ * @param {object} config 已归一化的配置
+ * @param {(disposer: Function) => void} track
+ * @param {Readonly<object>} card 启动时加载一次的人格卡（state.card）
+ * @returns {'off'|'rewrite'|'takeover'} 实际生效的模式（注册失败回落 'off'）
+ */
+function registerDeploymentShadow(platform, config, track, card) {
+  const mode = config.persona?.shadowDeployment ?? 'off';
+  if (mode === 'off') return 'off';
+  if (typeof platform.onAssemble !== 'function') {
+    platform.log('warn', '[dsh-companion] system-prompt/assemble unavailable; deployment persona shadow disabled', {
+      mode,
+    });
+    return 'off';
+  }
+  const source = card ?? DEFAULT_CARD;
+  const personaText = renderTemplate(source.chatIdentity || DEFAULT_CARD.chatIdentity, {
+    name: source.name || DEFAULT_CARD.name,
+    address: source.address || DEFAULT_CARD.address,
+  });
+  const handler = createAssembleHandler({
+    mode,
+    personaText,
+    warn: (message, meta) => platform.log('warn', message, meta),
+  });
+  const disposer = platform.onAssemble(handler);
+  if (typeof disposer !== 'function') {
+    platform.log('warn', '[dsh-companion] system-prompt/assemble registration failed; deployment persona shadow disabled', {
+      mode,
+    });
+    return 'off';
+  }
+  track(disposer);
+  platform.log('info', '[dsh-companion] deployment persona shadow enabled', { mode });
+  return mode;
+}
+
+/**
  * 第三个状态板发布时机：线程恢复（unarchive）。
  * 工具层只会调用 platform.unarchiveSession，因此在这里包一层，成功后发布。
  * @param {object} platform
@@ -886,6 +935,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             },
             // v0.4.12：/状态 展示人格卡来源（内置默认 / 文件路径 / 加载失败原因）。
             persona: personaStatus(state),
+            // P2（v0.4.13）：/状态 展示部署人设的遮蔽状态。
+            shadow: { mode: state.shadowMode },
             // P3-c：/状态 展示情绪状态；未启用时命令层只输出「情绪：未启用」。
             emotion: { enabled: state.card?.emotion?.enabled === true },
           });
