@@ -1,6 +1,10 @@
 /**
- * 情绪接线（P3-c）：把「读库 → 衰减 → 节律 → 安静时段 → 分类事件 → 应用 →
- * 落库 → 描述」串成可注入依赖的纯逻辑。
+ * 情绪接线（P3-c）：把「读库 → 朝目标衰减 → 分类事件 → 应用 → 落库 → 描述」
+ * 串成可注入依赖的纯逻辑。
+ *
+ * V50-H1：昼夜节律与安静时段是**目标偏移**（targetFor），不是每轮增量。
+ * 状态每轮朝「baseline + 节律 + 安静」指数回归（decay 的 target），
+ * 只有分类事件在衰减之后叠加；因此连发消息不会把节律重复累加进状态。
  *
  * 设计约束：
  * - 不读时钟、不读环境变量：now / hour / minute / quiet 全部由调用方算好传入；
@@ -12,17 +16,20 @@
 
 import {
   DEFAULT_BASELINE,
-  applyDeltas,
+  QUIET_ENERGY_OFFSET,
   applyEvent,
-  circadian,
   classify,
   createState,
   decay,
   describe,
+  targetFor,
 } from './emotion.js';
 
-/** 安静时段对 energy 的额外环境增量（与节律增量相加后一并计入事件 deltas）。 */
-export const QUIET_ENERGY_DELTA = -3;
+/**
+ * 安静时段对 energy 的额外目标偏移（与节律一样属于环境项，由 targetFor 折算，
+ * 不再是每轮增量）。数值保持 -3，历史导入名不变。
+ */
+export const QUIET_ENERGY_DELTA = QUIET_ENERGY_OFFSET;
 
 /** 注入消息的 source.kind；转录/巩固/主会话绑定都按它排除。 */
 export const EMOTION_SOURCE_KIND = 'companion-emotion';
@@ -107,22 +114,27 @@ export function runEmotionTurn(input = {}) {
   const baseline = emotion.baseline ?? DEFAULT_BASELINE;
   const halfLifeHours = emotion.halfLifeHours ?? 6;
 
-  const stored = store.getEmotionState(scope) ?? createState({ nowMs: now, baseline });
-  const decayed = decay(stored, { baseline, halfLifeHours, nowMs: now });
+  // V50-H1：节律 + 安静时段折算成「此刻的平衡目标」，不是本轮增量。
+  const target = targetFor({ baseline, hour, minute, quiet: quiet === true });
 
-  // 节律 + 安静时段作为「本轮环境项」并入；安静时段只额外压 energy。
-  const rhythm = circadian({ hour, minute });
-  const environment = {};
-  for (const dim of DIMENSIONS) environment[dim] = rhythm[dim];
-  environment.energy += quiet === true ? QUIET_ENERGY_DELTA : 0;
-  const ambient = applyDeltas(decayed, environment, baseline);
+  const stored = store.getEmotionState(scope);
+  // 无历史状态时直接从目标起步（而不是先按 baseline 起步再被节律顶过去），
+  // 保证冷启动与上一轮刚写过状态的结果一致；reference 保留 baseline 口径，
+  // 用于「环境项变化是否值得记一条 ambient」的审计。
+  const reference = stored ?? createState({ nowMs: now, baseline });
+  const seed = stored ?? createState({ nowMs: now, baseline: target });
+  // 朝目标回归：节律/安静只影响目标位置，不会作为增量写进状态。
+  const decayed = decay(seed, { baseline, target, halfLifeHours, nowMs: now });
+  // 对照「只朝 baseline 回归」的反事实状态，得到本轮环境项的净贡献，
+  // 仅用于 ambient 审计（不参与状态计算）。
+  const baselineDecayed = decay(reference, { baseline, halfLifeHours, nowMs: now });
 
   const classified = classify(typeof text === 'string' ? text : '');
-  let state = ambient;
+  let state = decayed;
   let event = null;
   if (classified.confidence > 0) {
-    // hour=16 是节律全零的中性时刻：环境项已经单独并入，这里只取事件固有增量。
-    const applied = applyEvent(ambient, {
+    // hour=16 是节律全零的中性时刻：目标值已含环境项，这里只叠加事件固有增量。
+    const applied = applyEvent(decayed, {
       type: classified.type,
       intensity: intensityFor(classified.confidence),
       nowMs: now,
@@ -134,15 +146,18 @@ export function runEmotionTurn(input = {}) {
     event = applied.event;
   }
 
-  // 本轮「环境 + 事件」的实际增量（相对衰减后的状态），用于事件表。
+  // 本轮「事件」的实际增量（相对朝目标衰减后的状态）；环境项另有 environmentDeltas。
   const turnDeltas = {};
+  const environmentDeltas = {};
   let changed = false;
   for (const dim of DIMENSIONS) {
     turnDeltas[dim] = round2(state[dim] - decayed[dim]);
-    if (Math.abs(state[dim] - stored[dim]) > SIGNIFICANT_DELTA) changed = true;
+    environmentDeltas[dim] = round2(decayed[dim] - baselineDecayed[dim]);
+    if (Math.abs(state[dim] - reference[dim]) > SIGNIFICANT_DELTA) changed = true;
   }
   if (event === null && changed) {
-    event = { at: now, type: AMBIENT_EVENT_TYPE, deltas: turnDeltas };
+    // ambient 只记环境项（节律/安静）的净贡献；纯衰减时 deltas 为 0。
+    event = { at: now, type: AMBIENT_EVENT_TYPE, deltas: environmentDeltas };
   } else if (event !== null) {
     event = { at: event.at, type: event.type, deltas: turnDeltas };
   }
@@ -168,7 +183,9 @@ export function runEmotionTurn(input = {}) {
   return {
     state,
     event,
-    line: describe(state),
+    // V50-M1：把本轮事件类型交给 describe，blame / vent 用各自的专属句；
+    // 其余类型（含 ambient）与不传第二参时完全一致。
+    line: describe(state, event === null ? undefined : { eventType: event.type }),
     changed,
   };
 }

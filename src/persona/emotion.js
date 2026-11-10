@@ -52,8 +52,16 @@ export const EVENT_TYPES = Object.freeze([
   'reunion',
   'goodnight',
   'conflict',
+  'blame',
+  'vent',
   'comfort',
 ]);
+
+/**
+ * 安静时段对 energy 的额外目标偏移（与昼夜节律一样属于环境项，不是每轮增量）。
+ * wiring 里以 `QUIET_ENERGY_DELTA` 的历史名字导出，数值保持不变。
+ */
+export const QUIET_ENERGY_OFFSET = -3;
 
 /**
  * 各事件类型在 intensity=1 时的四维固有增量（正负即语义方向）。
@@ -69,6 +77,10 @@ const EVENT_DELTAS = Object.freeze({
   reunion: Object.freeze({ pleasure: 6, arousal: 4, dominance: 1, energy: 1 }),
   goodnight: Object.freeze({ pleasure: 1, arousal: -5, dominance: 0.5, energy: 2 }),
   conflict: Object.freeze({ pleasure: -6, arousal: 4, dominance: -4, energy: -1 }),
+  // 冲着她来的负面话：愉悦明显掉、唤醒略升、精力略降（不迁怒状态句）。
+  blame: Object.freeze({ pleasure: -6.4, arousal: 1.5, dominance: -1, energy: -1 }),
+  // 用户自述疲惫：只小幅压愉悦，掌控/精力不下沉（避免把诉苦读成对她的不满）。
+  vent: Object.freeze({ pleasure: -1.5, arousal: -0.5, dominance: 0.5, energy: 0 }),
   comfort: Object.freeze({ pleasure: 5, arousal: -2, dominance: 1, energy: -1 }),
 });
 
@@ -171,6 +183,20 @@ const CLASSIFY_RULES = Object.freeze([
     pattern: /(?:你怎么了|你怎么啦|还好吗|注意身体|别太累|别熬夜|早点休息|多喝|照顾好自己|没事吧|要不要紧)/,
   },
   {
+    // 指向她的负面话：第二人称 / 她的名字 + 负面词。排在 complain 之前，
+    // 才能把「你好烦」（冲她）与「今天加班好累」（用户诉苦）分开。
+    type: 'blame',
+    base: 0.74,
+    pattern: /(?:你|您|珞然)[^。！？!?，,]{0,6}(?:烦|讨厌|笨|没用|闭嘴|失望|恶心|受不了|滚(?:开|蛋|出去|吧|啊|！|!|$))/,
+  },
+  {
+    // 用户自述疲惫/委屈：第一人称或「今天/最近」+ 疲惫词，且不是在问她累不累。
+    // 「你也不容易」是体谅，不含负面词，因此混合句仍落到 vent。
+    type: 'vent',
+    base: 0.68,
+    pattern: /^(?!.*(?:你|您)[^。！？!?，,]{0,4}(?:累不累|累吗|还好吗))(?:我|俺|今天|最近|这周|这几天|这阵子)[^。！？!?]{0,12}(?:累|加班|难受|委屈|压力大|撑不住|扛不住|好辛苦|想哭)/,
+  },
+  {
     type: 'complain',
     base: 0.66,
     pattern: /(?:烦|累死|气死|难受|压力|崩溃|郁闷|好累|太累|心累|不开心|堵得慌)/,
@@ -214,6 +240,24 @@ export const DESCRIBE_SENTENCES = Object.freeze([
   '现在心情低落，精神倒还足，说话轻一点，别追问',
   '现在心情低落，精神一般，先别急着劝，陪着就好',
   '现在心情低落，精神也低，回应短一点，今天稳一点',
+]);
+
+/**
+ * V50-M1：针对「冲她来的负面话」的专属表述（事件类型 blame）。
+ * 与 DESCRIBE_SENTENCES 同口径：无阿拉伯数字、≤40 码点；按愉悦档位二选一。
+ */
+export const BLAME_SENTENCES = Object.freeze([
+  '现在心里被扎了一下，先稳住，别赌气，话少一点',
+  '现在有点委屈又有点气，回应短些，别把话顶回去',
+]);
+
+/**
+ * V50-M1：针对「用户自述疲惫」的专属表述（事件类型 vent）。
+ * 只体现关心与心疼，不含责备；与 DESCRIBE_SENTENCES 同口径。
+ */
+export const VENT_SENTENCES = Object.freeze([
+  '现在心软下来，先问问累在哪，别急着讲道理',
+  '现在有点心疼，先接住这份累，陪着就好',
 ]);
 
 /** 分档边界（写死，勿改）：pleasure ≥65 不错 / 45–64 平稳 / 35–44 有点闷 / <35 低落。 */
@@ -339,12 +383,16 @@ export function createState(options) {
 }
 
 /**
- * 向基线指数回归：v' = b + (v - b) * 0.5 ** (dtHours / halfLifeHours)。
+ * 向目标值指数回归：v' = t + (v - t) * 0.5 ** (dtHours / halfLifeHours)。
  * 四维共用同一半衰期（简单、可复算）；dt 为负视为 0；dt 为 0 时逐值恒等，
  * 不引入浮点漂移。半衰期合法区间 (0, 168] 小时。
  *
+ * `target` 是可选的目标状态（V50-H1）：昼夜节律 + 安静时段等环境项由接线方
+ * 折算成目标偏移传入，状态朝目标回归，**不会**把环境项当成每轮增量反复叠加。
+ * 缺省（不传 target）时沿用 baseline，与旧调用完全兼容。
+ *
  * @param {object} state
- * @param {{baseline?:object, nowMs:number, halfLifeHours:number}} options
+ * @param {{baseline?:object, target?:object, nowMs:number, halfLifeHours:number}} options
  * @returns {object} 新状态，updatedAt = nowMs
  */
 export function decay(state, options) {
@@ -367,6 +415,8 @@ export function decay(state, options) {
   }
 
   const resolved = resolveBaseline(opts.baseline);
+  // 目标缺省 = 基线（旧行为）；显式传 target 时朝目标回归。
+  const anchor = opts.target === undefined ? resolved : resolveBaseline(opts.target);
   const current = normalizeState(state, resolved);
   const dtHours = Math.max(0, (opts.nowMs - current.updatedAt) / HOUR_MS);
   if (dtHours === 0) return { ...current, updatedAt: opts.nowMs };
@@ -374,7 +424,7 @@ export function decay(state, options) {
   const factor = 0.5 ** (dtHours / halfLifeHours);
   const next = {};
   for (const dim of DIMENSIONS) {
-    const base = resolved[dim];
+    const base = anchor[dim];
     next[dim] = clamp(base + (current[dim] - base) * factor, VALUE_MIN, VALUE_MAX);
   }
   next.updatedAt = opts.nowMs;
@@ -438,6 +488,32 @@ export function circadian(timeOfDay, _state) {
     offsets[dim] = round2(interpolate(CIRCADIAN_POINTS[dim], hourOfDay));
   }
   return offsets;
+}
+
+/**
+ * 某时刻的平衡目标（V50-H1）：baseline + 昼夜节律 + 安静时段偏移，逐维夹到 0–100。
+ *
+ * 这是「状态该停在哪里」而不是「本轮该加多少」：接线方把它传给 `decay`，
+ * 状态朝目标指数回归，因此节律/安静不会被当成增量每轮重复叠加。
+ * 安静时段只额外压 energy（沿用 wiring 的 QUIET_ENERGY_DELTA = QUIET_ENERGY_OFFSET）。
+ *
+ * @param {{baseline?:object, hour:number, minute?:number, quiet?:boolean}} options
+ * @returns {{pleasure:number,arousal:number,dominance:number,energy:number}}
+ */
+export function targetFor(options) {
+  const opts = options === null || options === undefined ? {} : options;
+  if (typeof opts !== 'object') {
+    throw new TypeError(`targetFor(options): options must be an object (got ${typeof options})`);
+  }
+  const resolved = resolveBaseline(opts.baseline);
+  const offsets = circadian({ hour: opts.hour, minute: opts.minute });
+  const quiet = opts.quiet === true;
+  const target = {};
+  for (const dim of DIMENSIONS) {
+    const quietOffset = quiet && dim === 'energy' ? QUIET_ENERGY_OFFSET : 0;
+    target[dim] = round2(clamp(resolved[dim] + offsets[dim] + quietOffset, VALUE_MIN, VALUE_MAX));
+  }
+  return target;
 }
 
 /**
@@ -617,13 +693,25 @@ function bandIndex(value, bands) {
  * 句式由 pleasure 四档 × energy 三档决定（共 12 种，见 DESCRIBE_SENTENCES）。
  * 四维缺失/非数值按 DEFAULT_BASELINE 回落，不要求 updatedAt。
  *
+ * 可选第二参 `context.eventType` 用于区分「冲她来的负面话」与「用户自述疲惫」：
+ * blame / vent 走各自的专属句（BLAME_SENTENCES / VENT_SENTENCES），
+ * 其余类型或省略第二参时与原行为完全一致。
+ *
  * @param {object} state
+ * @param {{eventType?:string}} [context]
  * @returns {string}
  */
-export function describe(state) {
+export function describe(state, context) {
   const dimensions = readDimensions(state);
   const pleasureTier = bandIndex(dimensions.pleasure, PLEASURE_BANDS);
   const energyTier = bandIndex(dimensions.energy, ENERGY_BANDS);
+  if (context !== undefined && context !== null) {
+    if (typeof context !== 'object' || Array.isArray(context)) {
+      throw new TypeError(`describe(state, context): context must be an object (got ${typeof context})`);
+    }
+    if (context.eventType === 'blame') return BLAME_SENTENCES[pleasureTier % BLAME_SENTENCES.length];
+    if (context.eventType === 'vent') return VENT_SENTENCES[pleasureTier % VENT_SENTENCES.length];
+  }
   return DESCRIBE_SENTENCES[pleasureTier * 3 + energyTier];
 }
 
