@@ -24,12 +24,28 @@ export const CARD_STATUS = Object.freeze({
 
 /**
  * 默认人格卡。
- * 字段与任务卡一致：name/address/tone/relation/proactive/bannedPhrases/values/taboos/version。
+ *
+ * v0.4.13（P1）起身份由卡驱动：description / personality / scenario 进 core 段，
+ * tone.notes 取代原先写死在 sections.js 的尾句，chatIdentity 取代 chat.js 的
+ * 硬编码开场白；mes_example / first_mes / post_history_instructions / memoryCitation
+ * 与 emotion 只做**存储 + 结构校验**（emotion 逻辑由其它任务卡实现）。
+ *
+ * 缺省值刻意让渲染结果与 v0.4.12 逐字节一致（test/fixtures/persona-v0412.json 锁定）。
+ * `{{char}}` 渲染为 name、`{{user}}` 渲染为 address；卡里存的原文保持不变，便于 diff。
  */
 export const DEFAULT_CARD = deepFreeze({
   name: '珞然',
   address: '你',
-  tone: { style: '简洁', warmth: '温和', structure: '先结论' },
+  description: '你是{{char}}，用户的私人管家。称呼用户为“{{user}}”。\n身份是 AI 助手；关系以管家为主、朋友为辅，保持可靠与克制。',
+  personality: '',
+  scenario: '',
+  tone: {
+    style: '简洁',
+    warmth: '温和',
+    structure: '先结论',
+    notes: '不堆铺垫，不夸张感叹，不用亲密称呼',
+    voice: '',
+  },
   relation: { butler: 0.7, friend: 0.3 },
   proactive: {
     dailyCap: 3,
@@ -52,8 +68,41 @@ export const DEFAULT_CARD = deepFreeze({
     '劝酒赌博',
     '医疗与法律与投资的结论性建议',
   ],
+  mes_example: '',
+  first_mes: '',
+  post_history_instructions: '',
+  memoryCitation: 'explicit',
+  chatIdentity: '你是用户的私人助手{{char}}，称呼用户为「{{user}}」。',
+  emotion: {
+    enabled: false,
+    baseline: { pleasure: 50, arousal: 50, dominance: 50, energy: 60 },
+    halfLifeHours: 6,
+  },
   version: 1,
 });
+
+/** memoryCitation 的两个合法取值（v0.4.13 P1）。 */
+export const MEMORY_CITATION_MODES = Object.freeze(['explicit', 'natural']);
+
+/** emotion.baseline 的四个维度（结构校验用；不实现情绪逻辑）。 */
+const EMOTION_BASELINE_KEYS = Object.freeze(['pleasure', 'arousal', 'dominance', 'energy']);
+
+/**
+ * 渲染卡里的模板占位符：`{{char}}` → name，`{{user}}` → address。
+ *
+ * 只做一次替换（不递归），非字符串原样返回；生产卡已校验，这里对部分字段缺失的
+ * 旧调用方保持宽松（缺失按空串处理）。
+ *
+ * @param {string} text
+ * @param {{name?: string, address?: string}} context
+ * @returns {string}
+ */
+export function renderTemplate(text, context) {
+  if (typeof text !== 'string') return text;
+  const name = typeof context?.name === 'string' ? context.name : '';
+  const address = typeof context?.address === 'string' ? context.address : '';
+  return text.split('{{char}}').join(name).split('{{user}}').join(address);
+}
 
 /**
  * 读取人格卡；不存在则使用默认卡。
@@ -93,7 +142,19 @@ export function loadCard(path) {
  * @param {string} [path] 仅用于错误消息
  * @returns {Readonly<object>}
  */
-function parseCardSource(source, path = '') {
+export function parseCardSource(source, path = '') {
+  return parseCardSourceDetailed(source, path).card;
+}
+
+/**
+ * 同 parseCardSource()，但额外返回导入期诊断（v0.4.13 P1：CCv2/v3 的
+ * `character_book` 被忽略时给出一条 warning，不进渲染文本）。
+ *
+ * @param {string} source
+ * @param {string} [path]
+ * @returns {Readonly<{card: Readonly<object>, warnings: ReadonlyArray<{code: string}>}>}
+ */
+export function parseCardSourceDetailed(source, path = '') {
   let parsed;
   try {
     parsed = JSON.parse(source);
@@ -109,16 +170,75 @@ function parseCardSource(source, path = '') {
     throw new TypeError(`loadCard(${path}): card must be a JSON object`);
   }
 
-  // 必填字段必须在卡文件里显式给出；其余字段才走默认值深合并。
-  requireText(parsed, 'name');
-  requireText(parsed, 'address');
-  if (!isPlainObject(parsed.tone)) {
-    throw new TypeError('persona card: "tone" must be an object');
+  const { input, warnings } = normalizeCardSource(parsed);
+  if (!isCcCardSource(parsed)) {
+    // 原生卡：必填字段必须在卡文件里显式给出；其余字段才走默认值深合并。
+    requireText(parsed, 'name');
+    requireText(parsed, 'address');
+    if (!isPlainObject(parsed.tone)) {
+      throw new TypeError('persona card: "tone" must be an object');
+    }
+  } else {
+    // CCv2/v3：其它字段缺失用默认值，但 name 仍必须非空（不能静默变成内置名）。
+    requireText(input, 'name');
   }
 
-  const merged = mergeInto(DEFAULT_CARD, parsed);
+  const merged = mergeInto(DEFAULT_CARD, input);
   validateCard(merged);
-  return deepFreeze(merged);
+  return Object.freeze({
+    card: deepFreeze(merged),
+    warnings: Object.freeze(warnings.map((warning) => Object.freeze(warning))),
+  });
+}
+
+/**
+ * 是否为 CCv2/v3 包装（`{spec, spec_version, data:{...}}`）。
+ * 只认这两种 spec，避免把任意带 data 的 JSON 误当角色卡。
+ * @param {Record<string, any>} parsed
+ * @returns {boolean}
+ */
+function isCcCardSource(parsed) {
+  return (parsed.spec === 'chara_card_v2' || parsed.spec === 'chara_card_v3')
+    && isPlainObject(parsed.data);
+}
+
+/**
+ * 归一化卡来源（v0.4.13 P1）：
+ * - 原生卡：原样返回；
+ * - `spec` 为 `chara_card_v2` / `chara_card_v3` 且顶层有 `data` 对象：把 CCv2/v3
+ *   字段映射到本卡结构。缺失字段不报错（合并时用默认值），`address` 缺失用 `你`，
+ *   `version` 缺失用 `1`。
+ * - `character_book` 一律忽略，只返回 `{code:'character_book_ignored'}`，不读不打印书内容。
+ *
+ * @param {Record<string, any>} parsed
+ * @returns {{input: Record<string, any>, warnings: Array<{code: string}>}}
+ */
+function normalizeCardSource(parsed) {
+  if (!isCcCardSource(parsed)) return { input: parsed, warnings: [] };
+
+  const data = parsed.data;
+  const mapped = {};
+  for (const key of [
+    'name',
+    'description',
+    'personality',
+    'scenario',
+    'mes_example',
+    'first_mes',
+    'post_history_instructions',
+  ]) {
+    if (Object.hasOwn(data, key)) mapped[key] = data[key];
+  }
+  mapped.address = typeof data.address === 'string' && data.address.trim() !== ''
+    ? data.address
+    : '你';
+  mapped.version = Number.isInteger(data.version) && data.version >= 1 ? data.version : 1;
+
+  const warnings = [];
+  if (data.character_book !== undefined && data.character_book !== null) {
+    warnings.push({ code: 'character_book_ignored' });
+  }
+  return { input: mapped, warnings };
 }
 
 /**
@@ -172,10 +292,13 @@ export function resolveCardPath(cardPath, deps = {}) {
  * - JSON 非法、必填字段缺失（validateCard 抛错）。
  * 以上全部 → status='fallback' + 内置卡 + 原因（含解析后路径，不含卡正文）。
  *
+ * v0.4.13（P1）：新增 `warnings`（导入期诊断，如 CCv2/v3 的 `character_book_ignored`），
+ * 由 index.js 在 apply 时各记一条 warn；不含卡正文。
+ *
  * @param {string|null|undefined} cardPath 配置值 persona.cardPath
  * @param {{env?: Record<string, string|undefined>, homedir?: string|(() => string)}} [deps]
  * @returns {Readonly<{card: Readonly<object>, status: 'builtin'|'file'|'fallback',
- *   path: string|null, reason: string|null}>}
+ *   path: string|null, reason: string|null, warnings: ReadonlyArray<{code: string}>}>}
  */
 export function loadPersonaCard(cardPath, deps = {}) {
   const resolved = resolveCardPath(cardPath, deps);
@@ -185,6 +308,7 @@ export function loadPersonaCard(cardPath, deps = {}) {
       status: CARD_STATUS.BUILTIN,
       path: null,
       reason: null,
+      warnings: Object.freeze([]),
     });
   }
 
@@ -197,15 +321,18 @@ export function loadPersonaCard(cardPath, deps = {}) {
       status: CARD_STATUS.FALLBACK,
       path: resolved,
       reason: describeReadError(err, resolved),
+      warnings: Object.freeze([]),
     });
   }
 
   try {
+    const parsed = parseCardSourceDetailed(source, resolved);
     return Object.freeze({
-      card: parseCardSource(source, resolved),
+      card: parsed.card,
       status: CARD_STATUS.FILE,
       path: resolved,
       reason: null,
+      warnings: parsed.warnings,
     });
   } catch (err) {
     return Object.freeze({
@@ -213,6 +340,7 @@ export function loadPersonaCard(cardPath, deps = {}) {
       status: CARD_STATUS.FALLBACK,
       path: resolved,
       reason: describeParseError(err, resolved),
+      warnings: Object.freeze([]),
     });
   }
 }
@@ -347,7 +475,10 @@ function sanitizeParseReason(message) {
 }
 
 /**
- * 校验人格卡必填字段；失败抛 TypeError（含字段名）。
+ * 校验人格卡字段；失败抛 TypeError（含字段名/字段路径）。
+ *
+ * v0.4.13（P1）新增字段全部**可选**：卡里没写就不校验（合并后由默认值补齐）；
+ * 写了就必须是对的类型，避免把数字/对象渲染进 system 段。
  * @param {Record<string, any>} card
  */
 export function validateCard(card) {
@@ -362,13 +493,80 @@ export function validateCard(card) {
   requireText(card.tone, 'style', 'tone.');
   requireText(card.tone, 'warmth', 'tone.');
   requireText(card.tone, 'structure', 'tone.');
+  optionalString(card, 'description');
+  optionalString(card, 'personality');
+  optionalString(card, 'scenario');
+  optionalString(card, 'mes_example');
+  optionalString(card, 'first_mes');
+  optionalString(card, 'post_history_instructions');
+  optionalString(card, 'chatIdentity');
+  optionalString(card.tone, 'notes', 'tone.');
+  optionalString(card.tone, 'voice', 'tone.');
   requireStringArray(card, 'bannedPhrases');
   requireStringArray(card, 'values');
   requireStringArray(card, 'taboos');
+  if (card.memoryCitation !== undefined && !MEMORY_CITATION_MODES.includes(card.memoryCitation)) {
+    throw new TypeError(
+      'persona card: "memoryCitation" must be "explicit" or "natural"',
+    );
+  }
+  validateEmotion(card.emotion);
   if (!Number.isInteger(card.version) || card.version < 1) {
     throw new TypeError('persona card: "version" must be a positive integer');
   }
   return card;
+}
+
+/**
+ * 字段存在时必须是字符串（v0.4.13 P1）。空串合法（表示「不渲染这一段」）。
+ * @param {Record<string, any>} holder
+ * @param {string} key
+ * @param {string} [prefix]
+ */
+function optionalString(holder, key, prefix = '') {
+  if (!Object.hasOwn(holder, key) || holder[key] === undefined) return;
+  if (typeof holder[key] !== 'string') {
+    throw new TypeError(`persona card: "${prefix}${key}" must be a string`);
+  }
+}
+
+/**
+ * emotion 结构校验（v0.4.13 P1）。
+ *
+ * 本卡**只校验 + 透传**，不实现情绪演化逻辑（由另一张任务卡实现）。字段存在时：
+ * `enabled` 布尔；`baseline` 四维数在 0–100；`halfLifeHours` 在 (0, 168]。
+ * 缺省字段（旧卡）直接跳过。
+ * @param {any} emotion
+ */
+function validateEmotion(emotion) {
+  if (emotion === undefined) return;
+  if (!isPlainObject(emotion)) {
+    throw new TypeError('persona card: "emotion" must be an object');
+  }
+  if (Object.hasOwn(emotion, 'enabled') && typeof emotion.enabled !== 'boolean') {
+    throw new TypeError('persona card: "emotion.enabled" must be a boolean');
+  }
+  if (emotion.baseline !== undefined) {
+    if (!isPlainObject(emotion.baseline)) {
+      throw new TypeError('persona card: "emotion.baseline" must be an object');
+    }
+    for (const key of EMOTION_BASELINE_KEYS) {
+      const value = emotion.baseline[key];
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 100) {
+        throw new TypeError(
+          `persona card: "emotion.baseline.${key}" must be a number between 0 and 100`,
+        );
+      }
+    }
+  }
+  if (emotion.halfLifeHours !== undefined) {
+    const value = emotion.halfLifeHours;
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0 || value > 168) {
+      throw new TypeError(
+        'persona card: "emotion.halfLifeHours" must be a number greater than 0 and at most 168',
+      );
+    }
+  }
 }
 
 /**
