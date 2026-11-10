@@ -167,7 +167,7 @@ test('migrate：v6 库补 first_reneed/used 七列与索引，旧行保持 NULL'
 
   const second = Store.open(path);
   try {
-    assert.equal(second.getMeta('schema_version'), '13');
+    assert.equal(second.getMeta('schema_version'), '14');
     const columns = second.db
       .prepare("PRAGMA table_info('facts')")
       .all()
@@ -225,7 +225,7 @@ test('migrate：v7 旧库升到 v9 幂等，重复打开不重复加列/触发�
   for (let round = 0; round < 2; round += 1) {
     const store = Store.open(path);
     try {
-      assert.equal(store.getMeta('schema_version'), '13', `第 ${round + 1} 次打开版本稳定`);
+      assert.equal(store.getMeta('schema_version'), '14', `第 ${round + 1} 次打开版本稳定`);
       const columns = store.db
         .prepare("PRAGMA table_info('facts')")
         .all()
@@ -358,7 +358,7 @@ test('migrate：v8 库补 first_used_* 三列，旧行 NULL，重复打开幂等
   for (let round = 0; round < 2; round += 1) {
     const store = Store.open(path);
     try {
-      assert.equal(store.getMeta('schema_version'), '13', `第 ${round + 1} 次打开版本稳定`);
+      assert.equal(store.getMeta('schema_version'), '14', `第 ${round + 1} 次打开版本稳定`);
       const columns = store.db
         .prepare("PRAGMA table_info('facts')")
         .all()

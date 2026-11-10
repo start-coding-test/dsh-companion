@@ -286,7 +286,7 @@ test('V6-M1：v10 → v11 迁移补 occurrence_key，旧行为 NULL 且 claim �
 
   const store = Store.open(dbPath);
   try {
-    assert.equal(store.getMeta('schema_version'), '13');
+    assert.equal(store.getMeta('schema_version'), '14');
     const columns = store.db
       .prepare("PRAGMA table_info('reminders')")
       .all()
@@ -314,7 +314,7 @@ test('V6-M1：v10 → v11 迁移补 occurrence_key，旧行为 NULL 且 claim �
   // 重开：已是最新版本，补列幂等。
   const reopened = Store.open(dbPath);
   try {
-    assert.equal(reopened.getMeta('schema_version'), '13');
+    assert.equal(reopened.getMeta('schema_version'), '14');
     assert.equal(reopened.getReminder('old-10').status, 'fired');
   } finally {
     reopened.close();

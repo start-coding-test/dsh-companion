@@ -73,14 +73,31 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  *     口径（#scrubLegacyEpisodes），只有真正变化的行才更新并重建 FTS。成功后
  *     在 schema_meta 写 episode_scrub_v13 标记，重复打开直接跳过；审计只写一条
  *     memory_events（action=scrub，detail={scanned,changed}，不含正文）。
+ * v14（P3-b）：新增 emotion_state / emotion_events 两张表，只建表、不动既有数据；
+ *     DDL 走 CREATE TABLE IF NOT EXISTS，v13 库打开时自动补表（幂等）。
+ *     时间戳按卡面独立约定用「毫秒」epoch（既有表多用秒），所以 emotion_events.at
+ *     与 purge 的秒级 cutoff 比较时要先换算，见 purge()。
  */
-const SCHEMA_VERSION = '13';
+const SCHEMA_VERSION = '14';
 /** v13：存量 episode 脱敏标记；存在即表示一次性 scrub 已完成（幂等跳过）。 */
 const EPISODE_SCRUB_MARKER = 'episode_scrub_v13';
 /** v13 scrub 的 rowid 批大小：大库分批复用同一游标，避免一次读全表。 */
 const EPISODE_SCRUB_BATCH = 200;
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
+
+/** P3-b：情绪四维（顺序即 deltas_json / 校验顺序，避免多处漂移）。 */
+export const EMOTION_DIMENSIONS = Object.freeze(['pleasure', 'arousal', 'dominance', 'energy']);
+
+/** P3-b：每 scope 保留的情绪事件条数（追加后截断，超出删最旧）。 */
+export const EMOTION_EVENT_RETENTION = 50;
+
+/** P3-b：listEmotionEvents 的默认条数。 */
+const EMOTION_EVENT_DEFAULT_LIMIT = 3;
+
+/** P3-b：情绪四维合法区间（含端点）。 */
+const EMOTION_MIN = 0;
+const EMOTION_MAX = 100;
 
 /** 提醒两阶段投递的最大尝试次数（超过后过期，避免死循环重试）。 */
 export const REMINDER_MAX_DELIVERY_ATTEMPTS = 3;
@@ -397,6 +414,29 @@ CREATE TABLE IF NOT EXISTS state_board_rev (
   updated_at       INTEGER NOT NULL
 );
 
+-- P3-b（v14）：情绪状态与情绪事件。
+-- 时间戳约定：这两张表用「毫秒」epoch（既有表多用秒），卡面要求新表独立口径，
+-- 因此 updated_at / last_event_at / at 都是毫秒，不参与既有表的秒级比较。
+-- 每 scope 一行状态；事件行由 store 侧保证每 scope 只留最近 50 条。
+CREATE TABLE IF NOT EXISTS emotion_state (
+  scope         TEXT PRIMARY KEY,
+  pleasure      REAL NOT NULL,
+  arousal       REAL NOT NULL,
+  dominance     REAL NOT NULL,
+  energy        REAL NOT NULL,
+  updated_at    INTEGER NOT NULL,  -- 毫秒
+  last_event_at INTEGER            -- 毫秒，可空
+);
+CREATE TABLE IF NOT EXISTS emotion_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope       TEXT NOT NULL,
+  at          INTEGER NOT NULL,    -- 毫秒
+  type        TEXT NOT NULL,
+  deltas_json TEXT NOT NULL,       -- {"pleasure":..,"arousal":..,"dominance":..,"energy":..}
+  note        TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_emotion_events ON emotion_events (scope, at);
+
 CREATE TABLE IF NOT EXISTS threads (
   key             TEXT PRIMARY KEY,
   name            TEXT NOT NULL,
@@ -657,6 +697,123 @@ function clampOffset(value) {
   const num = Number(value);
   if (!Number.isFinite(num) || num < 0) return 0;
   return Math.trunc(num);
+}
+
+/**
+ * P3-b：情绪四维校验（0–100 的有限数）。字符串数字也不算合法（按 Number.isFinite
+ * 的严格口径），避免调用方把「'60'」当成 60 静默落库。
+ * @param {unknown} value
+ * @param {string} name
+ * @returns {number}
+ */
+function requireEmotionValue(value, name) {
+  if (typeof value !== 'number' || !Number.isFinite(value)
+    || value < EMOTION_MIN || value > EMOTION_MAX) {
+    throw new TypeError(`[store] ${name} must be a finite number in ${EMOTION_MIN}..${EMOTION_MAX}`);
+  }
+  return value;
+}
+
+/**
+ * P3-b：毫秒时间戳校验。emotion_* 两张表按卡面新表约定用毫秒，这里不做
+ * 秒/毫秒猜测定性（既有表才用秒）；非有限数一律 TypeError。
+ * @param {unknown} value
+ * @param {string} name
+ * @returns {number}
+ */
+function requireEmotionMillis(value, name) {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new TypeError(`[store] ${name} must be a finite millisecond timestamp`);
+  }
+  return Math.trunc(value);
+}
+
+/**
+ * P3-b：可空毫秒时间戳。null/undefined 都表示「没有」，其余按 {@link requireEmotionMillis}。
+ * @param {unknown} value
+ * @param {string} name
+ * @returns {number|null}
+ */
+function optionalEmotionMillis(value, name) {
+  if (value === null || value === undefined) return null;
+  return requireEmotionMillis(value, name);
+}
+
+/**
+ * P3-b：deltas 归一化——必须是含四维有限数的对象。
+ * 增量允许为负（一次负向事件），所以这里不做 0–100 限制，只有 state 才限制。
+ * @param {unknown} deltas
+ * @returns {{pleasure:number, arousal:number, dominance:number, energy:number}}
+ */
+function normalizeEmotionDeltas(deltas) {
+  if (deltas === null || typeof deltas !== 'object' || Array.isArray(deltas)) {
+    throw new TypeError(
+      '[store] emotion deltas must be an object with pleasure/arousal/dominance/energy',
+    );
+  }
+  const out = {};
+  for (const dimension of EMOTION_DIMENSIONS) {
+    const value = deltas[dimension];
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw new TypeError(`[store] emotion deltas.${dimension} must be a finite number`);
+    }
+    out[dimension] = value;
+  }
+  return /** @type {{pleasure:number, arousal:number, dominance:number, energy:number}} */ (out);
+}
+
+/**
+ * P3-b：deltas_json 反序列化。坏数据返回空对象，读路径不因单行损坏而整体失败。
+ * @param {unknown} text
+ * @returns {object}
+ */
+function parseEmotionDeltas(text) {
+  if (typeof text !== 'string' || text === '') return {};
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return {};
+  }
+  if (value === null || typeof value !== 'object' || Array.isArray(value)) return {};
+  return value;
+}
+
+/**
+ * P3-b：DB 行（snake_case）→ 对外状态对象（camelCase）。
+ * @param {object} row
+ * @returns {{scope:string, pleasure:number, arousal:number, dominance:number,
+ *            energy:number, updatedAt:number, lastEventAt:number|null}}
+ */
+function mapEmotionStateRow(row) {
+  return {
+    scope: String(row.scope),
+    pleasure: Number(row.pleasure),
+    arousal: Number(row.arousal),
+    dominance: Number(row.dominance),
+    energy: Number(row.energy),
+    updatedAt: Number(row.updated_at),
+    lastEventAt: row.last_event_at === null || row.last_event_at === undefined
+      ? null
+      : Number(row.last_event_at),
+  };
+}
+
+/**
+ * P3-b：DB 行（snake_case）→ 对外事件对象（deltas 已反序列化）。
+ * @param {object} row
+ * @returns {{id:number, scope:string, at:number, type:string,
+ *            deltas:object, note:string|null}}
+ */
+function mapEmotionEventRow(row) {
+  return {
+    id: Number(row.id),
+    scope: String(row.scope),
+    at: Number(row.at),
+    type: String(row.type),
+    deltas: parseEmotionDeltas(row.deltas_json),
+    note: row.note === null || row.note === undefined ? null : String(row.note),
+  };
 }
 
 /**
@@ -1106,11 +1263,13 @@ export class Store {
    * （#ensureReminderRetryColumn），旧行 NULL，不需要回填。
    * v12 → v13 只推进版本号（无新列）；存量 episode 的脱敏 scrub 由 migrate()
    * 统一执行（#scrubLegacyEpisodes，带 schema_meta 标记，幂等）。
+   * v13 → v14 只推进版本号（纯新增表）；emotion_state / emotion_events 由
+   * migrate() 的 SCHEMA_SQL 幂等建好，旧库打开即补齐，不做任何数据回填。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
-    if (from === '12' || from === '11' || from === '10' || from === '9' || from === '8'
-      || from === '7' || from === '6') {
+    if (from === '13' || from === '12' || from === '11' || from === '10' || from === '9'
+      || from === '8' || from === '7' || from === '6') {
       this.#db
         .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
         .run(SCHEMA_VERSION);
@@ -3095,11 +3254,210 @@ export class Store {
     return merged.slice(0, limit);
   }
 
+  // ---------------------------------------------------------------- emotion
+
+  /**
+   * P3-b：读取某 scope 的情绪状态行。
+   *
+   * 时间戳是毫秒 epoch（emotion_* 两张表按卡面新表约定用毫秒，既有表多用秒）；
+   * 没有状态行返回 null（表示「还没有情绪基线」，不是四维全 0）。
+   * @param {string} scope
+   * @returns {{scope: string, pleasure: number, arousal: number, dominance: number,
+   *            energy: number, updatedAt: number, lastEventAt: number|null}|null}
+   */
+  getEmotionState(scope) {
+    const key = requireString(scope, 'emotion_state.scope');
+    const row = this.#db.prepare('SELECT * FROM emotion_state WHERE scope = ?').get(key);
+    return row === undefined ? null : mapEmotionStateRow(row);
+  }
+
+  /**
+   * P3-b：写入/覆盖某 scope 的情绪状态（ON CONFLICT(scope) DO UPDATE）。
+   *
+   * 校验：四维必须是 0–100 的有限数、updatedAt 必须是有限毫秒数，否则 TypeError；
+   * lastEventAt 可空。调用方**省略** lastEventAt（undefined）时保留库里已有的值，
+   * 避免「只更新四维」的写入把 appendEmotionEvent 维护的事件时间抹掉；要显式清除
+   * 必须传 null。
+   * @param {string} scope
+   * @param {{pleasure: number, arousal: number, dominance: number, energy: number,
+   *          updatedAt: number, lastEventAt?: number|null}} state
+   * @returns {{scope: string, pleasure: number, arousal: number, dominance: number,
+   *            energy: number, updatedAt: number, lastEventAt: number|null}}
+   */
+  setEmotionState(scope, state = {}) {
+    const key = requireString(scope, 'emotion_state.scope');
+    if (state === null || typeof state !== 'object' || Array.isArray(state)) {
+      throw new TypeError('[store] emotion state must be an object');
+    }
+    const values = {};
+    for (const dimension of EMOTION_DIMENSIONS) {
+      values[dimension] = requireEmotionValue(state[dimension], `emotion_state.${dimension}`);
+    }
+    const updatedAt = requireEmotionMillis(state.updatedAt, 'emotion_state.updated_at');
+    let lastEventAt;
+    if (state.lastEventAt === undefined) {
+      const existing = this.#db
+        .prepare('SELECT last_event_at FROM emotion_state WHERE scope = ?')
+        .get(key);
+      lastEventAt = existing === undefined || existing.last_event_at === null
+        ? null
+        : Number(existing.last_event_at);
+    } else {
+      lastEventAt = optionalEmotionMillis(state.lastEventAt, 'emotion_state.last_event_at');
+    }
+    this.#db
+      .prepare(
+        `INSERT INTO emotion_state (
+           scope, pleasure, arousal, dominance, energy, updated_at, last_event_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(scope) DO UPDATE SET
+           pleasure = excluded.pleasure,
+           arousal = excluded.arousal,
+           dominance = excluded.dominance,
+           energy = excluded.energy,
+           updated_at = excluded.updated_at,
+           last_event_at = excluded.last_event_at`,
+      )
+      .run(
+        key,
+        values.pleasure,
+        values.arousal,
+        values.dominance,
+        values.energy,
+        updatedAt,
+        lastEventAt,
+      );
+    return this.getEmotionState(key);
+  }
+
+  /**
+   * P3-b：追加一条情绪事件，并把该 scope 的事件裁剪到最近
+   * {@link EMOTION_EVENT_RETENTION} 条（超出删最旧），单事务。
+   *
+   * 同时把 emotion_state.last_event_at 更新为本次 `at`（仅当该 scope 有状态行），
+   * 让「最近一次情绪事件」无需扫事件表即可读出。
+   * 校验：at 有限毫秒数、type 非空字符串、deltas 含四维有限数，否则 TypeError；
+   * note 可空。非法输入在开启事务之前就抛错，不会留下半截写入。
+   * @param {string} scope
+   * @param {{at: number, type: string, deltas: object, note?: string|null}} input
+   * @returns {{id: number, scope: string, at: number, type: string,
+   *            deltas: object, note: string|null}}
+   */
+  appendEmotionEvent(scope, input = {}) {
+    const key = requireString(scope, 'emotion_events.scope');
+    if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+      throw new TypeError('[store] emotion event must be an object');
+    }
+    const at = requireEmotionMillis(input.at, 'emotion_events.at');
+    const type = requireString(input.type, 'emotion_events.type');
+    const deltas = normalizeEmotionDeltas(input.deltas);
+    let note = null;
+    if (input.note !== null && input.note !== undefined) {
+      if (typeof input.note !== 'string') {
+        throw new TypeError('[store] emotion_events.note must be a string or null');
+      }
+      note = input.note === '' ? null : input.note;
+    }
+    return this.#atomic(() => {
+      const info = this.#db
+        .prepare(
+          `INSERT INTO emotion_events (scope, at, type, deltas_json, note)
+           VALUES (?, ?, ?, ?, ?)`,
+        )
+        .run(key, at, type, JSON.stringify(deltas), note);
+      this.#trimEmotionEvents(key);
+      this.#db
+        .prepare('UPDATE emotion_state SET last_event_at = ? WHERE scope = ?')
+        .run(at, key);
+      return { id: Number(info.lastInsertRowid), scope: key, at, type, deltas, note };
+    });
+  }
+
+  /**
+   * P3-b：把某 scope 的事件裁剪到最近 N 条（按 at DESC, id DESC 保留，删其余）。
+   * 调用方负责事务；返回实际删除条数。
+   * @param {string} scope
+   * @returns {number}
+   */
+  #trimEmotionEvents(scope) {
+    const info = this.#db
+      .prepare(
+        `DELETE FROM emotion_events
+          WHERE scope = ?
+            AND id NOT IN (
+              SELECT id FROM emotion_events
+               WHERE scope = ?
+               ORDER BY at DESC, id DESC
+               LIMIT ?
+            )`,
+      )
+      .run(scope, scope, EMOTION_EVENT_RETENTION);
+    return Number(info.changes);
+  }
+
+  /**
+   * P3-b：按 `at DESC, id DESC` 取某 scope 最近 N 条情绪事件（默认 3）。
+   * deltas_json 反序列化成对象返回；坏 JSON 退化为空对象，不阻断读取。
+   * @param {string} scope
+   * @param {number} [limit]
+   * @returns {{id: number, scope: string, at: number, type: string,
+   *            deltas: object, note: string|null}[]}
+   */
+  listEmotionEvents(scope, limit = EMOTION_EVENT_DEFAULT_LIMIT) {
+    const key = requireString(scope, 'emotion_events.scope');
+    const size = clampLimit(limit, EMOTION_EVENT_DEFAULT_LIMIT);
+    const rows = this.#db
+      .prepare(
+        `SELECT id, scope, at, type, deltas_json, note
+           FROM emotion_events
+          WHERE scope = ?
+          ORDER BY at DESC, id DESC
+          LIMIT ?`,
+      )
+      .all(key, size);
+    return rows.map((row) => mapEmotionEventRow(row));
+  }
+
+  /**
+   * P3-b：某 scope 的情绪事件总数。
+   * @param {string} scope
+   * @returns {number}
+   */
+  countEmotionEvents(scope) {
+    const key = requireString(scope, 'emotion_events.scope');
+    const row = this.#db
+      .prepare('SELECT COUNT(*) AS n FROM emotion_events WHERE scope = ?')
+      .get(key);
+    return Number(row?.n ?? 0);
+  }
+
+  /**
+   * P3-b：清空某 scope 的情绪状态与全部事件（单事务，其它 scope 不受影响）。
+   * @param {string} scope
+   * @returns {{events: number}} 被删除的事件条数
+   */
+  resetEmotion(scope) {
+    const key = requireString(scope, 'emotion_state.scope');
+    return this.#atomic(() => {
+      const info = this.#db
+        .prepare('DELETE FROM emotion_events WHERE scope = ?')
+        .run(key);
+      this.#db.prepare('DELETE FROM emotion_state WHERE scope = ?').run(key);
+      return { events: Number(info.changes) };
+    });
+  }
+
   // ---------------------------------------------------------- maintenance
 
   /**
    * S2：物理删除已过冷静期的 facts/episodes，同步清 FTS，并写 PURGED 审计。
    * 审计只留 id/档位，不留正文。
+   *
+   * P3-b（v14）：同一事务里顺带遗忘窗口外的情绪痕迹——删除
+   * `emotion_events.at < cutoff` 的事件行，并删除这些 scope 的
+   * `emotion_state` 行（窗口外的情绪不留基线）；有删除时额外写一条
+   * PURGED 审计（table_name='emotion_events'，detail 只含条数，不含正文）。
+   * 返回形状保持 `{facts, episodes}` 不变（安全测试依赖）。
    * @param {{now?: number|Date, cutoffDays?: number}} [options]
    * @returns {{facts: number, episodes: number}}
    */
@@ -3123,8 +3481,47 @@ export class Store {
             WHERE deleted_at IS NOT NULL AND deleted_at <= ?`,
         )
         .all(cutoff);
-      return this.#purgeRows({ facts, episodes, at, actor: 'scheduler', reason: 'purge' });
+      const result = this.#purgeRows({
+        facts, episodes, at, actor: 'scheduler', reason: 'purge',
+      });
+      // emotion_* 用毫秒，purge 的 cutoff 是秒：这里显式换算，不改既有表口径。
+      const emotion = this.#purgeEmotionBefore(cutoff * 1000);
+      if (emotion.events > 0 || emotion.states > 0) {
+        this.appendEvent({
+          at,
+          action: 'PURGED',
+          table_name: 'emotion_events',
+          row_id: null,
+          actor: 'scheduler',
+          reason: 'purge',
+          detail_json: { emotionEvents: emotion.events, emotionStates: emotion.states },
+        });
+      }
+      return result;
     });
+  }
+
+  /**
+   * P3-b：删除毫秒 cutoff 之前的情绪事件，并删除这些 scope 的状态行。
+   * 调用方负责事务；只返回条数，不返回正文。
+   * @param {number} cutoffMs
+   * @returns {{events: number, states: number}}
+   */
+  #purgeEmotionBefore(cutoffMs) {
+    if (!Number.isFinite(cutoffMs)) return { events: 0, states: 0 };
+    const scopes = this.#db
+      .prepare('SELECT DISTINCT scope FROM emotion_events WHERE at < ?')
+      .all(cutoffMs)
+      .map((row) => row.scope);
+    if (scopes.length === 0) return { events: 0, states: 0 };
+    const marks = scopes.map(() => '?').join(',');
+    const events = this.#db
+      .prepare('DELETE FROM emotion_events WHERE at < ?')
+      .run(cutoffMs);
+    const states = this.#db
+      .prepare(`DELETE FROM emotion_state WHERE scope IN (${marks})`)
+      .run(...scopes);
+    return { events: Number(events.changes), states: Number(states.changes) };
   }
 
   /**
@@ -3245,6 +3642,7 @@ export class Store {
     const tables = [
       'entities', 'episodes', 'facts', 'reminders', 'state_board', 'state_board_rev',
       'threads', 'consolidations', 'memory_events',
+      'emotion_state', 'emotion_events',
     ];
     /** @type {Record<string, number>} */
     const counts = {};

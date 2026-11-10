@@ -360,7 +360,7 @@ test('V5-L2 回归：v11 旧库经 apply 迁到 v12，retry_at 为 NULL 且到�
       .all()
       .map((column) => column.name);
     assert.ok(columns.includes('retry_at'), 'v12 必须补 retry_at');
-    assert.equal(migratedStore.getMeta('schema_version'), '13');
+    assert.equal(migratedStore.getMeta('schema_version'), '14');
     const migrated = migratedStore.getReminder('old-11');
     assert.equal(migrated.status, 'pending');
     assert.equal(migrated.retry_at, null, 'v11 旧行的 retry_at 必须为 NULL');
@@ -379,7 +379,7 @@ test('V5-L2 回归：v11 旧库经 apply 迁到 v12，retry_at 为 NULL 且到�
   handle.dispose();
   const reopened = Store.open(dbPath);
   try {
-    assert.equal(reopened.getMeta('schema_version'), '13');
+    assert.equal(reopened.getMeta('schema_version'), '14');
     const row = reopened.getReminder('old-11');
     assert.equal(row.status, 'fired');
     assert.equal(row.retry_at, null);
