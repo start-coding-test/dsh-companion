@@ -384,3 +384,207 @@ Select-String -Path docs\persona-card.md -Pattern 'extensions\.address|\{\{char\
 - 未修改 `src/`、`test/`、`CHANGELOG.md`、`README.md`；未 push。
 - 复审对象是 `f391fe7`；`5714b1d..f391fe7` 仅 CHANGELOG/README 两文件，代码与 `5714b1d` 相同，故上述所有代码级证据对两者都成立。
 - 上一版基线 worktree 为 `D:\test\agent-plugin\.probe-v20\wt-v0412`（detached `6eedde9`），仅用于对比，不提交。
+
+## 7. 复审（r2，对象 1e152be）
+
+### 7.1 结论
+
+- 复审对象：`1e152be`（父 `91928dc`，分支 `main`），`git diff --stat 91928dc..1e152be` = 21 files, +199/−72；复审开始时工作树干净。
+- **结论：needs_revision；H=0，M=1，L=1。**
+- M-1、M-2 的提示词渲染部分、M-3 均已按独立复现关闭；L-1..L-8 均已关闭（L-4 只在历史版本段落保留 v0.4.13）。
+- 新增 **M-4**：`bannedPhrases` 的**输出过滤**仍使用卡内原始短语，渲染后的违禁表达可绕过过滤；这是 M-2 修复未覆盖到的一条下游链路，不是重复计数。
+- 新增 **L-9**：`chat.js` 的 `String(...)` 使未校验卡里的 `bannedPhrases: [null]` / `[undefined]` 从旧版「省略」变成提示词里的 `"null"` / `"undefined"`；合法卡在 `validateCard` 处已被拒绝，故不阻塞。
+- 因 M>0，按验收规则结论为 `needs_revision`。旧 §1–§6 原样保留，本节只追加。
+- 旧 §4 的验收项 #4（CCv2 address）、#5（占位符渲染）、#8（写死身份）已因本次修复恢复为通过；#5 的提示词部分通过，但 `bannedPhrases` 过滤仍有 M-4，不能把「违禁表达已被拦截」一并算通过。
+
+### 7.2 M/L 关闭情况
+
+| 编号 | 原问题 | r2 状态 | 独立证据 |
+| --- | --- | --- | --- |
+| M-1 | 文档写 `data.extensions.address`，实现只读 `data.address` | ✅ 关闭 | `src/persona/card.js:317-325` 改为顶层优先、extensions 兜底；`r2-probe` 实测 extOnly `先生`、both `老板`、wsTop `先生`、wsExt `你`、ext 非对象/数组/数字全 `你`、v3 `先生`；`docs/persona-card.md:49` 已改为两种来源 |
+| M-2 | `tone.*` 与 `bannedPhrases` 中的 `{{char}}`/`{{user}}` 未渲染 | ✅ 提示词关闭；过滤链见 M-4 | `sections.js:152-156`、`chat.js:112-118` 逐项 render；`r2-probe` 的 `{"core":true,"chat":true,"voice":true}`，禁用表达行为 `叫老板老大、自称岚大人。`；内置卡无占位符；`dump.mjs` 逐字节仍一致 |
+| M-3 | `buildConsolidationPrompt` 仍写死「私人管家」 | ✅ 关闭 | `src/memory/consolidate.js:532` 首行已改为 `你是记忆巩固器。…`；`r2-probe` 的 `M3 firstLine` 无「管家/助手」 |
+| L-1 | 导出文档未提情绪两表 | ✅ 关闭 | `docs/usage.md:89`、`:397` 已写 `emotion.state/events`、敏感 note 置 null |
+| L-2 | merge 文档未说明情绪例外 | ✅ 关闭 | `docs/usage.md:423-424` 已写 fresh 含情绪两表、merge 的 events 追加/state upsert |
+| L-3 | CHANGELOG 的 rewrite 文案写成「已遮蔽」 | ✅ 关闭 | `CHANGELOG.md:12` 已与 `src/runtime/commands.js:646-652`、`docs/persona-shadow.md:46-48` 一致：`已替换（人格卡身份）` |
+| L-4 | src/docs 多处 v0.4.13 标签 | ✅ 关闭（当前发布文档） | src 注释、persona-shadow/usage/known-debt 已改为 v0.5.0 或「后续版本」；历史 README v0.4.12 段、persona.example.md:70、CHANGELOG 0.4.12 段保留旧标签，属历史记录 |
+| L-5 | README 称已发布，但 tag/package 仍是 v0.4.12 | ✅ 关闭 | `package.json` 0.5.0；`test/smoke.test.js` 断言 0.5.0；README 改为「v0.5.0 待发布（复审通过后打 tag）」；`git tag` 仍只有 v0.4.12，与「待发布」一致 |
+| L-6 | e2e 基线常量仍叫 V0411 | ✅ 关闭 | `test/e2e/persona-card.test.js` 已改名 `V0412_*`，注释说明 SHA 采集于 `08493eb` 且与 `6eedde9` 相同；断言仍是过滤新增三行后逐行等值，没有放宽 |
+| L-7 | 内置卡 baseline 50/50/50/60 与 `DEFAULT_BASELINE` 55/45/50/50 不一致 | ✅ 关闭 | `src/persona/emotion.js:33-41` 改为 50/50/50/60；`r2-probe` 的 default/invalidFallback/omitted 全为该组；`docs/persona-card.md:65` 已写「缺省继承 / 非法回落同一组」 |
+| L-8 | deploy 验收文案对内置卡/`/状态` 不精确 | ✅ 关闭 | `docs/deploy-v050.md:54-55` 已改为「自定义卡不应再出现内置卡『私人助手』」与「注入句本体无数字，`/状态` 的最近 N 分钟允许数字」 |
+| L-9 | `String()` 对未校验 `bannedPhrases` 元素的副作用 | ⚠️ 新增 L（非阻塞） | 合法卡 `validateCard` 要求 `bannedPhrases` 为 string[]；仅绕过校验直接调用 `buildChatPrompt` 时，`[null]`/`[undefined]` 由旧版省略变为 `"null"`/`"undefined"` |
+
+### 7.3 M-1 / M-2 / M-3 关闭证据
+
+#### M-1：CCv2/V3 address 两种来源
+
+实现（`src/persona/card.js:317-325`）：
+
+```js
+const extensions = data.extensions !== null && typeof data.extensions === 'object' ? data.extensions : {};
+const address = typeof data.address === 'string' && data.address.trim() !== ''
+  ? data.address
+  : (typeof extensions.address === 'string' ? extensions.address : '');
+mapped.address = address.trim() !== '' ? address : '你';
+```
+
+独立探针 `D:\test\agent-plugin\.probe-v20\r2-probe.mjs` 的实际结果：
+
+```text
+M1 extOnly 先生
+M1 both 老板
+M1 wsTop 先生
+M1 wsExt 你
+M1 extNull 你
+M1 extString 你
+M1 extArray 你
+M1 extNumber 你
+M1 nonStringTop 先生
+M1 v3 先生
+```
+
+结论：文档声明的两种路径都可用；顶层 `data.address` 优先；空白串回落；`extensions` 非对象不会抛错。`docs/persona-card.md:49` 已与实现一致。
+
+#### M-2：提示词占位符
+
+修复点：`src/persona/sections.js:152-156` 对 `tone.style/warmth/structure` 逐项 `render()`；`src/persona/chat.js:112-118` 对三项与 `bannedPhrases` 逐项 `renderTemplate(String(...))`。
+
+独立探针实际输出：
+
+```text
+M2 {"core":true,"chat":true,"voice":true}
+M2 banned 禁用表达：叫老板老大、自称岚大人。
+M2 builtin {"core":true,"chat":true}
+```
+
+即 core/chat/voice 均已无 `{{`，内置卡也没有因修复引入占位符泄漏。`dump.mjs` 对 v0.4.12 worktree 与当前 HEAD 的输出仍为 `sections=True chatCtx=True chatBare=True`。
+
+`String(...)` 对非字符串 tone 的行为也做了实测：`tone.style=123, warmth=false, structure={toString:'对象结构'}` 时，chat 前三行为 `["岚在。","语气：123、false、对象结构。","写一条主动的…"]`，不抛错；合法卡（`validateCard` 要求 tone 三项为 string）输出不变。
+
+#### M-3：记忆巩固提示词
+
+`src/memory/consolidate.js:532` 首行现在是：
+
+```text
+你是记忆巩固器。把下面这段对话压缩成一条情景记忆与若干长期事实。
+```
+
+`r2-probe` 的 `M3 firstLine` 与该行逐字一致；旧「私人管家」已不在生产提示词中。
+
+### 7.4 新 M-4：`bannedPhrases` 输出过滤仍用原始短语
+
+**级别：M。** 位置：
+
+- `src/index.js:4101-4103`：生产路径把 `card.bannedPhrases` **原始数组**传给 `normalizeChatText`。
+- `src/persona/chat.js:199-207`：过滤函数用 `raw.includes(phrase)` 匹配原始 phrase，不调用 `renderTemplate`。
+
+最小复现（探针已实际跑过）：
+
+```js
+// 卡：bannedPhrases: ['叫{{user}}老大']
+const prompt = buildChatPrompt({ card });
+// 提示词中已经是：禁用表达：叫老板老大
+const out = '叫老板老大。今天天气不错。中午吃了面。下午把桌子收拾了。晚上准备早点休息。明天要早起。';
+normalizeChatText(out, { bannedPhrases: card.bannedPhrases });
+// => { ok: true, ..., reason: 'ok' }          <-- 过滤失败
+normalizeChatText(out, { bannedPhrases: ['叫老板老大'] });
+// => { ok: false, ..., reason: 'banned_phrase' }
+```
+
+实际输出：
+
+```text
+M2 filter raw {"ok":true,"text":"叫老板老大。今天天气不错。中午吃了面。下午把桌子收拾了。晚上准备早点休息。明天要早起。","sentences":6,"reason":"ok"}
+M2 filter rendered {"ok":false,...,"reason":"banned_phrase"}
+```
+
+影响：卡作者在 `bannedPhrases` 里写 `{{user}}`/`{{char}}` 时，提示词会显示渲染后的违禁表达，但模型真的输出它时过滤不会命中；违禁表达的第二道防线失效。它不是 H：只影响带占位符的违禁词，且模型通常仍按提示词避让；但它是 M，因为 P1 明确保留 `bannedPhrases`，文档也承诺占位符渲染。
+
+修复方向（复审不实施）：在 `index.js` 生成一次渲染后的数组，同时用于 `buildChatPrompt` 与 `normalizeChatText`；或让 `normalizeChatText` 接收 `{name,address}` 并在匹配前渲染每个 phrase。修复后应加一个「模型返回渲染后违禁词 → `banned_phrase`」的回归测试。
+
+### 7.5 副作用与回归检查
+
+- **`String()` 强制转换**：合法卡无变化；数字/布尔/对象 tone 值现在稳定转字符串，不抛错；`bannedPhrases` 的合法 string[] 逐项渲染，行为符合预期。唯一变化是未校验输入里的 `null`/`undefined`（L-9）。
+- **`data.extensions` 非对象**：`null`、字符串、数组、数字都走 `{}` 兜底，`extensions.address` 缺失时回「你」；数组没有 `address` 时也不会误取元素。
+- **`DEFAULT_BASELINE` 改为 50/50/50/60**：`r2-probe` 的 default / invalidFallback / omitted 三组均为 `{pleasure:50,arousal:50,dominance:50,energy:60}`；全量 1109 用例通过；`/状态` 的默认/启用路径仍为 `情绪：未启用` / `情绪：未开始`，重启与 3 条事件显示正常。
+- **逐字节基线**：`dump.mjs` 对 v0.4.12 worktree（`6eedde9`）与当前 HEAD 的输出为 `sections=True chatCtx=True chatBare=True`。本次自算 SHA-256（sections 数组 JSON / chat 文本，取前 16 位）：
+  ```text
+  sections  41bb0145b4b9d0f1  41bb0145b4b9d0f1
+  chatCtx   ecd5a198ec2d6184  ecd5a198ec2d6184
+  chatBare  1904ed77a2cf9445  1904ed77a2cf9445
+  ```
+  左右分别为 base/head；相等即逐字节一致。
+- **测试计数**：默认、`TZ=UTC`、`TZ=America/New_York` 均为 `# tests 1109`、`# suites 28`、`# pass 1109`、`# fail 0`，EXIT=0。日志：`.probe-v20/r2-tz-default.log`、`r2-tz-UTC.log`、`r2-tz-NY.log`。
+- **既有测试是否改松**：r2 只改 `V0411_*` → `V0412_*` 命名与注释；`lines.length = V0412_STATUS_LINES.length + 3` 与过滤后逐行等值断言仍在，没有新增跳过或降低断言。
+- **旧观察**：`src/runtime/commands.js:699` 的 `describe(state)` 仍在 `try` 外；`formatStatus` 统计表清单仍不列情绪两表。两者都不是 r2 引入，风险低，未升级为 M/L。
+
+### 7.6 实际运行命令与输出
+
+```powershell
+$NODE = 'C:\Users\93488\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe'
+cd D:\test\agent-plugin\dsh-companion
+
+# 1) 三时区全量
+& $NODE --test 2>&1 | Tee-Object D:\test\agent-plugin\.probe-v20\r2-tz-default.log
+$env:TZ='UTC'; & $NODE --test 2>&1 | Tee-Object D:\test\agent-plugin\.probe-v20\r2-tz-UTC.log
+$env:TZ='America/New_York'; & $NODE --test 2>&1 | Tee-Object D:\test\agent-plugin\.probe-v20\r2-tz-NY.log
+Remove-Item Env:TZ
+
+# 2) 独立功能探针（M-1/M-2/M-3/L-7 + 过滤链）
+& $NODE D:\test\agent-plugin\.probe-v20\r2-probe.mjs
+
+# 3) 逐字节基线（dump.mjs 输出 JSON 到 stdout）
+& $NODE D:\test\agent-plugin\.probe-v20\dump.mjs D:\test\agent-plugin\.probe-v20\wt-v0412 | Out-File -Encoding utf8 D:\test\agent-plugin\.probe-v20\base-r2.json
+& $NODE D:\test\agent-plugin\.probe-v20\dump.mjs . | Out-File -Encoding utf8 D:\test\agent-plugin\.probe-v20\head-r2.json
+
+# 4) 功能/状态回归
+& $NODE D:\test\agent-plugin\.probe-v20\functional.mjs
+& $NODE D:\test\agent-plugin\.probe-v20\status3.mjs
+```
+
+关键实际输出：
+
+```text
+# 三次全量（分别）
+ℹ tests 1109
+ℹ suites 28
+ℹ pass 1109
+ℹ fail 0
+
+# r2-probe
+M1 extOnly 先生
+M1 both 老板
+M1 wsTop 先生
+M1 wsExt 你
+M1 nonStringTop 先生
+M1 v3 先生
+M2 {"core":true,"chat":true,"voice":true}
+M2 filter raw {"ok":true,...,"reason":"ok"}
+M2 filter rendered {"ok":false,...,"reason":"banned_phrase"}
+M3 firstLine 你是记忆巩固器。把下面这段对话压缩成一条情景记忆与若干长期事实。
+L7 default {"pleasure":50,"arousal":50,"dominance":50,"energy":60}
+L7 invalidFallback {"pleasure":50,"arousal":50,"dominance":50,"energy":60}
+L7 omitted {"pleasure":50,"arousal":50,"dominance":50,"energy":60}
+--- r2 probe DONE ---
+
+# dump.mjs
+sections=True chatCtx=True chatBare=True
+
+# functional.mjs（r2 仍通过）
+--- probe functional PASS ---
+[default] pre-step injected=0, emotion tables=0, status ok
+[enabled] injected: 你此刻：现在心情平稳，精神一般，说到哪算哪，不用急着回应
+[enabled] reopened state ok, events=1
+[enabled] restart injection ok, events=2
+[shadow] rewrite/takeover pure semantics ok, warnings= 1
+[shadow-apply] rewrite ok; status line: 部署人设：已替换（人格卡身份）
+[shadow-apply] takeover ok; status line: 部署人设：已接管
+[config] DEFAULTS keys= 16
+```
+
+### 7.7 工作区与提交
+
+- r2 复审只追加 `docs/review-v20.md` 的 §7；未改 `src/`、`test/`、`CHANGELOG.md`、`README.md`。
+- 旧 §1–§6 未改动，旧段里的行号/结论保留为 r1 时点证据；以本节为准。
+- 提交信息：`docs(review): v0.5.0 复审 r2`；不 push。
+- 复审对象 `1e152be` 的父为 r1 报告提交 `91928dc`；r2 修复 diff 为 21 files, +199/−72，已逐文件检查，未发现隐藏的源码逻辑改动。
