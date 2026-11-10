@@ -428,6 +428,22 @@ export function createAdapter(ctx, opts = {}) {
   }
 
   /**
+   * 注册 system-prompt/assemble waterfall 监听器（v0.4.13 P2）。
+   *
+   * 与 onPreStep 不同：宿主没有该能力时这里不抛错，返回 null，交由接线层
+   * 静默降级（遮蔽失败不能挡住宿主装配）。返回 disposer。
+   * @param {(assembly: object, context: object, next: Function) => object|Promise<object>} handler
+   * @returns {Function|null}
+   */
+  function onAssemble(handler) {
+    if (typeof handler !== 'function') {
+      throw new TypeError('onAssemble(handler): handler must be a function');
+    }
+    if (typeof ctx.on !== 'function') return null;
+    return ctx.on('system-prompt/assemble', handler);
+  }
+
+  /**
    * 注册周期定时器，返回 disposer。
    * @param {number} ms 周期毫秒
    * @param {Function} callback
@@ -902,6 +918,7 @@ export function createAdapter(ctx, opts = {}) {
     log,
     section,
     onPreStep,
+    onAssemble,
     onTurnStopping,
     every,
     compactRegion,

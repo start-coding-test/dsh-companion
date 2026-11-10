@@ -4,6 +4,7 @@
  */
 
 import { DEFAULT_TIMEZONE, isValidTimeZone, zonedMinutesOfDay } from './time.js';
+import { normalizeShadowMode } from './persona/shadow.js';
 
 export class ConfigError extends Error {
   /**
@@ -153,9 +154,11 @@ Object.defineProperty(DEFAULT_VALUES, 'timing', {
 
 // v0.4.12：人格卡文件路径。默认 null（用内置卡）；相对路径相对 DSH_HOME
 // （`DSH_HOME` 否则 ~/.dsh）解析。只在 apply 时加载一次，改卡需重启。
+// v0.4.13 P2：shadowDeployment 三态，默认 'off'（完全不注册 assemble 监听）。
 // 该节同样不参与 16 键安装自检（与 vector/recall/session/consolidation/thread/timing 一致）。
 const PERSONA_DEFAULTS = Object.freeze({
   cardPath: null,
+  shadowDeployment: 'off',
 });
 
 Object.defineProperty(DEFAULT_VALUES, 'persona', {
@@ -604,17 +607,30 @@ export function normalizePersona(raw, warnings = []) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ConfigError('persona', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
   }
-  const allowed = new Set(['cardPath']);
+  const allowed = new Set(['cardPath', 'shadowDeployment']);
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) warnings.push(`unknown config field "persona.${key}" ignored`);
   }
   const value = raw.cardPath === undefined ? defaults.cardPath : raw.cardPath;
-  if (value === null) return defaults;
-  if (typeof value !== 'string') {
+  let cardPath;
+  if (value === null) {
+    cardPath = null;
+  } else if (typeof value !== 'string') {
     throw new ConfigError('persona.cardPath', `must be a string or null, got ${JSON.stringify(value)}`);
+  } else {
+    cardPath = value.trim() === '' ? null : value.trim();
   }
-  const cardPath = value.trim() === '' ? null : value.trim();
-  return Object.freeze({ cardPath });
+  const rawShadow = raw.shadowDeployment === undefined
+    ? defaults.shadowDeployment
+    : raw.shadowDeployment;
+  const shadowDeployment = normalizeShadowMode(rawShadow);
+  if (shadowDeployment === null) {
+    throw new ConfigError(
+      'persona.shadowDeployment',
+      `must be "off", "rewrite", "takeover", true, or false, got ${JSON.stringify(rawShadow)}`,
+    );
+  }
+  return Object.freeze({ cardPath, shadowDeployment });
 }
 
 /**

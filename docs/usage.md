@@ -782,6 +782,39 @@ persona:
 
 完整 JSON 示例与复制模板见 [persona.example.md](../persona.example.md)。
 
+### 遮蔽宿主人设（P2，v0.4.13）
+
+宿主 0.4.x 的默认人设来自全局层 `deployment:persona-prefix`（人设本体）与
+`deployment:persona-suffix`（收尾）。插件以 profile 行挂载，**不能**注册同名段；唯一入口是
+`system-prompt/assemble` waterfall。配置仍在 `persona` 可选段里：
+
+```yaml
+persona:
+  cardPath: persona.json
+  # off（默认，也接受 false）/ rewrite（true 等价）/ takeover
+  shadowDeployment: rewrite
+```
+
+- `off`：完全不注册 assemble 监听，提示装配路径与旧版一致（`/状态` 多一行「宿主默认」）；
+- `rewrite`：只把 prefix 的文本换成人格卡的 `chatIdentity`（`{{char}}` / `{{user}}` 已渲染），
+  其它段与位置不变；
+- `takeover`：摘掉 prefix 与空/纯空白的 suffix；非空 suffix 保留并写一次 warn；
+- 非法值 fail-fast：`ConfigError('persona.shadowDeployment')`。
+
+只影响 agent scope；子代理按现有 `classifySession()` 判定为 `subagent` 时**不遮蔽**（fork 子会话
+若 header 只有 `parentSession` 会被当作主会话继续遮蔽，见
+[persona-shadow.md](persona-shadow.md)）。遮蔽失败只写 warn 并放行原 assembly，不挡装配；
+宿主两段都缺失（改版）时同样只 warn 一次。`/状态` 增加：
+
+```text
+部署人设：宿主默认
+部署人设：已替换（人格卡身份）
+部署人设：已接管
+```
+
+回滚：把 `shadowDeployment` 改回 `off` 并重启，无需改卡或清数据。机制、探针实测与影响面见
+[persona-shadow.md](persona-shadow.md)。
+
 ### headless 一次性运行与 round C 口径（V10-M1，v0.4.11）
 
 **headless / one-shot 不会发生巩固。** headless（`--profile headless`）、one-shot

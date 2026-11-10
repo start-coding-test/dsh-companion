@@ -11,6 +11,10 @@
    ```yaml
    persona:
      cardPath: persona.json
+     # 遮蔽宿主默认人设：off（默认，也接受 false）/ rewrite（true 等价）/ takeover。
+     # rewrite 用卡的 chatIdentity 替换宿主 deployment:persona-prefix；
+     # takeover 还摘掉空/纯空白的 deployment:persona-suffix。详见 docs/persona-shadow.md。
+     shadowDeployment: rewrite
    ```
 
 3. **改卡后重启宿主**（或重载 profile）。插件只在 `apply` 时加载一次人格卡，
