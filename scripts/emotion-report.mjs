@@ -464,6 +464,9 @@ const APPRAISE_ENV = Object.freeze({
   baseUrl: Object.freeze(['EMOTION_APPRAISE_BASE_URL', 'OPENAI_BASE_URL']),
   apiKey: Object.freeze(['EMOTION_APPRAISE_API_KEY', 'OPENAI_API_KEY']),
   model: Object.freeze(['EMOTION_APPRAISE_MODEL', 'OPENAI_MODEL']),
+  /** V60-L3：额外请求头（JSON 对象），以及 opencode-go 需要的会话头。 */
+  headers: 'EMOTION_APPRAISE_HEADERS',
+  session: 'EMOTION_APPRAISE_SESSION',
 });
 
 /** @param {readonly string[]} names @param {Record<string, string | undefined>} env */
@@ -495,11 +498,21 @@ export function createLlmJudge(env = process.env, fetchImpl = fetch) {
     ].filter((name) => name !== '').join('、');
     throw new Error(`缺少环境变量：${missing}`);
   }
+  // V60-L3：opencode-go 的网关要求 `x-opencode-session`，否则 400 MissingSessionID。
+  // 额外头统一由 EMOTION_APPRAISE_HEADERS（JSON）提供，命令行不接明文头。
+  const extraHeaders = parseExtraHeaders(env[APPRAISE_ENV.headers]);
+  const session = typeof env[APPRAISE_ENV.session] === 'string' ? env[APPRAISE_ENV.session].trim() : '';
+  const headers = { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` };
+  if (session !== '') headers['x-opencode-session'] = session;
+  for (const [name, value] of Object.entries(extraHeaders)) {
+    if (name.toLowerCase() === 'authorization' || name.toLowerCase() === 'content-type') continue;
+    headers[name] = value;
+  }
   return async (text) => {
     const messages = buildAppraisalMessages({ text, lastReply: '', cardName: '' });
     const response = await fetchImpl(`${baseUrl}/chat/completions`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
+      headers,
       body: JSON.stringify({ model, messages, temperature: 0, max_tokens: 200 }),
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -508,6 +521,31 @@ export function createLlmJudge(env = process.env, fetchImpl = fetch) {
     const verdict = parseAppraisal(raw);
     return { type: verdict.type, confidence: verdict.confidence };
   };
+}
+
+/**
+ * 解析 `EMOTION_APPRAISE_HEADERS`（JSON 对象）；非法时抛错，避免悄悄少带鉴权头。
+ *
+ * @param {string|undefined} raw
+ * @returns {Record<string, string>}
+ */
+export function parseExtraHeaders(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('EMOTION_APPRAISE_HEADERS 必须是 JSON 对象');
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error('EMOTION_APPRAISE_HEADERS 必须是 JSON 对象');
+  }
+  const headers = {};
+  for (const [name, value] of Object.entries(parsed)) {
+    if (typeof value !== 'string') throw new Error(`EMOTION_APPRAISE_HEADERS.${name} 必须是字符串`);
+    headers[name] = value;
+  }
+  return headers;
 }
 
 /**

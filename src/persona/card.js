@@ -13,7 +13,12 @@ import { homedir } from 'node:os';
 import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 
 import { DEFAULT_BASELINE } from './emotion.js';
-import { APPRAISAL_TIMEOUT_DEFAULT as APPRAISE_TIMEOUT_DEFAULT } from './emotion-appraise.js';
+import {
+  APPRAISAL_MIN_CONFIDENCE_CEIL as APPRAISE_MIN_CONFIDENCE_CEIL,
+  APPRAISAL_MIN_CONFIDENCE_DEFAULT as APPRAISE_MIN_CONFIDENCE_DEFAULT,
+  APPRAISAL_MIN_CONFIDENCE_FLOOR as APPRAISE_MIN_CONFIDENCE_FLOOR,
+  APPRAISAL_TIMEOUT_DEFAULT as APPRAISE_TIMEOUT_DEFAULT,
+} from './emotion-appraise.js';
 
 /** 敏感对象键，深合并时直接忽略，避免原型污染。 */
 const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
@@ -83,6 +88,7 @@ export const DEFAULT_CARD = deepFreeze({
     appraiser: 'rules',
     appraiseModel: null,
     appraiseTimeoutMs: APPRAISE_TIMEOUT_DEFAULT,
+    appraiseMinConfidence: APPRAISE_MIN_CONFIDENCE_DEFAULT,
   },
   version: 1,
 });
@@ -306,6 +312,7 @@ export function normalizeCardEmotion(emotion) {
         appraiser: 'rules',
         appraiseModel: null,
         appraiseTimeoutMs: APPRAISE_TIMEOUT_DEFAULT,
+        appraiseMinConfidence: APPRAISE_MIN_CONFIDENCE_DEFAULT,
       },
       warnings: [{ code: 'emotion_invalid' }],
     };
@@ -354,6 +361,17 @@ export function normalizeCardEmotion(emotion) {
       provider: emotion.appraiseModel.provider.trim(),
       model: emotion.appraiseModel.model.trim(),
     };
+  }
+
+  // V60-M3：llm 来源单独的入账阈值，默认 0.65；越界回落默认值并 warn（只影响 llm 路径）。
+  if (emotion.appraiseMinConfidence === undefined) {
+    normalized.appraiseMinConfidence = APPRAISE_MIN_CONFIDENCE_DEFAULT;
+  } else if (typeof emotion.appraiseMinConfidence !== 'number'
+    || !Number.isFinite(emotion.appraiseMinConfidence)
+    || emotion.appraiseMinConfidence < APPRAISE_MIN_CONFIDENCE_FLOOR
+    || emotion.appraiseMinConfidence > APPRAISE_MIN_CONFIDENCE_CEIL) {
+    normalized.appraiseMinConfidence = APPRAISE_MIN_CONFIDENCE_DEFAULT;
+    warnings.push({ code: 'emotion_appraise_min_confidence_invalid' });
   }
 
   if (emotion.appraiseTimeoutMs === undefined) {

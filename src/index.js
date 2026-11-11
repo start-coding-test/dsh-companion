@@ -672,6 +672,11 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
      * 在装配时读取，不再造 user 消息；未算过/已关闭时没有值。
      */
     emotionTextByScope: new Map(),
+    /**
+     * V60-M1：每个 scope 最近一次「模型判定成功」的类型，下一轮 pre-step 借给
+     * describe 一次（专属句），用完即清。只存内存，重启不影响状态机。
+     */
+    lastAppraisalByScope: new Map(),
     lastHumanAt: null,
     tokens: 0,
     overCount: 0,
@@ -2819,6 +2824,7 @@ function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
     const parts = zonedParts(now, config.timezone);
     const quiet = isQuietAt(new Date(now), config);
     const llmMode = state.card?.emotion?.appraiser === 'llm';
+    const borrowed = takeBorrowedAppraisal(state, scope, now);
 
     // v0.6-E2：llm 模式下 pre-step 只做「衰减 + 描述」，立刻返回不等模型；
     // 判定在后台进行，结果到达后由 applyClassifiedEvent 单独落库，下一轮生效。
@@ -2833,6 +2839,7 @@ function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
       scope,
       text,
       skipEvent: llmMode,
+      eventType: borrowed,
       note: llmMode ? undefined : 'rules',
     });
     state.emotionTextByScope?.set(scope, `${EMOTION_PROMPT_PREFIX}${result.line}`);
@@ -2858,6 +2865,27 @@ function injectEmotion(state, payload, messages, turnKey, scope = SCOPE) {
 
 
 /**
+ * V60-M1：借出「上一次模型判定成功」的类型——只借 10 分钟内的，且借一次就清。
+ * 不在 apply 回调里直接改 emotionTextByScope，避免和本轮装配竞态。
+ *
+ * @param {object} state
+ * @param {string} scope
+ * @param {number} now
+ * @returns {string|undefined}
+ */
+function takeBorrowedAppraisal(state, scope, now) {
+  const pending = state.lastAppraisalByScope?.get(scope);
+  if (pending === undefined) return undefined;
+  state.lastAppraisalByScope.delete(scope);
+  return Number.isFinite(pending.at) && now - pending.at <= BORROWED_APPRAISAL_TTL_MS
+    ? pending.type
+    : undefined;
+}
+
+/** 借用窗口：超过它就不再影响本轮描述（用户 m08225 的 V60-M1 口径）。 */
+const BORROWED_APPRAISAL_TTL_MS = 10 * 60 * 1000;
+
+/**
  * 判定模型路由：卡内显式 {provider, model} 优先，否则复用共识模型解析。
  * @param {object} state
  * @returns {Promise<{provider: string, model: string, source: string}|null>}
@@ -2874,18 +2902,48 @@ async function resolveAppraiserRoute(state) {
 
 /**
  * 判定 token 计入每日预算（与 recordTurnUsage 同一本账，v0.6-E4）。
- * 用「输入码点 + 输出码点」估算，宁可高估不低估。
+ *
+ * V60-L1：优先用宿主的 usage；拿不到时按「system 正文 + user 正文 + 输出」的
+ * 码点数 × 1.0 估算（中文约 1 码点 ≈ 0.6–1 token，除二会低估）。
+ *
+ * @param {object} state
+ * @param {unknown[]} messages 实际发出去的消息
+ * @param {string} replyText 模型返回的原文
+ * @param {object|null} [usage] 宿主 `{type:"usage"}` chunk 的 `usage`
  */
-function recordAppraisalUsage(state, promptText, replyText) {
-  // 码点计数（与文档口径一致）：代理对算 1 个，而不是 String#length 的 2 个。
-  const codepoints = (text) => (typeof text === 'string' ? [...text].length : 0);
-  const estimate = Math.ceil((codepoints(promptText) + codepoints(replyText)) / 2);
-  if (estimate <= 0) return;
+function recordAppraisalUsage(state, messages, replyText, usage) {
+  const estimate = appraisalUsageEstimate(messages, replyText, usage);
+  if (!Number.isFinite(estimate) || estimate <= 0) return;
   recordTurnUsage(state.budget, estimate, {
     at: state.platform.now(),
     timezone: state.config.timezone,
   });
   refreshBudget(state);
+}
+
+/**
+ * 判定用量估算：宿主 usage 优先，其次按码点 × 1.0。
+ *
+ * @param {unknown[]} messages
+ * @param {string} replyText
+ * @param {object|null} usage
+ * @returns {number}
+ */
+function appraisalUsageEstimate(messages, replyText, usage) {
+  const codepoints = (text) => (typeof text === 'string' ? [...text].length : 0);
+  if (usage !== null && typeof usage === 'object') {
+    if (Number.isFinite(usage.totalTokens)) return Math.ceil(usage.totalTokens);
+    const input = Number.isFinite(usage.inputTokens) ? usage.inputTokens : null;
+    const output = Number.isFinite(usage.outputTokens) ? usage.outputTokens : null;
+    if (input !== null || output !== null) return Math.ceil((input ?? 0) + (output ?? 0));
+  }
+  let inputChars = 0;
+  for (const message of Array.isArray(messages) ? messages : []) {
+    for (const part of Array.isArray(message?.content) ? message.content : []) {
+      if (typeof part?.text === 'string') inputChars += codepoints(part.text);
+    }
+  }
+  return Math.ceil(inputChars + codepoints(replyText));
 }
 
 /**
@@ -2913,8 +2971,16 @@ function ensureAppraiserQueue(state) {
         lastReply: item.lastReply,
         cardName: state.card?.name,
       });
-      const raw = await state.platform.complete({ provider: route.provider, model: route.model, messages });
-      recordAppraisalUsage(state, JSON.stringify(messages), raw);
+      let usage = null;
+      const raw = await state.platform.complete({
+        provider: route.provider,
+        model: route.model,
+        messages,
+        onUsage: (value) => {
+          usage = value;
+        },
+      });
+      recordAppraisalUsage(state, messages, raw, usage);
       return raw;
     },
     apply: async (item, verdict, source) => {
@@ -2925,18 +2991,29 @@ function ensureAppraiserQueue(state) {
       const intensity = Number.isFinite(verdict?.intensity)
         ? Math.min(1.5, Math.max(0.5, 0.5 + verdict.intensity))
         : undefined;
-      applyClassifiedEvent({
+      const appliedAt = state.platform.now();
+      const parts = zonedParts(appliedAt, state.config.timezone);
+      const result = applyClassifiedEvent({
         store: state.store,
         card: state.card,
         scope: item.scope,
         classified: verdict,
         intensity,
         note: source,
-        now: state.platform.now(),
-        hour: zonedParts(state.platform.now(), state.config.timezone).hour,
-        minute: zonedParts(state.platform.now(), state.config.timezone).minute,
-        quiet: isQuietAt(new Date(state.platform.now()), state.config),
+        now: appliedAt,
+        hour: parts.hour,
+        minute: parts.minute,
+        quiet: isQuietAt(new Date(appliedAt), state.config),
+        // V60-M3：阈值只对 llm 来源生效；规则兜底仍用 0.5 的既有口径。
+        minConfidence: source === 'llm' ? state.card?.emotion?.appraiseMinConfidence : undefined,
       });
+      // V60-M1：只有真的推动了状态的事件才借给下一轮描述；零增量的模糊档不外借。
+      const moved = result.event !== null
+        && result.event.type !== 'none'
+        && Object.values(result.event.deltas).some((value) => Math.abs(value) > 0);
+      if (source === 'llm' && moved) {
+        state.lastAppraisalByScope?.set(item.scope, { type: result.event.type, at: appliedAt });
+      }
     },
   });
   return state.appraiserQueue;

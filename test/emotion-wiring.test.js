@@ -182,6 +182,7 @@ test('normalizeCardEmotion：合法值原样保留；非法值逐项回落并给
     appraiser: 'rules',
     appraiseModel: null,
     appraiseTimeoutMs: 8000,
+    appraiseMinConfidence: 0.65,
   });
   assert.deepEqual(valid.warnings, []);
 

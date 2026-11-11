@@ -886,8 +886,12 @@ export function createAdapter(ctx, opts = {}) {
    * 走平台唯一模型调用路径（`ctx.llm.stream`），把文本增量拼成完整字符串。
    * 只用于巩固草稿这类一次性文本生成；失败时抛错，由调用方降级。
    *
+   * `request.onUsage` 可选：宿主发出 `{type:'usage'}` chunk（`StreamChunk` 联合类型，
+   * `TokenUsage = {inputTokens, outputTokens, totalTokens?, cacheReadTokens?, …}`）时回调。
+   * 缺失用法不影响结果（调用方按码点自估）。
+   *
    * @param {{provider: string, model: string, messages: unknown[],
-   *          signal?: AbortSignal}} request
+   *          signal?: AbortSignal, onUsage?: (usage: object) => void}} request
    * @returns {Promise<string>}
    */
   async function complete(request) {
@@ -920,6 +924,14 @@ export function createAdapter(ctx, opts = {}) {
       if (chunk.type === 'text-delta') {
         const delta = chunk.text ?? chunk.delta ?? '';
         if (typeof delta === 'string') text += delta;
+      } else if (chunk.type === 'usage') {
+        if (typeof request.onUsage === 'function' && chunk.usage !== null && typeof chunk.usage === 'object') {
+          try {
+            request.onUsage(chunk.usage);
+          } catch {
+            // 用量回调只做记账，失败不影响正文。
+          }
+        }
       } else if (chunk.type === 'finish') {
         if (chunk.reason?.kind === 'error' || chunk.reason?.kind === 'aborted') {
           failure = chunk.reason?.failure?.message ?? chunk.reason?.kind;

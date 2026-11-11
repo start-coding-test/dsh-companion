@@ -12,8 +12,8 @@ test('package.json name 为 dsh-companion', () => {
   assert.equal(pkg.name, 'dsh-companion');
 });
 
-test('package.json version 为 0.6.0', () => {
-  assert.equal(pkg.version, '0.6.0');
+test('package.json version 为 0.6.1', () => {
+  assert.equal(pkg.version, '0.6.1');
 });
 
 test('package.json 定义了 node --test 脚本', () => {

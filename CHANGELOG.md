@@ -2,6 +2,40 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.6.1] - 2026-11-11
+
+v0.6 判定器上线后的第一批修正：专属句在 llm 模式下能出现了，情绪句里的第二人称不再指错人，
+llm 来源有了单独的入账阈值，预算估算与报告脚本的网关头也补齐。schema 仍为 **v14**；
+默认 `appraiser: "rules"` 的行为与 v0.5.2 一致；情绪关闭时提示词与 v0.6.0 逐字节相同。
+
+### Fixed
+
+- **V60-M1 专属句死代码**：llm 模式 pre-step 不落事件，`describe()` 拿不到类型，
+  `BLAME` / `VENT` / `REASSURE` 专属句永远不出现。判定成功后改在内存记 `lastAppraisal`，
+  下一轮 pre-step 借用一次（距判定 < 10 分钟、用过即清）；不在判定回调里改本轮情绪句，避免装配竞态。
+- **V60-M2 第二人称指代**：`REASSURE_SENTENCES` 里的「你」会被读成她本人，改为「对方」；
+  四组情绪句（DESCRIBE / BLAME / VENT / REASSURE）现均不含「你 / 他 / 她」。
+- **V60-L1 预算估算**：改用宿主 `{type:"usage"}` chunk 的 usage（`totalTokens`，否则输入+输出），
+  缺失时按「system + user + 输出」码点 × 1.0 估算（原「除 2」是低估）。
+- **V60-L2 none 不再落库**：`type=none` 只进 `/状态` 统计，不写 `emotion_events`，
+  避免闲聊把每作用域 50 条的保留窗口挤满。
+- **V60-L3 报告脚本网关头**：`createLlmJudge` 支持 `EMOTION_APPRAISE_SESSION`（`x-opencode-session`）
+  与 `EMOTION_APPRAISE_HEADERS`（JSON，合并进请求头）。
+
+### Added
+
+- **V60-M3 `emotion.appraiseMinConfidence`**：默认 0.65（合法 0.5–0.95，越界回落并 warning），
+  **只对 llm 来源**生效；规则路径仍用 0.5。低于阈值的判定只写一条零增量事件。
+- 提示词补「type=none 时 target 必须也是 none」（解析仍严格，不做宽松修复）。
+- `test/v061-fixes.test.js`（9 例）：句子人称、借用一次/超时不用、阈值分流、none 不落库、
+  usage chunk、网关头。
+
+### Tests
+
+- 1218 个用例 / 34 个套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区全绿；
+  round A + round B 门禁 PASS（round C 无凭据 SKIP）。
+
+---
 ## [0.6.0] - 2026-11-11
 
 按用户 v0.6 清单把「判断感受」交给模型、「管物理量」留给代码：规则分类器不再是唯一入口，默认仍是 `rules`（与 v0.5.2 行为一致），卡里写 `emotion.appraiser: "llm"` 才启用模型判定。schema 仍为 **v14**（来源写进 `emotion_events.note`，不新增列或表），记忆 / 提醒 / 线程行为未改，零新增运行时依赖；情绪关闭时 `persona:*` 三段与闲聊提示词与 v0.5.2 **逐字节一致**。

@@ -154,7 +154,8 @@
     "halfLifeHours": 6,
     "appraiser": "rules",
     "appraiseModel": null,
-    "appraiseTimeoutMs": 8000
+    "appraiseTimeoutMs": 8000,
+    "appraiseMinConfidence": 0.65
   },
   "version": 1
 }

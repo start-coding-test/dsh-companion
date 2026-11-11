@@ -271,6 +271,7 @@ function writeCard(dir, appraiser) {
     appraiser,
     appraiseModel: null,
     appraiseTimeoutMs: 8000,
+    appraiseMinConfidence: 0.65,
   };
   const path = join(dir, 'persona.json');
   writeFileSync(path, JSON.stringify(card, null, 2), 'utf8');

@@ -232,6 +232,7 @@ describe('emotion 结构校验（只校验 + 透传，不实现逻辑）', () =>
       appraiser: 'rules',
       appraiseModel: null,
       appraiseTimeoutMs: 8000,
+      appraiseMinConfidence: 0.65,
     });
   });
 
@@ -248,6 +249,7 @@ describe('emotion 结构校验（只校验 + 透传，不实现逻辑）', () =>
       appraiser: 'rules',
       appraiseModel: null,
       appraiseTimeoutMs: 8000,
+      appraiseMinConfidence: 0.65,
     });
   });
 

@@ -202,8 +202,23 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
   判定结果不会被写进已关闭的插件实例（`apply` 回调有 `state.disposed` 守卫）。
 - **建议排期**：不阻塞发版。后续可给队列加 `cancel()`（`AbortController` 传给
   `platform.complete`），`dispose()` 先取消再 drain，把最坏等待压到一次请求中止的时间。
-- **验收方式**：`test/v060-fixes.test.js` 的 L8 用例覆盖「同一事件只入账一次」；
+- **验收方式**：`test/v060-fixes.test.js` 的 L8 用例覆盖「同一事件只入账一次」；
   取消能力落地后补「dispose 期间不发新请求、在途请求被中止」用例。
+
+### D-15 v0.6.1 L3：宿主是否自带 `x-opencode-session` 与 `usage` chunk 未核实
+
+- **现状**：报告脚本 `createLlmJudge` 已支持 `EMOTION_APPRAISE_SESSION` 与 `EMOTION_APPRAISE_HEADERS`
+  （`x-opencode-session`）。但插件内路径走宿主的 `ctx.llm.stream`：本地解包源码
+  （`.dsh-src` 86 个 js 与 `app.asar.unpacked`）里搜不到 `x-opencode-session` / `MissingSessionID` /
+  `opencode`，无法确认宿主是否代填该头。同理，宿主是否在流里发 `{type:"usage"}` chunk 也未见
+  provider 实现（类型声明存在：`dsh-tool-cordis/lib/types/api-catalog.js` 的 `StreamChunk` /
+  `TokenUsage`）。
+- **影响**：若 g02 上判定请求 400，会全部落 `rules:fallback:error`（`/状态` 的「最近失败」可见）；
+  若宿主不发 usage，判定 token 按码点 × 1.0 估算，可能偏低但仍非「除二」的旧口径。
+- **建议排期**：g02 隔离库试跑 30 轮时观察：`rules:fallback:error` 占比、
+  `判定器：模型（…）` 的延迟分布；若确有 400，再确认宿主需要的头并写入部署配置。
+- **验收方式**：g02 跑满 30 轮后，报告 `error` 占比为 0（或给出宿主实际所需头与配置示例）；
+  同时核对 `/状态` 的 token 增量与对话 token 是否同量级。
 
 ## 6. 关联文档
 

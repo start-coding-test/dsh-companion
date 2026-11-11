@@ -17,6 +17,7 @@
 | `appraiser` | `"rules"` | `"rules"` = v0.5.2 规则分类；`"llm"` = 先模型判定、失败回落规则。非法值记 `emotion_appraiser_invalid` 并回落 `rules` |
 | `appraiseModel` | `null` | `{ "provider": "...", "model": "..." }`；缺省复用聊天模型路由（`resolveLlmRoute`）。写错记 `emotion_appraise_model_invalid` 并回落 `null` |
 | `appraiseTimeoutMs` | `8000` | 100–60000；越界回落默认并记 `emotion_appraise_timeout_invalid` |
+| `appraiseMinConfidence` | `0.65` | v0.6.1：**只对 `llm` 来源**生效的入账阈值，0.5–0.95；越界回落默认并记 `emotion_appraise_min_confidence_invalid`。低于它只写一条零增量事件；规则路径仍用 0.5 |
 | `enabled` | `false` | 关闭时**不发任何请求**、不读不写库（单测断言调用次数为 0） |
 
 ```json
@@ -43,7 +44,9 @@
 
 - 严格解析：非 JSON（含代码块、前后解释）、数组、枚举外、`type`/`target` 的 `none` 不一致、
   `intensity` / `confidence` 越界或非数字、**多出任何键（包括 PAD 增量）**，**一律算失败**，不做宽松修复。
-- `confidence < 0.5`（`AMBIGUOUS_CONFIDENCE`）只记一条零增量审计事件，不改状态。
+- `confidence` 低于阈值只记一条零增量审计事件、不改状态：规则路径用 `AMBIGUOUS_CONFIDENCE = 0.5`，
+  llm 路径用卡里的 `appraiseMinConfidence`（默认 0.65）。
+- `type = none` **不落事件表**（v0.6.1 / V60-L2）：只计入 `/状态` 的统计，避免闲聊把 50 条保留窗口挤满。
 - 强度映射：模型给的 `intensity`（0–1）线性映射到物理力度 `0.5 + intensity`（0.5–1.5），
   与规则路径的 `intensityFor = 0.5 + confidence` 落在同一区间——**物理参数不变**，
   只有「这一下推多重」由模型决定。
@@ -55,6 +58,7 @@ pre-step
   ├─ 读库 → 朝 target 衰减 → describe → 注入（立即返回，不等模型）
   └─ 后台 submitAppraisal(scope, text, lastReply, now, hour, minute, quiet)
         ├─ 判定成功 → applyClassifiedEvent → 写 emotion_state + emotion_events(note='llm')
+        │     └─ 内存记 lastAppraisal{scope,type,at} → 下一轮 pre-step 借用一次专属句（V60-M1）
         └─ 失败/超时/越界/预算/被覆盖 → 规则分类 → 同上，note='rules:fallback:<原因>'
 ```
 
@@ -62,6 +66,10 @@ pre-step
   （`rules:fallback:superseded`），事件不丢。
 - 同一事件只入账一次：llm 模式下 pre-step 不写事件（`skipEvent`），只有判定结果到达才写。
 - 斜杠命令、工具尾消息、空文本、子代理会话都不判定。
+- **专属句借用（V60-M1）**：llm 模式本轮不落事件，`describe()` 拿不到类型；判定成功后把类型记在内存
+  （`lastAppraisal`），下一轮 pre-step 若距判定 **< 10 分钟**且尚未用过，就借给 `describe` 一次
+  （`BLAME` / `VENT` / `REASSURE` 专属句），用完即清；超过 10 分钟不再借用。
+  **不在判定回调里直接改本轮情绪句**——那会和本轮装配竞态。零增量（模糊档 / `none`）不外借。
 
 ## 5. 失败与兜底
 
@@ -78,8 +86,11 @@ pre-step
 
 ## 6. 预算与可观测
 
-- 判定 token 按「输入 + 输出码点 / 2」估算，走与对话同一本 `recordTurnUsage` 账、
-  同一闸门（熔断时不再判定）。
+- 判定 token 走与对话同一本 `recordTurnUsage` 账、同一闸门（熔断时不再判定）。
+  计量顺序（v0.6.1 / V60-L1）：宿主 `{type:"usage"}` chunk 的 `usage` 优先（`totalTokens`，否则
+  `inputTokens + outputTokens`）；拿不到时按「system 正文 + user 正文 + 输出」**码点 × 1.0** 估算
+  （中文约 1 码点 ≈ 0.6–1 token，以前「除 2」是低估）。宿主 `StreamChunk` 的 usage 声明见
+  `dsh-tool-cordis/lib/types/api-catalog.js` 的 `StreamChunk` / `TokenUsage` 两个 interface。
 - `/状态` 新增一行：
 
   ```
@@ -115,6 +126,15 @@ node scripts/emotion-report.mjs --input test/fixtures/emotion-golden.jsonl --app
 
 环境变量也可用通用名：`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL`。
 
+网关需要额外请求头时（例如 opencode-go 的 `x-opencode-session`，缺它会 400 MissingSessionID）：
+
+```powershell
+$env:EMOTION_APPRAISE_SESSION = "<session id>"          # 简写：等价于 x-opencode-session
+$env:EMOTION_APPRAISE_HEADERS = '{"x-other":"1"}'    # 任意额外头（JSON 对象，值为字符串）
+```
+
+`authorization` / `content-type` 由脚本自己设置，`EMOTION_APPRAISE_HEADERS` 里的同名键会被忽略。
+
 ## 9. 已知限制
 
 - 每作用域 1 在途 + 1 排队：连续快速发问时，中间那句走规则（记 `superseded`）。
@@ -123,3 +143,7 @@ node scripts/emotion-report.mjs --input test/fixtures/emotion-golden.jsonl --app
 - 判定与对话共用每日预算；额度紧张时会更多落到规则。
 - `appraiseModel` 指向的 provider/model 必须在部署环境存在，否则每次判定都会 `error` 回落规则
   （`/状态` 的「最近失败」会显示 `error`）。
+- 宿主是否在 `ctx.llm.stream` 里自带 `x-opencode-session` **未核实**：本地解包源码（`.dsh-src` 与
+  `app.asar.unpacked`）里搜不到该字符串。报告脚本已支持手动注入；插件内路径是否也会 400，
+  由 g02 试跑观察 `rules:fallback:error` 占比确认（D-15）。
+- 宿主 usage chunk 是否真的发出同样未核实：拿不到就退回码点估算，口径已在上一节写明。

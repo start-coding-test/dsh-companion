@@ -120,6 +120,7 @@ export function runEmotionTurn(input = {}) {
     text = '',
     note,
     skipEvent = false,
+    eventType,
   } = input;
   void config;
 
@@ -226,9 +227,25 @@ export function runEmotionTurn(input = {}) {
     event,
     // V50-M1：把本轮事件类型交给 describe，blame / vent 用各自的专属句；
     // 其余类型（含 ambient）与不传第二参时完全一致。
-    line: describe(state, event === null ? undefined : { eventType: event.type }),
+    // V60-M1：llm 模式本轮没有事件，由调用方把上一次判定的类型借进来一次。
+    line: describe(state, describeContextFor(event, eventType)),
     changed,
   };
+}
+
+/**
+ * V60-M1：本轮描述用的 `eventType` —— 优先用调用方借来的上一次判定类型，
+ * 否则用本轮事件类型（含 ambient）。两者都没有时返回 undefined。
+ *
+ * @param {{type: string}|null} event
+ * @param {unknown} borrowed
+ * @returns {{eventType: string}|undefined}
+ */
+function describeContextFor(event, borrowed) {
+  if (typeof borrowed === 'string' && borrowed !== '' && borrowed !== AMBIENT_EVENT_TYPE) {
+    return { eventType: borrowed };
+  }
+  return event === null ? undefined : { eventType: event.type };
 }
 
 /**
@@ -263,6 +280,7 @@ export function applyClassifiedEvent(input = {}) {
     hour,
     minute,
     quiet = false,
+    minConfidence,
   } = input;
 
   if (!store || typeof store.getEmotionState !== 'function'
@@ -295,17 +313,15 @@ export function applyClassifiedEvent(input = {}) {
   let state = decayed;
   let event = null;
 
+  // V60-M3：llm 来源可以在卡里配更高的入账阈值（默认仍是 0.5）。
+  const threshold = Number.isFinite(minConfidence) && minConfidence > 0 && minConfidence <= 1
+    ? minConfidence
+    : AMBIGUOUS_CONFIDENCE;
+
   if (classified.type === 'none' || classified.confidence <= 0) {
-    // 判不出事件：只记一条零增量审计，状态不动（口径与 v0.5.2 的模糊档一致）。
-    if (typeof note === 'string' && note !== '') {
-      store.appendEmotionEvent(scope, {
-        at: now,
-        type: 'none',
-        deltas: { pleasure: 0, arousal: 0, dominance: 0, energy: 0 },
-        note,
-      });
-    }
-  } else if (classified.confidence < AMBIGUOUS_CONFIDENCE) {
+    // V60-L2：判不出事件不落事件表（只计入 appraiserStats），避免闲聊把真实事件挤出保留窗口。
+    event = null;
+  } else if (classified.confidence < threshold) {
     store.appendEmotionEvent(scope, {
       at: now,
       type: classified.type,
