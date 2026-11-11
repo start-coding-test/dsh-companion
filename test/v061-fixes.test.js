@@ -16,7 +16,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
-import { DEFAULT_CARD } from '../src/persona/card.js';
+import { DEFAULT_CARD, normalizeCardEmotion } from '../src/persona/card.js';
 import {
   BLAME_SENTENCES,
   DESCRIBE_SENTENCES,
@@ -45,6 +45,25 @@ test('情绪句不出现第二/第三人称（M2）', () => {
     for (const sentence of sentences) {
       assert.doesNotMatch(sentence, /[你他她]/u, `${group} 句含人称代词：${sentence}`);
     }
+  }
+});
+
+// ---------------------------------------------------------------- 配置归一化
+
+test('appraiseMinConfidence：默认 0.65、边界合法、越界回落并 warning（M3）', () => {
+  const base = { enabled: true, baseline: { ...BASELINE_50 }, halfLifeHours: 6, appraiser: 'llm' };
+  const plain = normalizeCardEmotion(base);
+  assert.equal(plain.emotion.appraiseMinConfidence, 0.65);
+  assert.deepEqual(plain.warnings, []);
+  for (const value of [0.5, 0.65, 0.95]) {
+    const ok = normalizeCardEmotion({ ...base, appraiseMinConfidence: value });
+    assert.equal(ok.emotion.appraiseMinConfidence, value);
+    assert.deepEqual(ok.warnings, []);
+  }
+  for (const value of [0.49, 0.96, '0.7', null, Number.NaN]) {
+    const bad = normalizeCardEmotion({ ...base, appraiseMinConfidence: value });
+    assert.equal(bad.emotion.appraiseMinConfidence, 0.65);
+    assert.deepEqual(bad.warnings.map((w) => w.code), ['emotion_appraise_min_confidence_invalid']);
   }
 });
 
