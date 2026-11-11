@@ -32,7 +32,7 @@ llm 来源有了单独的入账阈值，预算估算与报告脚本的网关头�
 
 ### Tests
 
-- 1218 个用例 / 34 个套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区全绿；
+- 1219 个用例 / 33 个套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区全绿；
   round A + round B 门禁 PASS（round C 无凭据 SKIP）。
 
 ---

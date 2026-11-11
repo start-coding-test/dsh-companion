@@ -202,7 +202,7 @@ R-M2 已修，代码侧单测见 `test/thread-slot.test.js`；下面两条仍需
   判定结果不会被写进已关闭的插件实例（`apply` 回调有 `state.disposed` 守卫）。
 - **建议排期**：不阻塞发版。后续可给队列加 `cancel()`（`AbortController` 传给
   `platform.complete`），`dispose()` 先取消再 drain，把最坏等待压到一次请求中止的时间。
-- **验收方式**：`test/v060-fixes.test.js` 的 L8 用例覆盖「同一事件只入账一次」；
+- **验收方式**：`test/v060-fixes.test.js` 的 L8 用例覆盖「同一事件只入账一次」；
   取消能力落地后补「dispose 期间不发新请求、在途请求被中止」用例。
 
 ### D-15 v0.6.1 L3：宿主是否自带 `x-opencode-session` 与 `usage` chunk 未核实

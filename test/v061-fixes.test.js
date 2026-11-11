@@ -92,10 +92,24 @@ test('llm 阈值：0.6 的判定落在 0.65 之下只写零增量（M3）', (t) 
   assert.equal(rows[0].type, 'blame');
   assert.deepEqual(rows[0].deltas, { pleasure: 0, arousal: 0, dominance: 0, energy: 0 });
   const state = temp.store.getEmotionState('main');
-  assert.deepEqual(
-    { pleasure: state.pleasure, arousal: state.arousal },
-    { pleasure: state.pleasure, arousal: state.arousal },
-  );
+  assert.ok(state && state.updatedAt === now);
+
+  // 对照：同样的判定、同样的状态，置信度 0.9 越过阈值，pleasure 必须被压低。
+  const high = makeTempStore();
+  t.after(() => high.cleanup());
+  applyClassifiedEvent({
+    store: high.store,
+    card,
+    scope: 'main',
+    classified: { type: 'blame', confidence: 0.9 },
+    note: 'llm',
+    minConfidence: 0.65,
+    now,
+    hour: 10,
+    minute: 0,
+  });
+  const pushed = high.store.getEmotionState('main');
+  assert.ok(pushed.pleasure < state.pleasure - 1, `expected ${pushed.pleasure} < ${state.pleasure} - 1`);
 });
 
 test('llm 阈值不越界影响规则路径（规则 0.6 仍入账）', (t) => {

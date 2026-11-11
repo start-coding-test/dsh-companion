@@ -2877,7 +2877,7 @@ function takeBorrowedAppraisal(state, scope, now) {
   const pending = state.lastAppraisalByScope?.get(scope);
   if (pending === undefined) return undefined;
   state.lastAppraisalByScope.delete(scope);
-  return Number.isFinite(pending.at) && now - pending.at <= BORROWED_APPRAISAL_TTL_MS
+  return Number.isFinite(pending.at) && now - pending.at < BORROWED_APPRAISAL_TTL_MS
     ? pending.type
     : undefined;
 }
