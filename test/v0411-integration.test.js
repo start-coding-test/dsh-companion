@@ -288,7 +288,7 @@ test('v0.4.11 集成：apply 巩固/压缩耗时进 /状态，超阈值只告警
     assert.match(facts[0].statement, /8000/u);
     assert.ok(temp.store.getBoardState('main').staged_revision >= 1);
     assert.equal(streams.length, 1);
-    assert.equal(temp.store.getMeta('schema_version'), '14');
+    assert.equal(temp.store.getMeta('schema_version'), '15');
 
     const consolidateWarns = warnLogs(ctx, 'consolidation took');
     assert.equal(consolidateWarns.length, 1, `只应告警一次，实际 ${JSON.stringify(consolidateWarns)}`);
@@ -465,6 +465,8 @@ function makeLegacyDb(t) {
     store.db
       .prepare("UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'")
       .run();
+    // B1：空库建库时已写标记；删掉以模拟真正的 v12 旧库。
+    store.db.prepare("DELETE FROM schema_meta WHERE key = 'episode_scrub_v13'").run();
   } finally {
     store.close();
   }
@@ -486,7 +488,7 @@ test('v0.4.11 集成：apply 打开 v12 旧库先 scrub episodes/FTS，二次 ap
   let snapshot = null;
   const inspected = Store.open(file);
   try {
-    assert.equal(inspected.getMeta('schema_version'), '14');
+    assert.equal(inspected.getMeta('schema_version'), '15');
 
     const sensitive = inspected.getEpisode(SENSITIVE_LEGACY_ROW.id);
     const narrative = inspected.getEpisode(NARRATIVE_LEGACY_ROW.id);

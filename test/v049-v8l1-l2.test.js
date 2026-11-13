@@ -127,7 +127,7 @@ test('V8-L1：v11 旧库（无 retry_at、带 ix_rm_fire）打开时就地补建
       const names = reminderIndexes(store).map((row) => row.name);
       assert.ok(names.includes('ix_rm_due'), `第 ${pass} 次打开应有 ix_rm_due：${names.join(',')}`);
       assert.ok(!names.includes('ix_rm_fire'), `第 ${pass} 次打开后旧索引必须已删除`);
-      assert.equal(store.getMeta('schema_version'), '14', '不因索引迁移提升版本');
+      assert.equal(store.getMeta('schema_version'), '15', '不因索引迁移提升版本');
       const columns = store.db
         .prepare("PRAGMA table_info('reminders')")
         .all()
@@ -163,7 +163,7 @@ test('V8-L1：已是 v12 但还留着 ix_rm_fire 的库，重开时只换索引�
     const row = reopened.getReminder(reminder.id);
     assert.equal(row.next_fire_at, NOW - 60, '迁移不得改写数据');
     assert.equal(row.retry_at, NOW + 300, '迁移不得清空已有的 retry_at');
-    assert.equal(reopened.getMeta('schema_version'), '14');
+    assert.equal(reopened.getMeta('schema_version'), '15');
   } finally {
     reopened.close();
     rmSync(temp.dir, { recursive: true, force: true });
@@ -174,7 +174,7 @@ test('V8-L1：EXPLAIN QUERY PLAN 命中 ix_rm_due（含 scope 过滤）', () => 
   const temp = makeTempStore();
   try {
     const { store } = temp;
-    assert.equal(store.getMeta('schema_version'), '14');
+    assert.equal(store.getMeta('schema_version'), '15');
     insertReminder(store, '到期项', { nextFireAt: NOW - 60 });
 
     for (const options of [{ now: NOW }, { now: NOW, scope: 'main' }]) {

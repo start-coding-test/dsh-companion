@@ -41,11 +41,11 @@ function makeFact(overrides = {}) {
   };
 }
 
-test('Store.open 建出 13 张业务/辅助表与 2 张 FTS 虚表', () => {
+test('Store.open 建出 14 张业务/辅助表与 2 张 FTS 虚表', () => {
   const expected = [
     'entities', 'episodes', 'facts', 'reminders', 'state_board',
     'state_board_rev', 'threads', 'consolidations', 'memory_events', 'schema_meta',
-    'fact_vectors', 'emotion_state', 'emotion_events',
+    'fact_vectors', 'emotion_state', 'emotion_events', 'token_usage',
   ];
   const names = store.db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -60,7 +60,7 @@ test('Store.open 建出 13 张业务/辅助表与 2 张 FTS 虚表', () => {
   const version = store.db
     .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
     .get();
-  assert.equal(version.value, '14');
+  assert.equal(version.value, '15');
 
   // 状态板占位行
   const board = store.getBoardState('main');
@@ -692,7 +692,7 @@ test('v3 库迁移到 v4：加 compaction_start_seq、清空 consolidations、ep
     const version = migrated.db
       .prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'")
       .get();
-    assert.equal(version.value, '14');
+    assert.equal(version.value, '15');
     const columns = migrated.db
       .prepare("PRAGMA table_info('consolidations')")
       .all()

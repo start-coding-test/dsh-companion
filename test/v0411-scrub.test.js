@@ -13,7 +13,8 @@
  *   3. 纯叙事（提到「密码」但没有值）不被整段抹掉；JSON 数组保持合法；
  *      脱敏面漏网但残留值形态的字段整段替换为 [凭据已省略]；
  *   4. 审计事件 detail 只有 {scanned, changed} 计数，不含正文；
- *   5. 新建空库不写标记、不写 scrub 事件（不给新用户留审计噪音）；
+ *   5. 新建空库也写标记（B1：避免每次打开都重扫），但不写 scrub 事件（不给新
+ *      用户留审计噪音）；
  *   6. 已是 v13 但还没有标记的库（例如标记写入前失败后被外部恢复）也会补齐一次。
  */
 import test from 'node:test';
@@ -158,7 +159,9 @@ function makeLegacyDb(t) {
   const file = join(dir, 'memory.db');
   const store = Store.open(file);
   try {
-    assert.equal(store.getMeta(SCRUB_MARKER), null, '新建空库不应有 scrub 标记');
+    // B1（v15）：空库也会写标记，避免每次打开都重扫；这里模拟 v12 旧库，删掉标记。
+    assert.notEqual(store.getMeta(SCRUB_MARKER), null, 'B1：新建空库也应写 scrub 标记');
+    store.db.prepare('DELETE FROM schema_meta WHERE key = ?').run(SCRUB_MARKER);
     insertLegacyEpisode(store, SENSITIVE_LEGACY_ROW);
     insertLegacyEpisode(store, NARRATIVE_LEGACY_ROW);
     store.db
@@ -177,7 +180,7 @@ test('V10-L1：v12 旧库升级到 v13 时脱敏 episodes 六字段并重建 FTS
 
   const store = Store.open(file);
   try {
-    assert.equal(store.getMeta('schema_version'), '14');
+    assert.equal(store.getMeta('schema_version'), '15');
     assert.notEqual(store.getMeta(SCRUB_MARKER), null, 'scrub 成功后应写标记');
 
     const sensitive = store.getEpisode(SENSITIVE_LEGACY_ROW.id);
@@ -266,7 +269,7 @@ test('V10-L1：二次打开无变化、不新增第二条 scrub 事件', (t) => 
 
   const second = Store.open(file);
   try {
-    assert.equal(second.getMeta('schema_version'), '14');
+    assert.equal(second.getMeta('schema_version'), '15');
     assert.deepEqual(
       second.db.prepare('SELECT * FROM episodes ORDER BY rowid ASC').all(),
       snapshot.rows,
@@ -283,14 +286,14 @@ test('V10-L1：二次打开无变化、不新增第二条 scrub 事件', (t) => 
   }
 });
 
-test('V10-L1：新建空库不写 scrub 标记、不写 scrub 事件', (t) => {
+test('V10-L1：新建空库也写 scrub 标记，但不写 scrub 事件', (t) => {
   const dir = tempDir(t);
   const store = Store.open(join(dir, 'memory.db'));
   try {
-    assert.equal(store.getMeta(SCRUB_MARKER), null);
+    assert.notEqual(store.getMeta(SCRUB_MARKER), null, 'B1：空库也要写标记，避免重扫');
     assert.equal(store.listEvents({ action: SCRUB_ACTION }).length, 0);
     assert.equal(store.listEvents().length, 0);
-    assert.equal(store.getMeta('schema_version'), '14');
+    assert.equal(store.getMeta('schema_version'), '15');
   } finally {
     store.close();
   }
@@ -302,6 +305,8 @@ test('V10-L1：已是 v13 但无标记的库也会补齐一次（非升级路径
   const seed = Store.open(file);
   try {
     insertLegacyEpisode(seed, SENSITIVE_LEGACY_ROW);
+    // B1：空库建库时就写了标记；删掉以模拟「已是 v13 但无标记」的库。
+    seed.db.prepare('DELETE FROM schema_meta WHERE key = ?').run(SCRUB_MARKER);
   } finally {
     seed.close();
   }
@@ -349,6 +354,7 @@ test('V10-L1：超过单批大小的库按 rowid 键集分批扫完（不跳行�
     seed.db
       .prepare("UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'")
       .run();
+    seed.db.prepare('DELETE FROM schema_meta WHERE key = ?').run(SCRUB_MARKER);
   } finally {
     seed.close();
   }
@@ -385,6 +391,7 @@ test('V10-L1：已脱敏的 JSON 数组不被重新序列化（未命中行逐�
     seed.db
       .prepare("UPDATE schema_meta SET value = '12' WHERE key = 'schema_version'")
       .run();
+    seed.db.prepare('DELETE FROM schema_meta WHERE key = ?').run(SCRUB_MARKER);
   } finally {
     seed.close();
   }

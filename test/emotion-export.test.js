@@ -85,7 +85,7 @@ test('exportAll json：emotion.state 全量、events 每 scope 最近 50 且按 
   const exported = exportAll({ store, format: 'json', dir, now: TEST_NOW });
   const payload = readJson(exported.path);
 
-  assert.equal(payload.schema_version, '14');
+  assert.equal(payload.schema_version, '15');
   assert.equal(payload.counts.facts, 0, 'counts 未新增情绪键，保持既有形状');
   assert.equal(payload.data.emotion.state.length, 2);
   assert.equal(payload.data.emotion.events.length, 4);
@@ -294,7 +294,7 @@ test('importAll：单文件内 55 条情绪事件导入后只留最近 50 条', 
     version: 1,
     exported_at: '2026-11-05T09:00:00.000Z',
     scope: 'main',
-    schema_version: '14',
+    schema_version: '15',
     counts: {},
     data: {
       facts: [], episodes: [], reminders: [], threads: [],
