@@ -77,8 +77,23 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  *     DDL 走 CREATE TABLE IF NOT EXISTS，v13 库打开时自动补表（幂等）。
  *     时间戳按卡面独立约定用「毫秒」epoch（既有表多用秒），所以 emotion_events.at
  *     与 purge 的秒级 cutoff 比较时要先换算，见 purge()。
+ * v15（v0.4.13 存储卡）：
+ *     - 新增 token_usage 入账账本（A1），按 day_key + source 聚合；day_key 由调用方
+ *       按配置时区算好，store 不读时区配置。at 是毫秒。
+ *     - facts 增加 injected_count / used_count / unused_streak（A8.1/A8.2）；旧的
+ *       recall_count 保留但新代码不再写（v14 遗留，只读旧库时仍可参考），升级时
+ *       用 `used_count = recall_count` 回填一次（幂等）。
+ *     - facts.kind 扩枚举（A8.5）：lifestyle / mood 新增，共 8 类。SQLite 改不了
+ *       CHECK，按「表 SQL 是否已含 lifestyle」检测后重建表，显式保留 rowid
+ *       以维持 fts_facts 的 rowid 关联。
+ *     - memory_events.action 扩枚举（B3）：govern / EDIT / scrub，同样重建表并
+ *       保留 rowid、ix_ev_row 与 append-only 触发器。
+ *     - reminders 增加 expired_notified_at / series_index（A4/A5），按列检测补列。
+ *     重建表期间必须临时关闭 foreign_keys：facts 是 fact_vectors 的父表，FK 打开
+ *     时 DROP TABLE 会隐式 DELETE 并级联清空向量行；PRAGMA 在事务内是 no-op，
+ *     所以由 migrate() 在 BEGIN 之前关闭、提交/回滚后恢复。
  */
-const SCHEMA_VERSION = '14';
+export const SCHEMA_VERSION = '15';
 /** v13：存量 episode 脱敏标记；存在即表示一次性 scrub 已完成（幂等跳过）。 */
 const EPISODE_SCRUB_MARKER = 'episode_scrub_v13';
 /** v13 scrub 的 rowid 批大小：大库分批复用同一游标，避免一次读全表。 */
@@ -129,10 +144,13 @@ const SALIENCE_VALUES = new Set(Object.keys(SALIENCE_STRENGTH_DAYS));
 const RENEED_TIERS = new Set(['clear', 'ambiguous', 'miss']);
 const RENEED_KIND_SET = new Set(RENEED_KINDS);
 
-const EVENT_ACTIONS = new Set([
+export const EVENT_ACTIONS = new Set([
   'ADD', 'UPDATE', 'SUPERSEDE', 'MERGE', 'NOOP', 'SKIP',
   'REINFORCE', 'DECAY', 'DEGRADE', 'TOMBSTONE', 'RESTORE', 'PURGED',
   'READ', 'USED', 'EXPORT',
+  // v15（B3）：治理/导出改写/存量脱敏三类审计动作。此前靠
+  // PRAGMA ignore_check_constraints 绕过 CHECK 写入，v15 起是合法枚举。
+  'govern', 'EDIT', 'scrub',
 ]);
 const EVENT_ACTORS = new Set(['consolidator', 'user', 'scheduler', 'migrator']);
 const CONSOLIDATION_STATUSES = new Set(['running', 'written', 'compacted', 'failed']);
@@ -184,6 +202,30 @@ const FIDELITY_VALUES = new Set(['full', 'gist', 'index']);
 const BOARD_SECTIONS = new Set(['in_progress', 'decided', 'open_question', 'upcoming', 'threads']);
 
 /**
+ * v15（A8.5）：facts.kind 的合法枚举。
+ *
+ * `lifestyle` 覆盖作息/饮食/兴趣等长期习惯，`mood` 覆盖情绪事件；人际关系继续用
+ * `relation`，不再新增 person 类。顺序即文档/提示词里的展示顺序。
+ * 这里是 store 侧的单一来源：insertFact / updateFact 用它校验，DDL 的 CHECK 也由
+ * 它生成；consolidate.js 与 runtime/tools.js 各自的旧 6 类集合由后续卡跟进。
+ */
+export const FACT_KINDS = Object.freeze([
+  'identity', 'relation', 'preference', 'project', 'knowledge', 'lifestyle', 'mood', 'other',
+]);
+
+const FACT_KIND_SET = new Set(FACT_KINDS);
+
+/** v15（A1）：token_usage.source 的六类调用来源。 */
+export const TOKEN_USAGE_SOURCES = Object.freeze([
+  'main', 'consolidate', 'smalltalk', 'embedding', 'task', 'thread',
+]);
+
+const TOKEN_USAGE_SOURCE_SET = new Set(TOKEN_USAGE_SOURCES);
+
+/** v15（A1）：token_usage.peak 的取值（v0.4.14 错峰计价预留）。 */
+const TOKEN_PEAK_SET = new Set(['peak', 'offpeak']);
+
+/**
  * V8-L2：提醒「唯一到期口径」的 SQL 表达式。
  *
  * 到期时刻 = `max(next_fire_at, retry_at)`：next_fire_at 是原定到点时间，
@@ -228,6 +270,82 @@ function toEpochOrNull(value) {
     if (Number.isFinite(num)) return Math.trunc(num);
   }
   return null;
+}
+
+/**
+ * v15：facts 表 DDL 的单一来源。
+ *
+ * 新库建表（SCHEMA_SQL）与 v15 的 kind 枚举重建（#rebuildFactsForKindEnum）共用
+ * 同一份列定义，避免两处漂移；重建只换表名。kind 的 CHECK 由 {@link FACT_KINDS}
+ * 生成。`recall_count` 是 v14 遗留列：v15 起新代码只写 used_count，保留它是为了
+ * 打开旧库时还能读到历史召回次数（升级时一次性回填 used_count）。
+ * @param {string} table 表名（仅内部常量，不接受外部输入）
+ */
+function factsTableDdl(table) {
+  const kinds = FACT_KINDS.map((kind) => `'${kind}'`).join(',');
+  return `CREATE TABLE IF NOT EXISTS ${table} (
+  id                  TEXT PRIMARY KEY,
+  scope               TEXT NOT NULL DEFAULT 'main',
+  kind                TEXT NOT NULL CHECK (kind IN (${kinds})),
+  subject_id          TEXT REFERENCES entities(id),
+  subject_text        TEXT NOT NULL,
+  predicate           TEXT NOT NULL,
+  object_text         TEXT,
+  statement           TEXT NOT NULL,
+  source_kind         TEXT NOT NULL CHECK (source_kind IN ('user_explicit','turn','task','consolidated','inferred')),
+  source_episode_id   TEXT REFERENCES episodes(id),
+  source_excerpt      TEXT,
+  salience            TEXT NOT NULL CHECK (salience IN ('trivial','normal','notable','explicit','pinned')),
+  privacy             TEXT NOT NULL DEFAULT 'normal' CHECK (privacy IN ('normal','sensitive','secret')),
+  observed_at         INTEGER NOT NULL,
+  valid_from          INTEGER,
+  valid_to            INTEGER,
+  strength_days       REAL,
+  last_reinforced_at  INTEGER NOT NULL,
+  recall_count        INTEGER NOT NULL DEFAULT 0,
+  injected_count      INTEGER NOT NULL DEFAULT 0,
+  used_count          INTEGER NOT NULL DEFAULT 0,
+  unused_streak       INTEGER NOT NULL DEFAULT 0,
+  fidelity            TEXT NOT NULL DEFAULT 'full' CHECK (fidelity IN ('full','gist','index')),
+  status              TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','dormant','superseded','tombstoned')),
+  superseded_by       TEXT REFERENCES facts(id),
+  deleted_at          INTEGER,
+  purge_payload       TEXT,
+  created_at          INTEGER NOT NULL DEFAULT (unixepoch()),
+  updated_at          INTEGER NOT NULL DEFAULT (unixepoch()),
+  first_reneed_at     INTEGER,
+  first_reneed_tier   TEXT,
+  reneed_kind         TEXT,
+  same_context        INTEGER NOT NULL DEFAULT 0 CHECK (same_context IN (0,1)),
+  first_used_at       INTEGER,
+  first_used_tier     TEXT,
+  used_same_context   INTEGER CHECK (used_same_context IN (0,1)),
+  CONSTRAINT ck_fact_pin_decay CHECK ((salience = 'pinned' AND strength_days IS NULL)
+                                   OR (salience <> 'pinned' AND strength_days IS NOT NULL))
+);`;
+}
+
+/**
+ * v15：memory_events 表 DDL 的单一来源（action 枚举与重建共用）。
+ *
+ * 与 facts 一样只返回 CREATE TABLE；ix_ev_row 与两个 append-only 触发器由调用方
+ * 在表就位后补建（重建时必须先 DROP 旧表，否则旧触发器名会挡住新建）。
+ * @param {string} table 表名（仅内部常量）
+ */
+function memoryEventsTableDdl(table) {
+  return `CREATE TABLE IF NOT EXISTS ${table} (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  at          INTEGER NOT NULL DEFAULT (unixepoch()),
+  action      TEXT NOT NULL CHECK (action IN (
+                'ADD','UPDATE','SUPERSEDE','MERGE','NOOP','SKIP',
+                'REINFORCE','DECAY','DEGRADE','TOMBSTONE','RESTORE','PURGED',
+                'READ','USED','EXPORT','govern','EDIT','scrub')),
+  table_name  TEXT NOT NULL,
+  row_id      TEXT,
+  actor       TEXT NOT NULL CHECK (actor IN ('consolidator','user','scheduler','migrator')),
+  reason      TEXT,
+  detail_json TEXT
+);`;
 }
 
 /**
@@ -308,43 +426,7 @@ CREATE INDEX IF NOT EXISTS ix_ep_scope_time ON episodes(scope, started_at DESC) 
 CREATE INDEX IF NOT EXISTS ix_ep_decay ON episodes(status, last_reinforced_at) WHERE strength_days IS NOT NULL;
 CREATE INDEX IF NOT EXISTS ix_ep_purge ON episodes(deleted_at) WHERE deleted_at IS NOT NULL;
 
-CREATE TABLE IF NOT EXISTS facts (
-  id                  TEXT PRIMARY KEY,
-  scope               TEXT NOT NULL DEFAULT 'main',
-  kind                TEXT NOT NULL CHECK (kind IN ('identity','relation','preference','project','knowledge','other')),
-  subject_id          TEXT REFERENCES entities(id),
-  subject_text        TEXT NOT NULL,
-  predicate           TEXT NOT NULL,
-  object_text         TEXT,
-  statement           TEXT NOT NULL,
-  source_kind         TEXT NOT NULL CHECK (source_kind IN ('user_explicit','turn','task','consolidated','inferred')),
-  source_episode_id   TEXT REFERENCES episodes(id),
-  source_excerpt      TEXT,
-  salience            TEXT NOT NULL CHECK (salience IN ('trivial','normal','notable','explicit','pinned')),
-  privacy             TEXT NOT NULL DEFAULT 'normal' CHECK (privacy IN ('normal','sensitive','secret')),
-  observed_at         INTEGER NOT NULL,
-  valid_from          INTEGER,
-  valid_to            INTEGER,
-  strength_days       REAL,
-  last_reinforced_at  INTEGER NOT NULL,
-  recall_count        INTEGER NOT NULL DEFAULT 0,
-  fidelity            TEXT NOT NULL DEFAULT 'full' CHECK (fidelity IN ('full','gist','index')),
-  status              TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','dormant','superseded','tombstoned')),
-  superseded_by       TEXT REFERENCES facts(id),
-  deleted_at          INTEGER,
-  purge_payload       TEXT,
-  created_at          INTEGER NOT NULL DEFAULT (unixepoch()),
-  updated_at          INTEGER NOT NULL DEFAULT (unixepoch()),
-  first_reneed_at     INTEGER,
-  first_reneed_tier   TEXT,
-  reneed_kind         TEXT,
-  same_context        INTEGER NOT NULL DEFAULT 0 CHECK (same_context IN (0,1)),
-  first_used_at       INTEGER,
-  first_used_tier     TEXT,
-  used_same_context   INTEGER CHECK (used_same_context IN (0,1)),
-  CONSTRAINT ck_fact_pin_decay CHECK ((salience = 'pinned' AND strength_days IS NULL)
-                                   OR (salience <> 'pinned' AND strength_days IS NOT NULL))
-);
+${factsTableDdl('facts')}
 CREATE INDEX IF NOT EXISTS ix_facts_key ON facts(subject_text, predicate, status);
 CREATE INDEX IF NOT EXISTS ix_facts_scope ON facts(scope, status) WHERE deleted_at IS NULL;
 CREATE INDEX IF NOT EXISTS ix_facts_decay ON facts(status, last_reinforced_at) WHERE strength_days IS NOT NULL;
@@ -380,6 +462,9 @@ CREATE TABLE IF NOT EXISTS reminders (
   closed_at         INTEGER,
   source_episode_id TEXT REFERENCES episodes(id),
   delivery_attempts INTEGER NOT NULL DEFAULT 0,
+  -- v15（A4/A5）：过期提醒的一次性通知标记 + 重复提醒的系列序号。
+  expired_notified_at INTEGER,
+  series_index      INTEGER NOT NULL DEFAULT 0,
   created_at        INTEGER NOT NULL DEFAULT (unixepoch()),
   updated_at        INTEGER NOT NULL DEFAULT (unixepoch()),
   deleted_at        INTEGER
@@ -450,24 +535,30 @@ CREATE TABLE IF NOT EXISTS threads (
 -- H3：一个线程会话只对应一条线程目录行；按 session_id 反查 scope 依赖唯一性。
 CREATE UNIQUE INDEX IF NOT EXISTS ux_threads_session ON threads(session_id);
 
-CREATE TABLE IF NOT EXISTS memory_events (
-  id          INTEGER PRIMARY KEY AUTOINCREMENT,
-  at          INTEGER NOT NULL DEFAULT (unixepoch()),
-  action      TEXT NOT NULL CHECK (action IN (
-                'ADD','UPDATE','SUPERSEDE','MERGE','NOOP','SKIP',
-                'REINFORCE','DECAY','DEGRADE','TOMBSTONE','RESTORE','PURGED',
-                'READ','USED','EXPORT')),
-  table_name  TEXT NOT NULL,
-  row_id      TEXT,
-  actor       TEXT NOT NULL CHECK (actor IN ('consolidator','user','scheduler','migrator')),
-  reason      TEXT,
-  detail_json TEXT
-);
+${memoryEventsTableDdl('memory_events')}
 CREATE INDEX IF NOT EXISTS ix_ev_row ON memory_events(table_name, row_id, at DESC);
 CREATE TRIGGER IF NOT EXISTS ev_no_update BEFORE UPDATE ON memory_events
 BEGIN SELECT RAISE(ABORT,'append-only'); END;
 CREATE TRIGGER IF NOT EXISTS ev_no_delete BEFORE DELETE ON memory_events
 BEGIN SELECT RAISE(ABORT,'append-only'); END;
+
+-- v15（A1）：token 入账账本。
+-- day_key 由调用方按配置时区算好的本地日键（YYYY-MM-DD），store 不读时区配置；
+-- at 是毫秒（与 emotion_* 一致，便于 5 小时滑窗），其余表多用秒。
+-- peak 预留给 v0.4.14 错峰计价，当前只写入、不参与聚合。
+CREATE TABLE IF NOT EXISTS token_usage (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  at               INTEGER NOT NULL,
+  day_key          TEXT NOT NULL,
+  source           TEXT NOT NULL CHECK (source IN ('main','consolidate','smalltalk','embedding','task','thread')),
+  scope            TEXT,
+  input_tokens     INTEGER NOT NULL DEFAULT 0,
+  output_tokens    INTEGER NOT NULL DEFAULT 0,
+  cache_hit_tokens INTEGER NOT NULL DEFAULT 0,
+  peak             TEXT CHECK (peak IS NULL OR peak IN ('peak','offpeak')),
+  request_id       TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_token_usage_day ON token_usage(day_key, source);
 
 -- 全文检索：列名 txt 存放 toBigrams() 结果，rowid 与主表 rowid 对齐
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_facts USING fts5(txt, tokenize = 'unicode61');
@@ -492,6 +583,32 @@ function newId(prefix) {
 function requireString(value, name) {
   if (typeof value !== 'string' || value === '') {
     throw new TypeError(`[store] ${name} must be a non-empty string`);
+  }
+  return value;
+}
+
+/**
+ * v15（A8.5）：facts.kind 校验（白名单见 {@link FACT_KINDS}）。
+ * @param {unknown} value
+ * @returns {string}
+ */
+function requireFactKind(value) {
+  const kind = requireString(value, 'facts.kind');
+  if (!FACT_KIND_SET.has(kind)) {
+    throw new TypeError(`[store] invalid facts.kind: ${kind}`);
+  }
+  return kind;
+}
+
+/**
+ * v15（A1）：token 计数 / 毫秒时间戳的校验：必须是 >= 0 的整数。
+ * @param {unknown} value
+ * @param {string} name
+ * @returns {number}
+ */
+function requireNonNegativeInteger(value, name) {
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    throw new TypeError(`[store] ${name} must be a non-negative integer`);
   }
   return value;
 }
@@ -1102,7 +1219,14 @@ export class Store {
       .get();
     const from = row ? String(row.value) : 'missing';
     const upgrading = from !== SCHEMA_VERSION;
-    if (upgrading) this.#db.exec('BEGIN IMMEDIATE');
+    // v15：升级路径要重建 facts / memory_events（SQLite 改不了 CHECK）。facts 是
+    // fact_vectors 的父表，foreign_keys=ON 时 DROP TABLE 会隐式 DELETE 并级联清空
+    // 向量行；PRAGMA foreign_keys 在事务内是 no-op，所以必须在 BEGIN 之前关闭，
+    // 提交/回滚后再恢复。非升级路径没有 DROP TABLE，不需要动。
+    if (upgrading) {
+      this.#db.exec('PRAGMA foreign_keys = OFF');
+      this.#db.exec('BEGIN IMMEDIATE');
+    }
     try {
       if (upgrading) this.#migrateFrom(from);
       // v10：reminders 增加 delivering 状态与 delivery_attempts；SQLite 改不了
@@ -1112,11 +1236,16 @@ export class Store {
       this.#ensureReminderOccurrenceColumn();
       // v12：reminders 增加 retry_at（V5-L2 退避时刻），按列检测补列，旧行 NULL。
       this.#ensureReminderRetryColumn();
+      // v15：reminders 增加 expired_notified_at / series_index（A4/A5），按列检测
+      // 补列；升级路径已在 #migrateFrom 里补过，这里是新库/修复路径的幂等兜底。
+      this.#ensureReminderExpiryColumns();
       // V8-L1/L2：到期表达式索引 + 改期清空 retry_at 的库级不变量（幂等，旧库就地补建）。
       this.#ensureReminderDueIndex();
       // v6/v7/v8/v9 的列与索引放在迁移之后处理：旧表此时才补上 embedder_id 与
       // first_reneed_*/same_context/first_used_* 列。ALTER 按列检测，重复调用安全。
       this.#ensureFactsReneedColumns();
+      // v15：facts 计数三列（injected_count / used_count / unused_streak）。
+      this.#ensureFactsCounterColumns();
       this.#ensureReneedKindTriggers();
       this.#db.exec(`
         CREATE INDEX IF NOT EXISTS ix_fact_vectors_embedder ON fact_vectors(embedder_id);
@@ -1137,6 +1266,9 @@ export class Store {
         }
       }
       throw error;
+    } finally {
+      // 无论提交还是回滚，都恢复连接默认的 FK 约束（#applyPragmas 的约定）。
+      if (upgrading) this.#db.exec('PRAGMA foreign_keys = ON');
     }
   }
 
@@ -1265,16 +1397,19 @@ export class Store {
    * 统一执行（#scrubLegacyEpisodes，带 schema_meta 标记，幂等）。
    * v13 → v14 只推进版本号（纯新增表）；emotion_state / emotion_events 由
    * migrate() 的 SCHEMA_SQL 幂等建好，旧库打开即补齐，不做任何数据回填。
+   * v14 → v15 由 #upgradeToV15 统一处理：facts 补计数三列并重建 kind CHECK、
+   * memory_events 重建 action CHECK、reminders 补两列，再用 recall_count 回填
+   * used_count；各步都按列/表 SQL 检测，可重复执行。
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
-    if (from === '13' || from === '12' || from === '11' || from === '10' || from === '9'
-      || from === '8' || from === '7' || from === '6') {
-      this.#db
-        .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
-        .run(SCHEMA_VERSION);
-      return;
+    const known = new Set(['3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14']);
+    if (!known.has(from)) {
+      throw new StoreError(
+        `[store] unsupported schema_version: ${from} (expected ${SCHEMA_VERSION})`,
+      );
     }
+    // 各版本自己的数据修补；列/索引/表重建统一由 #upgradeToV15 的幂等检测收口。
     if (from === '5') {
       // 事务由 migrate() 统一开启/提交（v8：整个升级路径单事务）。
       const columns = this.#db
@@ -1287,35 +1422,160 @@ export class Store {
       this.#db.exec(
         "UPDATE fact_vectors SET embedder_id = 'hash:' || dim WHERE embedder_id = ''",
       );
-      this.#db
-        .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
-        .run(SCHEMA_VERSION);
-      return;
+    } else if (from === '3') {
+      // v3 → v4：事务由 migrate() 统一开启/提交（v8：整个升级路径单事务）。
+      const columns = this.#db
+        .prepare("PRAGMA table_info('consolidations')")
+        .all()
+        .map((column) => column.name);
+      if (!columns.includes('compaction_start_seq')) {
+        this.#db.exec('ALTER TABLE consolidations ADD COLUMN compaction_start_seq INTEGER');
+      }
+      this.#db.exec('UPDATE episodes SET consolidation_id = NULL WHERE consolidation_id IS NOT NULL');
+      this.#db.exec('DELETE FROM consolidations');
     }
-    if (from === '4') {
-      this.#db
-        .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
-        .run(SCHEMA_VERSION);
-      return;
-    }
-    if (from !== '3') {
-      throw new StoreError(
-        `[store] unsupported schema_version: ${from} (expected ${SCHEMA_VERSION})`,
-      );
-    }
-    // v3 → v4：事务由 migrate() 统一开启/提交（v8：整个升级路径单事务）。
-    const columns = this.#db
-      .prepare("PRAGMA table_info('consolidations')")
-      .all()
-      .map((column) => column.name);
-    if (!columns.includes('compaction_start_seq')) {
-      this.#db.exec('ALTER TABLE consolidations ADD COLUMN compaction_start_seq INTEGER');
-    }
-    this.#db.exec('UPDATE episodes SET consolidation_id = NULL WHERE consolidation_id IS NOT NULL');
-    this.#db.exec('DELETE FROM consolidations');
+    // v3..v14 → v15：补列 + 两处 CHECK 枚举重建 + recall_count 回填，全部幂等。
+    this.#upgradeToV15();
     this.#db
       .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
       .run(SCHEMA_VERSION);
+  }
+
+  /**
+   * v15：把任意 v3..v14 库补齐到 v15 形态。
+   *
+   * 四步都按「列是否存在 / 表 SQL 是否已含新枚举」检测，重复调用安全；调用方
+   * （#migrateFrom）已在 migrate() 的升级事务内，且事务期间 foreign_keys 已关闭
+   * （facts 重建不能级联清空 fact_vectors）。
+   */
+  #upgradeToV15() {
+    this.#ensureFactsCounterColumns();
+    this.#rebuildFactsForKindEnum();
+    this.#rebuildMemoryEventsForActions();
+    this.#ensureReminderExpiryColumns();
+    // v14 遗留：recall_count 只被旧代码累加。v15 起 used_count 是唯一计数来源，
+    // 升级时把历史召回次数搬一次；`used_count = 0` 条件保证重复执行不会重复累加。
+    this.#db.exec(`
+      UPDATE facts
+         SET used_count = recall_count
+       WHERE used_count = 0 AND recall_count > 0
+    `);
+  }
+
+  /**
+   * v15（A8.1/A8.2）：facts 增加 injected_count / used_count / unused_streak。
+   * 逐列 ALTER，旧行取默认 0；新库 SCHEMA_SQL 已含三列，直接命中。
+   */
+  #ensureFactsCounterColumns() {
+    const columns = new Set(
+      this.#db
+        .prepare("PRAGMA table_info('facts')")
+        .all()
+        .map((column) => column.name),
+    );
+    if (!columns.has('injected_count')) {
+      this.#db.exec('ALTER TABLE facts ADD COLUMN injected_count INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!columns.has('used_count')) {
+      this.#db.exec('ALTER TABLE facts ADD COLUMN used_count INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!columns.has('unused_streak')) {
+      this.#db.exec('ALTER TABLE facts ADD COLUMN unused_streak INTEGER NOT NULL DEFAULT 0');
+    }
+  }
+
+  /**
+   * v15（A8.5）：facts.kind 扩枚举，SQLite 改不了 CHECK，只能整表重建。
+   *
+   * - 幂等：以 sqlite_master 里 facts 的 SQL 是否已含 `'lifestyle'` 判定；旧库
+   *   （v3..v14）的 SQL 里没有该值，新库由 SCHEMA_SQL 直接建好，直接返回。
+   * - 行标识：INSERT 显式带上 rowid，并在 SELECT 里取旧 rowid——fts_facts 是独立
+   *   FTS5 表、按 `facts.rowid` 关联，丢了 rowid 旧行的全文命中会全部错位。
+   * - 列集合取新旧交集（PRAGMA table_info），旧版本缺的列由新 DDL 的默认值补；
+   *   先前的 ALTER 已把 v15 三列补上，所以它们会被原样搬过去。
+   * - DROP/RENAME 期间 FK 已由 migrate() 关闭，fact_vectors 不会被级联删除。
+   */
+  #rebuildFactsForKindEnum() {
+    const row = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'facts'")
+      .get();
+    if (row && String(row.sql).includes("'lifestyle'")) return;
+    const columns = this.#db
+      .prepare("PRAGMA table_info('facts')")
+      .all()
+      .map((column) => column.name);
+    if (columns.length === 0) {
+      throw new StoreError('[store] facts table missing during v15 rebuild');
+    }
+    this.#db.exec('DROP TABLE IF EXISTS facts_v15');
+    this.#db.exec(factsTableDdl('facts_v15'));
+    const names = columns.join(', ');
+    this.#db.exec(`INSERT INTO facts_v15 (rowid, ${names}) SELECT rowid, ${names} FROM facts`);
+    this.#db.exec('DROP TABLE facts');
+    this.#db.exec('ALTER TABLE facts_v15 RENAME TO facts');
+    // 索引随旧表 DROP 一起消失，按新表名重建（名字保持 v14 约定）。
+    this.#db.exec(`
+      CREATE INDEX IF NOT EXISTS ix_facts_key ON facts(subject_text, predicate, status);
+      CREATE INDEX IF NOT EXISTS ix_facts_scope ON facts(scope, status) WHERE deleted_at IS NULL;
+      CREATE INDEX IF NOT EXISTS ix_facts_decay ON facts(status, last_reinforced_at) WHERE strength_days IS NOT NULL;
+      CREATE INDEX IF NOT EXISTS ix_facts_purge ON facts(deleted_at) WHERE deleted_at IS NOT NULL;
+    `);
+  }
+
+  /**
+   * v15（B3）：memory_events.action 扩枚举（govern / EDIT / scrub）。
+   *
+   * 与 facts 同样整表重建，显式保留 rowid（id 是 INTEGER PRIMARY KEY，别名 rowid；
+   * 旧 id 有空洞时也原样保留，AUTOINCREMENT 的下一个值由 SQLite 自己续上）。
+   * 重建后补回 ix_ev_row 与两个 append-only 触发器。
+   */
+  #rebuildMemoryEventsForActions() {
+    const row = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'memory_events'")
+      .get();
+    if (row && String(row.sql).includes("'govern'")) return;
+    const columns = this.#db
+      .prepare("PRAGMA table_info('memory_events')")
+      .all()
+      .map((column) => column.name);
+    if (columns.length === 0) {
+      throw new StoreError('[store] memory_events table missing during v15 rebuild');
+    }
+    this.#db.exec('DROP TABLE IF EXISTS memory_events_v15');
+    this.#db.exec(memoryEventsTableDdl('memory_events_v15'));
+    // id 就是 rowid 的别名，只显式写 rowid，避免同一列出现两次。
+    const names = columns.filter((name) => name !== 'id').join(', ');
+    this.#db.exec(
+      `INSERT INTO memory_events_v15 (rowid, ${names}) SELECT rowid, ${names} FROM memory_events`,
+    );
+    this.#db.exec('DROP TABLE memory_events');
+    this.#db.exec('ALTER TABLE memory_events_v15 RENAME TO memory_events');
+    this.#db.exec(`
+      CREATE INDEX IF NOT EXISTS ix_ev_row ON memory_events(table_name, row_id, at DESC);
+      CREATE TRIGGER IF NOT EXISTS ev_no_update BEFORE UPDATE ON memory_events
+      BEGIN SELECT RAISE(ABORT,'append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS ev_no_delete BEFORE DELETE ON memory_events
+      BEGIN SELECT RAISE(ABORT,'append-only'); END;
+    `);
+  }
+
+  /**
+   * v15（A4/A5）：reminders 增加 expired_notified_at（过期一次性通知）与
+   * series_index（重复提醒系列序号）。逐列 ALTER，旧行分别取 NULL / 0。
+   */
+  #ensureReminderExpiryColumns() {
+    const columns = new Set(
+      this.#db
+        .prepare("PRAGMA table_info('reminders')")
+        .all()
+        .map((column) => column.name),
+    );
+    if (!columns.has('expired_notified_at')) {
+      this.#db.exec('ALTER TABLE reminders ADD COLUMN expired_notified_at INTEGER');
+    }
+    if (!columns.has('series_index')) {
+      this.#db.exec('ALTER TABLE reminders ADD COLUMN series_index INTEGER NOT NULL DEFAULT 0');
+    }
   }
 
   /**
@@ -1331,8 +1591,9 @@ export class Store {
    *
    * 幂等与审计：成功后在 schema_meta 写 `episode_scrub_v13` 标记，之后重复打开
    * 直接跳过；扫描过行就写一条 memory_events（action=scrub，detail 只含
-   * {scanned, changed}，不含正文）。空库不写标记也不写事件，避免给新建库留
-   * 审计噪音。凭据判定面在每行上逐字段重跑，不依赖 SQL 预筛（预筛只能当优化，
+   * {scanned, changed}，不含正文）。空库也写标记（v15/B1：否则每次打开空库都要
+   * 重新探测一遍），但 scanned === 0 时不写审计事件，避免给新建库留审计噪音。
+   * 凭据判定面在每行上逐字段重跑，不依赖 SQL 预筛（预筛只能当优化，
    * 会漏掉 sk-/卡号/设备值等没有「密码」字样的形态）。
    *
    * 事务：升级路径由 `migrate()` 的 BEGIN IMMEDIATE 包住（失败连同版本号一起
@@ -1360,6 +1621,9 @@ export class Store {
       .filter((name) => columns.has(name));
     const total = Number(this.#db.prepare('SELECT COUNT(*) AS n FROM episodes').get().n);
     if (total === 0) {
+      // v15（B1）：空库也落标记，避免每次打开都重跑一遍探测；没有扫描到行，
+      // 所以不写审计事件（新建库不应有 scrub 审计噪音）。
+      this.setMeta(EPISODE_SCRUB_MARKER, String(nowSeconds()));
       return { skipped: false, scanned: 0, changed: 0, eventId: null };
     }
 
@@ -2006,7 +2270,7 @@ export class Store {
       .run(
         id,
         input.scope ?? 'main',
-        requireString(input.kind, 'facts.kind'),
+        requireFactKind(input.kind),
         input.subject_id ?? null,
         requireString(input.subject_text, 'facts.subject_text'),
         requireString(input.predicate, 'facts.predicate'),
@@ -2022,6 +2286,7 @@ export class Store {
         epochOr(input.valid_to, null),
         strengthDays,
         lastReinforcedAt,
+        // v14 遗留列：v15 起新 API 不再写 recall_count（保留仅为读旧库/导入兼容）。
         input.recall_count ?? 0,
         input.fidelity ?? 'full',
         input.status ?? 'active',
@@ -2056,7 +2321,7 @@ export class Store {
     /** @type {Map<string, unknown>} */
     const fields = new Map();
     const textColumns = new Set([
-      'kind', 'subject_id', 'subject_text', 'predicate', 'object_text', 'statement',
+      'subject_id', 'subject_text', 'predicate', 'object_text', 'statement',
       'source_kind', 'source_episode_id', 'source_excerpt', 'privacy', 'fidelity',
       'status', 'superseded_by', 'purge_payload',
     ]);
@@ -2065,7 +2330,10 @@ export class Store {
     for (const [key, value] of Object.entries(patch)) {
       if (epochColumns.has(key)) {
         fields.set(key, epochOr(value, null));
+      } else if (key === 'kind') {
+        fields.set(key, requireFactKind(value));
       } else if (key === 'recall_count') {
+        // v14 遗留计数：保留写入仅为兼容旧导入；新代码用 markFactsUsed。
         fields.set(key, Number(value) || 0);
       } else if (key === 'salience') {
         if (!SALIENCE_VALUES.has(value)) {
@@ -2172,6 +2440,62 @@ export class Store {
   }
 
   /**
+   * v15（A8.1）：批量累加「被注入」计数（injected_count / unused_streak）。
+   *
+   * 单事务批量更新，只作用于 `status='active' AND deleted_at IS NULL` 的行；未知
+   * 或非 active 的 id 静默跳过（检索侧可能拿着上一轮快照的 id，不能因为并发删除
+   * 让整批失败）。atSeconds 只做类型校验、当前不落库：facts 没有 per-event 注入
+   * 时间列，保留参数是为了和 markFactsUsed 的签名对称、后续审计扩展不破坏调用方。
+   * @param {string[]} ids
+   * @param {number|Date} [atSeconds]
+   * @returns {{updated: number}}
+   */
+  bumpFactInjected(ids, atSeconds) {
+    return this.#bumpFactCounters(ids, atSeconds, 'injected');
+  }
+
+  /**
+   * v15（A8.2）：批量累加「被用上」计数（used_count+1）并清零 unused_streak。
+   *
+   * 与 bumpFactInjected 同一批量/过滤/跳过语义；`used_count` 是 v15 起的唯一
+   * 「用上」计数来源（v14 的 recall_count 只由旧 reinforce 路径继续累加）。
+   * @param {string[]} ids
+   * @param {number|Date} [atSeconds]
+   * @returns {{updated: number}}
+   */
+  markFactsUsed(ids, atSeconds) {
+    return this.#bumpFactCounters(ids, atSeconds, 'used');
+  }
+
+  /**
+   * @param {string[]} ids
+   * @param {number|Date|undefined} atSeconds
+   * @param {'injected'|'used'} mode
+   * @returns {{updated: number}}
+   */
+  #bumpFactCounters(ids, atSeconds, mode) {
+    const list = normalizeIdList(ids);
+    // 参数校验先于空数组短路：非法时间戳不应该因为 ids 为空就被吞掉。
+    if (atSeconds !== undefined && atSeconds !== null) toEpoch(atSeconds);
+    if (list.length === 0) return { updated: 0 };
+    const sql = mode === 'injected'
+      ? `UPDATE facts
+            SET injected_count = injected_count + 1,
+                unused_streak = unused_streak + 1
+          WHERE id = ? AND status = 'active' AND deleted_at IS NULL`
+      : `UPDATE facts
+            SET used_count = used_count + 1,
+                unused_streak = 0
+          WHERE id = ? AND status = 'active' AND deleted_at IS NULL`;
+    return this.#atomic(() => {
+      const statement = this.#db.prepare(sql);
+      let updated = 0;
+      for (const id of list) updated += Number(statement.run(id).changes);
+      return { updated };
+    });
+  }
+
+  /**
    * S1：标记删除（保留行与 FTS 直到 purge）。
    * @param {string} id
    * @param {{now?: number|Date}} [options]
@@ -2260,8 +2584,9 @@ export class Store {
       .prepare(
         `INSERT INTO reminders (
            id, scope, kind, title, detail, counterparty, due_at, due_granularity, rrule,
-           next_fire_at, retry_at, last_fire_key, status, closed_at, source_episode_id, deleted_at
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           next_fire_at, retry_at, last_fire_key, occurrence_key, status, closed_at,
+           source_episode_id, expired_notified_at, series_index, deleted_at
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -2276,9 +2601,16 @@ export class Store {
         epochOr(input.next_fire_at, null),
         epochOr(input.retry_at, null),
         input.last_fire_key ?? null,
+        input.occurrence_key === undefined || input.occurrence_key === null
+          ? null
+          : requireString(input.occurrence_key, 'reminders.occurrence_key'),
         input.status ?? 'pending',
         epochOr(input.closed_at, null),
         input.source_episode_id ?? null,
+        epochOr(input.expired_notified_at, null),
+        input.series_index === undefined || input.series_index === null
+          ? 0
+          : requireNonNegativeInteger(input.series_index, 'reminders.series_index'),
         epochOr(input.deleted_at, null),
       );
     return this.getReminder(id);
@@ -2360,6 +2692,50 @@ export class Store {
       .run(nextFireAt, dueAt, dueGranularity, status, reminderId);
     if (Number(info.changes) === 0) return null;
     return this.getReminder(reminderId);
+  }
+
+  /**
+   * v15（A5）：把一条提醒推进到下一次 occurrence（重复提醒/系列提醒用）。
+   *
+   * 与 rescheduleReminder 的区别：这是「本次已经走完、进入系列下一集」，所以
+   * 无条件把状态拉回 pending 并清空投递现场（attempts/retry_at/closed_at），
+   * 同时写入新的 next_fire_at / occurrence_key / series_index。只对未删除的行
+   * 生效；行不存在（或已物理删除）返回 `{ok:false}`，不抛错。
+   *
+   * @param {string} id
+   * @param {{nextFireAt?: number|Date, at?: number|Date, occurrenceKey?: string,
+   *          seriesIndex?: number}} options `at` 是 nextFireAt 的兼容别名；
+   *          occurrenceKey 缺省时按 `nextFireAt-occ_xxx` 生成
+   * @returns {{ok: boolean}}
+   */
+  advanceReminderOccurrence(id, options = {}) {
+    const reminderId = requireString(id, 'reminders.id');
+    const nextFireRaw = options.nextFireAt ?? options.at;
+    if (nextFireRaw === null || nextFireRaw === undefined) {
+      throw new TypeError('[store] advanceReminderOccurrence requires nextFireAt');
+    }
+    const nextFireAt = toEpoch(nextFireRaw);
+    const occurrenceKey = options.occurrenceKey === undefined || options.occurrenceKey === null
+      ? `${nextFireAt}-${newId('occ')}`
+      : requireString(options.occurrenceKey, 'reminders.occurrence_key');
+    const seriesIndex = options.seriesIndex === undefined || options.seriesIndex === null
+      ? 0
+      : requireNonNegativeInteger(options.seriesIndex, 'reminders.series_index');
+    const info = this.#db
+      .prepare(
+        `UPDATE reminders
+            SET next_fire_at = ?,
+                occurrence_key = ?,
+                series_index = ?,
+                status = 'pending',
+                delivery_attempts = 0,
+                retry_at = NULL,
+                closed_at = NULL,
+                updated_at = unixepoch()
+          WHERE id = ? AND deleted_at IS NULL`,
+      )
+      .run(nextFireAt, occurrenceKey, seriesIndex, reminderId);
+    return { ok: Number(info.changes) > 0 };
   }
 
   /**
@@ -2620,6 +2996,56 @@ export class Store {
           LIMIT ? OFFSET ?`,
       )
       .all(...args, limit, offset);
+  }
+
+  /**
+   * v15（A4）：列出某 scope 下「已过期但还没通知过」的提醒。
+   *
+   * 只返回投递侧需要的最小字段；按 due_at 升序（NULL 排最后——理论上 expired
+   * 行都有 due_at，这里只是防御），同一时刻按 id 稳定排序。已软删的行不返回。
+   * @param {string} scope
+   * @returns {{id: string, title: string, due_at: number|null, kind: string,
+   *            rrule: string|null}[]}
+   */
+  listUnnotifiedExpired(scope) {
+    const scopeKey = requireString(scope, 'reminders.scope');
+    return this.#db
+      .prepare(
+        `SELECT id, title, due_at, kind, rrule
+           FROM reminders
+          WHERE scope = ?
+            AND status = 'expired'
+            AND expired_notified_at IS NULL
+            AND deleted_at IS NULL
+          ORDER BY (due_at IS NULL) ASC, due_at ASC, id ASC`,
+      )
+      .all(scopeKey);
+  }
+
+  /**
+   * v15（A4）：批量标记过期提醒已通知（写 expired_notified_at）。
+   *
+   * 只命中仍处于 expired 且尚未标记的行，重复调用幂等；未知/已标记的 id 跳过。
+   * @param {string[]} ids
+   * @param {number|Date} [atSeconds] 缺省取当前秒
+   * @returns {{updated: number}}
+   */
+  markExpiredNotified(ids, atSeconds) {
+    const list = normalizeIdList(ids);
+    const at = epochOr(atSeconds, nowSeconds());
+    if (list.length === 0) return { updated: 0 };
+    return this.#atomic(() => {
+      const statement = this.#db.prepare(
+        `UPDATE reminders
+            SET expired_notified_at = ?
+          WHERE id = ?
+            AND status = 'expired'
+            AND expired_notified_at IS NULL`,
+      );
+      let updated = 0;
+      for (const id of list) updated += Number(statement.run(at, id).changes);
+      return { updated };
+    });
   }
 
   /**
@@ -3144,6 +3570,141 @@ export class Store {
     return this.getConsolidation(id);
   }
 
+  // ----------------------------------------------------------- token usage
+
+  /**
+   * v15（A1）：写入一条 token 用量账本。
+   *
+   * `day_key` 由调用方按配置时区算好（store 不碰时区），`at` 是毫秒时间戳；
+   * 三个计数都是非负整数，`cacheHit` 是 input 的子集、只做统计展示，不参与
+   * `total`（见 {@link aggregateTokenUsage}）。`peak` 预留给 v0.4.14 错峰计费，
+   * 现在只做枚举校验。
+   * @param {{at?: number, dayKey: string, source: string, scope?: string|null,
+   *          input?: number, output?: number, cacheHit?: number,
+   *          peak?: 'peak'|'offpeak'|null, requestId?: string|null}} input
+   * @returns {{id: number}}
+   */
+  recordTokenUsage(input = {}) {
+    const at = input.at === undefined || input.at === null
+      ? Date.now()
+      : requireNonNegativeInteger(input.at, 'token_usage.at');
+    const dayKey = requireString(input.dayKey, 'token_usage.day_key');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dayKey)) {
+      throw new TypeError('[store] token_usage.day_key must be YYYY-MM-DD');
+    }
+    const source = requireString(input.source, 'token_usage.source');
+    if (!TOKEN_USAGE_SOURCE_SET.has(source)) {
+      throw new TypeError(`[store] invalid token_usage.source: ${source}`);
+    }
+    const scope = input.scope === undefined || input.scope === null
+      ? null
+      : requireString(input.scope, 'token_usage.scope');
+    const inputTokens = input.input === undefined || input.input === null
+      ? 0
+      : requireNonNegativeInteger(input.input, 'token_usage.input');
+    const outputTokens = input.output === undefined || input.output === null
+      ? 0
+      : requireNonNegativeInteger(input.output, 'token_usage.output');
+    const cacheHitTokens = input.cacheHit === undefined || input.cacheHit === null
+      ? 0
+      : requireNonNegativeInteger(input.cacheHit, 'token_usage.cacheHit');
+    const peak = input.peak === undefined ? null : input.peak;
+    if (peak !== null && !TOKEN_PEAK_SET.has(peak)) {
+      throw new TypeError(`[store] invalid token_usage.peak: ${String(peak)}`);
+    }
+    const requestId = input.requestId === undefined || input.requestId === null
+      ? null
+      : requireString(input.requestId, 'token_usage.request_id');
+    const info = this.#db
+      .prepare(
+        `INSERT INTO token_usage (
+           at, day_key, source, scope, input_tokens, output_tokens,
+           cache_hit_tokens, peak, request_id
+         ) VALUES (?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(at, dayKey, source, scope, inputTokens, outputTokens, cacheHitTokens, peak, requestId);
+    return { id: Number(info.lastInsertRowid) };
+  }
+
+  /**
+   * v15（A1）：按天聚合 token 用量。
+   *
+   * `total.total = input + output`（cacheHit 是 input 的子集，不重复计入）；
+   * 每个 source 的 `share = 该 source 的 total / 当日 total`，保留 4 位小数。
+   * 无数据时返回 `total.total === 0` 且 `bySource: []`；有行但全为 0 时
+   * `share` 取 0（不做 0/0）。排序按 total 降序，同额按 source 升序保证稳定。
+   * @param {string} dayKey 本地日键 YYYY-MM-DD
+   * @returns {{dayKey: string, total: {input: number, output: number,
+   *            cacheHit: number, total: number},
+   *            bySource: {source: string, input: number, output: number,
+   *                       cacheHit: number, total: number, share: number}[]}}
+   */
+  aggregateTokenUsage(dayKey) {
+    const key = requireString(dayKey, 'token_usage.day_key');
+    const rows = this.#db
+      .prepare(
+        `SELECT source,
+                COALESCE(SUM(input_tokens), 0) AS input,
+                COALESCE(SUM(output_tokens), 0) AS output,
+                COALESCE(SUM(cache_hit_tokens), 0) AS cache_hit
+           FROM token_usage
+          WHERE day_key = ?
+          GROUP BY source`,
+      )
+      .all(key);
+    const total = { input: 0, output: 0, cacheHit: 0, total: 0 };
+    const bySource = [];
+    for (const row of rows) {
+      const inputTokens = Number(row.input);
+      const outputTokens = Number(row.output);
+      const cacheHit = Number(row.cache_hit);
+      const sourceTotal = inputTokens + outputTokens;
+      total.input += inputTokens;
+      total.output += outputTokens;
+      total.cacheHit += cacheHit;
+      total.total += sourceTotal;
+      bySource.push({
+        source: String(row.source),
+        input: inputTokens,
+        output: outputTokens,
+        cacheHit,
+        total: sourceTotal,
+        share: 0,
+      });
+    }
+    for (const entry of bySource) {
+      entry.share = total.total === 0 ? 0 : Math.round((entry.total / total.total) * 10000) / 10000;
+    }
+    bySource.sort((a, b) => b.total - a.total || a.source.localeCompare(b.source));
+    return { dayKey: key, total, bySource };
+  }
+
+  /**
+   * v15（A1）：统计 `at >= atMs` 的窗口用量（5 小时滑窗用）。
+   * @param {number} atMs 毫秒时间戳（含）
+   * @returns {{input: number, output: number, cacheHit: number, total: number}}
+   */
+  sumTokenUsageSince(atMs) {
+    const since = requireNonNegativeInteger(atMs, 'token_usage.since');
+    const row = this.#db
+      .prepare(
+        `SELECT COALESCE(SUM(input_tokens), 0) AS input,
+                COALESCE(SUM(output_tokens), 0) AS output,
+                COALESCE(SUM(cache_hit_tokens), 0) AS cache_hit
+           FROM token_usage
+          WHERE at >= ?`,
+      )
+      .get(since);
+    const inputTokens = Number(row.input);
+    const outputTokens = Number(row.output);
+    return {
+      input: inputTokens,
+      output: outputTokens,
+      cacheHit: Number(row.cache_hit),
+      total: inputTokens + outputTokens,
+    };
+  }
+
   // -------------------------------------------------------- memory events
 
   /**
@@ -3642,7 +4203,7 @@ export class Store {
     const tables = [
       'entities', 'episodes', 'facts', 'reminders', 'state_board', 'state_board_rev',
       'threads', 'consolidations', 'memory_events',
-      'emotion_state', 'emotion_events',
+      'emotion_state', 'emotion_events', 'token_usage',
     ];
     /** @type {Record<string, number>} */
     const counts = {};

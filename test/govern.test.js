@@ -298,8 +298,10 @@ test('appendEventWithAction：允许 govern/EDIT 直插，结束后恢复 CHECK 
   const pragma = store.db.prepare('PRAGMA ignore_check_constraints').get();
   assert.equal(pragma.ignore_check_constraints, 0);
   assert.throws(
-    () => store.db.prepare("INSERT INTO memory_events (at, action, table_name, actor) VALUES (0, 'govern', 'facts', 'user')").run(),
+    () => store.db.prepare("INSERT INTO memory_events (at, action, table_name, actor) VALUES (0, 'NOPE', 'facts', 'user')").run(),
     /CHECK/i,
     '恢复后普通插入仍受 CHECK 约束',
   );
+  // v15 起 govern/EDIT/scrub 已在 CHECK 白名单内：普通插入不再需要临时 PRAGMA。
+  store.db.prepare("INSERT INTO memory_events (at, action, table_name, actor) VALUES (0, 'govern', 'facts', 'user')").run();
 });

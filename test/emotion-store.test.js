@@ -100,7 +100,7 @@ test('迁移：v13 库（已建库后降版本并 DROP 新表）打开后升到 
 
   const migrated = Store.open(dbPath);
   live = migrated;
-  assert.equal(migrated.getMeta('schema_version'), '14');
+  assert.equal(migrated.getMeta('schema_version'), '15');
   assert.ok(tableExists(migrated, 'emotion_state'));
   assert.ok(tableExists(migrated, 'emotion_events'));
   assert.equal(
@@ -119,7 +119,7 @@ test('迁移：v13 库（已建库后降版本并 DROP 新表）打开后升到 
   migrated.close();
   const reopened = Store.open(dbPath);
   live = reopened;
-  assert.equal(reopened.getMeta('schema_version'), '14');
+  assert.equal(reopened.getMeta('schema_version'), '15');
   assert.equal(reopened.db.prepare('SELECT COUNT(*) AS n FROM facts').get().n, 1);
   assert.equal(
     reopened.db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE name = 'emotion_state'").get().n,

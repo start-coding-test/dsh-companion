@@ -129,6 +129,8 @@ test('schema_version：meta 缺失时回退当前版本而不是旧常量', (t) 
   store.db.prepare("DELETE FROM schema_meta WHERE key = 'schema_version'").run();
   const exported = exportAll({ store, format: 'json', dir, now: TEST_NOW });
   const payload = JSON.parse(readFileSync(exported.path, 'utf8'));
+  // 本卡只改 store.js：export.js:87 的 CURRENT_SCHEMA_VERSION 仍是 '14'（旧常量）。
+  // store.js 现已导出 SCHEMA_VERSION，后续卡应让 export.js 直接 import 以消除双写。
   assert.equal(payload.schema_version, '14');
 });
 
