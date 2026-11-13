@@ -214,6 +214,22 @@ Object.defineProperty(DEFAULT_VALUES, 'budget', {
   configurable: false,
 });
 
+// v0.4.13 A3：worker token 预算。tokenWarn/ tokenStop 与 src/task/limits.js 的
+// WORKER_WARN_TOKENS / WORKER_STOP_TOKENS 对齐；sampleMs 是等待 idle 期间的采样间隔。
+// 该节同样不参与 16 键安装自检（与 vector/recall/session/consolidation/thread/timing/persona/compact 一致）。
+const TASK_DEFAULTS = Object.freeze({
+  tokenWarn: 60_000,
+  tokenStop: 80_000,
+  sampleMs: 5_000,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'task', {
+  value: TASK_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -813,6 +829,56 @@ export function normalizeCompact(raw, warnings = []) {
 }
 
 /**
+ * 合并任务 token 预算节并校验；未知子字段 warn，越界抛 ConfigError。
+ *
+ * 语义：tokenWarn 是「投递一次收尾提示」的软线，tokenStop 是「结束等待」的硬线，
+ * 必须 tokenStop > tokenWarn；sampleMs 是等待 idle 期间的采样间隔。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{tokenWarn: number, tokenStop: number, sampleMs: number}>}
+ */
+export function normalizeTask(raw, warnings = []) {
+  const defaults = DEFAULTS.task;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('task', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['tokenWarn', 'tokenStop', 'sampleMs']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "task.${key}" ignored`);
+  }
+  const tokenWarn = raw.tokenWarn === undefined ? defaults.tokenWarn : raw.tokenWarn;
+  if (!Number.isInteger(tokenWarn) || tokenWarn < 1 || tokenWarn > 10_000_000) {
+    throw new ConfigError(
+      'task.tokenWarn',
+      `must be an integer within 1..10000000, got ${JSON.stringify(tokenWarn)}`,
+    );
+  }
+  const tokenStop = raw.tokenStop === undefined ? defaults.tokenStop : raw.tokenStop;
+  if (!Number.isInteger(tokenStop) || tokenStop < 2 || tokenStop > 20_000_000) {
+    throw new ConfigError(
+      'task.tokenStop',
+      `must be an integer within 2..20000000, got ${JSON.stringify(tokenStop)}`,
+    );
+  }
+  if (tokenStop <= tokenWarn) {
+    throw new ConfigError(
+      'task.tokenStop',
+      `must be greater than task.tokenWarn, got ${JSON.stringify(tokenStop)}`,
+    );
+  }
+  const sampleMs = raw.sampleMs === undefined ? defaults.sampleMs : raw.sampleMs;
+  if (!Number.isInteger(sampleMs) || sampleMs < 100 || sampleMs > 600_000) {
+    throw new ConfigError(
+      'task.sampleMs',
+      `must be an integer within 100..600000, got ${JSON.stringify(sampleMs)}`,
+    );
+  }
+  return Object.freeze({ tokenWarn, tokenStop, sampleMs });
+}
+
+/**
  * 合并默认值并校验配置；未知字段只产生 warning，不阻断。
  * @param {Record<string, unknown>} [raw]
  * @returns {Readonly<Record<string, unknown>>} 冻结后的配置（含 warnings 数组）
@@ -891,6 +957,7 @@ export function normalizeConfig(raw = {}) {
   cfg.compact = normalizeCompact(input.compact, warnings);
   cfg.budget = normalizeBudget(input.budget, warnings);
   cfg.quota = normalizeQuota(input.quota, warnings);
+  cfg.task = normalizeTask(input.task, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }
