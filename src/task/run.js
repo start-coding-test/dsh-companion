@@ -18,16 +18,24 @@
  * - USED / `kind:'task_run'`：任务生命周期记录。
  *   `memory_events.action` 的白名单里没有 `TASK`，故用 USED + kind 表达，
  *   避免为一个内部事件升级 schema。
+ *
+ * token 预算（v0.4.13 A3，D-1 / N-M4 / W1）：worker 因估算 token 超过硬线而
+ * 提前结束时回 `partial`（区别于成功 done / 超时 timeout / 失败 failed），
+ * 对外结果多一个 `partial:true` 与 `reason:'token_limit'`，回执追加
+ * 「因 token 上限提前结束」一行；硬超时仍是 `timeout`，两者不混淆。
  */
 
 import { formatReceipt, writeReceipt } from './receipt.js';
 import {
   DEFAULT_HARD_MS,
+  DEFAULT_SAMPLE_MS,
   DEFAULT_SOFT_MS,
+  TOKEN_LIMIT_NOTE,
   runTask as runWorkerTask,
 } from './worker.js';
+import { WORKER_STOP_TOKENS, WORKER_WARN_TOKENS } from './limits.js';
 
-export { DEFAULT_HARD_MS, DEFAULT_SOFT_MS };
+export { DEFAULT_HARD_MS, DEFAULT_SAMPLE_MS, DEFAULT_SOFT_MS };
 
 /** 并发上限：同一时刻只允许一个 worker 会话（H6）。 */
 export const MAX_EXEC_SLOTS = 1;
@@ -41,10 +49,11 @@ export const GOAL_MAX_CHARS = 2000;
 /** `title` 的最大字符数（码点）。 */
 export const TITLE_MAX_CHARS = 80;
 
-/** 对外状态 → 回执状态词表（receipt.js 的 成功/超时/失败）。 */
+/** 对外状态 → 回执状态词表（receipt.js 的 成功/超时/失败；partial 原样输出）。 */
 const RECEIPT_STATUS = Object.freeze({
   done: 'ok',
   timeout: 'timeout',
+  partial: 'partial',
   failed: 'error',
 });
 
@@ -52,6 +61,7 @@ const RECEIPT_STATUS = Object.freeze({
 function defaultSummary(status, error) {
   if (status === 'done') return '任务完成';
   if (status === 'timeout') return '任务超时，已两段式取消';
+  if (status === 'partial') return TOKEN_LIMIT_NOTE;
   return error === undefined ? '任务失败' : `任务失败：${error}`;
 }
 
@@ -115,15 +125,17 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
    * @param {string} options.goal 任务目标（1..2000 码点）
    * @param {string} [options.title] 任务标题（≤80 码点），只用于回执与审计
    * @param {number} [options.at] 起始毫秒时间戳（缺省用 now()）
-   * @param {{softMs?: number, hardMs?: number}} [options.limits]
+   * @param {{softMs?: number, hardMs?: number, tokenWarn?: number, tokenStop?: number,
+   *   sampleMs?: number}} [options.limits]
    * @param {number|Function} [options.now=Date.now] 时钟
    * @param {string} [options.cwd] worker 会话工作目录
    * @param {string} [options.agentPreset] worker 会话 preset
    * @param {string} [options.claimKey] 本次执行的稳定标识；给了就生成
    *   `companion-task:<taskId>:<claimKey>` 作为 prompt requestId（C5-H1b）
    * @param {string} [options.scope='main'] 回执/审计 scope
-   * @returns {Promise<{ok: true, taskId: string, status: 'done'|'timeout'|'failed',
-   *   receipt: string, sessionId: string|null, durationMs: number, error?: string}
+   * @returns {Promise<{ok: true, taskId: string, status: 'done'|'timeout'|'partial'|'failed',
+   *   receipt: string, sessionId: string|null, durationMs: number,
+   *   partial?: true, reason?: string, error?: string}
    *   | {ok: false, reason: 'busy', queue: number}>}
    */
   async function runTask(options = {}) {
@@ -143,7 +155,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
 
     const goalText = normalizeGoal(goal);
     const titleText = normalizeTitle(title);
-    const { softMs, hardMs } = normalizeLimits(limits);
+    const { softMs, hardMs, tokenWarn, tokenStop, sampleMs } = normalizeLimits(limits);
     const clock = typeof now === 'function' ? () => Number(now()) : () => Number(now);
     const startedAt = Number.isFinite(at) ? Number(at) : clock();
     const taskId = nextTaskId(startedAt);
@@ -175,6 +187,9 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
           now: clock,
           softMs,
           hardMs,
+          tokenWarn,
+          tokenStop,
+          sampleMs,
         });
       } catch (error) {
         // 参数/适配器异常：worker 尚未接管，直接收敛成 failed 回执。
@@ -190,9 +205,14 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
       const durationMs = Number.isFinite(workerResult.durationMs)
         ? Number(workerResult.durationMs)
         : Math.max(0, clock() - startedAt);
-      const summary = titleText === undefined
+      const baseSummary = titleText === undefined
         ? defaultSummary(status, workerResult.error)
         : titleText;
+      // token 硬线：标题保留已完成内容，另起一行说明提前结束的原因。
+      const summary = status === 'partial' && titleText !== undefined
+        ? `${titleText}\n${TOKEN_LIMIT_NOTE}`
+        : baseSummary;
+      const reason = status === 'partial' ? workerResult.reason ?? 'token_limit' : undefined;
       const receipt = formatReceipt({
         status: RECEIPT_STATUS[status],
         summary: status === 'failed' ? defaultSummary(status, workerResult.error) : summary,
@@ -211,6 +231,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
         durationMs,
         sessionId: workerResult.sessionId ?? null,
         atSeconds: Math.floor(startedAt / 1000),
+        reason,
       });
 
       finished += 1;
@@ -224,6 +245,10 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
       };
       if (status === 'failed' && workerResult.error !== undefined) {
         result.error = String(workerResult.error);
+      }
+      if (status === 'partial') {
+        result.partial = true;
+        result.reason = reason;
       }
       return result;
     } finally {
@@ -286,7 +311,7 @@ export function releaseExecSlot() {
  * @returns {void}
  */
 function writeAudit({
-  platform, store, scope, taskId, title, status, receipt, durationMs, sessionId, atSeconds,
+  platform, store, scope, taskId, title, status, receipt, durationMs, sessionId, atSeconds, reason,
 }) {
   if (store === null || store === undefined) return;
   try {
@@ -318,6 +343,8 @@ function writeAudit({
           status,
           durationMs,
           sessionId,
+          // 只有 partial（token 截断）才带 reason，其余终态保持旧形状。
+          ...(reason === undefined ? {} : { reason }),
         },
       });
     }
@@ -328,10 +355,11 @@ function writeAudit({
   }
 }
 
-/** @param {string} status @returns {'done'|'timeout'|'failed'} */
+/** @param {string} status @returns {'done'|'timeout'|'partial'|'failed'} */
 function toStatus(status) {
   if (status === 'ok') return 'done';
   if (status === 'timeout') return 'timeout';
+  if (status === 'partial') return 'partial';
   return 'failed';
 }
 
@@ -368,6 +396,9 @@ function normalizeLimits(limits) {
   }
   const softMs = limits.softMs ?? DEFAULT_SOFT_MS;
   const hardMs = limits.hardMs ?? DEFAULT_HARD_MS;
+  const tokenWarn = limits.tokenWarn ?? WORKER_WARN_TOKENS;
+  const tokenStop = limits.tokenStop ?? WORKER_STOP_TOKENS;
+  const sampleMs = limits.sampleMs ?? DEFAULT_SAMPLE_MS;
   if (typeof softMs !== 'number' || !Number.isFinite(softMs) || softMs <= 0) {
     throw new TypeError('task_run: limits.softMs must be a positive finite number');
   }
@@ -377,7 +408,19 @@ function normalizeLimits(limits) {
   if (hardMs < softMs) {
     throw new TypeError('task_run: limits.hardMs must be >= limits.softMs');
   }
-  return { softMs, hardMs };
+  if (typeof tokenWarn !== 'number' || !Number.isFinite(tokenWarn) || tokenWarn < 0) {
+    throw new TypeError('task_run: limits.tokenWarn must be a non-negative finite number');
+  }
+  if (typeof tokenStop !== 'number' || !Number.isFinite(tokenStop) || tokenStop <= 0) {
+    throw new TypeError('task_run: limits.tokenStop must be a positive finite number');
+  }
+  if (tokenStop <= tokenWarn) {
+    throw new TypeError('task_run: limits.tokenStop must be greater than limits.tokenWarn');
+  }
+  if (typeof sampleMs !== 'number' || !Number.isFinite(sampleMs) || sampleMs <= 0) {
+    throw new TypeError('task_run: limits.sampleMs must be a positive finite number');
+  }
+  return { softMs, hardMs, tokenWarn, tokenStop, sampleMs };
 }
 
 /** @param {string} text @returns {number} */
