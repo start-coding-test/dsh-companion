@@ -2,6 +2,25 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.2] - 2026-11-14
+
+### Fixed
+
+- **V71-H1 IM 合并消息被整条当信封丢弃**：dsh-im 把 `<dsh_im_source>` / `<dsh_im_reply_to>` 与
+  正文放进同一条 `user` 消息（`source.kind='user'`）时，旧逻辑按文本前缀整条判为信封，导致
+  召回查询为空、情绪判定与过期通知都不触发，转录也丢掉用户正文。现在新增 `stripImEnvelopes`：
+  按同名闭合标签逐个剥掉开头的信封块，剥完为空才算 notice；`isPluginNotice` 的 `source` 判定
+  保持不变。`lastUserText` 不再按 `<dsh_im_` 前缀跳过整条。
+
+### Added
+
+- mirror debug 增 `strippedEnvelopes`（本批被剥掉的信封块数），仍不记录正文。
+
+### Tests
+
+- 1427 个用例 / 51 个套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区全绿；新增
+  `test/v072-im-envelope.test.js`（10 例，含现场 seq 2104 形状与两条真实 apply 接线）。
+
 ## [0.7.1] - 2026-11-13
 
 ### Fixed
