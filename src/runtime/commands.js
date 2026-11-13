@@ -141,6 +141,8 @@ export function handleCommand({
   timing,
   // A6（v0.4.13）：压缩底与迟滞参数（没有样本时整行省略）。
   compact,
+  // A2（v0.4.13）：额度闸门（source=none 时为 null，整行省略）。
+  quota,
   persona,
   shadow,
   emotion,
@@ -186,6 +188,7 @@ export function handleCommand({
       threadAgentPreset,
       timing,
       compact,
+      quota,
       persona,
       shadow,
       emotion,
@@ -601,6 +604,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
     if (options.compact.over) line += '；压后仍超目标，建议 calibrate';
     lines.push(line);
   }
+  // A2：额度闸门行（紧张时给暂停截止；充裕时给各窗口余量）。不传则整行省略。
+  const quotaLine = formatQuotaStatusLine(options.quota, timeZone);
+  if (quotaLine !== null) lines.push(quotaLine);
   // V3-M2：主会话绑定对排障关键（提醒投错会话时先看这里）。
   const mainSession = options.mainSession;
   if (mainSession !== null && mainSession !== undefined && typeof mainSession === 'object') {
@@ -1004,6 +1010,33 @@ function toMillis(value) {
   // 非法时间戳不读全局时钟：交给调用方注入的 now 语义保持一致，记为 0。
   if (!Number.isFinite(n)) return 0;
   return n < 1e11 ? n * 1000 : n;
+}
+
+/**
+ * A2（v0.4.13）：额度闸门行。
+ *
+ * 紧张时只报「暂停到几点」（后台任务能等，用户不需要看各窗口细节）；充裕时直接
+ * 用接线层算好的文案（含各窗口余量与比例）。没传 quota（source=none）时不输出。
+ *
+ * @param {{paused?: unknown, pausedUntil?: unknown, line?: unknown}} [quota]
+ * @param {string} timeZone
+ * @returns {string|null}
+ */
+function formatQuotaStatusLine(quota, timeZone) {
+  if (quota === null || quota === undefined || typeof quota !== 'object') return null;
+  if (quota.paused === true) {
+    const until = formatClock(quota.pausedUntil, timeZone);
+    return until === null ? '额度紧张，后台暂停中' : `额度紧张，后台暂停至 ${until}`;
+  }
+  return typeof quota.line === 'string' && quota.line.trim() !== '' ? quota.line.trim() : null;
+}
+
+/** @param {number|null|undefined} sec @param {string} timeZone @returns {string|null} */
+function formatClock(sec, timeZone) {
+  const n = Number(sec);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const parts = zonedParts(n * 1000, timeZone);
+  return `${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}`;
 }
 
 /** @param {number|null|undefined} sec @param {string} timeZone */

@@ -176,6 +176,22 @@ const COMPACT_DEFAULTS = Object.freeze({
   cooldownTurns: 3,
 });
 
+// v0.4.13 A2：额度闸门。quota.source='none' 时完全无副作用；'file' 时读一份外部
+// 写好的快照（订阅额度），任一窗口剩余低于预留线就暂停后台任务。插件不登录、
+// 不碰 cookie，只读文件。
+const QUOTA_DEFAULTS = Object.freeze({
+  source: 'none',
+  path: null,
+  reserve: Object.freeze({ '5h': 0.3, '7d': 0.2, month: 0.1 }),
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'quota', {
+  value: QUOTA_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 Object.defineProperty(DEFAULT_VALUES, 'compact', {
   value: COMPACT_DEFAULTS,
   enumerable: false,
@@ -649,6 +665,60 @@ export function normalizePersona(raw, warnings = []) {
 }
 
 /**
+ * 校验 quota 配置（v0.4.13 A2，额度闸门）。
+ *
+ * `source` 只接受 none/file；file 必须给 `path`（读外部快照）。`reserve` 是三个
+ * 窗口各自的预留比例（5h/7d/month），0..1，缺省 30%/20%/10%。该节同样不参与
+ * 16 键安装自检。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{source: 'none'|'file', path: string|null, reserve: Readonly<Record<string, number>>}>}
+ */
+export function normalizeQuota(raw, warnings = []) {
+  const defaults = DEFAULTS.quota;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('quota', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['source', 'path', 'reserve']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "quota.${key}" ignored`);
+  }
+  const source = raw.source === undefined ? defaults.source : raw.source;
+  if (source !== 'none' && source !== 'file') {
+    throw new ConfigError('quota.source', `must be "none" or "file", got ${JSON.stringify(source)}`);
+  }
+  const pathValue = raw.path === undefined ? defaults.path : raw.path;
+  let path = null;
+  if (pathValue !== null) {
+    if (typeof pathValue !== 'string' || pathValue.trim() === '') {
+      throw new ConfigError('quota.path', `must be a non-empty string or null, got ${JSON.stringify(pathValue)}`);
+    }
+    path = pathValue.trim();
+  }
+  if (source === 'file' && path === null) {
+    throw new ConfigError('quota.path', 'is required when quota.source is "file"');
+  }
+  const reserveRaw = raw.reserve === undefined ? null : raw.reserve;
+  if (reserveRaw !== null && (typeof reserveRaw !== 'object' || Array.isArray(reserveRaw))) {
+    throw new ConfigError('quota.reserve', 'must be a plain object');
+  }
+  const reserve = {};
+  for (const name of ['5h', '7d', 'month']) {
+    const value = reserveRaw?.[name] === undefined ? defaults.reserve[name] : reserveRaw[name];
+    if (typeof value !== 'number' || !Number.isFinite(value) || value < 0 || value > 1) {
+      throw new ConfigError(
+        `quota.reserve.${name}`,
+        `must be a number within 0..1, got ${JSON.stringify(value)}`,
+      );
+    }
+    reserve[name] = value;
+  }
+  return Object.freeze({ source, path, reserve: Object.freeze(reserve) });
+}
+
+/**
  * 校验 compact 配置（v0.4.13 A6，压缩迟滞）。
  *
  * `minIncrementTokens` 是「压后水位之上再涨多少 token 才值得再压一次」，默认 4096；
@@ -765,6 +835,7 @@ export function normalizeConfig(raw = {}) {
   cfg.timing = normalizeTiming(input.timing, warnings);
   cfg.persona = normalizePersona(input.persona, warnings);
   cfg.compact = normalizeCompact(input.compact, warnings);
+  cfg.quota = normalizeQuota(input.quota, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

@@ -37,6 +37,8 @@ import {
   overlapRatio,
 } from './memory/reinforce.js';
 import { buildConsolidationPrompt, consolidate, planConsolidation } from './memory/consolidate.js';
+import { backoffAfter429 } from './runtime/quota.js';
+import { deferBackground, isQuotaError, readQuotaFile } from './runtime/quota-gate.js';
 import {
   episodeSourceInSurface,
   isSameContextSample,
@@ -695,6 +697,11 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     compactFloorByScope: new Map(),
     compactFloorWarnByScope: new Map(),
     thresholdTurnsByScope: new Map(),
+    /** A2（v0.4.13）：额度快照与暂停截止（Unix 秒）；source='none' 时始终为空。 */
+    quota: null,
+    quotaCheckedAt: 0,
+    quotaPausedUntil: null,
+    quotaBackoffAttempt: 0,
     /** N-M1：每个 scope 一个待压缩槽，跨 scope 不再互相覆盖。 */
     pendingCompact: createPendingCompacts(),
     /** M3：待执行的巩固任务（pre-step 只登记，不 await）。 */
@@ -1025,6 +1032,15 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
               consolidateWarnMs: config.timing?.consolidateWarnMs,
             },
             // A6：压缩底与迟滞参数；未压过（无样本）时命令层整行省略。
+            // A2：额度闸门状态（source='none' 或未读到快照时命令层整行省略）。
+            quota: config.quota?.source === 'file'
+              ? {
+                source: 'file',
+                paused: quotaPaused(state),
+                pausedUntil: state.quotaPausedUntil,
+                line: state.quota?.line ?? null,
+              }
+              : null,
             compact: {
               floor: state.compactFloorByScope.get(SCOPE) ?? null,
               target: config.compactAtTokens,
@@ -2239,7 +2255,86 @@ function runRssCheck(state) {
  */
 function proactiveBlocked(state) {
   refreshBudget(state);
-  return state.budgetTripped === true || levelAtLeast(state.rss.level, 'stop_dispatch');
+  return state.budgetTripped === true || levelAtLeast(state.rss.level, 'stop_dispatch') || quotaPaused(state);
+}
+
+/**
+ * A2（v0.4.13）：额度是否紧张。暂停只挡后台任务（闲聊、主动消息、回填、非 hard
+ * 巩固）；主会话、hard 巩固与压缩不受影响——用户当面说的话永远优先。
+ * @param {object} state
+ * @returns {boolean}
+ */
+function quotaPaused(state) {
+  if (state.quotaPausedUntil === null) return false;
+  if (state.quotaPausedUntil * 1000 <= state.platform.now()) {
+    state.quotaPausedUntil = null;
+    return false;
+  }
+  return true;
+}
+
+/**
+ * A2：按配置读一次额度快照（最多每 60s 一次）。读不到、过期、格式非法一律
+ * 退回「不紧张」——闸门是降级装置，不能因为配额文件坏了反而卡住后台任务。
+ * @param {object} state
+ * @param {{force?: boolean}} [options]
+ * @returns {object|null}
+ */
+function refreshQuota(state, { force = false } = {}) {
+  const { platform, config } = state;
+  const quota = config.quota;
+  if (quota?.source !== 'file' || typeof quota.path !== 'string') return null;
+  const nowMs = platform.now();
+  if (!force && nowMs - state.quotaCheckedAt < 60_000) return state.quota;
+  state.quotaCheckedAt = nowMs;
+  const read = readQuotaFile({
+    path: quota.path,
+    nowMs,
+    reserve: quota.reserve,
+    timeZone: config.timezone,
+  });
+  if (read.ok !== true) {
+    // 读不到/过期/非法：退回「不紧张」，只留一条可诊断的日志（不打正文）。
+    platform.log('debug', '[dsh-companion] quota snapshot unavailable', {
+      path: quota.path,
+      reason: read.reason,
+    });
+    state.quota = null;
+    if (read.reason !== 'file_missing') state.quotaPausedUntil = null;
+    return null;
+  }
+  const { evaluation, line } = read;
+  state.quota = { evaluation, line, checkedAt: nowMs };
+  if (evaluation.paused === true && evaluation.resumeAt !== null) {
+    state.quotaPausedUntil = evaluation.resumeAt;
+  } else if (evaluation.paused !== true) {
+    state.quotaPausedUntil = null;
+  }
+  return state.quota;
+}
+
+/**
+ * A2：遇到 429 / 额度不足时退避到窗口 resetAt（没有 resetAt 就指数退避），
+ * 不重试刷量。返回是否识别为额度类错误。
+ * @param {object} state
+ * @param {unknown} error
+ * @returns {boolean}
+ */
+function noteQuota429(state, error) {
+  if (!isQuotaError(error)) return false;
+  const nowMs = state.platform.now();
+  const next = backoffAfter429({
+    now: nowMs,
+    attempt: state.quotaBackoffAttempt ?? 0,
+    resetAt: state.quota?.evaluation?.resumeAt ?? null,
+  });
+  state.quotaBackoffAttempt = next.attempt;
+  state.quotaPausedUntil = Math.ceil(next.retryAt / 1000);
+  state.platform.log('warn', '[dsh-companion] quota backoff engaged', {
+    retryAt: next.retryAt,
+    attempt: next.attempt,
+  });
+  return true;
 }
 
 /**
@@ -2275,6 +2370,12 @@ function scheduleConsolidation(state, payload, scope = SCOPE) {
       state.thresholdTurnsByScope.get(scope) ?? config.compact?.cooldownTurns ?? 3,
   });
   if (!plan.trigger) return;
+  // A2：额度紧张只挡「非 hard」巩固；hard 是安全阀，压缩也不能等。
+  refreshQuota(state);
+  if (deferBackground({ paused: quotaPaused(state), trigger: plan.trigger })) {
+    platform.log('debug', '[dsh-companion] consolidation deferred by quota', { trigger: plan.trigger });
+    return;
+  }
   if (state.transcript.length === 0) return;
 
   // V3-H1：召回注入块也会作为 user/message 出现在 surface 上；选区文本里
@@ -2519,6 +2620,8 @@ async function executeConsolidationJob(state, job) {
       trigger: job.trigger,
       message,
     });
+    // A2：额度类错误退避到窗口 resetAt，避免失败重试把额度刷得更干。
+    noteQuota429(state, error);
     if (state.disposed) return;
 
     const attempts = Number(job.attempts ?? 0) + 1;
@@ -4053,8 +4156,10 @@ function startScheduler(state) {
       runRssCheck(state);
       // E-M1：local 模型预热/退避重试；未就绪期间 backfill 直接跳过。
       prewarmEmbedder(state);
+      // A2：额度紧张时停掉回填（后台可延后，不影响主会话）。
+      refreshQuota(state);
       // W4：空闲时回填一批缺失/不匹配的向量；失败不阻塞后续闲聊。
-      await backfillVectors(state);
+      if (!quotaPaused(state)) await backfillVectors(state);
       if (proactiveBlocked(state)) return;
       await runLightChat(state);
       const report = await proactive.flush();
