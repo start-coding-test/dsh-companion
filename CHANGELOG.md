@@ -2,6 +2,26 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.1] - 2026-11-13
+
+### Fixed
+
+- **V70-M1 过期通知不再把投递回合当用户发言**：正文判定改由 `src/index.js` 的 `lastUserText` 统一负责
+  （跳过 runtime-context、`companion-*` 与 `[提醒] …` 投递），`src/reminder/expired-notice.js` 不再自建一套；
+  没有正文时不占 `turnSeen`，提醒投递回合不会把过期提醒标成「已告知」。
+- **V70-L2 排障日志覆盖空召回**：`DSH_COMPANION_MIRROR_DEBUG=1` 的 mirror debug 行移到 query 之后、
+  任何 early return 之前，召回为空的回合也会记录。
+
+### Added
+
+- **V70-M2 同义偏好去重能选到候选**：`preference` / `lifestyle` 类事实按 kind 取最近 N 条活跃事实交给
+  巩固模型（不再要求 `subject_text` 在对话里字面出现，同一 subject 的多条全部可见）；
+  `config.consolidate.existingFactsLimit` 默认 12（1..50）。
+
+### Tests
+
+- 1417 个用例 / 51 个套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区全绿。
+
 ## [0.7.0] - 2026-11-13
 
 清单代号 v0.4.13（2026-11-06 那份清单里顺延至今的 A1–A8 与 B）。schema 升到 **v15**，

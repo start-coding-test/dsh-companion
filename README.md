@@ -4,7 +4,16 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.7.0 已发布**（2026-11-13，tag `v0.7.0`，清单代号 v0.4.13）。`node --test` 全绿：1410 个用例 / 51 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.7.1 已发布**（2026-11-13，tag `v0.7.1`）。`node --test` 全绿：1417 个用例 / 51 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+
+## v0.7.1 变更摘要
+
+- **过期提醒不再被「自己说的话」骗过**：正文判定统一走主干的 `lastUserText`（跳过 runtime-context 与
+  `[提醒] …` 投递），提醒投递回合不会把过期通知标成已告知；没有正文时不占用本轮 `turnSeen`。
+- **同义偏好终于能去重**：`preference` / `lifestyle` 类事实按 kind 取最近 N 条候选（默认 12，
+  `config.consolidate.existingFactsLimit` 可调），不再要求 `subject_text` 在对话里字面出现，同一 subject
+  的多条也全部交给模型；对话里用「我」换三种说法，巩固后 active 只剩一条。
+- **排障日志覆盖空召回**：`DSH_COMPANION_MIRROR_DEBUG=1` 的日志移到早期返回之前，召回为空的回合也有记录。
 
 ## v0.7.0 变更摘要
 
