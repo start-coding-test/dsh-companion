@@ -21,6 +21,7 @@ import {
 } from '../task/run.js';
 import { summarizeCost } from './commands.js';
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
+import { nextOccurrence, parseRRule } from '../scheduler/recurrence.js';
 
 const FACT_KINDS = new Set(['identity', 'relation', 'preference', 'project', 'knowledge', 'other']);
 const SALIENCE = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
@@ -360,6 +361,9 @@ export function createTools({
           due_at: { type: 'integer', description: '到期时间（Unix 秒），可选' },
           detail: { type: 'string', description: '补充说明（可选）' },
           counterparty: { type: 'string', description: '相关的人/方（可选）' },
+          // A4（v0.4.13）：重复提醒。支持 FREQ=DAILY / FREQ=WEEKLY;BYDAY=… 与
+          // INTERVAL / COUNT / UNTIL；不支持的形式明确返回 rrule_unsupported。
+          rrule: { type: 'string', description: '重复规则（RFC 5545 子集，如 FREQ=DAILY 或 FREQ=WEEKLY;BYDAY=MO,TH），可选' },
           scope: SCOPE_SCHEMA,
         },
         required: ['title'],
@@ -373,15 +377,45 @@ export function createTools({
         const requested = optionalString(args.scope, 'reminder_add', 'scope');
         const resolved = resolveScope(requested);
         if (!resolved.ok) return resolved;
+
+        // A4：带 rrule 就是系列提醒；第一次触发点由规则算，不能直接拿 due_at 当唯一时间。
+        // 空白 rrule 视为「没给规则」，与 kind=repeat 一样要求补规则；避免把
+        // 「随便写了几个空格」当成合法系列。
+        if (typeof args.rrule === 'string' && args.rrule.trim() === '') {
+          return { ok: false, reason: 'rrule_required', message: 'rrule 不能为空字符串' };
+        }
+        const rruleText = optionalString(args.rrule, 'reminder_add', 'rrule');
+        let rrule = null;
+        let firstAt = dueAt ?? null;
+        if (rruleText !== undefined) {
+          const parsed = parseRRule(rruleText);
+          if (!parsed.ok) return { ok: false, reason: parsed.reason, message: parsed.detail };
+          const anchor = dueAt ?? Math.floor(nowMs() / 1000);
+          const next = nextOccurrence({
+            rule: parsed.rule,
+            anchorAt: anchor,
+            afterAt: anchor - 1,
+            timeZone,
+          });
+          if (next.ok !== true) {
+            return { ok: false, reason: next.reason ?? 'rrule_unsupported', message: next.detail ?? '' };
+          }
+          rrule = rruleText.trim();
+          firstAt = next.at;
+        } else if (kind === 'repeat') {
+          return { ok: false, reason: 'rrule_required', message: 'kind=repeat 需要 rrule' };
+        }
+
         const row = store.insertReminder({
           scope: resolved.scope,
           kind,
           title,
           detail: optionalString(args.detail, 'reminder_add', 'detail') ?? null,
           counterparty: optionalString(args.counterparty, 'reminder_add', 'counterparty') ?? null,
-          due_at: dueAt ?? null,
-          due_granularity: dueAt === undefined ? 'none' : 'exact',
-          next_fire_at: dueAt ?? null,
+          due_at: firstAt,
+          due_granularity: firstAt === null ? 'none' : 'exact',
+          next_fire_at: firstAt,
+          rrule,
         });
         return { ok: true, reminder: row };
       },
