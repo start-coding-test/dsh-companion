@@ -379,13 +379,20 @@ function normalizeReminder(raw, index) {
  */
 function normalizeDraft(draft) {
   if (!isPlainObject(draft)) throw badDraft('draft must be an object');
-  const episode = normalizeEpisode(draft.episode);
+  // A8④（v0.4.13）：纯工具/命令区间可以没有情景记忆，episode 允许为 null；
+  // 但不能整段空手而归——那样说明模型没读懂，按 bad-draft 重试更安全。
+  const episode = draft.episode === undefined || draft.episode === null
+    ? null
+    : normalizeEpisode(draft.episode);
   if (!Array.isArray(draft.facts)) throw badDraft('draft.facts must be an array');
   const facts = draft.facts.map((fact, index) => normalizeFact(fact, index));
   if (draft.reminders !== undefined && draft.reminders !== null && !Array.isArray(draft.reminders)) {
     throw badDraft('draft.reminders must be an array when present');
   }
   const reminders = (draft.reminders ?? []).map((reminder, index) => normalizeReminder(reminder, index));
+  if (episode === null && facts.length === 0 && reminders.length === 0) {
+    throw badDraft('draft is empty (episode, facts and reminders are all absent)');
+  }
   return { episode, facts, reminders };
 }
 
@@ -556,12 +563,15 @@ export function buildConsolidationPrompt(input = {}) {
   return [
     '你是记忆巩固器。把下面这段对话压缩成一条情景记忆与若干长期事实。',
     '只输出一个 JSON 对象，不要解释，不要 Markdown 代码块。格式：',
-    '{"episode":{"title":"...","summary":"..."},',
-    ' "facts":[{"kind":"identity|relation|preference|project|knowledge|other",',
+    '{"episode":{"title":"...","summary":"..."} 或 null,',
+    ' "facts":[{"kind":"identity|relation|preference|project|lifestyle|mood|knowledge|other",',
     '           "subject_text":"...","predicate":"...","object_text":"...","statement":"..."}],',
     ' "reminders":[{"kind":"todo","title":"..."}]}',
     '对话里形如 [相关记忆] … [/相关记忆] 的段落是历史检索快照，只能作为已知内容的佐证，不得据此新建事实或改写现有结论。',
     '不得复述密码、口令、token、卡号等凭据值；必须提及时写成「用户提到一个密码」这类描述。',
+    '这一段如果只是工具调用、命令与它们的输出，没有值得记住的对话内容，"episode" 写 null，不要编造情景。',
+    '生活类信息也要抽：作息（几点睡/起）、饮食（口味/忌口/常吃）、兴趣（最近在看/在玩/在读）、情绪事件（为什么高兴或低落）、人际关系（家人朋友同事的近况），分别用 lifestyle / mood / relation / preference 等 kind。',
+    '同一对象（例如「咖啡」）已有事实时，subject_text 保持一致（用同一个词），只输出这次新增或变化的部分，不要换词重写同一条。',
     `scope=${scope} seq=${input.seqFrom}-${input.seqTo}`,
     '对话：',
     body,
@@ -664,7 +674,7 @@ export async function consolidate(input = {}) {
   const { episode, facts: draftedFacts, reminders: draftedReminders } = normalizeDraft(draft);
   // V9-M1：episode 四字段（及 topics/entities）落库前逐个脱敏，凭据值不落库；
   // store.insertEpisode 还会再做一次防御性脱敏（任何调用方都不落明文）。
-  const safeEpisode = redactEpisode(episode);
+  const safeEpisode = episode === null ? null : redactEpisode(episode);
   const matchedFacts = draftedFacts.filter(
     (fact) => !matchesExcludedStatement(fact.statement, excludedStatements),
   );
@@ -694,23 +704,26 @@ export async function consolidate(input = {}) {
       finished_at: at,
     });
 
-    const episodeRow = store.insertEpisode({
-      scope,
-      session_id: sessionId,
-      consolidation_id: consolidation.id,
-      started_at: safeEpisode.started_at ?? at,
-      ended_at: safeEpisode.ended_at ?? at,
-      title: safeEpisode.title,
-      summary: safeEpisode.summary,
-      evidence: safeEpisode.evidence,
-      topics: safeEpisode.topics,
-      entities: safeEpisode.entities,
-      mood: safeEpisode.mood,
-      mood_evidence: safeEpisode.mood_evidence,
-      salience: safeEpisode.salience,
-      privacy: safeEpisode.privacy,
-      fidelity: safeEpisode.fidelity,
-    });
+    // A8④：episode 为 null 时（纯工具/命令区间）不写占位情景记忆。
+    const episodeRow = safeEpisode === null
+      ? null
+      : store.insertEpisode({
+        scope,
+        session_id: sessionId,
+        consolidation_id: consolidation.id,
+        started_at: safeEpisode.started_at ?? at,
+        ended_at: safeEpisode.ended_at ?? at,
+        title: safeEpisode.title,
+        summary: safeEpisode.summary,
+        evidence: safeEpisode.evidence,
+        topics: safeEpisode.topics,
+        entities: safeEpisode.entities,
+        mood: safeEpisode.mood,
+        mood_evidence: safeEpisode.mood_evidence,
+        salience: safeEpisode.salience,
+        privacy: safeEpisode.privacy,
+        fidelity: safeEpisode.fidelity,
+      });
 
     // facts：key+value 完全相同的跳过（MVP 的「cos 去重」简化）。
     // 分页读取全量事实（含墓碑），避免 limit=500 截断后重复写入（L1）。
@@ -759,7 +772,7 @@ export async function consolidate(input = {}) {
         object_text: fact.object_text,
         statement: fact.statement,
         source_kind: 'consolidated',
-        source_episode_id: episodeRow.id,
+        source_episode_id: episodeRow?.id ?? null,
         source_excerpt: fact.source_excerpt,
         salience: fact.salience,
         privacy: fact.privacy,
@@ -783,7 +796,7 @@ export async function consolidate(input = {}) {
         rrule: reminder.rrule,
         next_fire_at: reminder.next_fire_at,
         status: reminder.status,
-        source_episode_id: episodeRow.id,
+        source_episode_id: episodeRow?.id ?? null,
       });
     }
 
@@ -814,11 +827,12 @@ export async function consolidate(input = {}) {
     const finishedMs = epochMs(clock());
     durationMs = Math.max(0, Math.round((finishedMs ?? startedMs) - startedMs));
 
+    // A8④：episode 为 null 时审计挂在 consolidations 行上（没有 episode 可指）。
     store.appendEvent({
       at,
       action: 'ADD',
-      table_name: 'episodes',
-      row_id: episodeRow.id,
+      table_name: episodeRow === null ? 'consolidations' : 'episodes',
+      row_id: episodeRow === null ? consolidation.id : episodeRow.id,
       actor: 'consolidator',
       reason: trigger,
       detail_json: {
@@ -830,7 +844,11 @@ export async function consolidate(input = {}) {
       },
     });
 
-    return { episodeId: episodeRow.id, facts: insertedFacts, sensitive: sensitiveCount };
+    return {
+      episodeId: episodeRow === null ? undefined : episodeRow.id,
+      facts: insertedFacts,
+      sensitive: sensitiveCount,
+    };
   });
 
   // 4) 事务已提交，水位推进到 to。
