@@ -548,3 +548,69 @@ plugin-gate: PASS (round A + round B + round C)
 | `_r24/probe12-fts.mjs` | 迁移后 FTS 检索 | 通过 |
 
 测试日志：`_r24/test-__default__.log`、`_r24/test-UTC.log`、`_r24/test-America_New_York.log`；门禁：`_r24/gate.log`。
+
+---
+
+## 9. 复审（r2，对象 2a48024）
+
+- 复审对象：`2a48024`（`feat/v0413`），未 push；r1 报告为 `1ffaff0`，修复提交为 `e04f407`（H-1/M-1/M-2/M-3）与 `2a48024`（L-1..L-6）。
+- **结论：needs_revision。H = 0，M = 1，L = 0。** r1 的 H-1、M-1..M-3 与 L-2..L-6 均已闭环；L-1 只完成“按新轮计数 + 持久化”，但“阈值压缩成功后归零”仍未生效，构成 1 个 M。
+- 可发版判断：暂缓。补上 §9.1 的 M-1 并加一条集成测试后即可转 pass；其余改动已具备发版条件。
+
+### 9.1 必须修项（r2，M）
+
+**M-1（对应 r1 的 L-1）：threshold 冷却计数永不归零，`recordCompactionFloor` 的重置分支不可达**
+
+- 位置：
+  - `src/state/pending-compact.js:32-37`：`setPendingCompact` 只保留 `id/startSeq/endSeq/scope`，把 `trigger` 丢掉；
+  - `src/index.js:2682-2687`、`src/index.js:4216-4221`：两处 `setPendingCompact(...)` 都没有传 `trigger`；
+  - `src/index.js:3081`：`recordCompactionFloor(state, payload, scope, pending.trigger)`，实际拿到的永远是 `undefined`；
+  - `src/index.js:3006-3013`：`if (trigger === 'threshold')` 才把 `thresholdTurnsByScope` 和 `schema_meta.compact_threshold_turns:<scope>` 归零，该分支不可达。
+- 现象：threshold 巩固成功后，`compact_threshold_turns:<scope>` 不会被写成 `'0'`；计数只增不减。重启能读回计数（L-1 的“持久化”部分成立），但此后该 scope 的 `turnsSinceThreshold` 恒大于 `cooldownTurns`，冷却不再限制下一次 threshold 巩固（剩余约束只有 `minIncrementTokens`/floor）。
+- 最小复现（直接）：
+  ```bash
+  cd D:\test\agent-plugin\dsh-companion
+  & "C:\Users\93488\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe" --input-type=module -e "import('./src/state/pending-compact.js').then(m=>{const map=m.createPendingCompacts();m.setPendingCompact(map,{id:'c1',startSeq:10,endSeq:20,scope:'main',trigger:'threshold'});console.log(m.peekPendingCompact(map,'main'))})"
+  # 实际输出：{ id: 'c1', startSeq: 10, endSeq: 20, scope: 'main' }   —— trigger 丢失
+  ```
+  `_r24/probe20-r2-pending-trigger.mjs` 复验输出 `trigger preserved = false`。
+- e2e 观察：`_r24/probe14-r2-cooldown.mjs` 两轮 threshold 巩固后，`compact_threshold_turns:main` 实际为 `'5'`（不是 `'0'`）；重启后 turn4 就出现第 2 条 nap 行（若正常在 turn3 归零，应 turn5 才出现）。`_r24/probe21-r2-cooldown-exact.mjs` 另验证了计数本身：同一 turn 的第二次 pre-step 不推进（4→4），新 turn 推进（4→5→6），说明“按新轮计数”已生效；失败只在“成功后归零”。
+- 测试缺口：`test/v0413-compact.test.js` 仍只测 `planConsolidation` 纯函数，没有“巩固成功后 meta=0 / 重启后 N 轮内不再压”的集成用例；这就是该残留没有被测试发现的原因。
+- 建议修法（二选一，推荐 1）：
+  1. 在 `executeConsolidationJob` 成功分支（`src/index.js:2682` 附近）判断 `job.trigger === 'threshold'`，直接 `state.thresholdTurnsByScope.set(scope, 0)` 并 `store.setMeta('compact_threshold_turns:' + scope, '0')`；
+  2. 或把 `trigger` 纳入 pendingCompact 形状（`src/state/pending-compact.js:32-37`），两处调用分别传 `job.trigger` 和 `null`，保留 `recordCompactionFloor` 里的重置。
+  并加集成测试：两轮触发 threshold→断言 meta 为 0→重启后再压需等满 `cooldownTurns`。
+
+### 9.2 修复项逐条复验（r2）
+
+| 修复 | 复验方式 | 结果 |
+| --- | --- | --- |
+| H-1（A5 宿主形状） | `_r24/probe9-a5-source.mjs` 6 例：`source:{kind:'user'}` + rpcId、无 source、仅信封、尾部 companion-expired | 6/6；宿主正文注入 1 条，仅信封不注入，去重仍生效 |
+| M-1（无 resetAt 暂停） | `_r24/probe11-quota-null-reset.mjs` + `_r24/probe19-r2-quota-retry.mjs`（t0、+30s、+61s 三轮） | 3/3 + 3/3；t0/+30s/+61s 均被挡 |
+| M-2（显式 null） | `_r24/probe13-r2-quota.mjs` 19 例 | 19/19；`resetAt:null` 与缺键等价且 tight/paused，`updatedAt:null` 按缺失→stale，坏类型仍 invalid |
+| M-3（rrule 系列） | `_r24/probe10-rrule-kind.mjs` 7 例 | 7/7；`todo`+`rrule` 经 `reminder_add` 后强制 `repeat`，首投后 `next_fire_at=+86400`、`series_index=1` |
+| L-1（计数/持久化） | `_r24/probe21-r2-cooldown-exact.mjs` + `_r24/probe14-r2-cooldown.mjs` | 计数按新轮（4→4→5→6，首次从 fallback 3 起算）且重启可读回；但“成功后归零”失败，见 M-1 |
+| L-2（文档口径） | 读 `docs/usage-v0413.md:12-20,54-58,62-68` | 五类已接线、`embedding`/`thread` 未入账已明示；window5h 与 UNTIL 语义已更新 |
+| L-3（window5hLimit） | `_r24/probe18-r2-window-budget.mjs` 5 例（真实 apply + task_run 闸门） | 5/5；近 5h 1500 触发 `daily_budget_exceeded`，400 放行，6h 前 1500 不计入，无窗口线放行，恰好 1000 触发 |
+| L-4（短任务入账） | `_r24/probe17-r2-worker-tokens.mjs` 8 例 | 8/8；无周期采样时终值 `tokensIn=4321`，无 meter/measure 抛错均 fail-open |
+| L-5（UNTIL 时区） | `_r24/probe15-r2-until.mjs` 15 例（UTC/NY/Asia_Shanghai） | 15/15；当地日末语义、`20260230` 拒绝、显式 `Z` 仍按 UTC |
+| L-6（缓存命中单位） | `_r24/probe16-r2-format.mjs` 6 例（真实 `/状态`） | 6/6；输出 `｜缓存命中 6789 tokens` |
+
+### 9.3 r2 全量复跑数字
+
+- `node --test` 三时区：默认 / `UTC` / `America/New_York` 各 **1409 tests / 51 suites / 1409 pass / 0 fail / 0 cancelled / 0 skipped**，exit 0；耗时 7197.97 / 7213.44 / 7466.09 ms。日志：`_r24/r2-test-default.log`、`_r24/r2-test-UTC.log`、`_r24/r2-test-NY.log`（HEAD `2a48024`）。
+- v14→v15 迁移：`_r24/probe2-schema.mjs` **20/20**。仍断言 `schema_version=15`、`recall_count=7 → used_count=7`、`fact_vectors` 未被删、`PRAGMA foreign_keys=1`、`integrity_check=ok`、重复打开幂等；`_r24/probe12-fts.mjs` 复验迁移后 FTS 仍命中。
+- 人设字节基线：`_r24/probe3-persona.mjs` 与 `v0.6.1`（`1fdfcbd`）逐字节一致，4 个 SHA-256 均不变（`e55e9873…`、`1955a6b3…`、`fc8d490c…`、`b720a39d…`）。
+- 门禁：`plugin-gate: PASS (round A + round B + round C)`；round B `exit=1 firstReneedAt=1794559482`；round C `verdict=skip credentials=missing consolidations=0 tokenEvents=1 maxTokensIn=0`。日志：`_r24/r2-gate.log`、`.data/plugin-gate.log`。
+- 探针汇总：probe2 20/20、probe3 4 哈希一致、probe9 6/6、probe10 7/7、probe11 3/3、probe13 19/19、probe15 15/15、probe16 6/6、probe17 8/8、probe18 5/5、probe19 3/3；probe14 2/4、probe21 0/5 的失败项是探针期望问题（均指向 §9.1 M-1，probe21 还因 session 事件不足未触发 region），probe20 直接复现 `trigger` 丢失。
+
+### 9.4 测试自证复核（r2）
+
+- §三 点名的 7 条在 r2 仍成立（未新增同源自证）。
+- r2 新增测试用的是字面量契约，不是拿实现算期望：`test/quota.test.js:115-122`（显式 null）、`test/v0413-expired-notice.test.js:88-98`（宿主 `source.kind='user'`）、`test/recurrence.test.js`（UNTIL 三种时区均写死 UTC 期望）。
+- 唯一新增覆盖缺口：L-1 的“成功后归零”没有集成测试（`test/v0413-compact.test.js` 仍只测纯函数），与 §9.1 的 M-1 对应。
+
+### 9.5 建议
+
+1. 修 §9.1 M-1，并在 `test/v0413-compact.test.js` 或 e2e 加一条“threshold 成功后 meta=0 + 重启后冷却生效”的用例。
+2. 其余项无需改动；修完重跑三时区与门禁即可给 pass/可发版结论。
