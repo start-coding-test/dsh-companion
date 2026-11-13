@@ -1781,6 +1781,14 @@ function reinforceOnUse(state, messages, isNewTurn, scope = SCOPE) {
       state.metrics.inc('reinforcements');
       // v8/S-M1：复述命中即「用上」；v9 起按用上那一刻记录 used 样本。
       markUsedReneed(state, id, fact, at, samples.get(id), tiers.get(id));
+      // A8①（v0.4.13）：复述命中即「用上」，写回库并清零连击。
+      try {
+        state.store?.markFactsUsed?.([id], Math.floor(Number(at) / 1000));
+      } catch (error) {
+        state.platform.log('debug', '[dsh-companion] markFactsUsed failed', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
       state.platform.log('debug', '[dsh-companion] reinforced recalled fact', {
         id,
         alpha,
@@ -3502,6 +3510,29 @@ function recallMessage(text) {
  * @param {string} [scope] 本轮注入所属的会话作用域
  * @param {number} [at] 注入时刻（毫秒），与 platform.now() 同口径
  */
+/**
+ * A8①（v0.4.13）：把本轮真正注入的 fact 记到库里（injected_count/unused_streak）。
+ *
+ * 抽成独立函数便于单测；store 缺 API 或写库失败都只 debug，不影响本轮。
+ *
+ * @param {object} state
+ * @param {string[]} ids
+ * @param {number} atSeconds
+ * @returns {boolean} 是否写库成功
+ */
+export function noteInjectedFacts(state, ids, atSeconds) {
+  if (!Array.isArray(ids) || ids.length === 0) return false;
+  try {
+    const result = state?.store?.bumpFactInjected?.(ids, atSeconds);
+    return result !== undefined && result !== null;
+  } catch (error) {
+    state?.platform?.log?.('debug', '[dsh-companion] bumpFactInjected failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return false;
+  }
+}
+
 function recordRecalledFacts(state, recalled, assembled, scope = SCOPE, at = Date.now()) {
   const dropped = Array.isArray(assembled?.dropped?.recall) ? assembled.dropped.recall : [];
   const droppedIds = new Set(
@@ -3560,6 +3591,8 @@ function recordRecalledFacts(state, recalled, assembled, scope = SCOPE, at = Dat
       });
     }
   }
+  // A8①（v0.4.13）：把「本轮真正注入的 fact」写回库（之前只记内存）。
+  noteInjectedFacts(state, ids, atSeconds);
   state.lastRecalledIds = ids;
   state.lastRecallSamples = samples;
   state.lastRecallTiers = tiers;

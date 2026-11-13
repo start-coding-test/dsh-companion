@@ -210,21 +210,26 @@ test('V3-M3 minVectorScore=0：任何非零向量命中都算相关（边界语�
 // ---------------------------------------------------------------- 配置
 
 test('V4-M1 recall 配置：默认值、minQueryChars 覆盖、非法值抛 ConfigError', () => {
-  assert.deepEqual(normalizeRecall(undefined), {
+  const baseRecall = {
     minVectorScore: 0.35,
     skipSmallTalk: true,
     minQueryChars: 2,
     chatLimit: 1,
-  });
-  assert.deepEqual(normalizeRecall({}), {
-    minVectorScore: 0.35,
-    skipSmallTalk: true,
-    minQueryChars: 2,
-    chatLimit: 1,
-  });
+    unusedThreshold: 3,
+    unusedPenalty: 0.85,
+  };
+  assert.deepEqual(normalizeRecall(undefined), baseRecall);
+  assert.deepEqual(normalizeRecall({}), baseRecall);
   assert.deepEqual(
     normalizeRecall({ minVectorScore: 0.5, skipSmallTalk: false, minQueryChars: 4 }),
-    { minVectorScore: 0.5, skipSmallTalk: false, minQueryChars: 4, chatLimit: 1 },
+    {
+      minVectorScore: 0.5,
+      skipSmallTalk: false,
+      minQueryChars: 4,
+      chatLimit: 1,
+      unusedThreshold: 3,
+      unusedPenalty: 0.85,
+    },
   );
   // 0 与 1 都是合法边界。
   assert.equal(normalizeRecall({ minVectorScore: 0 }).minVectorScore, 0);

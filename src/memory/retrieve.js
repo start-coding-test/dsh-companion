@@ -612,13 +612,19 @@ export async function retrieve({
     const text = renderItem(row, fidelity);
     if (text === null || text === '') continue;
 
+    // A8②（v0.4.13）：连续注入多次仍没用上的事实降权（默认 3 次后 ×0.85）。
+    const unusedStreak = candidate.type === 'fact' ? Number(row.unused_streak ?? 0) : 0;
+    const unusedThreshold = Number.isFinite(recallCfg?.unusedThreshold) ? recallCfg.unusedThreshold : 3;
+    const unusedPenalty = Number.isFinite(recallCfg?.unusedPenalty) ? recallCfg.unusedPenalty : 0.85;
+    const unusedFactor = unusedStreak >= unusedThreshold ? Math.max(0, Math.min(1, unusedPenalty)) : 1;
+
     scored.push({
       kind: candidate.type,
       id: row.id,
       text,
       fidelity,
-      score: 0.6 * rel + 0.4 * R
-        + (candidate.vector === true && maxRrf > 0 ? 0.1 * (Number(candidate.rrf) / maxRrf) : 0),
+      score: (0.6 * rel + 0.4 * R
+        + (candidate.vector === true && maxRrf > 0 ? 0.1 * (Number(candidate.rrf) / maxRrf) : 0)) * unusedFactor,
       R,
     });
   }

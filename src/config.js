@@ -79,6 +79,10 @@ const RECALL_DEFAULTS = Object.freeze({
   minVectorScore: 0.35,
   // 查询门：短查询、纯符号/算术、常见问候词一律跳过召回。
   skipSmallTalk: true,
+  // A8②：连续注入这么多次仍未用上，就开始按 unusedPenalty 降权。
+  unusedThreshold: 3,
+  // A8②：降权系数（乘在 score 上）；0 表示不再召回、1 表示不降权。
+  unusedPenalty: 0.85,
   // V4-M1：查询门的最短有效长度（按码点计，首尾标点不计），统一 2。
   // 2 字节中文实体（「蓝鲸」「生日」）因此可召回；拉丁 2 字母词仍会被
   // 问候词/算术/停用词等规则过滤，见 docs/usage.md「召回相关性门槛」。
@@ -462,7 +466,14 @@ export function normalizeRecall(raw, warnings = []) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ConfigError('recall', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
   }
-  const allowed = new Set(['minVectorScore', 'skipSmallTalk', 'minQueryChars', 'chatLimit']);
+  const allowed = new Set([
+    'minVectorScore',
+    'skipSmallTalk',
+    'minQueryChars',
+    'chatLimit',
+    'unusedThreshold',
+    'unusedPenalty',
+  ]);
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) warnings.push(`unknown config field "recall.${key}" ignored`);
   }
@@ -502,7 +513,22 @@ export function normalizeRecall(raw, warnings = []) {
       `must be an integer within 0..5, got ${JSON.stringify(chatLimit)}`,
     );
   }
-  return Object.freeze({ minVectorScore, skipSmallTalk, minQueryChars, chatLimit });
+  // A8②（v0.4.13）：连续多次注入却没用上的 fact 在召回里降权。
+  const unusedThreshold = raw.unusedThreshold === undefined ? defaults.unusedThreshold : raw.unusedThreshold;
+  if (typeof unusedThreshold !== 'number' || !Number.isInteger(unusedThreshold) || unusedThreshold < 1 || unusedThreshold > 100) {
+    throw new ConfigError(
+      'recall.unusedThreshold',
+      `must be an integer within 1..100, got ${JSON.stringify(unusedThreshold)}`,
+    );
+  }
+  const unusedPenalty = raw.unusedPenalty === undefined ? defaults.unusedPenalty : raw.unusedPenalty;
+  if (typeof unusedPenalty !== 'number' || !Number.isFinite(unusedPenalty) || unusedPenalty < 0 || unusedPenalty > 1) {
+    throw new ConfigError(
+      'recall.unusedPenalty',
+      `must be a finite number within 0..1, got ${JSON.stringify(unusedPenalty)}`,
+    );
+  }
+  return Object.freeze({ minVectorScore, skipSmallTalk, minQueryChars, chatLimit, unusedThreshold, unusedPenalty });
 }
 
 /**

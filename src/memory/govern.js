@@ -271,8 +271,10 @@ const SALIENCE_RANK = Object.freeze({
 function compareQuality(left, right) {
   const rankDiff = (SALIENCE_RANK[left.salience] ?? 0) - (SALIENCE_RANK[right.salience] ?? 0);
   if (rankDiff !== 0) return rankDiff;
-  const recallDiff = Number(left.recall_count ?? 0) - Number(right.recall_count ?? 0);
-  if (recallDiff !== 0) return recallDiff;
+  // A8①（v0.4.13）：质量按「真正用上」比较；recall_count 是 v14 遗留口径。
+  const usedDiff = Number(left.used_count ?? left.recall_count ?? 0)
+    - Number(right.used_count ?? right.recall_count ?? 0);
+  if (usedDiff !== 0) return usedDiff;
   const strengthDiff = Number(left.strength_days ?? 0) - Number(right.strength_days ?? 0);
   if (strengthDiff !== 0) return strengthDiff;
   const observedDiff = Number(left.observed_at ?? 0) - Number(right.observed_at ?? 0);
@@ -414,29 +416,23 @@ export function appendEventWithAction(store, {
   if (typeof action !== 'string' || action === '') {
     throw new TypeError('[govern] action must be a non-empty string');
   }
-  const db = store.db;
-  const previous = db.prepare('PRAGMA ignore_check_constraints').get();
-  const previousValue = previous?.ignore_check_constraints ?? 0;
-  try {
-    db.exec('PRAGMA ignore_check_constraints = ON');
-    const info = db
-      .prepare(
-        `INSERT INTO memory_events (at, action, table_name, row_id, actor, reason, detail_json)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        toEpochSeconds(at),
-        action,
-        tableName,
-        rowId,
-        actor,
-        reason,
-        detail === null || detail === undefined ? null : JSON.stringify(detail),
-      );
-    return Number(info.lastInsertRowid);
-  } finally {
-    db.exec(`PRAGMA ignore_check_constraints = ${previousValue ? 'ON' : 'OFF'}`);
-  }
+  // D-2（v0.4.13）：memory_events.action 的 CHECK 已包含 govern/EDIT/scrub，
+  // 不再需要临时关闭 CHECK 约束。
+  const info = store.db
+    .prepare(
+      `INSERT INTO memory_events (at, action, table_name, row_id, actor, reason, detail_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      toEpochSeconds(at),
+      action,
+      tableName,
+      rowId,
+      actor,
+      reason,
+      detail === null || detail === undefined ? null : JSON.stringify(detail),
+    );
+  return Number(info.lastInsertRowid);
 }
 
 /**
