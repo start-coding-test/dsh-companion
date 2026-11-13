@@ -614,3 +614,41 @@ plugin-gate: PASS (round A + round B + round C)
 
 1. 修 §9.1 M-1，并在 `test/v0413-compact.test.js` 或 e2e 加一条“threshold 成功后 meta=0 + 重启后冷却生效”的用例。
 2. 其余项无需改动；修完重跑三时区与门禁即可给 pass/可发版结论。
+
+---
+
+## 10. 复审（r3，对象 a5601b4）
+
+- 复审对象：`a5601b4`（`fix(v0413): reset threshold cooldown after success`，分支 `feat/v0413`，未 push）。
+- **结论：pass。H = 0，M = 0，L = 1（文档注释）。** r2 的 M-1 已按推荐方案闭环；无阻断/重要问题，**可发布 v0.7.0**。
+- L-1 为非阻断项：`src/index.js:2976-2984` 的 JSDoc 仍写着“记录实测水位并（对 threshold 触发）重置冷却计数”，并声明 `payload`/`trigger` 参数，但这段注释现在挂在 `resetThresholdCooldown(state, scope)` 上方，`recordCompactionFloor` 反而没有注释。建议把原注释移回 `recordCompactionFloor`，给 `resetThresholdCooldown` 补两参数说明；不需要为此重跑。
+
+### 10.1 修复实现核对
+
+- 新增 `resetThresholdCooldown(state, scope)`（`src/index.js:2985-2992`）：清 `state.thresholdTurnsByScope` 并写 `schema_meta` 的 `compact_threshold_turns:<scope>='0'`；写失败只吞掉，不影响压缩流程。
+- 成功路径（`src/index.js:2690`）在 `setPendingCompact`（`:2682-2687`）之后、`setWatermark`（`:2691`）之前，按 `job.trigger === 'threshold'` 归零；不再依赖 `pendingCompact.trigger`。
+- trigger 传递链已核对：`scheduleConsolidation` 的 `plan.trigger`（`:2487`）→ `pendingConsolidation.trigger`（`:2504`）→ `runConsolidationJob` 的 `job`（`:2530-2535`）→ `executeConsolidationJob` 的 `job.trigger`（`:2690`）。重试任务用 `{...job}`（`:2771`）保留 trigger，重试成功也会归零。
+- `recordCompactionFloor` 签名为 `(state, payload, scope)`（`src/index.js:2994`），唯一调用点 `src/index.js:3085` 已同步；全仓库无其它调用点，旧的 `trigger === 'threshold'` 分支已删除。
+- `pendingCompact` 仍不保存 trigger（`src/state/pending-compact.js:32-37`），但归零已移到 `job.trigger`，这条路径不再被依赖；属于可接受的设计取舍，不再构成 M。
+
+### 10.2 原缺陷复验（成功归零 + 重启）
+
+- 新增集成测试 `test/e2e/compact-cooldown.test.js`：13K tokens / `compactAtTokens=12000`，两轮后等水位推进，断言 `compact_threshold_turns:main === '0'` 且只有 1 条 nap；重启同一库后第 1/2 轮断言 nap 仍为 1、meta 依次为 `'1'`/`'2'`。20/20 targeted 全绿（含本文件、`test/v0413-compact.test.js`、`test/e2e/apply-turn.test.js`）。
+- 自有探针 `_r24/probe14-r2-cooldown.mjs`：**4/4**。输出：`counter persisted as 0 after threshold :: meta=0`、`restart respects persisted cooldown (2 turns -> no compaction) :: napRows=1`、`third new turn after restart compacts :: napRows=2`（r2 时同一探针为 2/4、meta='5'）。
+- 归零发生在 `setWatermark` 之前，测试以水位为同步点，不存在“先看到水位再看到归零”的竞态。
+
+### 10.3 全量回归
+
+- `node --test` 三时区：默认 / `UTC` / `America/New_York` 各 **1410 tests / 51 suites / 1410 pass / 0 fail / 0 cancelled / 0 skipped**，exit 0；耗时 7380.759 / 7291.8577 / 7501.5871 ms。日志：`_r24/r3-test-default.log`、`_r24/r3-test-UTC.log`、`_r24/r3-test-NY.log`（HEAD `a5601b4`）。
+- targeted：`compact-cooldown` + `v0413-compact` + `e2e/apply-turn` 共 20 tests / 3 suites / 20 pass / 0 fail（748.3862 ms），`_r24/r3-targeted.log`。
+- v14→v15 迁移 `_r24/probe2-schema.mjs` 仍 **20/20**；FTS 复验 `_r24/probe12-fts.mjs` 仍命中 `f1`、FK=1；人设 `_r24/probe3-persona.mjs` 与 `v0.6.1` 仍逐字节一致（4 个 SHA-256 不变）。
+- 门禁：`plugin-gate: PASS (round A + round B + round C)`；round B `exit=1 firstReneedAt=1794560350`；round C `verdict=skip credentials=missing consolidations=0 tokenEvents=1 maxTokensIn=0`。日志：`_r24/r3-gate.log`、`.data/plugin-gate.log`。
+
+### 10.4 测试自证复核（r3）
+
+- 新增 `test/e2e/compact-cooldown.test.js` 用字面量断言（`'0'`、`'1'`、`'2'`、nap 行数），期望值不是用实现函数现算的；没有新增自证测试。
+- 该测试覆盖了“成功后归零 + 重启从 0 起算”的主路径；`probe14` 额外覆盖“重启后第三轮才再次压缩”，两者互补。
+
+### 10.5 结论
+
+- **pass（H=0 / M=0 / L=1 文档注释）**，可发布 v0.7.0。L-1 只是注释错位，建议随版本顺手修，不阻塞发版。
