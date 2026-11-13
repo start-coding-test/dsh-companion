@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 import { Store } from '../src/memory/store.js';
 import { buildExpiredNotice, injectExpiredNotices, EXPIRED_SOURCE_KIND } from '../src/reminder/expired-notice.js';
+import { lastUserText } from '../src/index.js';
 
 const NOW_MS = Date.UTC(2026, 10, 13, 2, 0, 0); // 2026-11-13 10:00 +08
 const NOW_S = Math.floor(NOW_MS / 1000);
@@ -40,12 +41,8 @@ function fakeState(store, overrides = {}) {
   return { state, logs };
 }
 
-function userMessages(text) {
-  return [
-    { id: 'u1', role: 'user', content: [{ type: 'text', text }] },
-    { id: 'a1', role: 'assistant', content: [{ type: 'text', text: '我在。' }] },
-    { id: 'u2', role: 'user', content: [{ type: 'text', text }] },
-  ];
+function userMessage(text, extra = {}) {
+  return { id: 'u1', role: 'user', content: [{ type: 'text', text }], ...extra };
 }
 
 /** 造一条已过期、未通知的提醒（重试用尽的那条路径）。 */
@@ -76,7 +73,7 @@ test('buildExpiredNotice: 条数、标题、原定时间（本地时区）与上
   const many = Array.from({ length: 8 }, (_, index) => ({
     id: `m${index}`,
     title: `提醒${index}`,
-    due_at: NOW_S - 60,
+    dueAt: NOW_S - 60,
   }));
   const trimmed = buildExpiredNotice(many, { timeZone: 'Asia/Shanghai' });
   assert.equal(trimmed.split('\n').filter((line) => line.startsWith('- ')).length, 5);
@@ -85,78 +82,105 @@ test('buildExpiredNotice: 条数、标题、原定时间（本地时区）与上
   assert.equal(buildExpiredNotice(null), '');
 });
 
-test('injectExpiredNotices: 宿主真实正文（source.kind=user）能被识别（H-1）', async () => {
+test('V70-M1: 提醒投递回合不算用户发言（正文由主干 lastUserText 判定）', async () => {
   await withStore(async (store) => {
     insertExpired(store, { title: '交电费', dueAt: NOW_S - 3600 });
     const { state } = fakeState(store);
-    const hostMessages = [
-      { id: 'h1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '刚到家' }] },
+    // 宿主把插件投递记成普通 user/message：source.kind='user' + rpcId companion-*。
+    const delivery = [
+      {
+        id: 'd1',
+        role: 'user',
+        source: { kind: 'user', rpcId: 'companion-reminder:r1' },
+        content: [{ type: 'text', text: '[提醒] 交电费\n到点了。' }],
+      },
     ];
-    const result = await injectExpiredNotices(state, {}, hostMessages, 'turn-host', 'main');
-    assert.ok(result, '宿主的 source.kind=user 不应被当成注入消息');
-    assert.equal(result.inject.length, 1);
-  });
-});
+    const text = lastUserText(delivery);
+    assert.equal(text, '', '投递回合不应被视为用户正文');
 
-test('injectExpiredNotices: 无过期提醒时不注入', async () => {
-  await withStore(async (store) => {
-    const { state } = fakeState(store);
-    const result = await injectExpiredNotices(state, {}, userMessages('在吗'), 'turn-1', 'main');
+    const result = await injectExpiredNotices(state, {}, 'turn-delivery', 'main', text);
     assert.equal(result, null);
+    assert.equal(store.listUnnotifiedExpired('main').length, 1, '不能标记已告知');
+    assert.equal(state.turnSeen.size, 0, '没有正文时不应占用本轮 turnSeen');
   });
 });
 
-test('injectExpiredNotices: 注入一条 companion-expired 通知并标记已告知', async () => {
+test('V70-M1: 只有 runtime-context 的回合不注入', async () => {
+  await withStore(async (store) => {
+    insertExpired(store, { title: '交电费', dueAt: NOW_S - 3600 });
+    const { state } = fakeState(store);
+    const messages = [
+      {
+        id: 'c1',
+        role: 'user',
+        source: { kind: 'runtime-context', form: 'snapshot' },
+        content: [{ type: 'text', text: 'This snapshot supersedes earlier runtime-context snapshots.' }],
+      },
+    ];
+    const text = lastUserText(messages);
+    assert.equal(text, '');
+    assert.equal(await injectExpiredNotices(state, {}, 'turn-ctx', 'main', text), null);
+    assert.equal(store.listUnnotifiedExpired('main').length, 1);
+  });
+});
+
+test('V70-M1: 下一条真实用户消息注入一次并标记', async () => {
   await withStore(async (store) => {
     insertExpired(store, { title: '交电费', dueAt: NOW_S - 3600 });
     insertExpired(store, { title: '拿快递', dueAt: NOW_S - 7200 });
     const { state, logs } = fakeState(store);
 
-    const result = await injectExpiredNotices(state, {}, userMessages('晚上好'), 'turn-1', 'main');
+    const messages = [
+      userMessage('刚到家', { source: { kind: 'user' } }),
+    ];
+    const text = lastUserText(messages);
+    assert.equal(text, '刚到家');
+
+    const result = await injectExpiredNotices(state, {}, 'turn-real', 'main', text);
     assert.ok(result);
-    assert.equal(result.inject.length, 1);
     const message = result.inject[0];
     assert.equal(message.role, 'user');
     assert.equal(message.source.kind, EXPIRED_SOURCE_KIND);
     assert.equal(message.source.form, 'notice');
     assert.match(message.content[0].text, /有 2 条提醒未能按时送达/u);
     assert.match(message.content[0].text, /交电费/u);
+    assert.equal(store.listUnnotifiedExpired('main').length, 0);
     assert.ok(logs.some((entry) => entry.message.includes('expired notice injected')));
 
-    // 已打标：同一进程再来一次不再注入。
-    const again = await injectExpiredNotices(state, {}, userMessages('还在吗'), 'turn-2', 'main');
-    assert.equal(again, null);
-    assert.equal(store.listUnnotifiedExpired('main').length, 0);
+    // 同一进程再来一次不再注入。
+    assert.equal(
+      await injectExpiredNotices(state, {}, 'turn-next', 'main', lastUserText([userMessage('还在吗')])),
+      null,
+    );
 
     // 重启（新实例）也不会重复告知。
-    const reopened = await injectExpiredNotices(
-      fakeState(store).state,
-      {},
-      userMessages('重启后'),
-      'turn-3',
-      'main',
+    assert.equal(
+      await injectExpiredNotices(
+        fakeState(store).state,
+        {},
+        'turn-reopen',
+        'main',
+        lastUserText([userMessage('重启后')]),
+      ),
+      null,
     );
-    assert.equal(reopened, null);
   });
 });
 
-test('injectExpiredNotices: 斜杠命令与注入消息不触发', async () => {
+test('injectExpiredNotices: 无过期提醒时不注入', async () => {
+  await withStore(async (store) => {
+    const { state } = fakeState(store);
+    assert.equal(await injectExpiredNotices(state, {}, 'turn-1', 'main', '在吗'), null);
+  });
+});
+
+test('injectExpiredNotices: 斜杠命令与空正文不触发', async () => {
   await withStore(async (store) => {
     insertExpired(store, { title: '交电费', dueAt: NOW_S - 3600 });
     const { state } = fakeState(store);
-    assert.equal(await injectExpiredNotices(state, {}, userMessages('/状态'), 'turn-1', 'main'), null);
-    assert.equal(store.listUnnotifiedExpired('main').length, 1);
-
-    const injectedOnly = [
-      {
-        id: 'x1',
-        role: 'user',
-        content: [{ type: 'text', text: '召回内容' }],
-        source: { kind: 'companion-recall', form: 'snapshot' },
-      },
-    ];
-    assert.equal(await injectExpiredNotices(state, {}, injectedOnly, 'turn-2', 'main'), null);
-    assert.equal(store.listUnnotifiedExpired('main').length, 1);
+    assert.equal(await injectExpiredNotices(state, {}, 'turn-1', 'main', '/状态'), null);
+    assert.equal(await injectExpiredNotices(state, {}, 'turn-2', 'main', '   '), null);
+    assert.equal(store.listUnnotifiedExpired('main').length, 1, '两种跳过都不应标记');
   });
 });
 
@@ -164,7 +188,7 @@ test('injectExpiredNotices: 其它 scope 的过期提醒不影响本 scope', asy
   await withStore(async (store) => {
     insertExpired(store, { title: '线程里的提醒', dueAt: NOW_S - 60, scope: 'thread:t1' });
     const { state } = fakeState(store);
-    assert.equal(await injectExpiredNotices(state, {}, userMessages('你好'), 'turn-1', 'main'), null);
+    assert.equal(await injectExpiredNotices(state, {}, 'turn-1', 'main', '你好'), null);
     assert.equal(store.listUnnotifiedExpired('thread:t1').length, 1);
   });
 });
@@ -175,7 +199,7 @@ test('injectExpiredNotices: store 查询抛错时静默返回 null', async () =>
       throw new Error('boom');
     },
   });
-  const result = await injectExpiredNotices(state, {}, userMessages('你好'), 'turn-1', 'main');
+  const result = await injectExpiredNotices(state, {}, 'turn-1', 'main', '你好');
   assert.equal(result, null);
   assert.ok(logs.some((entry) => entry.message.includes('expired notice lookup failed')));
 });

@@ -46,17 +46,20 @@ export function buildExpiredNotice(rows, options = {}) {
  * @param {string} scope 记忆域
  * @returns {Promise<object|null>} `{inject:[message]}` 或 null
  */
-export async function injectExpiredNotices(state, payload, messages, turnKey, scope = 'main') {
+export async function injectExpiredNotices(state, payload, turnKey, scope = 'main', userText = '') {
   const { store, platform, config } = state ?? {};
+  // V70-M1：正文判定与主干共用（调用方传入 lastUserText），本模块不再自建一套——
+  // 否则 runtime-context 与插件自己投递的「[提醒] …」会被当成用户发言。
+  const text = typeof userText === 'string' ? userText.trim() : '';
+  if (text === '') return null;
+  if (text.startsWith('/')) return null;
   if (store === null || typeof store?.listUnnotifiedExpired !== 'function') return null;
+  // 只有确认「这一步确实有用户正文」之后才占位，投递/注入回合不会消耗掉这一轮。
   if (typeof turnKey === 'string' && state.turnSeen instanceof Set) {
     const key = `expired:${String(payload?.agent?.session?.id ?? scope)}:${turnKey}`;
     if (state.turnSeen.has(key)) return null;
     state.turnSeen.add(key);
   }
-  const text = lastUserTextOf(messages);
-  if (text === '') return null;
-  if (text.trimStart().startsWith('/')) return null;
 
   let rows;
   try {
@@ -90,34 +93,4 @@ export async function injectExpiredNotices(state, payload, messages, turnKey, sc
       },
     ],
   };
-}
-
-/** 注入消息的判定：宿主真实用户正文的 source.kind 是 'user'，不能一并跳过。 */
-function isInjectedMessage(message) {
-  const source = message?.source;
-  const kind = typeof source?.kind === 'string' ? source.kind : '';
-  if (kind === '') return false;
-  if (kind === 'user') return false;
-  if (kind.startsWith('companion-')) return true;
-  if (kind.startsWith('plugin:') && source?.form === 'notice') return true;
-  return false;
-}
-
-/** 取本步第一条非注入的用户正文（只看文本，跳过注入消息）。 */
-function lastUserTextOf(messages) {
-  if (!Array.isArray(messages)) return '';
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const message = messages[i];
-    if (message?.role !== 'user') continue;
-    if (isInjectedMessage(message)) continue;
-    const content = message?.content;
-    const parts = Array.isArray(content) ? content : [];
-    const text = parts
-      .filter((part) => part?.type === 'text' && typeof part.text === 'string')
-      .map((part) => part.text)
-      .join('')
-      .trim();
-    if (text !== '' && !text.startsWith('<dsh_im_')) return text;
-  }
-  return '';
 }

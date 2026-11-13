@@ -34,7 +34,7 @@ const fact = (statement, subject = '咖啡') => ({
   statement,
 });
 
-test('selectExistingFacts 只挑对话里提到过的 subject', async () => {
+test('selectExistingFacts：偏好类按 kind 取候选，其它 kind 仍要字面命中 subject', async () => {
   await withStore((store) => {
     store.insertFact({
       scope: 'main',
@@ -46,8 +46,19 @@ test('selectExistingFacts 只挑对话里提到过的 subject', async () => {
       source_kind: 'consolidated',
       observed_at: BASE,
     });
-    assert.equal(selectExistingFacts(store, 'main', '今天喝了咖啡').length, 1);
-    assert.equal(selectExistingFacts(store, 'main', '今天在写代码').length, 0);
+    store.insertFact({
+      scope: 'main',
+      kind: 'project',
+      subject_text: '项目甲',
+      predicate: '状态',
+      object_text: '进行中',
+      statement: '项目甲进行中',
+      source_kind: 'consolidated',
+      observed_at: BASE,
+    });
+    // V70-M2：偏好类不再要求 subject 字面出现（用户说「我」，库里写「用户」）。
+    assert.equal(selectExistingFacts(store, 'main', '今天在写代码').length, 1);
+    assert.equal(selectExistingFacts(store, 'main', '项目甲怎么样了').length, 2);
   });
 });
 

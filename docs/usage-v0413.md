@@ -115,6 +115,28 @@ dsh-im 会把 `<dsh_im_source>` / `<dsh_im_reply_to>` 作为独立 `user` 消息
 
 ### v14 → v15 迁移
 
+### v0.7.1 修复（V70-M1 / V70-M2 / V70-L2）
+
+- **过期通知的正文判定**：`injectExpiredNotices` 不再自己解析消息形状，改由 `src/index.js` 传入
+  `lastUserText` 的结果。于是 runtime-context 快照、`companion-*` 注入、以及插件自己投递的
+  `[提醒] …`（`source.kind='user'` + `rpcId=companion-*`）都不算用户正文；没有正文时也不会
+  占用本轮 `turnSeen`，投递回合不会把过期提醒标成已告知。
+- **同义偏好去重**：`preference` / `lifestyle` 类事实按 kind 取最近 N 条活跃事实作为候选，
+  不再要求 `subject_text` 在对话里字面出现（用户说「我」、库里写「用户」）；同一 subject 的多条
+  全部交给模型，由它选一条带 `supersedes` 整条改写。N 由 `consolidate.existingFactsLimit`
+  控制（默认 12，合法 1..50）：
+
+  ```yaml
+  consolidate:
+    existingFactsLimit: 12
+  ```
+
+  其它 kind（`project` / `identity` 等）仍按「subject_text 字面出现在本段对话里」挑选；
+  召回快照与压缩摘要段的排除规则不变。
+- **排障日志**：`DSH_COMPANION_MIRROR_DEBUG=1` 的日志位置前移到 query 之后，召回为空也有记录。
+
+### v14 → v15 迁移
+
 新表 `token_usage`；`facts` 增 `injected_count` / `used_count` / `unused_streak`（旧
 `recall_count` 迁入 `used_count`）；`reminders` 增 `expired_notified_at` / `series_index`；
 `facts.kind` 扩 `lifestyle` / `mood`，`memory_events.action` 扩 `govern` / `EDIT` / `scrub`

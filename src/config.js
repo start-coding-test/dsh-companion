@@ -236,6 +236,20 @@ Object.defineProperty(DEFAULT_VALUES, 'task', {
   configurable: false,
 });
 
+// v0.7.1 V70-M2：同义偏好去重。preference / lifestyle 类事实按 kind 取最近 N 条活跃
+// 事实交给模型改写（不再要求 subject_text 在对话里字面出现）；该节同样不参与 16 键
+// 安装自检（与 compact/quota/budget/task 一致）。
+const CONSOLIDATE_DEFAULTS = Object.freeze({
+  existingFactsLimit: 12,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'consolidate', {
+  value: CONSOLIDATE_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -864,6 +878,34 @@ export function normalizeCompact(raw, warnings = []) {
 }
 
 /**
+ * 校验 consolidate 节：existingFactsLimit 必须是 1..50 的整数。
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{existingFactsLimit: number}>}
+ */
+export function normalizeConsolidate(raw, warnings = []) {
+  const defaults = DEFAULTS.consolidate;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('consolidate', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['existingFactsLimit']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "consolidate.${key}" ignored`);
+  }
+  const existingFactsLimit = raw.existingFactsLimit === undefined
+    ? defaults.existingFactsLimit
+    : raw.existingFactsLimit;
+  if (!Number.isInteger(existingFactsLimit) || existingFactsLimit < 1 || existingFactsLimit > 50) {
+    throw new ConfigError(
+      'consolidate.existingFactsLimit',
+      `must be an integer within 1..50, got ${JSON.stringify(existingFactsLimit)}`,
+    );
+  }
+  return Object.freeze({ existingFactsLimit });
+}
+
+/**
  * 合并任务 token 预算节并校验；未知子字段 warn，越界抛 ConfigError。
  *
  * 语义：tokenWarn 是「投递一次收尾提示」的软线，tokenStop 是「结束等待」的硬线，
@@ -993,6 +1035,7 @@ export function normalizeConfig(raw = {}) {
   cfg.budget = normalizeBudget(input.budget, warnings);
   cfg.quota = normalizeQuota(input.quota, warnings);
   cfg.task = normalizeTask(input.task, warnings);
+  cfg.consolidate = normalizeConsolidate(input.consolidate, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

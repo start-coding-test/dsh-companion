@@ -38,6 +38,12 @@ export const DEFAULT_THRESHOLD_COOLDOWN_TURNS = 3;
 /** 去重扫描的事实分页大小（Store 单页上限远大于此值）。 */
 const FACT_PAGE_SIZE = 200;
 
+/** v0.7.1 V70-M2：按 kind 取候选的「偏好/生活」类（同义说法多、subject 多为「用户」）。 */
+const PREFERENCE_KINDS = new Set(['preference', 'lifestyle']);
+
+/** v0.7.1 V70-M2：偏好类候选的默认上限（可由 config.consolidate.existingFactsLimit 覆盖）。 */
+export const DEFAULT_EXISTING_FACTS_LIMIT = 12;
+
 const FACT_KINDS = new Set(STORE_FACT_KINDS);
 const SALIENCE_VALUES = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
 const PRIVACY_VALUES = new Set(['normal', 'sensitive', 'secret']);
@@ -401,7 +407,7 @@ function recallSnapshotText(text) {
  * @param {object[]} transcript
  * @returns {{id: string, subject_text: string, statement: string}[]}
  */
-function selectExistingFactsFromRegion(store, scope, regionText, transcript) {
+function selectExistingFactsFromRegion(store, scope, regionText, transcript, options = {}) {
   const body = promptBody(regionText, transcript);
   if (body === '') return [];
   // 段内只要出现召回快照，就不做「同主题改写」提示：快照里的旧事实与本次发言
@@ -413,7 +419,7 @@ function selectExistingFactsFromRegion(store, scope, regionText, transcript) {
   if (/<compacted-summary>/u.test(body) || /automatically generated checkpoint/u.test(body)) {
     return [];
   }
-  return selectExistingFacts(store, scope, body);
+  return selectExistingFacts(store, scope, body, options);
 }
 
 function promptBody(regionText, transcript) {
@@ -442,6 +448,9 @@ export function selectExistingFacts(store, scope, text, options = {}) {
   const body = typeof text === 'string' ? text.toLowerCase() : '';
   if (body === '') return [];
   const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : 12;
+  const preferenceLimit = Number.isInteger(options.preferenceLimit) && options.preferenceLimit > 0
+    ? options.preferenceLimit
+    : limit;
   const rows = [];
   for (let offset = 0; ; offset += FACT_PAGE_SIZE) {
     const page = store.listFacts({ scope, limit: FACT_PAGE_SIZE, offset });
@@ -449,22 +458,52 @@ export function selectExistingFacts(store, scope, text, options = {}) {
     if (page.length < FACT_PAGE_SIZE) break;
   }
   const bySubject = new Map();
+  const preferences = [];
   for (const row of rows) {
     if (row.status !== 'active') continue;
-    const subject = typeof row.subject_text === 'string' ? row.subject_text : '';
-    if (subject === '' || !body.includes(subject.toLowerCase())) continue;
     // 若这条事实的正文只出现在召回快照里，视为「旧内容」而非本段对话，不当作改写候选。
     if (recallText !== '' && typeof row.statement === 'string'
       && recallText.toLowerCase().includes(row.statement.toLowerCase())) continue;
+    // V70-M2：偏好/生活类按 kind 取候选——用户说「我」，subject 写「用户」，字面永远
+    // 命中不了；同一 subject 的多条也要全部交给模型，才能让它选一条改写。
+    const kind = typeof row.kind === 'string' ? row.kind : '';
+    if (PREFERENCE_KINDS.has(kind)) {
+      preferences.push(row);
+      continue;
+    }
+    const subject = typeof row.subject_text === 'string' ? row.subject_text : '';
+    if (subject === '' || !body.includes(subject.toLowerCase())) continue;
     const kept = bySubject.get(subject);
     if (kept === undefined || Number(row.last_reinforced_at) > Number(kept.last_reinforced_at)) {
       bySubject.set(subject, row);
     }
   }
-  return [...bySubject.values()]
+  const literal = [...bySubject.values()]
     .sort((a, b) => Number(b.last_reinforced_at) - Number(a.last_reinforced_at))
-    .slice(0, limit)
-    .map((row) => ({ id: row.id, subject_text: row.subject_text, statement: row.statement }));
+    .slice(0, limit);
+  const preferred = preferences
+    .sort((a, b) => Number(b.last_reinforced_at) - Number(a.last_reinforced_at))
+    .slice(0, preferenceLimit);
+  const seen = new Set();
+  const merged = [];
+  for (const row of [...literal, ...preferred].sort(
+    (a, b) => Number(b.last_reinforced_at) - Number(a.last_reinforced_at),
+  )) {
+    if (seen.has(row.id)) continue;
+    seen.add(row.id);
+    merged.push(row);
+  }
+  return merged.map((row) => ({ id: row.id, subject_text: row.subject_text, statement: row.statement }));
+}
+
+/**
+ * v0.7.1 V70-M2：把 config.consolidate.existingFactsLimit 夹到合法区间。
+ * @param {unknown} value
+ * @returns {number}
+ */
+function normalizeExistingFactsLimit(value) {
+  if (!Number.isInteger(value) || value < 1 || value > 50) return DEFAULT_EXISTING_FACTS_LIMIT;
+  return value;
 }
 
 /**
@@ -779,7 +818,9 @@ export async function consolidate(input = {}) {
 
   // 2) 模型切分 + 校验。校验失败在事务之前抛出，库内不产生任何行。
   // N1：选区文本优先，transcript 仅作兜底；模型回调原样收到 textSource 便于审计。
-  const existingFacts = selectExistingFactsFromRegion(store, scope, regionText, transcript);
+  const existingFacts = selectExistingFactsFromRegion(store, scope, regionText, transcript, {
+    preferenceLimit: normalizeExistingFactsLimit(input.existingFactsLimit),
+  });
   const draft = await llm({
     scope,
     seqFrom: from,

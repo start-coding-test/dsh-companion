@@ -1601,7 +1601,7 @@ async function runPreStep(state, payload) {
   injectEmotion(state, payload, messages, turnKey, scope);
   const injection = await injectRecall(state, payload, messages, turnKey, scope);
   // A5（V5-L1）：重试用尽而作废的提醒，在下一次真正发言时告知一次。
-  const expired = await injectExpiredNotices(state, payload, messages, turnKey, scope);
+  const expired = await injectExpiredNotices(state, payload, turnKey, scope, lastUserText(messages));
   const hints = [hint, privacy, ...(injection?.inject ?? []), ...(expired?.inject ?? [])]
     .filter((item) => item !== null);
   if (hints.length === 0) return injection;
@@ -2659,6 +2659,8 @@ async function executeConsolidationJob(state, job) {
       clock: platform.now,
       trigger: job.trigger,
       sessionId: job.sessionId,
+      // V70-M2：偏好/生活类候选上限（config.consolidate.existingFactsLimit）。
+      existingFactsLimit: state.config?.consolidate?.existingFactsLimit,
       // 窗口已在 surface 层选好；水位推进允许跨过旧值。
       guardWatermark: false,
     });
@@ -3457,6 +3459,23 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
     return null;
   }
   const query = lastUserText(messages).slice(0, 200);
+
+  // A7/V70-L2：排障开关。只记消息条数/信封条数/查询长度/来源 id，绝不记正文；
+  // 放在 query 之后、任何 early return 之前，召回为空的回合也要有记录。
+  if (process.env.DSH_COMPANION_MIRROR_DEBUG === '1') {
+    const list = Array.isArray(messages) ? messages : [];
+    const skippedNotices = list.filter((message) => isPluginNotice(message)).length;
+    const sourceRow = [...list].reverse().find(
+      (message) => message?.role === 'user' && !isInjectedMessage(message),
+    );
+    platform.log('info', '[dsh-companion] mirror debug', {
+      messages: list.length,
+      skippedNotices,
+      queryLength: query.length,
+      querySourceId: sourceRow?.source?.rpcId ?? sourceRow?.id ?? null,
+    });
+  }
+
   if (query === '') return null;
 
   let recalled;
@@ -3481,21 +3500,6 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
     return null;
   }
   if (Number.isInteger(recalled.vectorHits)) state.lastVectorHits = recalled.vectorHits;
-
-  // A7：排障开关。只记消息条数/信封条数/查询长度/来源 id，绝不记正文。
-  if (process.env.DSH_COMPANION_MIRROR_DEBUG === '1') {
-    const list = Array.isArray(messages) ? messages : [];
-    const skippedNotices = list.filter((message) => isPluginNotice(message)).length;
-    const sourceRow = [...list].reverse().find(
-      (message) => message?.role === 'user' && !isInjectedMessage(message),
-    );
-    platform.log('info', '[dsh-companion] mirror debug', {
-      messages: list.length,
-      skippedNotices,
-      queryLength: query.length,
-      querySourceId: sourceRow?.source?.rpcId ?? sourceRow?.id ?? null,
-    });
-  }
 
   const assembled = assemble({
     sections: [],
@@ -4218,6 +4222,7 @@ async function deepConsolidate(state) {
       clock: platform.now,
       trigger: 'deep-sleep',
       sessionId: SCOPE,
+      existingFactsLimit: state.config?.consolidate?.existingFactsLimit,
       guardWatermark: false,
     });
     if (result?.skipped) return { written: false, reason: 'skipped' };
