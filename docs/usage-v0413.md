@@ -107,13 +107,27 @@ recall:
 
 ### IM 信封不算用户正文（A7）
 
-dsh-im 会把 `<dsh_im_source>` / `<dsh_im_reply_to>` 作为独立 `user` 消息注入，现已在
-选取「用户正文」时统一跳过（`source.kind` 以 `plugin:` 开头且 `form: 'notice'`，或正文
-以 `<dsh_im_` 开头）。这样交互日、隐私提示、命令提示、确认强化、情绪判定与召回查询都
-不会把信封当成人说的话。排查时可设 `DSH_COMPANION_MIRROR_DEBUG=1`，每轮会多一行日志，
-只记消息 id / 长度 / 是否跳过信封，不记正文。
+dsh-im 有两种形态，插件都要处理：
+
+1. **独立 notice 消息**：`source.kind` 以 `plugin:` 开头且 `form: 'notice'`，正文只有信封；
+2. **合并消息**（V71-H1）：信封和正文在同一条 `user` 消息里，`source.kind='user'`，正文形如
+   `<dsh_im_source>{…}</dsh_im_source>\n\n我在`。
+
+选取「用户正文」时，先按同名闭合标签**逐个剥掉开头**的 `<dsh_im_*>` 信封（source、reply_to
+等），剩下的才是用户说的话；只有剥完为空才算 notice。这样合并消息不会再把正文一起丢掉，
+交互日、隐私提示、命令提示、确认强化、情绪判定、过期通知与召回查询都读得到正文；转录
+（`captureTranscript`）记录的也是剥掉信封后的正文。正文中间出现的字面 `<dsh_im_` 不受影响。
+
+排查时可设 `DSH_COMPANION_MIRROR_DEBUG=1`，每轮多一行日志：消息条数、被跳过的 notice 条数、
+被剥掉的信封块数、查询长度与来源 id，不记正文。
 
 ### v14 → v15 迁移
+
+新表 `token_usage`；`facts` 增 `injected_count` / `used_count` / `unused_streak`（旧
+`recall_count` 迁入 `used_count`）；`reminders` 增 `expired_notified_at` / `series_index`；
+`facts.kind` 扩 `lifestyle` / `mood`，`memory_events.action` 扩 `govern` / `EDIT` / `scrub`
+（两张表都会重建并保留 rowid，`fact_vectors` 不会被级联删除）。迁移在同一个事务里完成，
+失败会回滚到 v14。升级前请备份 `companion.db` 连同 `-wal`、`-shm` 文件。
 
 ### v0.7.1 修复（V70-M1 / V70-M2 / V70-L2）
 
@@ -135,10 +149,15 @@ dsh-im 会把 `<dsh_im_source>` / `<dsh_im_reply_to>` 作为独立 `user` 消息
   召回快照与压缩摘要段的排除规则不变。
 - **排障日志**：`DSH_COMPANION_MIRROR_DEBUG=1` 的日志位置前移到 query 之后，召回为空也有记录。
 
-### v14 → v15 迁移
+### v0.7.2 热修（V71-H1）
 
-新表 `token_usage`；`facts` 增 `injected_count` / `used_count` / `unused_streak`（旧
-`recall_count` 迁入 `used_count`）；`reminders` 增 `expired_notified_at` / `series_index`；
-`facts.kind` 扩 `lifestyle` / `mood`，`memory_events.action` 扩 `govern` / `EDIT` / `scrub`
-（两张表都会重建并保留 rowid，`fact_vectors` 不会被级联删除）。迁移在同一个事务里完成，
-失败会回滚到 v14。升级前请备份 `companion.db` 连同 `-wal`、`-shm` 文件。
+IM 合并消息（信封 + 正文同一条 `user` 消息）此前被整条当成信封丢弃：召回查询为空、情绪判定
+与过期通知都不触发。现在改为「剥离信封后取正文」，规则见上一节；`source` 判定保持原样。
+
+- 新增 `stripImEnvelopes(text)`：反复剥离开头的 `<dsh_im_xxx>…</dsh_im_xxx>` 块及其后空白；
+  开头是 `<dsh_im_` 但找不到闭合标签时视为整段信封；正文中间出现的标签不动。
+- `isPluginNotice` 的文本兜底改为「剥离后为空才算信封」；`source` 判定不变。
+- `textRows` 对 user 文本块先剥离再入行；`lastUserText` 不再按 `<dsh_im_` 前缀跳过整条。
+- mirror debug 增 `strippedEnvelopes`（本批被剥掉的信封块数）。
+
+行为不变：只有信封的消息仍然跳过；转录继续不含信封（V70-L1 的决定未变）。

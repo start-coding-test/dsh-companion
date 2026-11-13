@@ -254,6 +254,8 @@ const REMINDER_TEXT_PREFIX = '[提醒] ';
  */
 const PLUGIN_NOTICE_SOURCE_PREFIX = 'plugin:';
 const PLUGIN_NOTICE_TEXT_PREFIX = '<dsh_im_';
+/** V71-H1：开头的信封标签，如 `<dsh_im_source>`。 */
+const IM_ENVELOPE_TAG_PATTERN = /^<([A-Za-z0-9_.-]*)>/u;
 
 /** C5-H1a：投递失败事件 kind（memory_events.detail_json.kind）。 */
 const DELIVERY_ERROR_KIND = 'delivery_error';
@@ -3465,12 +3467,26 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
   if (process.env.DSH_COMPANION_MIRROR_DEBUG === '1') {
     const list = Array.isArray(messages) ? messages : [];
     const skippedNotices = list.filter((message) => isPluginNotice(message)).length;
+    // V71-H1：合并消息里的信封是被「剥掉」而不是整条跳过，单独计数便于排障。
+    let strippedEnvelopes = 0;
+    for (const message of list) {
+      if (message?.role !== 'user') continue;
+      for (const block of Array.isArray(message.content) ? message.content : []) {
+        if (block?.type === 'text' && typeof block.text === 'string') {
+          strippedEnvelopes += stripImEnvelopes(block.text).stripped;
+        }
+      }
+      if (typeof message.text === 'string') {
+        strippedEnvelopes += stripImEnvelopes(message.text).stripped;
+      }
+    }
     const sourceRow = [...list].reverse().find(
       (message) => message?.role === 'user' && !isInjectedMessage(message),
     );
     platform.log('info', '[dsh-companion] mirror debug', {
       messages: list.length,
       skippedNotices,
+      strippedEnvelopes,
       queryLength: query.length,
       querySourceId: sourceRow?.source?.rpcId ?? sourceRow?.id ?? null,
     });
@@ -3708,8 +3724,8 @@ function isInjectedMessage(message) {
 /**
  * A7（U13-H1）：这条消息是不是 IM 插件注入的信封（不是用户正文）。
  *
- * 判定顺序：先看 source（plugin: 前缀 + form:'notice'），再按正文 <dsh_im_ 前缀兜底。
- * 信封里是渠道/会话元数据，不是用户说的话。
+ * 判定顺序：先看 source（plugin: 前缀 + form:'notice'），再按正文兜底——正文里的
+ * IM 信封全部剥掉后仍然为空，才算「只有信封」。信封里是渠道/会话元数据，不是用户说的话。
  * @param {unknown} message
  * @returns {boolean}
  */
@@ -3724,10 +3740,47 @@ function isPluginNotice(message) {
   const blocks = Array.isArray(message.content) ? message.content : [];
   for (const block of blocks) {
     const text = typeof block === 'string' ? block : block?.type === 'text' ? block.text : null;
-    if (typeof text === 'string' && text.trimStart().startsWith(PLUGIN_NOTICE_TEXT_PREFIX)) return true;
+    if (typeof text !== 'string') continue;
+    const { text: body, stripped } = stripImEnvelopes(text);
+    if (stripped > 0 && body.trim() === '') return true;
   }
-  return typeof message.text === 'string'
-    && message.text.trimStart().startsWith(PLUGIN_NOTICE_TEXT_PREFIX);
+  if (typeof message.text === 'string') {
+    const { text: body, stripped } = stripImEnvelopes(message.text);
+    if (stripped > 0 && body.trim() === '') return true;
+  }
+  return false;
+}
+
+/**
+ * V71-H1：剥掉消息开头的 IM 信封，只留下用户正文。
+ *
+ * dsh-im 有两种形态：独立的 notice 消息（按 source 判定），以及把信封和正文塞进
+ * 同一条 user 消息（`source.kind='user'`，正文以 `<dsh_im_source>{…}</dsh_im_source>`
+ * 开头）。后者若按文本前缀整条丢弃，会把用户说的话一起扔掉；这里按同名闭合标签
+ * 逐个剥离，开头是 `<dsh_im_` 却没有闭合标签时视为整段信封。正文中间出现的
+ * `<dsh_im_` 保持原样。
+ *
+ * @param {unknown} raw
+ * @returns {{ text: string, stripped: number }} stripped 为被剥掉的信封块数
+ */
+function stripImEnvelopes(raw) {
+  if (typeof raw !== 'string') return { text: '', stripped: 0 };
+  if (!raw.trimStart().startsWith(PLUGIN_NOTICE_TEXT_PREFIX)) return { text: raw, stripped: 0 };
+  let rest = raw.trimStart();
+  let stripped = 0;
+  for (;;) {
+    if (!rest.startsWith(PLUGIN_NOTICE_TEXT_PREFIX)) break;
+    const match = IM_ENVELOPE_TAG_PATTERN.exec(rest);
+    if (match === null || !match[1].startsWith('dsh_im_')) {
+      return { text: '', stripped: stripped + 1 };
+    }
+    const close = `</${match[1]}>`;
+    const end = rest.indexOf(close, match[0].length);
+    if (end === -1) return { text: '', stripped: stripped + 1 };
+    stripped += 1;
+    rest = rest.slice(end + close.length).trimStart();
+  }
+  return { text: rest, stripped };
 }
 
 /**
@@ -5201,15 +5254,21 @@ function textRows(messages) {
     if (message === null || typeof message !== 'object') continue;
     // 召回/命令提示注入块回灌后也是 user/message，但不是用户发言（V3-H1 + V3-L3）。
     if (isInjectedMessage(message)) continue;
+    const role = typeof message.role === 'string' ? message.role : 'user';
     if (Array.isArray(message.content)) {
       for (const block of message.content) {
         if (block?.type !== 'text' || typeof block.text !== 'string') continue;
-        rows.push({ role: typeof message.role === 'string' ? message.role : 'user', text: block.text });
+        // V71-H1：IM 合并消息把信封和正文放在同一条 user 消息里，入行前先剥信封。
+        const text = role === 'user' ? stripImEnvelopes(block.text).text : block.text;
+        if (text.trim() === '') continue;
+        rows.push({ role, text });
       }
       continue;
     }
     if (message.type === 'text' && typeof message.text === 'string') {
-      rows.push({ role: typeof message.role === 'string' ? message.role : 'user', text: message.text });
+      const text = role === 'user' ? stripImEnvelopes(message.text).text : message.text;
+      if (text.trim() === '') continue;
+      rows.push({ role, text });
     }
   }
   return rows;
@@ -5233,7 +5292,6 @@ function lastUserText(messages) {
       || text.startsWith(RECALL_MARKER)
       || text.startsWith(EMOTION_PROMPT_PREFIX)
       || text.startsWith(REMINDER_TEXT_PREFIX)
-      || text.startsWith(PLUGIN_NOTICE_TEXT_PREFIX)
     ) continue;
     return text;
   }
@@ -5763,10 +5821,12 @@ function renderToolValue(value) {
 }
 
 export {
+  captureTranscript,
   formatChatStatus,
   handleChatCommand,
   isPluginNotice,
   lastUserText,
   runCommitmentFollowups,
   runLightChat,
+  stripImEnvelopes,
 };
