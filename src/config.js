@@ -176,6 +176,14 @@ const COMPACT_DEFAULTS = Object.freeze({
   cooldownTurns: 3,
 });
 
+// v0.4.13 A1：额度与熔断的可配置上限。dailyHardLimit 只防失控（默认 3M，与
+// DAILY_TOKEN_LIMIT 一致）；window5hLimit 为 null 表示不设 5 小时窗口线。
+// 该节不参与 16 键安装自检（与 quota/compact 等扩展节一致）。
+const BUDGET_DEFAULTS = Object.freeze({
+  dailyHardLimit: 3_000_000,
+  window5hLimit: null,
+});
+
 // v0.4.13 A2：额度闸门。quota.source='none' 时完全无副作用；'file' 时读一份外部
 // 写好的快照（订阅额度），任一窗口剩余低于预留线就暂停后台任务。插件不登录、
 // 不碰 cookie，只读文件。
@@ -194,6 +202,13 @@ Object.defineProperty(DEFAULT_VALUES, 'quota', {
 
 Object.defineProperty(DEFAULT_VALUES, 'compact', {
   value: COMPACT_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'budget', {
+  value: BUDGET_DEFAULTS,
   enumerable: false,
   writable: false,
   configurable: false,
@@ -730,6 +745,45 @@ export function normalizeQuota(raw, warnings = []) {
  * @param {string[]} [warnings]
  * @returns {Readonly<{minIncrementTokens: number, cooldownTurns: number}>}
  */
+/**
+ * 校验 budget 配置（v0.4.13 A1，额度上限）。
+ *
+ * 只放两个「防失控」上限：每日硬线（默认 3M）与可选的 5 小时窗口线。真正的
+ * 额度判断交给 A2 的 quota 闸门；这里只保证单日不会因为 bug 或死循环无限烧。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{dailyHardLimit: number, window5hLimit: number|null}>}
+ */
+export function normalizeBudget(raw, warnings = []) {
+  const defaults = DEFAULTS.budget;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('budget', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['dailyHardLimit', 'window5hLimit']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "budget.${key}" ignored`);
+  }
+  const daily = raw.dailyHardLimit === undefined ? defaults.dailyHardLimit : raw.dailyHardLimit;
+  if (!Number.isInteger(daily) || daily < 100_000 || daily > 1_000_000_000_000) {
+    throw new ConfigError(
+      'budget.dailyHardLimit',
+      `must be an integer within 100000..1000000000000, got ${JSON.stringify(daily)}`,
+    );
+  }
+  const window = raw.window5hLimit === undefined ? defaults.window5hLimit : raw.window5hLimit;
+  if (window !== null) {
+    if (!Number.isInteger(window) || window < 1_000 || window > daily) {
+      throw new ConfigError(
+        'budget.window5hLimit',
+        `must be null or an integer within 1000..dailyHardLimit, got ${JSON.stringify(window)}`,
+      );
+    }
+  }
+  return Object.freeze({ dailyHardLimit: daily, window5hLimit: window });
+}
+
 export function normalizeCompact(raw, warnings = []) {
   const defaults = DEFAULTS.compact;
   if (raw === undefined) return defaults;
@@ -835,6 +889,7 @@ export function normalizeConfig(raw = {}) {
   cfg.timing = normalizeTiming(input.timing, warnings);
   cfg.persona = normalizePersona(input.persona, warnings);
   cfg.compact = normalizeCompact(input.compact, warnings);
+  cfg.budget = normalizeBudget(input.budget, warnings);
   cfg.quota = normalizeQuota(input.quota, warnings);
 
   return Object.freeze({ ...cfg, warnings });

@@ -97,6 +97,7 @@ import {
   DAILY_TOKEN_LIMIT,
   checkMemory,
   createBudgetState,
+  dailyLimitFromConfig,
   levelAtLeast,
   overDailyBudget,
   recordTurnUsage,
@@ -1967,7 +1968,9 @@ function recordUsage(state, usage, sessionId) {
  */
 function refreshBudget(state, at = state.platform.now()) {
   const was = state.budgetTripped === true;
-  const tripped = overDailyBudget(state.budget, DAILY_TOKEN_LIMIT, {
+  // A1（v0.4.13）：每日硬线可配置；非法/缺失时退回 3M，保护逻辑不因配置失效。
+  const dailyLimit = dailyLimitFromConfig(state.config);
+  const tripped = overDailyBudget(state.budget, dailyLimit, {
     at,
     timezone: state.config.timezone,
   });
@@ -1977,7 +1980,7 @@ function refreshBudget(state, at = state.platform.now()) {
   if (tripped && !was) {
     state.platform.log('warn', '[dsh-companion] daily token budget tripped', {
       dailyTokens: state.budget.dailyTokens,
-      limit: DAILY_TOKEN_LIMIT,
+      limit: dailyLimit,
     });
   } else if (!tripped && was) {
     state.platform.log('info', '[dsh-companion] daily token budget reset', {
@@ -2168,7 +2171,7 @@ function budgetInfo(state) {
     : {};
   return {
     dailyTokens: state.budget.dailyTokens,
-    dailyLimit: DAILY_TOKEN_LIMIT,
+    dailyLimit: dailyLimitFromConfig(state.config),
     tripped: state.budgetTripped,
     rssLevel: state.rss.level,
     rssLevelCode: state.rss.code,

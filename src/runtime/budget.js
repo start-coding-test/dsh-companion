@@ -22,6 +22,19 @@ const MIB = 1024 ** 2;
 /** 每日 token 熔断线：3M。 */
 export const DAILY_TOKEN_LIMIT = 3_000_000;
 
+/**
+ * 从配置读取每日硬线（v0.4.13 A1）。配置缺失/非法时退回 DAILY_TOKEN_LIMIT，
+ * 保护逻辑不能因为配置错误而失效。
+ * @param {{budget?: {dailyHardLimit?: unknown}}|null} [config]
+ * @returns {number}
+ */
+export function dailyLimitFromConfig(config) {
+  const value = config !== null && typeof config === 'object'
+    ? config.budget?.dailyHardLimit
+    : undefined;
+  return Number.isInteger(value) && value >= 100_000 ? value : DAILY_TOKEN_LIMIT;
+}
+
 /** RSS 三档默认阈值（GiB）：2.95 / 3.0 / 3.15。 */
 export const DEFAULT_RSS_GIB = Object.freeze({ warn: 2.95, stop_dispatch: 3, main_only: 3.15 });
 

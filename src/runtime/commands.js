@@ -955,7 +955,7 @@ function formatTokenSnapshot(metrics, budget) {
     const rssName = RSS_LEVEL_NAMES[rssCode] ?? 'ok';
     const rssMB = Number(budget?.rssMB ?? snapshot.rssMB) || 0;
     return ` / tokens 本轮 入 ${tokensIn} 出 ${tokensOut}（超预算 ${overBudget} 次）`
-      + `｜今日 ${daily}/${DAILY_TOKEN_LIMIT}${tripped ? '（已熔断）' : ''}`
+      + `｜今日 ${daily}/${Number(budget?.dailyLimit) || DAILY_TOKEN_LIMIT}${tripped ? '（已熔断）' : ''}`
       + `｜RSS ${rssName} ${rssMB}MB`
       + vectorText;
   } catch {
