@@ -2,6 +2,57 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.0] - 2026-11-13
+
+清单代号 v0.4.13（2026-11-06 那份清单里顺延至今的 A1–A8 与 B）。schema 升到 **v15**，
+新增 token 账本、注入/使用计数与压缩底；所有新能力默认向后兼容——`quota.source` 默认
+`none`、`emotion.appraiser` 默认 `rules`、规则模式的情绪与 v0.5.2 逐字节一致。
+
+### Added
+
+- **A1 token 账本**：`token_usage` 表（11 列，`source` 六类 main/consolidate/smalltalk/embedding/task/thread
+  另加 appraise），按宿主 `usage` chunk 或码点估算入账，记 peak/offpeak 与 scope；
+  `/状态` 增「今日用量：… （各来源占比）｜缓存命中 N tokens」。
+  `budget.dailyHardLimit`、`budget.window5hLimit` 可配，日上限与 5 小时滑窗同源生效。
+- **A2 额度闸门**：`quota.source: none|file`，文件快照含 5h/7d/月三窗口与 `resetAt`；
+  15 分钟未更新视为过期；剩余低于预留线（30%/20%/10%）只暂停后台（非 hard 巩固、闲聊、向量回填），
+  主会话、hard 巩固与压缩不受影响；429/额度不足按 `resetAt` 退避，无则指数退避。
+- **A3 worker 预算**：任务运行中每 5s 采样，60K 注入收尾提示、80K 结束并回执 `status=partial`
+  （`partial:'部分完成'`），可重派；`task.tokenWarn/tokenStop/sampleMs` 可配。
+- **A4 重复提醒**：`reminder_add` 接受 `rrule`（DAILY / WEEKLY+BYDAY，含 INTERVAL/COUNT/UNTIL），
+  送到后按**原定序列**推进下次触发，停机错过只补最近一次（其余记 missed），跨 DST 不漂移；
+  状态板与列表显示「每天 08:00」这类节奏。
+- **A5 过期提醒通知**：重试用尽的提醒在下一次用户发言时一次性告知（标题 + 原定时间），
+  每条只告知一次、重启不重复；`/状态` 显示未告知过期数。
+- **A6 压缩迟滞**：压缩后 tokens 记为「压缩底」，threshold 触发要求 `tokens >= max(compactAtTokens, floor+增量门槛)`
+  且通过轮次冷却（新轮计数、写库、重启不绕过）；压后仍超目标时 `/status` 标注并建议 calibrate。
+- **A7 IM 信封**：`plugin:*` + `form:'notice'` 与 `<dsh_im_` 前缀不再被当作用户正文，
+  交互日、隐私提示、命令提示、确认强化、情绪判定、召回查询六处统一跳过；`DSH_COMPANION_MIRROR_DEBUG=1` 可排障。
+- **A8 记忆质量**：注入/使用计数拆分（`injected_count`/`used_count`/`unused_streak`，旧 `recall_count` 迁入 used），
+  连续未用按 `recall.unusedThreshold`/`unusedPenalty` 降权；巩固时可对同主题事实提出 `supersedes`；
+  纯工具区间允许 `episode: null`；生活类抽取指引与 `lifestyle`/`mood` 两种 kind；
+  闲聊轮生活类召回条数 `recall.chatLimit`（默认 1）。
+
+### Changed
+
+- schema **v14 → v15**：新增 `token_usage` 表；`facts` 增三列、`reminders` 增
+  `expired_notified_at`/`series_index`；`facts.kind` 与 `memory_events.action` 白名单扩容
+  （重建表时保留 rowid，向量表不受级联删除影响）。迁移在 v14 fixture 上验证：
+  版本→15、`recall_count` 迁入 `used_count`、FTS 命中保留、`integrity_check ok`。
+- `/状态` 增四行：压缩底、额度、今日用量与线程槽兜底/超时计数。
+
+### Fixed
+
+- `govern` 事件不再靠 `PRAGMA ignore_check_constraints` 绕过 CHECK（白名单已含 govern/EDIT/scrub）。
+- `deepConsolidate` 改读主会话自己的 transcript，不再误用最近一次切换的会话。
+- 空库也写 scrub 标记但补记审计；短任务（<5s）也能记 task token。
+- `UNTIL=YYYYMMDD` 按配置时区当地日末解释，且拒绝 2 月 30 日这类不存在的日期。
+
+### Tests
+
+1410 个用例 / 51 个套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区全绿；
+`plugin-gate: PASS (round A + round B + round C)`（round C 无凭据 SKIP）。
+
 ## [0.6.1] - 2026-11-11
 
 v0.6 判定器上线后的第一批修正：专属句在 llm 模式下能出现了，情绪句里的第二人称不再指错人，

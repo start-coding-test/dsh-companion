@@ -2974,13 +2974,10 @@ function compactFloorOf(state, scope) {
 }
 
 /**
- * A6：压缩成功后记录实测水位并（对 threshold 触发）重置冷却计数。
- * 水位仍高于 compactAtTokens 时写一条 warn，/状态 也会标注——这是「压不动」的
- * 直接证据，比每轮都压一次更有用。
+ * A6：threshold 压缩成功后把该 scope 的冷却计数清零（内存 + schema_meta）。
+ * 只影响 threshold 分支；hard/idle 不受冷却约束。
  * @param {object} state
- * @param {object} payload
  * @param {string} scope
- * @param {'idle'|'threshold'|'hard'|null} trigger
  */
 function resetThresholdCooldown(state, scope) {
   state.thresholdTurnsByScope.set(scope, 0);
@@ -2991,6 +2988,14 @@ function resetThresholdCooldown(state, scope) {
   }
 }
 
+/**
+ * A6：压缩成功后记录实测水位。
+ * 水位仍高于 compactAtTokens 时写一条 warn，/状态 也会标注——这是「压不动」的
+ * 直接证据，比每轮都压一次更有用。
+ * @param {object} state
+ * @param {object} payload
+ * @param {string} scope
+ */
 function recordCompactionFloor(state, payload, scope) {
   const { platform, store, config } = state;
   const measured = measureTokens(state, payload);
