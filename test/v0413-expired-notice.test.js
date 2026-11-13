@@ -85,6 +85,19 @@ test('buildExpiredNotice: 条数、标题、原定时间（本地时区）与上
   assert.equal(buildExpiredNotice(null), '');
 });
 
+test('injectExpiredNotices: 宿主真实正文（source.kind=user）能被识别（H-1）', async () => {
+  await withStore(async (store) => {
+    insertExpired(store, { title: '交电费', dueAt: NOW_S - 3600 });
+    const { state } = fakeState(store);
+    const hostMessages = [
+      { id: 'h1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: '刚到家' }] },
+    ];
+    const result = await injectExpiredNotices(state, {}, hostMessages, 'turn-host', 'main');
+    assert.ok(result, '宿主的 source.kind=user 不应被当成注入消息');
+    assert.equal(result.inject.length, 1);
+  });
+});
+
 test('injectExpiredNotices: 无过期提醒时不注入', async () => {
   await withStore(async (store) => {
     const { state } = fakeState(store);

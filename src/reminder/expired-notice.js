@@ -92,13 +92,24 @@ export async function injectExpiredNotices(state, payload, messages, turnKey, sc
   };
 }
 
+/** 注入消息的判定：宿主真实用户正文的 source.kind 是 'user'，不能一并跳过。 */
+function isInjectedMessage(message) {
+  const source = message?.source;
+  const kind = typeof source?.kind === 'string' ? source.kind : '';
+  if (kind === '') return false;
+  if (kind === 'user') return false;
+  if (kind.startsWith('companion-')) return true;
+  if (kind.startsWith('plugin:') && source?.form === 'notice') return true;
+  return false;
+}
+
 /** 取本步第一条非注入的用户正文（只看文本，跳过注入消息）。 */
 function lastUserTextOf(messages) {
   if (!Array.isArray(messages)) return '';
   for (let i = messages.length - 1; i >= 0; i -= 1) {
     const message = messages[i];
     if (message?.role !== 'user') continue;
-    if (typeof message?.source?.kind === 'string' && message.source.kind !== '') continue;
+    if (isInjectedMessage(message)) continue;
     const content = message?.content;
     const parts = Array.isArray(content) ? content : [];
     const text = parts

@@ -69,7 +69,7 @@ function finiteOr(value, fallback) {
  * 是否把「没有任何已知窗口」当作无额度信息。
  *
  * 严格口径：
- * - 字段缺失只认 `undefined`（JSON 里没有这个键）；显式 `null` 不是缺失，判非法；
+ * - `updatedAt` / `resetAt` 缺键或显式 `null` 都表示「没有这个时间」；其它非整数判非法；
  * - resetAt / updatedAt 缺失时在输出里归一为 `null`；
  * - 只有已知窗口参与重名检查，未知名被整体忽略。
  *
@@ -82,9 +82,12 @@ export function parseQuotaSnapshot(input) {
   const rawWindows = input.windows;
   if (!Array.isArray(rawWindows) || rawWindows.length === 0) return INVALID_SNAPSHOT;
 
+  // M-2：显式 null 表示「没有这个时间」，与缺键等价；只有非整数才判非法。
   const rawUpdatedAt = input.updatedAt;
-  if (rawUpdatedAt !== undefined && !isFiniteInteger(rawUpdatedAt)) return INVALID_SNAPSHOT;
-  const updatedAt = rawUpdatedAt === undefined ? null : rawUpdatedAt;
+  if (rawUpdatedAt !== undefined && rawUpdatedAt !== null && !isFiniteInteger(rawUpdatedAt)) {
+    return INVALID_SNAPSHOT;
+  }
+  const updatedAt = rawUpdatedAt === undefined || rawUpdatedAt === null ? null : rawUpdatedAt;
 
   /** @type {Array<{name: string, remaining: number, limit: number, resetAt: number|null}>} */
   const windows = [];
@@ -109,13 +112,15 @@ export function parseQuotaSnapshot(input) {
     if (!isFiniteInteger(limit) || limit <= 0) return INVALID_SNAPSHOT;
 
     const rawResetAt = raw.resetAt;
-    if (rawResetAt !== undefined && !isFiniteInteger(rawResetAt)) return INVALID_SNAPSHOT;
+    if (rawResetAt !== undefined && rawResetAt !== null && !isFiniteInteger(rawResetAt)) {
+      return INVALID_SNAPSHOT;
+    }
 
     windows.push({
       name,
       remaining,
       limit,
-      resetAt: rawResetAt === undefined ? null : rawResetAt,
+      resetAt: rawResetAt === undefined || rawResetAt === null ? null : rawResetAt,
     });
   }
 

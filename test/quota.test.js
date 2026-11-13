@@ -96,10 +96,8 @@ test('parseQuotaSnapshot：非对象 / 空 windows / 字段形状非法一律 in
     { windows: [{ name: '5h', remaining: 1, limit: 2.5 }] },
     { windows: [{ name: '5h', remaining: 1, limit: 2, resetAt: 1.5 }] },
     { windows: [{ name: '5h', remaining: 1, limit: 2, resetAt: '123' }] },
-    { windows: [{ name: '5h', remaining: 1, limit: 2, resetAt: null }] },
     { windows: [{ name: '5h', remaining: 1, limit: 2 }], updatedAt: 1.5 },
     { windows: [{ name: '5h', remaining: 1, limit: 2 }], updatedAt: '1' },
-    { windows: [{ name: '5h', remaining: 1, limit: 2 }], updatedAt: null },
     {
       windows: [
         { name: '5h', remaining: 1, limit: 2 },
@@ -112,6 +110,15 @@ test('parseQuotaSnapshot：非对象 / 空 windows / 字段形状非法一律 in
     assert.equal(parsed.ok, false, `应判非法：${JSON.stringify(input)}`);
     assert.equal(parsed.reason, 'invalid_snapshot');
   }
+});
+
+test('parseQuotaSnapshot：resetAt / updatedAt 显式 null 与缺键等价（M-2）', () => {
+  const withNullReset = parseQuotaSnapshot({ windows: [{ name: '5h', remaining: 1, limit: 2, resetAt: null }] });
+  assert.equal(withNullReset.ok, true);
+  assert.equal(withNullReset.windows[0].resetAt, null);
+  const withNullUpdated = parseQuotaSnapshot({ updatedAt: null, windows: [{ name: '5h', remaining: 1, limit: 2 }] });
+  assert.equal(withNullUpdated.ok, true);
+  assert.equal(withNullUpdated.updatedAt, null);
 });
 
 test('parseQuotaSnapshot：未知窗口忽略并记入 ignored，不算失败', () => {

@@ -393,7 +393,7 @@ export function createTools({
       execute(args = {}) {
         assertArgs(args, 'reminder_add');
         const title = requireString(args.title, 'reminder_add', 'title');
-        const kind = optionalEnum(args.kind, REMINDER_KINDS, 'reminder_add', 'kind') ?? 'todo';
+        let kind = optionalEnum(args.kind, REMINDER_KINDS, 'reminder_add', 'kind') ?? 'todo';
         const dueAt = optionalInt(args.due_at, 'reminder_add', 'due_at', 0, Number.MAX_SAFE_INTEGER);
         const requested = optionalString(args.scope, 'reminder_add', 'scope');
         const resolved = resolveScope(requested);
@@ -423,6 +423,8 @@ export function createTools({
           }
           rrule = rruleText.trim();
           firstAt = next.at;
+          // M-3：有 rrule 就是系列；kind 缺省 todo 也要按 repeat 存，否则首投后置 fired 不再推进。
+          kind = 'repeat';
         } else if (kind === 'repeat') {
           return { ok: false, reason: 'rrule_required', message: 'kind=repeat 需要 rrule' };
         }

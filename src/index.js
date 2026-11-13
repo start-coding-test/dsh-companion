@@ -2355,6 +2355,9 @@ function quotaPaused(state) {
   return true;
 }
 
+/** M-1：额度紧张但快照没有 resetAt 时，隔多久重查一次（秒）。 */
+const QUOTA_PAUSE_RETRY_SECONDS = 60;
+
 /**
  * A2：按配置读一次额度快照（最多每 60s 一次）。读不到、过期、格式非法一律
  * 退回「不紧张」——闸门是降级装置，不能因为配额文件坏了反而卡住后台任务。
@@ -2387,9 +2390,13 @@ function refreshQuota(state, { force = false } = {}) {
   }
   const { evaluation, line } = read;
   state.quota = { evaluation, line, checkedAt: nowMs };
-  if (evaluation.paused === true && evaluation.resumeAt !== null) {
-    state.quotaPausedUntil = evaluation.resumeAt;
-  } else if (evaluation.paused !== true) {
+  if (evaluation.paused === true) {
+    // M-1：没有 resetAt 的紧张（例如只剩 5h 窗口没有重置时间）也要暂停，
+    // 用一个短重查窗口，避免永久停摆，也避免每轮读盘。
+    state.quotaPausedUntil = evaluation.resumeAt !== null
+      ? evaluation.resumeAt
+      : Math.floor(nowMs / 1000) + QUOTA_PAUSE_RETRY_SECONDS;
+  } else {
     state.quotaPausedUntil = null;
   }
   return state.quota;
@@ -4379,9 +4386,9 @@ function startScheduler(state) {
 export function settleReminderSent(state, row) {
   const { store, platform, config } = state;
   const fresh = typeof store.getReminder === 'function' ? store.getReminder(row.id) : null;
+  // M-3：系列由「有 rrule」判定，不再依赖 kind——工具侧允许 rrule 与默认 kind=todo 同时出现。
   const isSeries = fresh !== null
     && fresh !== undefined
-    && fresh.kind === 'repeat'
     && typeof fresh.rrule === 'string'
     && fresh.rrule !== '';
   if (!isSeries) return store.markReminderDelivered(row.id);
