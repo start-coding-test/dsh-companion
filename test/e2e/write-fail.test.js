@@ -124,6 +124,7 @@ test('V15 正常路径：写库成功、水位推进、状态板只 staged 不�
       regionText: '',
       textSource: 'transcript',
       transcript: [],
+      existingFacts: [],
     },
   ]);
 

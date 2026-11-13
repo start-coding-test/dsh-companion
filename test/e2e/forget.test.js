@@ -238,6 +238,7 @@ test('helpers：假模型草稿合法，可被巩固链路消费且同段不重�
     regionText: '',
     textSource: 'transcript',
     transcript: [],
+    existingFacts: [],
   });
   assert.ok(store.getEpisode(result.episodeId));
   assert.equal(store.listFacts({ scope: 'main' }).length, 1);

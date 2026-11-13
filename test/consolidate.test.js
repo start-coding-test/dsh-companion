@@ -413,6 +413,8 @@ test('consolidate：成功写 episode/facts/reminders/consolidation 并只 stage
     regionText: '',
     textSource: 'transcript',
     transcript: [],
+    // A8③：同主题候选事实也随回调下发（这段没有候选，故为空数组）。
+    existingFacts: [],
   }]);
   assert.equal(result.skipped, false);
   assert.equal(result.upto_seq, 10);

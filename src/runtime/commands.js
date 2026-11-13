@@ -954,13 +954,28 @@ function formatTokenSnapshot(metrics, budget) {
     const rssCode = Number(budget?.rssLevelCode ?? snapshot.rssLevel) || 0;
     const rssName = RSS_LEVEL_NAMES[rssCode] ?? 'ok';
     const rssMB = Number(budget?.rssMB ?? snapshot.rssMB) || 0;
+    const slotText = formatThreadSlotText(snapshot);
     return ` / tokens 本轮 入 ${tokensIn} 出 ${tokensOut}（超预算 ${overBudget} 次）`
       + `｜今日 ${daily}/${Number(budget?.dailyLimit) || DAILY_TOKEN_LIMIT}${tripped ? '（已熔断）' : ''}`
       + `｜RSS ${rssName} ${rssMB}MB`
+      + slotText
       + vectorText;
   } catch {
     return ` / tokens 本轮 0${vectorText}`;
   }
+}
+
+/**
+ * 线程执行槽的可观测片段（云端-C11-L2）：兜底释放与超时强制释放的次数。
+ * 两项都为 0 时整段省略，避免占用 /状态 的行宽。
+ * @param {Record<string, number>} [snapshot]
+ * @returns {string}
+ */
+function formatThreadSlotText(snapshot) {
+  const fallback = Number(snapshot?.threadSlotFallback) || 0;
+  const timeout = Number(snapshot?.threadSlotTimeout) || 0;
+  if (fallback === 0 && timeout === 0) return '';
+  return `｜线程槽 兜底 ${fallback}·超时 ${timeout}`;
 }
 
 /**

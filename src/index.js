@@ -3887,7 +3887,7 @@ async function resolveConsolidationLlm(state) {
   const hook = state.companion?.consolidationLlm;
   if (typeof hook === 'function') {
     state.llmRouteProbed = true;
-    return async ({ scope, seqFrom, seqTo, regionText, textSource, transcript }) => hook({
+    return async ({ scope, seqFrom, seqTo, regionText, textSource, transcript, existingFacts }) => hook({
       scope,
       seqFrom,
       seqTo,
@@ -3895,6 +3895,8 @@ async function resolveConsolidationLlm(state) {
       regionText: regionText ?? '',
       textSource: textSource ?? (regionText ? 'region' : 'transcript'),
       transcript: Array.isArray(transcript) ? transcript : state.transcript,
+      // A8③：同主题既有事实（供宿主模型自行拼 prompt 时使用）。
+      existingFacts: Array.isArray(existingFacts) ? existingFacts : [],
     });
   }
 
@@ -3904,13 +3906,15 @@ async function resolveConsolidationLlm(state) {
     return null;
   }
   const { provider, model } = route;
-  return async ({ scope, seqFrom, seqTo, regionText, transcript }) => {
+  return async ({ scope, seqFrom, seqTo, regionText, transcript, existingFacts }) => {
     const prompt = buildConsolidationPrompt({
       scope,
       seqFrom,
       seqTo,
       regionText: regionText ?? '',
       transcript: Array.isArray(transcript) ? transcript : state.transcript,
+      // A8③：把同主题既有事实交给模型，让它用 supersedes 指定整条改写。
+      existingFacts: Array.isArray(existingFacts) ? existingFacts : [],
     });
     const text = await state.platform.complete({
       provider,
@@ -4012,7 +4016,13 @@ async function runDeepSleep(state) {
  */
 async function deepConsolidate(state) {
   const { store, platform } = state;
-  if (state.transcript.length === 0) return { written: false, reason: 'nothing-to-consolidate' };
+  // D-3：deep-sleep 是「给主会话」的巩固，不能读 state.transcript（它属于最近一次
+  // switchScope 解析出的会话；线程活跃时会被线程的转录覆盖，从而把线程内容写成主会话记忆）。
+  // 这里直接取 main 的作用域快照，找不到就按空处理。
+  const mainTranscript = state.transcriptByScope instanceof Map
+    ? (state.transcriptByScope.get(SCOPE) ?? [])
+    : (state.transcriptScope === SCOPE ? state.transcript : []);
+  if (mainTranscript.length === 0) return { written: false, reason: 'nothing-to-consolidate' };
   // 定时器没有 payload：用 main 最近一次 pre-step 的快照（无快照说明没跑过 agent）。
   const snapshot = state.surfaceSnapshotByScope.get(SCOPE)
     ?? (state.currentScope === SCOPE ? state.surfaceSnapshot : null);
@@ -4660,7 +4670,8 @@ async function runLightChat(state) {
         scope: SCOPE,
         now,
         budgetTokens: 600,
-        limit: 3,
+        // A8⑥（v0.4.13）：生活类记忆条数由 recall.chatLimit 决定，默认 1。
+        limit: state.config.recall?.chatLimit ?? 1,
         vector: vectorConfig(state),
       });
       recallSummary = recalled.items

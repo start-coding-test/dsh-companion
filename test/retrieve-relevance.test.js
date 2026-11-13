@@ -214,15 +214,17 @@ test('V4-M1 recall 配置：默认值、minQueryChars 覆盖、非法值抛 Conf
     minVectorScore: 0.35,
     skipSmallTalk: true,
     minQueryChars: 2,
+    chatLimit: 1,
   });
   assert.deepEqual(normalizeRecall({}), {
     minVectorScore: 0.35,
     skipSmallTalk: true,
     minQueryChars: 2,
+    chatLimit: 1,
   });
   assert.deepEqual(
     normalizeRecall({ minVectorScore: 0.5, skipSmallTalk: false, minQueryChars: 4 }),
-    { minVectorScore: 0.5, skipSmallTalk: false, minQueryChars: 4 },
+    { minVectorScore: 0.5, skipSmallTalk: false, minQueryChars: 4, chatLimit: 1 },
   );
   // 0 与 1 都是合法边界。
   assert.equal(normalizeRecall({ minVectorScore: 0 }).minVectorScore, 0);
@@ -243,6 +245,16 @@ test('V4-M1 recall 配置：默认值、minQueryChars 覆盖、非法值抛 Conf
       () => normalizeRecall({ minQueryChars: bad }),
       (error) => error instanceof ConfigError && /minQueryChars/.test(error.field ?? ''),
       `minQueryChars=${String(bad)} 应抛 ConfigError`,
+    );
+  }
+  // chatLimit（A8⑥）：0..5 整数，默认 1。
+  assert.equal(normalizeRecall({ chatLimit: 0 }).chatLimit, 0);
+  assert.equal(normalizeRecall({ chatLimit: 5 }).chatLimit, 5);
+  for (const bad of [-1, 6, 1.5, Number.NaN, '1', null]) {
+    assert.throws(
+      () => normalizeRecall({ chatLimit: bad }),
+      (error) => error instanceof ConfigError && /chatLimit/.test(error.field ?? ''),
+      `chatLimit=${String(bad)} 应抛 ConfigError`,
     );
   }
   assert.throws(

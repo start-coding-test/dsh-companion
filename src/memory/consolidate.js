@@ -377,6 +377,111 @@ function normalizeReminder(raw, index) {
  * @param {unknown} draft
  * @returns {{episode: object, facts: object[], reminders: object[]}}
  */
+/**
+ * A8③：把选区/转录文本拼成用于「同主题」匹配的一段纯文本。
+ * @param {string|null} regionText
+ * @param {object[]} transcript
+ * @returns {string}
+ */
+/**
+ * A8③：从选区/转录里取出召回快照文本（用于把「历史快照」排除出同主题匹配）。
+ * @param {string} text
+ * @returns {string}
+ */
+function recallSnapshotText(text) {
+  if (typeof text !== 'string' || text === '') return '';
+  const matched = text.match(/\[相关记忆\][\s\S]*?\[\/相关记忆\]/gu);
+  return matched === null ? '' : matched.join('\n');
+}
+
+/**
+ * A8③：选区优先、转录兜底，并在匹配前剔除召回快照。
+ * @param {object} store
+ * @param {string} scope
+ * @param {string|null} regionText
+ * @param {object[]} transcript
+ * @returns {{id: string, subject_text: string, statement: string}[]}
+ */
+function selectExistingFactsFromRegion(store, scope, regionText, transcript) {
+  const body = promptBody(regionText, transcript);
+  if (body === '') return [];
+  // 段内只要出现召回快照，就不做「同主题改写」提示：快照里的旧事实与本次发言
+  // 混在一起时无法可靠区分「用户又提到」还是「召回带进来的」，宁可不给模型
+  // 改写建议，也不把历史快照当成新话题（V4-L2）。
+  if (recallSnapshotText(body) !== '') return [];
+  // 压缩摘要（宿主或平台生成的历史跨度）本身可能夹带召回快照，正文没有
+  // [相关记忆] 标记也无法区分新旧；这类段同样不注入「可改写事实」（V4-L2）。
+  if (/<compacted-summary>/u.test(body) || /automatically generated checkpoint/u.test(body)) {
+    return [];
+  }
+  return selectExistingFacts(store, scope, body);
+}
+
+function promptBody(regionText, transcript) {
+  if (typeof regionText === 'string' && regionText !== '') return regionText;
+  const rows = Array.isArray(transcript) ? transcript : [];
+  return rows.map((row) => String(row?.text ?? '')).join('\n');
+}
+
+/**
+ * A8③（v0.4.13）：挑出「本段对话里提到过 subject」的既有活跃事实，交给模型
+ * 做整条改写（supersede）而不是再写一条同义事实。
+ *
+ * 只做字面包含匹配（不调 embedder、不做余弦），符合 v0.4.13 的「embedder=hash
+ * 时不引入余弦」约束；同一 subject 只取最近强化的一条，最多 limit 条。
+ *
+ * @param {object} store
+ * @param {string} scope
+ * @param {string} text
+ * @param {{limit?: number}} [options]
+ * @returns {{id: string, subject_text: string, statement: string}[]}
+ */
+export function selectExistingFacts(store, scope, text, options = {}) {
+  if (!store || typeof store.listFacts !== 'function') return [];
+  // 召回块是「历史快照」，不是本段对话；匹配前先剔除，避免把召回内容当新话题。
+  const recallText = typeof options.recallText === 'string' ? options.recallText : '';
+  const body = typeof text === 'string' ? text.toLowerCase() : '';
+  if (body === '') return [];
+  const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : 12;
+  const rows = [];
+  for (let offset = 0; ; offset += FACT_PAGE_SIZE) {
+    const page = store.listFacts({ scope, limit: FACT_PAGE_SIZE, offset });
+    rows.push(...page);
+    if (page.length < FACT_PAGE_SIZE) break;
+  }
+  const bySubject = new Map();
+  for (const row of rows) {
+    if (row.status !== 'active') continue;
+    const subject = typeof row.subject_text === 'string' ? row.subject_text : '';
+    if (subject === '' || !body.includes(subject.toLowerCase())) continue;
+    // 若这条事实的正文只出现在召回快照里，视为「旧内容」而非本段对话，不当作改写候选。
+    if (recallText !== '' && typeof row.statement === 'string'
+      && recallText.toLowerCase().includes(row.statement.toLowerCase())) continue;
+    const kept = bySubject.get(subject);
+    if (kept === undefined || Number(row.last_reinforced_at) > Number(kept.last_reinforced_at)) {
+      bySubject.set(subject, row);
+    }
+  }
+  return [...bySubject.values()]
+    .sort((a, b) => Number(b.last_reinforced_at) - Number(a.last_reinforced_at))
+    .slice(0, limit)
+    .map((row) => ({ id: row.id, subject_text: row.subject_text, statement: row.statement }));
+}
+
+/**
+ * A8③：校验草稿里的 supersedes 目标（缺省/空串 → null；非字符串 → bad-draft）。
+ * @param {object} fact
+ * @param {number} index
+ * @returns {string|null}
+ */
+function normalizeSupersedesTarget(fact, index) {
+  const raw = fact?.supersedes;
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'string') throw badDraft(`facts[${index}].supersedes must be a string`);
+  const trimmed = raw.trim();
+  return trimmed === '' ? null : trimmed;
+}
+
 function normalizeDraft(draft) {
   if (!isPlainObject(draft)) throw badDraft('draft must be an object');
   // A8④（v0.4.13）：纯工具/命令区间可以没有情景记忆，episode 允许为 null；
@@ -385,7 +490,10 @@ function normalizeDraft(draft) {
     ? null
     : normalizeEpisode(draft.episode);
   if (!Array.isArray(draft.facts)) throw badDraft('draft.facts must be an array');
-  const facts = draft.facts.map((fact, index) => normalizeFact(fact, index));
+  const facts = draft.facts.map((fact, index) => ({
+    ...normalizeFact(fact, index),
+    supersedes: normalizeSupersedesTarget(fact, index),
+  }));
   if (draft.reminders !== undefined && draft.reminders !== null && !Array.isArray(draft.reminders)) {
     throw badDraft('draft.reminders must be an array when present');
   }
@@ -560,6 +668,14 @@ export function buildConsolidationPrompt(input = {}) {
       .map((row) => `${row?.role ?? 'unknown'}: ${String(row?.text ?? '')}`)
     : [regionText];
   const body = rows.join('\n');
+  const existing = Array.isArray(input.existingFacts) ? input.existingFacts : [];
+  const existingLines = existing.length === 0
+    ? []
+    : [
+      '同主题已有事实（如需整条改写，在该 fact 上加 "supersedes":"<id>"；否则只输出新增或变化的部分）：',
+      // 只给 id 与主题：正文可能来自召回快照，复述会把「历史检索内容」带进巩固窗口。
+      ...existing.map((row) => `- id=${row.id}｜${row.subject_text ?? ''}`),
+    ];
   return [
     '你是记忆巩固器。把下面这段对话压缩成一条情景记忆与若干长期事实。',
     '只输出一个 JSON 对象，不要解释，不要 Markdown 代码块。格式：',
@@ -573,6 +689,7 @@ export function buildConsolidationPrompt(input = {}) {
     '生活类信息也要抽：作息（几点睡/起）、饮食（口味/忌口/常吃）、兴趣（最近在看/在玩/在读）、情绪事件（为什么高兴或低落）、人际关系（家人朋友同事的近况），分别用 lifestyle / mood / relation / preference 等 kind。',
     '同一对象（例如「咖啡」）已有事实时，subject_text 保持一致（用同一个词），只输出这次新增或变化的部分，不要换词重写同一条。',
     `scope=${scope} seq=${input.seqFrom}-${input.seqTo}`,
+    ...existingLines,
     '对话：',
     body,
   ].join('\n');
@@ -663,6 +780,7 @@ export async function consolidate(input = {}) {
 
   // 2) 模型切分 + 校验。校验失败在事务之前抛出，库内不产生任何行。
   // N1：选区文本优先，transcript 仅作兜底；模型回调原样收到 textSource 便于审计。
+  const existingFacts = selectExistingFactsFromRegion(store, scope, regionText, transcript);
   const draft = await llm({
     scope,
     seqFrom: from,
@@ -670,6 +788,7 @@ export async function consolidate(input = {}) {
     regionText: regionText ?? '',
     textSource,
     transcript,
+    existingFacts,
   });
   const { episode, facts: draftedFacts, reminders: draftedReminders } = normalizeDraft(draft);
   // V9-M1：episode 四字段（及 topics/entities）落库前逐个脱敏，凭据值不落库；
@@ -753,6 +872,9 @@ export async function consolidate(input = {}) {
       if (page.length < FACT_PAGE_SIZE) break;
     }
     let insertedFacts = 0;
+    let supersededFacts = 0;
+    // A8③：只允许改写本段候选中出现过的旧事实。
+    const candidateIds = new Set(existingFacts.map((row) => row.id));
     for (const fact of facts) {
       const key = factKey(fact);
       const existing = byKey.get(key);
@@ -763,7 +885,7 @@ export async function consolidate(input = {}) {
         continue;
       }
       byKey.set(key, { active: null, miss: null });
-      store.insertFact({
+      const inserted = store.insertFact({
         scope,
         kind: fact.kind,
         subject_id: fact.subject_id,
@@ -781,6 +903,17 @@ export async function consolidate(input = {}) {
         valid_to: fact.valid_to,
         fidelity: fact.fidelity,
       });
+      // A8③（v0.4.13）：模型按 prompt 里的 id 指定 supersedes 时，把旧行标为
+      // superseded 并指向新行。只接受本段候选集里的 id，避免误伤其它 scope。
+      if (fact.supersedes !== null && candidateIds.has(fact.supersedes)) {
+        const info = store.db
+          .prepare(
+            `UPDATE facts SET status = 'superseded', superseded_by = ?, updated_at = ?
+              WHERE id = ? AND scope = ? AND status = 'active'`,
+          )
+          .run(inserted.id, at, fact.supersedes, scope);
+        supersededFacts += Number(info.changes) || 0;
+      }
       insertedFacts += 1;
     }
 

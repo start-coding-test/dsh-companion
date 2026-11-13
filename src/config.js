@@ -83,6 +83,8 @@ const RECALL_DEFAULTS = Object.freeze({
   // 2 字节中文实体（「蓝鲸」「生日」）因此可召回；拉丁 2 字母词仍会被
   // 问候词/算术/停用词等规则过滤，见 docs/usage.md「召回相关性门槛」。
   minQueryChars: 2,
+  // A8⑥（v0.4.13）：闲聊轮最多带几条生活类记忆。默认 1，0 表示不带。
+  chatLimit: 1,
 });
 
 Object.defineProperty(DEFAULT_VALUES, 'recall', {
@@ -460,7 +462,7 @@ export function normalizeRecall(raw, warnings = []) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ConfigError('recall', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
   }
-  const allowed = new Set(['minVectorScore', 'skipSmallTalk', 'minQueryChars']);
+  const allowed = new Set(['minVectorScore', 'skipSmallTalk', 'minQueryChars', 'chatLimit']);
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) warnings.push(`unknown config field "recall.${key}" ignored`);
   }
@@ -493,7 +495,14 @@ export function normalizeRecall(raw, warnings = []) {
       `must be an integer within 1..64, got ${JSON.stringify(minQueryChars)}`,
     );
   }
-  return Object.freeze({ minVectorScore, skipSmallTalk, minQueryChars });
+  const chatLimit = raw.chatLimit === undefined ? defaults.chatLimit : raw.chatLimit;
+  if (typeof chatLimit !== 'number' || !Number.isInteger(chatLimit) || chatLimit < 0 || chatLimit > 5) {
+    throw new ConfigError(
+      'recall.chatLimit',
+      `must be an integer within 0..5, got ${JSON.stringify(chatLimit)}`,
+    );
+  }
+  return Object.freeze({ minVectorScore, skipSmallTalk, minQueryChars, chatLimit });
 }
 
 /**
