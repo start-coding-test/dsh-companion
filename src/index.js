@@ -26,6 +26,7 @@ import { basename, dirname, join } from 'node:path';
 import { isQuietAt, normalizeConfig } from './config.js';
 import { REMINDER_MAX_DELIVERY_ATTEMPTS, Store, reminderDueAt } from './memory/store.js';
 import { retrieve } from './memory/retrieve.js';
+import { nextSeriesFire } from './scheduler/series.js';
 import { createEmbedder } from './memory/embedders/index.js';
 import { assemble } from './memory/assemble.js';
 import {
@@ -4327,6 +4328,64 @@ function startScheduler(state) {
  * @param {object} state
  * @returns {number} 本次入队条数（因同 id 已排队而跳过的不计）
  */
+/**
+ * A4（v0.4.13）：一次提醒投递成功后的收尾。
+ *
+ * 普通提醒仍走「一次性 fired」；带 rrule 的 repeat 提醒则沿**原定序列**推进到
+ * 下一次（停机错过的多次只补最近一次，其余只计数），COUNT/UNTIL 用尽才收尾。
+ * 推进失败或规则失效时退回一次性完成，避免同一条提醒反复重投。
+ *
+ * @param {object} state
+ * @param {object} row 入队时的提醒行
+ * @returns {unknown}
+ */
+export function settleReminderSent(state, row) {
+  const { store, platform, config } = state;
+  const fresh = typeof store.getReminder === 'function' ? store.getReminder(row.id) : null;
+  const isSeries = fresh !== null
+    && fresh !== undefined
+    && fresh.kind === 'repeat'
+    && typeof fresh.rrule === 'string'
+    && fresh.rrule !== '';
+  if (!isSeries) return store.markReminderDelivered(row.id);
+
+  const seconds = Math.floor(platform.now() / 1000);
+  const anchor = Number(fresh.due_at ?? fresh.next_fire_at);
+  const plan = nextSeriesFire({
+    rrule: fresh.rrule,
+    anchorAt: anchor,
+    afterAt: Number(fresh.next_fire_at ?? anchor),
+    nowAt: seconds,
+    seriesIndex: Number(fresh.series_index ?? 0),
+    timeZone: config?.timezone,
+  });
+
+  if (plan.ok !== true) {
+    platform.log('warn', '[dsh-companion] repeat reminder rule invalid at delivery; closing series', {
+      id: row.id,
+      reason: plan.reason,
+    });
+    return store.markReminderDelivered(row.id);
+  }
+  if (plan.exhausted === true) {
+    platform.log('info', '[dsh-companion] repeat reminder series finished', { id: row.id, missed: plan.missed });
+    return store.markReminderDelivered(row.id);
+  }
+
+  const advanced = store.advanceReminderOccurrence(row.id, {
+    nextFireAt: plan.nextFireAt,
+    seriesIndex: plan.seriesIndex,
+  });
+  if (advanced?.ok !== true) return store.markReminderDelivered(row.id);
+  if (plan.missed > 0) {
+    platform.log('info', '[dsh-companion] repeat reminder skipped missed occurrences', {
+      id: row.id,
+      missed: plan.missed,
+    });
+  }
+  return advanced;
+}
+
 function fireDueReminders(state) {
   const { store, platform, proactive } = state;
   const now = platform.now();
@@ -4379,7 +4438,7 @@ function fireDueReminders(state) {
           REMINDER_MAX_DELIVERY_ATTEMPTS,
         );
       },
-      onSent: () => store.markReminderDelivered(row.id),
+      onSent: () => settleReminderSent(state, row),
       onFailed: () => store.markReminderDeliveryFailed(row.id, {
         now: Math.floor(platform.now() / 1000),
       }),

@@ -21,6 +21,7 @@
  */
 
 import { DEFAULT_TIMEZONE, zonedParts } from '../time.js';
+import { formatRRule } from '../scheduler/recurrence.js';
 
 /** 状态板总预算（token，按 Math.ceil(len / 2) 估算）。 */
 export const BOARD_TOKEN_LIMIT = 800;
@@ -191,6 +192,11 @@ function mapReminder(row, display) {
   const retrying = retryAt !== null && retryAt > display.now;
   const notes = [];
   if (day !== '') notes.push(day);
+  // A4（v0.4.13）：重复提醒显示节奏，例如「每天 08:00」。
+  if (typeof row.rrule === 'string' && row.rrule !== '') {
+    const rule = formatRRule(row.rrule, { timeZone: display.timeZone, anchorAt: due });
+    if (typeof rule === 'string' && rule !== '') notes.push(rule);
+  }
   if (retrying) {
     const clock = formatClock(retryAt, display.timeZone);
     notes.push(`重试中，下次 ${clock}`);
