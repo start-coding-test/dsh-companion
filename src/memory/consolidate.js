@@ -30,6 +30,10 @@ export const DEFAULT_AT_TOKENS = 24_000;
 /** 空闲阈值：距最后一条人类消息 30 分钟。 */
 export const DEFAULT_IDLE_MS = 30 * 60 * 1000;
 
+// A6（v0.4.13）：压缩迟滞的两个默认值；config.compact 可覆盖。
+export const DEFAULT_FLOOR_INCREMENT_TOKENS = 4_096;
+export const DEFAULT_THRESHOLD_COOLDOWN_TURNS = 3;
+
 /** 去重扫描的事实分页大小（Store 单页上限远大于此值）。 */
 const FACT_PAGE_SIZE = 200;
 
@@ -223,6 +227,22 @@ export function planConsolidation(input = {}) {
   const idleMs = finiteNumber(input.idleMs) ?? DEFAULT_IDLE_MS;
   const now = epochMs(input.now) ?? Date.now();
   const lastHumanAt = epochMs(input.lastHumanAt);
+  // A6（v0.4.13）：压缩迟滞。floorTokens 是上次压缩后的实测水位（不可压底），
+  // 涨不够 minIncrementTokens 就不值得再压；同一 scope 两次 threshold 之间还要
+  // 隔够 cooldownTurns 轮。hard 与 idle 分支不受这两条限制。
+  const floorTokens = finiteNumber(input.floorTokens);
+  const minIncrementTokens = Math.max(
+    0,
+    finiteNumber(input.minIncrementTokens) ?? DEFAULT_FLOOR_INCREMENT_TOKENS,
+  );
+  const cooldownTurns = Math.max(
+    0,
+    Math.trunc(finiteNumber(input.cooldownTurns) ?? DEFAULT_THRESHOLD_COOLDOWN_TURNS),
+  );
+  const turnsSinceThreshold = Math.max(
+    0,
+    Math.trunc(finiteNumber(input.turnsSinceThreshold) ?? cooldownTurns),
+  );
 
   /** @type {'idle'|'threshold'|'hard'|null} */
   let trigger = null;
@@ -230,7 +250,12 @@ export function planConsolidation(input = {}) {
     trigger = 'hard';
   } else if (lastHumanAt !== null && now - lastHumanAt >= idleMs) {
     trigger = 'idle';
-  } else if (overCount >= 2 && tokens >= atTokens) {
+  } else if (
+    overCount >= 2 &&
+    tokens >= atTokens &&
+    (floorTokens === null || tokens >= floorTokens + minIncrementTokens) &&
+    turnsSinceThreshold >= cooldownTurns
+  ) {
     trigger = 'threshold';
   }
   return { trigger, pending: trigger !== null };

@@ -168,6 +168,21 @@ Object.defineProperty(DEFAULT_VALUES, 'persona', {
   configurable: false,
 });
 
+// v0.4.13 A6：压缩迟滞。minIncrementTokens = 压后实测水位之上还要涨多少才值得再压；
+// cooldownTurns = 同一 scope 两次 threshold 压缩之间至少隔几轮（hard/idle 不受限）。
+// 该节同样不参与 16 键安装自检（与 vector/recall/session/consolidation/thread/timing/persona 一致）。
+const COMPACT_DEFAULTS = Object.freeze({
+  minIncrementTokens: 4_096,
+  cooldownTurns: 3,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'compact', {
+  value: COMPACT_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -634,6 +649,46 @@ export function normalizePersona(raw, warnings = []) {
 }
 
 /**
+ * 校验 compact 配置（v0.4.13 A6，压缩迟滞）。
+ *
+ * `minIncrementTokens` 是「压后水位之上再涨多少 token 才值得再压一次」，默认 4096；
+ * `cooldownTurns` 是同一 scope 两次 threshold 压缩之间的最小回合数，默认 3。
+ * 两者只影响 threshold 分支，hard 与 idle 触发不受限制。
+ * 该节默认不参与 Object.keys(DEFAULTS) 的 16 键安装自检（与其它扩展节一致）。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{minIncrementTokens: number, cooldownTurns: number}>}
+ */
+export function normalizeCompact(raw, warnings = []) {
+  const defaults = DEFAULTS.compact;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('compact', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['minIncrementTokens', 'cooldownTurns']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "compact.${key}" ignored`);
+  }
+  const minIncrementTokens =
+    raw.minIncrementTokens === undefined ? defaults.minIncrementTokens : raw.minIncrementTokens;
+  if (!Number.isInteger(minIncrementTokens) || minIncrementTokens < 256 || minIncrementTokens > 1_000_000) {
+    throw new ConfigError(
+      'compact.minIncrementTokens',
+      `must be an integer within 256..1000000, got ${JSON.stringify(minIncrementTokens)}`,
+    );
+  }
+  const cooldownTurns = raw.cooldownTurns === undefined ? defaults.cooldownTurns : raw.cooldownTurns;
+  if (!Number.isInteger(cooldownTurns) || cooldownTurns < 0 || cooldownTurns > 50) {
+    throw new ConfigError(
+      'compact.cooldownTurns',
+      `must be an integer within 0..50, got ${JSON.stringify(cooldownTurns)}`,
+    );
+  }
+  return Object.freeze({ minIncrementTokens, cooldownTurns });
+}
+
+/**
  * 合并默认值并校验配置；未知字段只产生 warning，不阻断。
  * @param {Record<string, unknown>} [raw]
  * @returns {Readonly<Record<string, unknown>>} 冻结后的配置（含 warnings 数组）
@@ -709,6 +764,7 @@ export function normalizeConfig(raw = {}) {
   cfg.thread = normalizeThread(input.thread, warnings);
   cfg.timing = normalizeTiming(input.timing, warnings);
   cfg.persona = normalizePersona(input.persona, warnings);
+  cfg.compact = normalizeCompact(input.compact, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

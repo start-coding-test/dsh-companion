@@ -139,6 +139,8 @@ export function handleCommand({
   pendingCompactions,
   threadAgentPreset,
   timing,
+  // A6（v0.4.13）：压缩底与迟滞参数（没有样本时整行省略）。
+  compact,
   persona,
   shadow,
   emotion,
@@ -183,6 +185,7 @@ export function handleCommand({
       pendingCompactions,
       threadAgentPreset,
       timing,
+      compact,
       persona,
       shadow,
       emotion,
@@ -579,6 +582,24 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // timing 只在接线层传入时输出，保持旧调用方（单测）的 /状态 格式不变。
   if (options.timing !== null && options.timing !== undefined && typeof options.timing === 'object') {
     lines.push(...formatTimingLines(options.timing));
+  }
+  // A6：压缩底只在压过至少一次（有实测样本）时输出；仍超目标时给出 calibrate 提示。
+  if (
+    options.compact !== null &&
+    options.compact !== undefined &&
+    typeof options.compact === 'object' &&
+    Number.isFinite(options.compact.floor)
+  ) {
+    const bits = [`目标 ${options.compact.target}`];
+    if (Number.isFinite(options.compact.minIncrementTokens)) {
+      bits.push(`增量门槛 ${options.compact.minIncrementTokens}`);
+    }
+    if (Number.isFinite(options.compact.cooldownTurns)) {
+      bits.push(`冷却 ${options.compact.cooldownTurns} 轮`);
+    }
+    let line = `压缩底：${options.compact.floor} tokens（${bits.join('，')}）`;
+    if (options.compact.over) line += '；压后仍超目标，建议 calibrate';
+    lines.push(line);
   }
   // V3-M2：主会话绑定对排障关键（提醒投错会话时先看这里）。
   const mainSession = options.mainSession;

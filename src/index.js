@@ -691,6 +691,10 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     lastHumanAt: null,
     tokens: 0,
     overCount: 0,
+    /** A6（v0.4.13）：每个 scope 的压缩底（压后实测水位）与 threshold 冷却计数。 */
+    compactFloorByScope: new Map(),
+    compactFloorWarnByScope: new Map(),
+    thresholdTurnsByScope: new Map(),
     /** N-M1：每个 scope 一个待压缩槽，跨 scope 不再互相覆盖。 */
     pendingCompact: createPendingCompacts(),
     /** M3：待执行的巩固任务（pre-step 只登记，不 await）。 */
@@ -1019,6 +1023,14 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
               lastConsolidateMs: state.lastConsolidateMs,
               compactWarnMs: config.timing?.compactWarnMs,
               consolidateWarnMs: config.timing?.consolidateWarnMs,
+            },
+            // A6：压缩底与迟滞参数；未压过（无样本）时命令层整行省略。
+            compact: {
+              floor: state.compactFloorByScope.get(SCOPE) ?? null,
+              target: config.compactAtTokens,
+              minIncrementTokens: config.compact?.minIncrementTokens ?? null,
+              cooldownTurns: config.compact?.cooldownTurns ?? null,
+              over: state.compactFloorWarnByScope.get(SCOPE) ?? null,
             },
             // v0.4.12：/状态 展示人格卡来源（内置默认 / 文件路径 / 加载失败原因）。
             persona: personaStatus(state),
@@ -1513,6 +1525,12 @@ async function runPreStep(state, payload) {
   if (usage !== null) {
     state.tokens = usage.tokensIn;
     state.overCount = usage.tokensIn >= config.compactAtTokens ? state.overCount + 1 : 0;
+    // A6：threshold 冷却按轮计（每个 pre-step 算一轮），hard/idle 不看这个数。
+    // 冷却从「上一次 threshold 压缩」起算；从没见过时按已满足处理。
+    state.thresholdTurnsByScope.set(
+      scope,
+      (state.thresholdTurnsByScope.get(scope) ?? (config.compact?.cooldownTurns ?? 3)) + 1,
+    );
     state.metrics.observe('tokensIn', usage.tokensIn);
     state.metrics.observe('tokensOut', usage.tokensOut);
     if (isNewTurn) recordTokenEvent(state, usage);
@@ -2248,6 +2266,13 @@ function scheduleConsolidation(state, payload, scope = SCOPE) {
     hardTokens: config.compactHardTokens,
     atTokens: config.compactAtTokens,
     idleMs: config.idleMs,
+    // A6：压后水位（不可压底）与冷却；没有样本时 floorTokens=null 表示不设门槛。
+    floorTokens: compactFloorOf(state, scope),
+    minIncrementTokens: config.compact?.minIncrementTokens,
+    cooldownTurns: config.compact?.cooldownTurns,
+    // 没记录过（该 scope 还没压过）时视为冷却已满足，否则新会话要空等 N 轮。
+    turnsSinceThreshold:
+      state.thresholdTurnsByScope.get(scope) ?? config.compact?.cooldownTurns ?? 3,
   });
   if (!plan.trigger) return;
   if (state.transcript.length === 0) return;
@@ -2674,6 +2699,86 @@ function maybeRetryConsolidation(state) {
  * @param {object} payload
  * @param {string} [scope] 当前会话作用域
  */
+/**
+ * A6（v0.4.13）：读某 scope 的压缩底（压后实测水位）。首次访问时从 schema_meta
+ * 持久化值恢复；顺手做一次启动自检——compactAtTokens 低于「底 + 增量门槛」时
+ * 压缩在物理上不可能把水位降下来，提示用 calibrate 推导。
+ * @param {object} state
+ * @param {string} scope
+ * @returns {number|null}
+ */
+function compactFloorOf(state, scope) {
+  if (state.compactFloorByScope.has(scope)) return state.compactFloorByScope.get(scope);
+  const { store, platform, config } = state;
+  let floor = null;
+  try {
+    const raw = store.getMeta(`compact_floor:${scope}`);
+    if (raw !== null) {
+      const parsed = Number(raw);
+      if (Number.isFinite(parsed) && parsed >= 0) floor = parsed;
+    }
+  } catch (error) {
+    platform.log('debug', '[dsh-companion] compact floor read failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+  state.compactFloorByScope.set(scope, floor);
+  const minIncrement = config.compact?.minIncrementTokens ?? 4096;
+  if (floor !== null && floor + minIncrement >= config.compactAtTokens) {
+    platform.log('warn', '[dsh-companion] compactAtTokens is below the incompressible floor', {
+      scope,
+      floor,
+      compactAtTokens: config.compactAtTokens,
+      minIncrementTokens: minIncrement,
+      hint: 'run scripts/calibrate to derive compactAtTokens from the real context window',
+    });
+  }
+  return floor;
+}
+
+/**
+ * A6：压缩成功后记录实测水位并（对 threshold 触发）重置冷却计数。
+ * 水位仍高于 compactAtTokens 时写一条 warn，/状态 也会标注——这是「压不动」的
+ * 直接证据，比每轮都压一次更有用。
+ * @param {object} state
+ * @param {object} payload
+ * @param {string} scope
+ * @param {'idle'|'threshold'|'hard'|null} trigger
+ */
+function recordCompactionFloor(state, payload, scope, trigger) {
+  const { platform, store, config } = state;
+  const measured = measureTokens(state, payload);
+  if (measured !== null) {
+    const floor = measured.tokensIn;
+    state.compactFloorByScope.set(scope, floor);
+    try {
+      store.setMeta(`compact_floor:${scope}`, String(floor));
+    } catch (error) {
+      platform.log('debug', '[dsh-companion] compact floor write failed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    const target = config.compactAtTokens;
+    const over = floor > target;
+    state.compactFloorWarnByScope.set(scope, over ? { floor, target } : null);
+    if (over) {
+      platform.log('warn', '[dsh-companion] compacted but still above compactAtTokens', {
+        scope,
+        floor,
+        target,
+      });
+    }
+  }
+  if (trigger === 'threshold') {
+    state.thresholdTurnsByScope.set(scope, 0);
+    try {
+      store.setMeta(`compact_threshold_turns:${scope}`, '0');
+    } catch {
+      // 计数只用于冷却，写失败不阻断压缩流程。
+    }
+  }
+}
+
 async function maybeCompact(state, payload, scope = SCOPE) {
   const { platform, store, config } = state;
   const pending = peekPendingCompact(state.pendingCompact, scope);
@@ -2738,6 +2843,8 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     if (pending.id) store.retargetConsolidation(pending.id, { uptoSeq: watermark });
     takePendingCompact(state.pendingCompact, scope);
     clearWatermarkAnchor(state.store, scope);
+    // A6：记录压后实测水位（持久化），并标注「压了还超目标」；threshold 触发后重置冷却。
+    recordCompactionFloor(state, payload, scope, pending.trigger);
     const revision = publishBoard(store, scope, 'compact');
 
     // V7-L2：压缩完成事件带毫秒耗时（detail.kind='compaction' 与巩固事件区分）。
