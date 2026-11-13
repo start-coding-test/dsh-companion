@@ -2685,6 +2685,9 @@ async function executeConsolidationJob(state, job) {
       endSeq,
       scope: job.scope,
     });
+    // r2 M-1：pendingCompact 不保存 trigger，所以冷却归零必须在这里按 job.trigger 做，
+    // 否则 recordCompactionFloor 里的 threshold 分支永远不可达，计数只增不减。
+    if (job.trigger === 'threshold') resetThresholdCooldown(state, job.scope);
     setWatermark(state, job.scope, endSeq);
     clearWatermarkAnchor(state.store, job.scope);
     state.consolidationRetry = null;
@@ -2979,7 +2982,16 @@ function compactFloorOf(state, scope) {
  * @param {string} scope
  * @param {'idle'|'threshold'|'hard'|null} trigger
  */
-function recordCompactionFloor(state, payload, scope, trigger) {
+function resetThresholdCooldown(state, scope) {
+  state.thresholdTurnsByScope.set(scope, 0);
+  try {
+    state.store.setMeta(`compact_threshold_turns:${scope}`, '0');
+  } catch {
+    // 计数只用于冷却，写失败不阻断压缩流程。
+  }
+}
+
+function recordCompactionFloor(state, payload, scope) {
   const { platform, store, config } = state;
   const measured = measureTokens(state, payload);
   if (measured !== null) {
@@ -3001,14 +3013,6 @@ function recordCompactionFloor(state, payload, scope, trigger) {
         floor,
         target,
       });
-    }
-  }
-  if (trigger === 'threshold') {
-    state.thresholdTurnsByScope.set(scope, 0);
-    try {
-      store.setMeta(`compact_threshold_turns:${scope}`, '0');
-    } catch {
-      // 计数只用于冷却，写失败不阻断压缩流程。
     }
   }
 }
@@ -3078,7 +3082,7 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     takePendingCompact(state.pendingCompact, scope);
     clearWatermarkAnchor(state.store, scope);
     // A6：记录压后实测水位（持久化），并标注「压了还超目标」；threshold 触发后重置冷却。
-    recordCompactionFloor(state, payload, scope, pending.trigger);
+    recordCompactionFloor(state, payload, scope);
     const revision = publishBoard(store, scope, 'compact');
 
     // V7-L2：压缩完成事件带毫秒耗时（detail.kind='compaction' 与巩固事件区分）。
