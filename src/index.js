@@ -238,6 +238,17 @@ const COMPANION_RPC_PREFIX = 'companion-';
 /** C5-H1a：提醒正文前缀（surface 记录没有 source，按正文兜底识别）。 */
 const REMINDER_TEXT_PREFIX = '[提醒] ';
 
+/**
+ * A7（U13-H1）：IM 插件的来源/引用信封。
+ *
+ * dsh-im 把信封作为独立 user 消息注入（source = {kind:'plugin:dsh-im', form:'notice'}），
+ * 并且来源信封排在正文之后。任何「用户正文」都不得把信封当成发言，否则召回查询、
+ * 情绪判定、交互日会拿到一串字段名。这里同时保留正文前缀兜底，供 source 丢失的
+ * 回放/旧宿主使用。
+ */
+const PLUGIN_NOTICE_SOURCE_PREFIX = 'plugin:';
+const PLUGIN_NOTICE_TEXT_PREFIX = '<dsh_im_';
+
 /** C5-H1a：投递失败事件 kind（memory_events.detail_json.kind）。 */
 const DELIVERY_ERROR_KIND = 'delivery_error';
 
@@ -3119,6 +3130,21 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
   }
   if (Number.isInteger(recalled.vectorHits)) state.lastVectorHits = recalled.vectorHits;
 
+  // A7：排障开关。只记消息条数/信封条数/查询长度/来源 id，绝不记正文。
+  if (process.env.DSH_COMPANION_MIRROR_DEBUG === '1') {
+    const list = Array.isArray(messages) ? messages : [];
+    const skippedNotices = list.filter((message) => isPluginNotice(message)).length;
+    const sourceRow = [...list].reverse().find(
+      (message) => message?.role === 'user' && !isInjectedMessage(message),
+    );
+    platform.log('info', '[dsh-companion] mirror debug', {
+      messages: list.length,
+      skippedNotices,
+      queryLength: query.length,
+      querySourceId: sourceRow?.source?.rpcId ?? sourceRow?.id ?? null,
+    });
+  }
+
   const assembled = assemble({
     sections: [],
     boardText: '',
@@ -3293,7 +3319,33 @@ function isInjectedMessage(message) {
     || kind === COMMAND_HINT_SOURCE_KIND
     || kind === PRIVACY_HINT_SOURCE_KIND
     || kind === RUNTIME_CONTEXT_SOURCE_KIND
-    || isCompanionMessage(message);
+    || isCompanionMessage(message)
+    || isPluginNotice(message);
+}
+
+/**
+ * A7（U13-H1）：这条消息是不是 IM 插件注入的信封（不是用户正文）。
+ *
+ * 判定顺序：先看 source（plugin: 前缀 + form:'notice'），再按正文 <dsh_im_ 前缀兜底。
+ * 信封里是渠道/会话元数据，不是用户说的话。
+ * @param {unknown} message
+ * @returns {boolean}
+ */
+function isPluginNotice(message) {
+  if (message === null || typeof message !== 'object') return false;
+  const source = message.source;
+  if (source !== null && typeof source === 'object') {
+    const kind = source.kind;
+    if (typeof kind === 'string' && kind.startsWith(PLUGIN_NOTICE_SOURCE_PREFIX)
+      && source.form === 'notice') return true;
+  }
+  const blocks = Array.isArray(message.content) ? message.content : [];
+  for (const block of blocks) {
+    const text = typeof block === 'string' ? block : block?.type === 'text' ? block.text : null;
+    if (typeof text === 'string' && text.trimStart().startsWith(PLUGIN_NOTICE_TEXT_PREFIX)) return true;
+  }
+  return typeof message.text === 'string'
+    && message.text.trimStart().startsWith(PLUGIN_NOTICE_TEXT_PREFIX);
 }
 
 /**
@@ -4712,6 +4764,7 @@ function lastUserText(messages) {
       || text.startsWith(RECALL_MARKER)
       || text.startsWith(EMOTION_PROMPT_PREFIX)
       || text.startsWith(REMINDER_TEXT_PREFIX)
+      || text.startsWith(PLUGIN_NOTICE_TEXT_PREFIX)
     ) continue;
     return text;
   }
@@ -5243,6 +5296,8 @@ function renderToolValue(value) {
 export {
   formatChatStatus,
   handleChatCommand,
+  isPluginNotice,
+  lastUserText,
   runCommitmentFollowups,
   runLightChat,
 };
