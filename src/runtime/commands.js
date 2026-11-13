@@ -21,6 +21,7 @@ import { describeAssembly, displaySectionName } from '../persona/assembly-record
 import { forgetMemory } from '../memory/forget.js';
 import { describe } from '../persona/emotion.js';
 import { DAILY_TOKEN_LIMIT } from './budget.js';
+import { TOKEN_SOURCE_LABELS } from './token-ledger.js';
 import { formatTimingLines } from './timing.js';
 import {
   DEFAULT_TIMEZONE,
@@ -148,6 +149,8 @@ export function handleCommand({
   emotion,
   assembly,
   appraiser,
+  // A1（v0.4.13）：今日按来源的 token 账本（没有样本时整行省略）。
+  tokenUsage,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -196,6 +199,8 @@ export function handleCommand({
       assembly,
       // v0.6-E4：判定器模式与近 24h 统计（只含元数据）。
       appraiser,
+      // A1：今日用量与来源占比。
+      tokenUsage,
       now: toMillis(now),
     }),
   };
@@ -549,6 +554,29 @@ function formatGiB(value) {
 }
 
 /** @param {object} store @param {string} scope @param {object|undefined} metrics @param {string} timeZone @param {object} [budget] @param {{threadsSupported?: boolean, mainSession?: {id?: string|null, binding?: string}, threadAgentPreset?: string|null, persona?: {name?: string, version?: number, status?: string, path?: string|null, reason?: string|null}, shadow?: {mode?: string}, emotion?: object}} [options] */
+/**
+ * A1：今日用量按来源占比；没有样本（total=0）时整行省略。
+ * @param {{total?: number, cacheHit?: number, bySource?: {source:string,label?:string,total:number,share:number}[]}} [usage]
+ * @returns {string|null}
+ */
+function formatTokenUsageLine(usage) {
+  if (usage === null || usage === undefined || typeof usage !== 'object') return null;
+  const total = Number(usage.total);
+  if (!Number.isFinite(total) || total <= 0) return null;
+  const rows = Array.isArray(usage.bySource) ? usage.bySource : [];
+  const parts = rows
+    .filter((row) => Number(row?.total) > 0)
+    .slice(0, 5)
+    .map((row) => {
+      const label = row.label ?? TOKEN_SOURCE_LABELS[row.source] ?? String(row.source);
+      const share = Math.round((Number(row.share) || 0) * 100);
+      return `${label} ${share}%`;
+    });
+  const cacheHit = Number(usage.cacheHit);
+  const cacheText = Number.isFinite(cacheHit) && cacheHit > 0 ? `｜缓存命中 ${cacheHit}` : '';
+  return `今日用量：${total} tokens（${parts.join(' / ')}）${cacheText}`;
+}
+
 function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   const stats = store.stats();
   const tables = [
@@ -565,8 +593,11 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   const tokenText = formatTokenSnapshot(metrics, budget);
   const failureText = formatFailureStatus(store, timeZone);
   const limitsText = formatRssLimits(budget);
+  const usageLine = formatTokenUsageLine(options.tokenUsage);
   const lines = [`状态：${counts} / ${fts}${tokenText}`];
   if (limitsText !== null) lines.push(limitsText);
+  // A1：今日按来源的 token 账本（只在接线层传入时输出）。
+  if (usageLine !== null) lines.push(usageLine);
   // H3②：宿主没有 sessionController 时线程/任务工具虽已注册但调用会返回
   // capability_missing，状态里说清楚，免得用户以为 /线程 为空是数据问题。
   if (options.threadsSupported === false) {

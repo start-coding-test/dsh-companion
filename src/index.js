@@ -103,6 +103,7 @@ import {
   recordTurnUsage,
   rssLimitsFromConfig,
 } from './runtime/budget.js';
+import { dayKeyOf, summarizeUsage, usageRow } from './runtime/token-ledger.js';
 import {
   MAX_CONSOLIDATION_RETRIES,
   errorMessage,
@@ -526,6 +527,8 @@ export function apply(ctx, rawConfig, hooks = {}) {
       metrics,
       (input) => retrieveVectors(state, input),
       vectorConfig(state),
+      // A1（v0.4.13）：worker 会话的 token 估算按 task 来源入账。
+      (entry) => recordModelUsage(state, entry),
     );
     track(startScheduler(state));
   } catch (error) {
@@ -1012,6 +1015,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             metrics,
             timeZone: config.timezone,
             budget: typeof budgetInfo === 'function' ? budgetInfo() : undefined,
+    // A1：今日按来源的 token 账本（读库，重启后仍在）。
+    tokenUsage: tokenUsageSnapshot(state),
             // V7-H1：每次命令调用时读能力位，不用 apply 时快照（宿主可能晚挂载）。
             threadsSupported: platform.capabilities.threadTools === true,
             // V3-M2：/状态 展示当前主会话与绑定模式。
@@ -1106,7 +1111,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
  * @param {(input: object) => Promise<object>} [retrieveFn] 带 embedder 的召回入口（缺省用 retrieve）
  * @param {object} [vectorCfg] 召回用的 vector 配置（embedder 不可用时 enabled=false）
  */
-function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg) {
+function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg, recordTokenUsage) {
   // V7-H1 审计：tools 是声明的 inject，apply 前就绪；工具注册只能在 apply
   // 阶段完成，故保留 apply 时判断。线程能力见下方 execute 内的调用时判断。
   if (!platform.capabilities.tools) return;
@@ -1125,6 +1130,8 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     currentScope,
     budgetGate,
     metrics,
+    // A1：task_run 结束后把 worker 用量送回账本。
+    recordTokenUsage: typeof recordTokenUsage === 'function' ? recordTokenUsage : undefined,
     vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
@@ -1936,6 +1943,40 @@ function recordTokenEvent(state, usage) {
  * @param {string|null} sessionId
  * @returns {number} 本次记入的增量
  */
+/**
+ * A1（v0.4.13）：把一次模型调用的 usage 写入 token_usage 账本。
+ *
+ * 记账是旁路：任何失败只记 debug，绝不能影响主流程（模型调用已经发生）。
+ * @param {object} state
+ * @param {{source: string, scope?: string|null, usage?: object|null,
+ *          at?: number, requestId?: string|null}} entry
+ * @returns {object|null} 写入的行
+ */
+function recordModelUsage(state, entry) {
+  const store = state?.store;
+  if (store === undefined || store === null || typeof store.recordTokenUsage !== 'function') {
+    return null;
+  }
+  try {
+    const row = usageRow({
+      at: entry.at ?? state.platform.now(),
+      timeZone: state.config?.timezone,
+      source: entry.source,
+      scope: entry.scope ?? null,
+      usage: entry.usage ?? null,
+      requestId: entry.requestId ?? null,
+    });
+    store.recordTokenUsage(row);
+    return row;
+  } catch (error) {
+    state.platform.log('debug', '[dsh-companion] token ledger write failed', {
+      source: entry.source,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return null;
+  }
+}
+
 function recordUsage(state, usage, sessionId) {
   if (usage === null || typeof usage !== 'object') return 0;
   const id = typeof sessionId === 'string' && sessionId !== '' ? sessionId : 'unknown';
@@ -1948,6 +1989,11 @@ function recordUsage(state, usage, sessionId) {
   }
   baselines.set(id, total);
   if (delta > 0) {
+    recordModelUsage(state, {
+      source: 'main',
+      scope: 'main',
+      usage: { inputTokens: delta },
+    });
     recordTurnUsage(state.budget, delta, {
       at: state.platform.now(),
       timezone: state.config.timezone,
@@ -2165,6 +2211,25 @@ export async function backfillVectors(state) {
  * @param {object} state
  * @returns {object}
  */
+/**
+ * A1：今日 token 账本摘要（读库聚合，重启后不丢）。
+ * @param {object} state
+ * @returns {object|null}
+ */
+function tokenUsageSnapshot(state) {
+  try {
+    const store = state?.store;
+    if (store === undefined || store === null || typeof store.aggregateTokenUsage !== 'function') {
+      return null;
+    }
+    const dayKey = dayKeyOf(state.platform.now(), state.config?.timezone);
+    return summarizeUsage(store.aggregateTokenUsage(dayKey));
+  } catch {
+    // 展示用旁路：失败就不显示这一行，不影响 /状态 其它内容。
+    return null;
+  }
+}
+
 function budgetInfo(state) {
   refreshBudget(state);
   const rssLimits = rssLimitsFromConfig(state.config).gib;
@@ -3207,6 +3272,8 @@ function ensureAppraiserQueue(state) {
         },
       });
       recordAppraisalUsage(state, messages, raw, usage);
+      // A1：判定器调用单列来源，不与主会话混淆。
+      recordModelUsage(state, { source: 'appraise', scope: 'main', usage });
       return raw;
     },
     apply: async (item, verdict, source) => {
@@ -3916,11 +3983,17 @@ async function resolveConsolidationLlm(state) {
       // A8③：把同主题既有事实交给模型，让它用 supersedes 指定整条改写。
       existingFacts: Array.isArray(existingFacts) ? existingFacts : [],
     });
+    let usage = null;
     const text = await state.platform.complete({
       provider,
       model,
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+      onUsage: (value) => {
+        usage = value;
+      },
     });
+    // A1：巩固调用单独入账（此前完全不计）。
+    recordModelUsage(state, { source: 'consolidate', scope, usage });
     return parseDraftJson(text);
   };
 }
@@ -4816,11 +4889,20 @@ async function resolveChatLlm(state) {
   }
   const { provider, model } = route;
   state.chatLlmRoute = { provider, model, source: route.source };
-  state.chatLlm = async (input) => state.platform.complete({
-    provider,
-    model,
-    messages: [{ role: 'user', content: [{ type: 'text', text: buildChatPrompt(input) }] }],
-  });
+  state.chatLlm = async (input) => {
+    let usage = null;
+    const text = await state.platform.complete({
+      provider,
+      model,
+      messages: [{ role: 'user', content: [{ type: 'text', text: buildChatPrompt(input) }] }],
+      onUsage: (value) => {
+        usage = value;
+      },
+    });
+    // A1：闲聊轮单独入账。
+    recordModelUsage(state, { source: 'smalltalk', scope: 'main', usage });
+    return text;
+  };
   return state.chatLlm;
 }
 

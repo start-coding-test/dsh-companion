@@ -389,7 +389,7 @@ test('token_usage：recordTokenUsage 校验与缺省 at', (t) => {
   track(dir, store);
 
   assert.deepEqual([...TOKEN_USAGE_SOURCES], [
-    'main', 'consolidate', 'smalltalk', 'embedding', 'task', 'thread',
+    'main', 'consolidate', 'smalltalk', 'embedding', 'task', 'thread', 'appraise',
   ]);
 
   const before = Date.now();

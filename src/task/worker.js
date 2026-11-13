@@ -141,6 +141,10 @@ export async function runTask(options = {}) {
 
   const durationMs = Math.max(0, clock() - startedAt);
   const result = { status: outcome.status, sessionId, durationMs };
+  if (Number.isFinite(outcome.tokensIn) && outcome.tokensIn > 0) {
+    // A1：worker 会话的 token 估算，供调用方记账（不写记忆）。
+    result.tokensIn = outcome.tokensIn;
+  }
   if (typeof outcome.reason === 'string' && outcome.reason !== '') {
     result.reason = outcome.reason;
   }
@@ -225,9 +229,12 @@ function waitForIdle({
     let hardTimer = null;
     let sampleTimer = null;
     let stage = 'run';
+    // A1：最后一次采样的 token 估算，用于向账本记 task/thread 来源。
+    let lastTokens = 0;
 
     const finish = (value) => {
       if (settled) return;
+      if (lastTokens > 0) value.tokensIn = lastTokens;
       settled = true;
       if (softTimer !== null) clearTimeout(softTimer);
       if (hardTimer !== null) clearTimeout(hardTimer);
@@ -286,6 +293,7 @@ function waitForIdle({
 
     function applySample(totalTokens) {
       if (settled) return;
+      lastTokens = totalTokens;
       const verdict = nextStage(stage, totalTokens, { warnAt: tokenWarn, stopAt: tokenStop });
       if (verdict.changed) {
         stage = verdict.stage;

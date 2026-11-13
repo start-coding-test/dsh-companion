@@ -215,9 +215,9 @@ export const FACT_KINDS = Object.freeze([
 
 const FACT_KIND_SET = new Set(FACT_KINDS);
 
-/** v15（A1）：token_usage.source 的六类调用来源。 */
+/** v15（A1）：token_usage.source 的调用来源（v0.6 判定器单列）。 */
 export const TOKEN_USAGE_SOURCES = Object.freeze([
-  'main', 'consolidate', 'smalltalk', 'embedding', 'task', 'thread',
+  'main', 'consolidate', 'smalltalk', 'embedding', 'task', 'thread', 'appraise',
 ]);
 
 const TOKEN_USAGE_SOURCE_SET = new Set(TOKEN_USAGE_SOURCES);
@@ -550,7 +550,7 @@ CREATE TABLE IF NOT EXISTS token_usage (
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   at               INTEGER NOT NULL,
   day_key          TEXT NOT NULL,
-  source           TEXT NOT NULL CHECK (source IN ('main','consolidate','smalltalk','embedding','task','thread')),
+  source           TEXT NOT NULL CHECK (source IN ('main','consolidate','smalltalk','embedding','task','thread','appraise')),
   scope            TEXT,
   input_tokens     INTEGER NOT NULL DEFAULT 0,
   output_tokens    INTEGER NOT NULL DEFAULT 0,

@@ -170,6 +170,24 @@ const LIMIT_SCHEMA = Object.freeze({
  * @param {{setTimeout:Function, clearTimeout:Function}} [deps.timers] 可注入定时器。
  * @returns {Array<{name:string, description:string, parameters:object, execute:Function}>}
  */
+/**
+ * A1（v0.4.13）：把 worker 会话的 token 估算按 task 来源交给账本。
+ *
+ * 抽成独立函数便于在不起真实 worker 的情况下单测；任何异常/缺字段都静默。
+ *
+ * @param {unknown} result runTask 的返回值（可能带 tokensIn）
+ * @param {{scope?: string, recordTokenUsage?: Function}} [options]
+ * @returns {boolean} 是否真正记账
+ */
+export function reportTaskUsage(result, options = {}) {
+  const { scope, recordTokenUsage } = options ?? {};
+  if (typeof recordTokenUsage !== 'function') return false;
+  const tokensIn = result !== null && typeof result === 'object' ? result.tokensIn : undefined;
+  if (!Number.isFinite(tokensIn) || tokensIn <= 0) return false;
+  recordTokenUsage({ source: 'task', scope: typeof scope === 'string' && scope !== '' ? scope : 'main', usage: { inputTokens: tokensIn } });
+  return true;
+}
+
 export function createTools({
   store,
   retrieve,
@@ -180,6 +198,7 @@ export function createTools({
   timeZone = DEFAULT_TIMEZONE,
   threadAgentPreset,
   taskLimits,
+  recordTokenUsage,
   currentScope,
   budgetGate,
   metrics,
@@ -706,7 +725,8 @@ export function createTools({
         // C5-H1b：一次 task_run 执行对应一个稳定 claimKey，worker 的 prompt
         // requestId = companion-task:<taskId>:<claimKey>，重试不换 id。
         const claimKey = makeExecutionId('claim', nowMs());
-        return runBackgroundTask({
+        const runScope = typeof scope === 'string' && scope !== '' ? scope : 'main';
+        const pending = runBackgroundTask({
           platform,
           store,
           goal,
@@ -717,6 +737,12 @@ export function createTools({
           claimKey,
           ...(taskLimits === undefined ? {} : { limits: taskLimits }),
         });
+        // A1（v0.4.13）：worker 会话的 token 估算按 task 来源入账；记账是旁路。
+        Promise.resolve(pending).then(
+          (result) => reportTaskUsage(result, { scope: runScope, recordTokenUsage }),
+          () => {},
+        );
+        return pending;
       },
     },
 
