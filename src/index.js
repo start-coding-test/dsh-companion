@@ -70,6 +70,7 @@ import {
   applyClassifiedEvent,
   runEmotionTurn,
 } from './persona/emotion-wiring.js';
+import { EXPIRED_SOURCE_KIND, injectExpiredNotices } from './reminder/expired-notice.js';
 import {
   APPRAISAL_ERRORS,
   AppraisalError,
@@ -1594,7 +1595,9 @@ async function runPreStep(state, payload) {
   // V50-M3：情绪只算不注入，结果由 systemPrompt.context 在装配时取用。
   injectEmotion(state, payload, messages, turnKey, scope);
   const injection = await injectRecall(state, payload, messages, turnKey, scope);
-  const hints = [hint, privacy, ...(injection?.inject ?? [])]
+  // A5（V5-L1）：重试用尽而作废的提醒，在下一次真正发言时告知一次。
+  const expired = await injectExpiredNotices(state, payload, messages, turnKey, scope);
+  const hints = [hint, privacy, ...(injection?.inject ?? []), ...(expired?.inject ?? [])]
     .filter((item) => item !== null);
   if (hints.length === 0) return injection;
   return { ...(injection ?? {}), inject: hints };
@@ -3635,6 +3638,7 @@ function isInjectedMessage(message) {
     || kind === COMMAND_HINT_SOURCE_KIND
     || kind === PRIVACY_HINT_SOURCE_KIND
     || kind === RUNTIME_CONTEXT_SOURCE_KIND
+    || kind === EXPIRED_SOURCE_KIND
     || isCompanionMessage(message)
     || isPluginNotice(message);
 }
