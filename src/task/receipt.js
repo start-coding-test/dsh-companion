@@ -16,6 +16,7 @@ const ARTIFACTS_BUDGET_MAX = 80;
 const STATUS_LABELS = Object.freeze({
   ok: '成功',
   timeout: '超时',
+  partial: '部分完成',
   error: '失败',
 });
 
@@ -25,7 +26,7 @@ const STATUS_LABELS = Object.freeze({
  * 四个要素始终保留；结论过长时截断并补「…」，产物过长时同样截断。
  *
  * @param {object} receipt
- * @param {string} receipt.status 'ok'|'timeout'|'error'（其它值原样展示）
+ * @param {string} receipt.status 'ok'|'timeout'|'partial'|'error'（其它值原样展示）
  * @param {string} [receipt.summary] 结论（一句话）
  * @param {Array<string|object>} [receipt.artifacts] 产物（路径或带 path/name 的对象）
  * @param {number} [receipt.durationMs] 耗时（毫秒）

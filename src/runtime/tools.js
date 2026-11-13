@@ -178,6 +178,7 @@ export function createTools({
   cwd,
   timeZone = DEFAULT_TIMEZONE,
   threadAgentPreset,
+  taskLimits,
   currentScope,
   budgetGate,
   metrics,
@@ -713,6 +714,7 @@ export function createTools({
           scope: typeof scope === 'string' && scope !== '' ? scope : 'main',
           cwd: defaultCwd,
           claimKey,
+          ...(taskLimits === undefined ? {} : { limits: taskLimits }),
         });
       },
     },

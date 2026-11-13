@@ -1120,6 +1120,8 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     timeZone: config.timezone,
     // V10-H1：线程会话 preset 由配置决定；null 时 thread_run 不传（宿主默认）。
     threadAgentPreset: config.thread?.agentPreset ?? null,
+    // A3：worker token 预算（60K 收尾 / 80K 结束）由配置驱动，缺省用 task/limits.js 的常量。
+    taskLimits: config.task,
     currentScope,
     budgetGate,
     metrics,

@@ -142,7 +142,7 @@ describe('worker token sampling', () => {
     assert.equal(promptsOf(ctx).length, 2);
   });
 
-  test('硬线 80001：两段式 cancel、reason=token_limit、回执 status=partial', async () => {
+  test('硬线 80001：两段式 cancel、reason=token_limit、回执部分完成', async () => {
     const ctx = new FakeCtx({
       deferIdle: true,
       returns: { 'tokenMeter.measure': { totalTokens: 80_001 } },
@@ -170,7 +170,7 @@ describe('worker token sampling', () => {
 
     const receipt = receiptEventOf(store);
     assert.equal(receipt.detail_json.status, 'partial');
-    assert.match(receipt.detail_json.text, /^状态：partial/u);
+    assert.match(receipt.detail_json.text, /^状态：部分完成/u);
     assert.match(receipt.detail_json.text, /写了一半的方案/u);
     assert.ok(receipt.detail_json.text.includes(TOKEN_LIMIT_NOTE));
     assert.ok(Array.from(receipt.detail_json.text).length <= 300);
@@ -307,7 +307,7 @@ describe('run.js partial 映射', () => {
     assert.equal(result.status, 'partial');
     assert.equal(result.partial, true);
     assert.equal(result.reason, 'token_limit');
-    assert.match(result.receipt, /^状态：partial/u);
+    assert.match(result.receipt, /^状态：部分完成/u);
     assert.match(result.receipt, /半成品方案/u);
     assert.ok(result.receipt.includes(TOKEN_LIMIT_NOTE));
 
