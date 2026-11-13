@@ -22,8 +22,9 @@ import {
 import { summarizeCost } from './commands.js';
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
 import { nextOccurrence, parseRRule } from '../scheduler/recurrence.js';
+import { FACT_KINDS as STORE_FACT_KINDS } from '../memory/store.js';
 
-const FACT_KINDS = new Set(['identity', 'relation', 'preference', 'project', 'knowledge', 'other']);
+const FACT_KINDS = new Set(STORE_FACT_KINDS);
 const SALIENCE = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
 const PRIVACY = new Set(['normal', 'sensitive', 'secret']);
 const REMINDER_KINDS = new Set(['todo', 'schedule', 'repeat', 'commitment']);

@@ -20,7 +20,7 @@ import { join } from 'node:path';
 
 import { toBigrams } from './bigram.js';
 import { isSensitiveText } from './govern.js';
-import { EMOTION_EVENT_RETENTION } from './store.js';
+import { EMOTION_EVENT_RETENTION, SCHEMA_VERSION } from './store.js';
 
 /** 本插件导出文件格式版本。 */
 export const EXPORT_VERSION = 1;
@@ -84,7 +84,7 @@ export function formatStamp(now = Date.now()) {
  * 导出该常量，因此这里仅作为 schema_meta 缺失时的兜底；正常情况下导出应
  * 读取数据库里的实际版本，而不是猜。
  */
-const CURRENT_SCHEMA_VERSION = '14';
+const CURRENT_SCHEMA_VERSION = SCHEMA_VERSION;
 
 /**
  * 读取导出 payload 应写入的 schema_version：优先 store.getMeta，

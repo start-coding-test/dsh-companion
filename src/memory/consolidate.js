@@ -21,6 +21,7 @@ import {
   redactSensitiveValues,
 } from './govern.js';
 import { decayOf } from './reinforce.js';
+import { FACT_KINDS as STORE_FACT_KINDS } from './store.js';
 import { renderBoard, stageBoard } from './state-board.js';
 
 /** 硬阈值：活跃 turn 中到 40k token 也必须巩固（安全阀）。 */
@@ -37,9 +38,7 @@ export const DEFAULT_THRESHOLD_COOLDOWN_TURNS = 3;
 /** 去重扫描的事实分页大小（Store 单页上限远大于此值）。 */
 const FACT_PAGE_SIZE = 200;
 
-const FACT_KINDS = new Set([
-  'identity', 'relation', 'preference', 'project', 'knowledge', 'other',
-]);
+const FACT_KINDS = new Set(STORE_FACT_KINDS);
 const SALIENCE_VALUES = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
 const PRIVACY_VALUES = new Set(['normal', 'sensitive', 'secret']);
 const FIDELITY_VALUES = new Set(['full', 'gist', 'index']);
