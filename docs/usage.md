@@ -186,6 +186,64 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
   只进上面这行的统计。
 - 判定 token 计入每日预算；预算熔断时不再发判定请求，直接走规则兜底。
 
+### 压缩底与冷却（A6，v0.4.13）
+
+压过至少一次之后，`/状态` 会多一行「压缩底」——它是上次压缩后**实测的 token 水位**，
+用来避免「刚压完还超阈值就再压一次」的来回抖动：
+
+```text
+压缩底：38800 tokens（目标 40000，增量门槛 4096，冷却 3 轮）
+压缩底：41200 tokens（目标 40000，增量门槛 4096，冷却 3 轮）；压后仍超目标，建议 calibrate
+```
+
+- 只有 `threshold` 触发受压缩底与冷却约束：要求当前 tokens 同时满足
+  `>= compactAtTokens`、`>= 压缩底 + compact.minIncrementTokens`、且距上次 threshold 压缩
+  已经过 `compact.cooldownTurns` 轮。`hard`（安全阀）与 `idle`（闲置）不受这两条限制。
+- 压缩底存在库里的 `schema_meta`（键 `compact_floor:<scope>`），重启后仍在；冷却按 pre-step
+  轮数计，只有 threshold 压缩成功后才归零。
+- 压完仍高于 `compactAtTokens`（说明正文里有压不下去的部分，例如工具输出与系统段）时：
+  日志写一条 warn，`/状态` 那行带上「压后仍超目标，建议 calibrate」。用 `node scripts/calibrate`
+  重新估算 `workingMemoryTokens` / `compactAtTokens`，不要硬调小阈值。
+- 两个键都不在安装自检的 16 个默认键里，按需配置即可：
+
+```yaml
+compact:
+  minIncrementTokens: 4096   # 256–1000000
+  cooldownTurns: 3           # 0–50，0 = 不冷却
+```
+
+### 额度闸门（A2，v0.4.13）
+
+`quota.source` 默认 `none`（不读任何配额文件）。设为 `file` 后，插件每次最多每 60s 读一次
+`quota.path` 指向的 JSON 快照，按各窗口剩余比例决定是否**暂停后台任务**：
+
+```json
+{
+  "updatedAt": 1794373643,
+  "windows": [
+    { "name": "5h",    "remaining": 120,  "limit": 1000, "resetAt": 1794377243 },
+    { "name": "7d",    "remaining": 9000, "limit": 100000, "resetAt": 1794800000 },
+    { "name": "month", "remaining": 90000, "limit": 1000000 }
+  ]
+}
+```
+
+- 时间戳都是 **Unix 秒**；`updatedAt` 超过 15 分钟未更新视为过期，按「不紧张」处理。
+- 预留比例默认 `5h: 0.3`、`7d: 0.2`、`month: 0.1`（`quota.reserve` 可覆盖，取值 0–1）：
+  任一窗口 `remaining / limit` 低于对应比例即视为紧张。
+- 紧张时**只停后台**：闲聊、主动消息、向量回填、非 hard 巩固。主会话回复、`hard` 巩固与压缩
+  永远不受影响——用户当面说的话优先于配额。
+- 遇到 429 / 限流 / 额度不足时按窗口 `resetAt` 退避（没有 `resetAt` 就指数退避），不重试刷量。
+- `/状态` 会多一行：紧张时「额度紧张，后台暂停至 18:30」，充裕时给出各窗口余量；
+  `quota.source=none` 时不输出该行。
+
+```yaml
+quota:
+  source: file
+  path: D:/dsh-companion/quota.json
+  # reserve: { "5h": 0.3, "7d": 0.2, month: 0.1 }   # 可选
+```
+
 ### `/别闲聊` 与 `/恢复闲聊`
 
 关闭 / 恢复低频主动闲聊。开关写入 `schema_meta`，跨重启持久化：
