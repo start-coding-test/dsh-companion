@@ -232,14 +232,31 @@ function waitForIdle({
     // A1：最后一次采样的 token 估算，用于向账本记 task/thread 来源。
     let lastTokens = 0;
 
-    const finish = (value) => {
+    const settle = (value) => {
       if (settled) return;
-      if (lastTokens > 0) value.tokensIn = lastTokens;
       settled = true;
       if (softTimer !== null) clearTimeout(softTimer);
       if (hardTimer !== null) clearTimeout(hardTimer);
       if (sampleTimer !== null) clearTimeout(sampleTimer);
       resolve(value);
+    };
+
+    const finish = (value) => {
+      if (settled) return;
+      if (lastTokens > 0 || typeof measure !== 'function') {
+        if (lastTokens > 0) value.tokensIn = lastTokens;
+        settle(value);
+        return;
+      }
+      // L-4：短任务可能在第一次采样之前就结束，收尾时补一次终值采样；
+      // 采样失败仍是 fail-open（不记 tokens，不影响任务结果）。
+      Promise.resolve()
+        .then(() => measure(session))
+        .then((measuredValue) => {
+          const total = readTotalTokens(measuredValue);
+          if (total > 0) value.tokensIn = total;
+        }, () => {})
+        .finally(() => settle(value));
     };
 
     softTimer = setTimeout(() => {

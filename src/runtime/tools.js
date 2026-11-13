@@ -409,7 +409,7 @@ export function createTools({
         let rrule = null;
         let firstAt = dueAt ?? null;
         if (rruleText !== undefined) {
-          const parsed = parseRRule(rruleText);
+          const parsed = parseRRule(rruleText, { timeZone });
           if (!parsed.ok) return { ok: false, reason: parsed.reason, message: parsed.detail };
           const anchor = dueAt ?? Math.floor(nowMs() / 1000);
           const next = nextOccurrence({

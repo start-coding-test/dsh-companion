@@ -65,15 +65,29 @@ function unsupported(detail) {
 
 /**
  * 解析 `YYYYMMDD` 或 `YYYYMMDDTHHMMSSZ`；失败返回 null。
- * 日期形态按「UTC 当日 23:59:59」折算成秒（包含当天），时刻形态按 UTC。
+ * 日期形态按「配置时区当日 23:59:59」折算成秒（包含当天），带 Z 的时刻形态按 UTC。
  * @param {string} value
+ * @param {string} [timeZone]
  * @returns {number|null}
  */
-function parseUntilValue(value) {
+function parseUntilValue(value, timeZone = DEFAULT_TIMEZONE) {
   const utcMatch = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/u.exec(value);
   const dayMatch = /^(\d{4})(\d{2})(\d{2})$/u.exec(value);
   if (dayMatch !== null) {
-    return utcSeconds(Number(dayMatch[1]), Number(dayMatch[2]), Number(dayMatch[3]), 23, 59, 59);
+    // L-5：UNTIL=20261120 指「当地 11-20 最后一刻」，不是 UTC 23:59:59。
+    const endMs = zonedTimeToInstant({
+      year: Number(dayMatch[1]),
+      month: Number(dayMatch[2]),
+      day: Number(dayMatch[3]),
+      hour: 23,
+      minute: 59,
+      second: 59,
+    }, timeZone);
+    if (!Number.isFinite(endMs)) return null;
+    // 回读本地时间，确认日期真实存在（zonedTimeToInstant 会把 2 月 30 日顺延）
+    const back = zonedParts(endMs, timeZone);
+    if (back.year !== Number(dayMatch[1]) || back.month !== Number(dayMatch[2]) || back.day !== Number(dayMatch[3])) return null;
+    return Math.floor(endMs / 1000);
   }
   if (utcMatch !== null) {
     return utcSeconds(
@@ -110,7 +124,8 @@ function utcSeconds(year, month, day, hour, minute, second) {
  *   byDay: string[]|null, count: number|null, until: number|null}}
  *   | {ok: false, reason: 'rrule_unsupported'|'rrule_invalid', detail: string}}
  */
-export function parseRRule(text) {
+export function parseRRule(text, options = {}) {
+  const untilZone = options?.timeZone ?? DEFAULT_TIMEZONE;
   if (typeof text !== 'string') return invalid('rrule must be a string');
   const trimmed = text.trim();
   if (trimmed === '') return invalid('rrule is empty');
@@ -156,7 +171,7 @@ export function parseRRule(text) {
   let until = null;
   if (fields.has('UNTIL')) {
     const rawUntil = fields.get('UNTIL');
-    until = parseUntilValue(rawUntil);
+    until = parseUntilValue(rawUntil, untilZone);
     if (until === null) return invalid(`invalid UNTIL=${rawUntil}`);
   }
 
@@ -202,9 +217,9 @@ function toUnixSeconds(value) {
  * @returns {{freq: 'DAILY'|'WEEKLY', interval: number, byDay: string[]|null,
  *   count: number|null, until: number|null}|null}
  */
-function normalizeRule(rule) {
+function normalizeRule(rule, timeZone = DEFAULT_TIMEZONE) {
   if (typeof rule === 'string') {
-    const parsed = parseRRule(rule);
+    const parsed = parseRRule(rule, { timeZone });
     return parsed.ok ? parsed.rule : null;
   }
   if (rule === null || typeof rule !== 'object') return null;
@@ -422,7 +437,7 @@ function createWalker(rule, anchorAt, timeZone) {
  *   | {ok: false, reason: string}}
  */
 export function nextOccurrence({ rule, anchorAt, afterAt, timeZone } = {}) {
-  const normalized = normalizeRule(rule);
+  const normalized = normalizeRule(rule, normalizeTimeZone(timeZone) ?? DEFAULT_TIMEZONE);
   if (normalized === null) return { ok: false, reason: 'rrule_invalid' };
   const zone = normalizeTimeZone(timeZone);
   if (zone === null) return { ok: false, reason: 'invalid_time_zone' };
@@ -452,7 +467,7 @@ export function nextOccurrence({ rule, anchorAt, afterAt, timeZone } = {}) {
  * @returns {{ok: true, count: number} | {ok: false, reason: string}}
  */
 export function countOccurrencesBetween({ rule, anchorAt, fromAt, toAt, timeZone } = {}) {
-  const normalized = normalizeRule(rule);
+  const normalized = normalizeRule(rule, normalizeTimeZone(timeZone) ?? DEFAULT_TIMEZONE);
   if (normalized === null) return { ok: false, reason: 'rrule_invalid' };
   const zone = normalizeTimeZone(timeZone);
   if (zone === null) return { ok: false, reason: 'invalid_time_zone' };

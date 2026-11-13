@@ -10,14 +10,17 @@ v0.6.1 一致；schema 从 v14 升到 v15，首次启动会自动迁移（旧库
 ```yaml
 budget:
   dailyHardLimit: 3000000   # 每日硬上限，只防失控；100000..1e12
-  window5hLimit: null       # 预留 5 小时窗口；null 表示不启用
+  window5hLimit: null       # 5 小时滑窗硬上限；null 表示不启用
 ```
 
 每次模型调用都会落一行 `token_usage`：来源分 `main` / `consolidate` / `smalltalk` /
 `embedding` / `task` / `thread` / `appraise`，并记录峰值/谷值（本地 00:30–08:30 记
-`offpeak`）。`/状态` 会多一行「今日用量：… （主会话 a% / 巩固 b% / …）｜缓存命中 M」。
-计数写库，重启不清零。`thread` 来源当前尚未入账（`thread_run` 没有可采样的会话对象），
-其余六类都已接线。
+`offpeak`）。`/状态` 会多一行「今日用量：… （主会话 a% / 巩固 b% / …）｜缓存命中 M tokens」。
+
+`budget.window5hLimit` 非空时，另外用 `token_usage` 表按 5 小时滑窗求和；任一条到线上都会点亮 `budgetTripped`（与日上限同一套后台闸门）。
+计数写库，重启不清零。当前已接线五类：`main` / `consolidate` / `smalltalk` / `task` /
+`appraise`；`embedding` 与 `thread` 尚未入账（本地 embedding 不产生模型结算，
+`thread_run` 没有可采样的会话对象），落库时这两类为空是预期行为。
 
 ### 后台额度闸门（A2）
 
@@ -52,6 +55,9 @@ quota:
 compact:
   minIncrementTokens: 4096  # 压完之后至少再涨这么多才允许下一次阈值压缩
   cooldownTurns: 3          # 两次阈值压缩之间至少隔几轮（hard/idle 不受限）
+
+冷却计数只在**新轮**推进（工具尾的 pre-step 不算），写进 `schema_meta` 的
+`compact_threshold_turns:<scope>`，重启后继续生效，不会因重启绕过。
 ```
 
 压缩成功后会把「压完的实际 token 数」记到 `schema_meta` 的 `compact_floor:<scope>`。
@@ -65,7 +71,7 @@ minIncrementTokens`、距上次阈值压缩 ≥ `cooldownTurns` 轮。`/状态` 
 （可带 `INTERVAL`）、`COUNT`、`UNTIL`；其它（如 `BYMONTHDAY`）返回
 `{ "ok": false, "reason": "rrule_unsupported" }`。投递成功后按**原定序列**推进到下一次
 （不按投递时间顺延），跨 DST 不漂移；停机错过多次只补最近一次，其余计入 missed。
-`COUNT`/`UNTIL` 耗尽后系列自然结束。状态板与 `/线程` 列表会显示「每天 08:00」这类节奏。
+`COUNT`/`UNTIL` 耗尽后系列自然结束。`UNTIL=YYYYMMDD` 按**配置时区**当地日末解释（`20261120` = 当地 11-20 23:59:59），时刻形态 `...T081500Z` 仍按 UTC。状态板与 `/线程` 列表会显示「每天 08:00」这类节奏。
 
 ### 过期提醒通知（A5）
 

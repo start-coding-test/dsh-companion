@@ -28,8 +28,8 @@ function at(iso) {
 }
 
 /** 解析并断言成功，返回 rule 对象。 */
-function ruleOf(text) {
-  const parsed = parseRRule(text);
+function ruleOf(text, timeZone = 'Asia/Shanghai') {
+  const parsed = parseRRule(text, { timeZone });
   assert.equal(parsed.ok, true, `parseRRule 应成功：${text}`);
   return parsed.rule;
 }
@@ -70,10 +70,19 @@ test('parseRRule：键名大小写不敏感、允许空格、重复键取第一�
   assert.equal(ruleOf('FREQ=DAILY;COUNT=2;COUNT=9').count, 2);
 });
 
-test('parseRRule：UNTIL 日期形态按当日 23:59:59Z 折算，时刻形态按 UTC', () => {
+test('parseRRule：UNTIL 日期形态按当地日末折算，时刻形态按 UTC', () => {
+  // L-5：UNTIL=20261120 指配置时区当地 11-20 最后一刻（默认 Asia/Shanghai）。
   assert.equal(
-    ruleOf('FREQ=DAILY;UNTIL=20261120').until,
+    ruleOf('FREQ=DAILY;UNTIL=20261120', 'Asia/Shanghai').until,
+    Date.UTC(2026, 10, 20, 15, 59, 59) / 1000,
+  );
+  assert.equal(
+    ruleOf('FREQ=DAILY;UNTIL=20261120', 'UTC').until,
     Date.UTC(2026, 10, 20, 23, 59, 59) / 1000,
+  );
+  assert.equal(
+    ruleOf('FREQ=DAILY;UNTIL=20261120', 'America/New_York').until,
+    Date.UTC(2026, 10, 21, 4, 59, 59) / 1000,
   );
   assert.equal(
     ruleOf('FREQ=DAILY;UNTIL=20261120T081500Z').until,

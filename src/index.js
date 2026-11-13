@@ -1553,12 +1553,17 @@ async function runPreStep(state, payload) {
   if (usage !== null) {
     state.tokens = usage.tokensIn;
     state.overCount = usage.tokensIn >= config.compactAtTokens ? state.overCount + 1 : 0;
-    // A6：threshold 冷却按轮计（每个 pre-step 算一轮），hard/idle 不看这个数。
-    // 冷却从「上一次 threshold 压缩」起算；从没见过时按已满足处理。
-    state.thresholdTurnsByScope.set(
-      scope,
-      (state.thresholdTurnsByScope.get(scope) ?? (config.compact?.cooldownTurns ?? 3)) + 1,
-    );
+    // L-1：冷却按「新轮」计数（工具尾的 pre-step 不算），并把计数写回 schema_meta，
+    // 重启后从库里恢复，不因重启绕过冷却。
+    if (isNewTurn) {
+      const next = thresholdTurnsOf(state, scope, config) + 1;
+      state.thresholdTurnsByScope.set(scope, next);
+      try {
+        state.store.setMeta(`compact_threshold_turns:${scope}`, String(next));
+      } catch {
+        // 计数只用于冷却，写失败不阻断主流程。
+      }
+    }
     state.metrics.observe('tokensIn', usage.tokensIn);
     state.metrics.observe('tokensOut', usage.tokensOut);
     if (isNewTurn) recordTokenEvent(state, usage);
@@ -2030,10 +2035,26 @@ function refreshBudget(state, at = state.platform.now()) {
   const was = state.budgetTripped === true;
   // A1（v0.4.13）：每日硬线可配置；非法/缺失时退回 3M，保护逻辑不因配置失效。
   const dailyLimit = dailyLimitFromConfig(state.config);
-  const tripped = overDailyBudget(state.budget, dailyLimit, {
+  const dailyTripped = overDailyBudget(state.budget, dailyLimit, {
     at,
     timezone: state.config.timezone,
   });
+  // L-3（A2）：可选的 5 小时滑窗硬线，从持久化账本取近 5 小时用量。
+  const windowLimit = state.config?.budget?.window5hLimit ?? null;
+  let windowTripped = false;
+  let windowTokens = null;
+  if (Number.isFinite(windowLimit) && windowLimit > 0 && typeof state.store?.sumTokenUsageSince === 'function') {
+    try {
+      const sum = state.store.sumTokenUsageSince(at - 5 * 60 * 60 * 1000);
+      windowTokens = Number(sum?.total ?? 0);
+      windowTripped = windowTokens >= windowLimit;
+    } catch (error) {
+      state.platform.log('debug', '[dsh-companion] window token sum failed', {
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  const tripped = dailyTripped || windowTripped;
   state.budgetTripped = tripped;
   state.metrics.observe('dailyTokens', state.budget.dailyTokens);
   state.metrics.observe('budgetTripped', tripped ? 1 : 0);
@@ -2041,6 +2062,8 @@ function refreshBudget(state, at = state.platform.now()) {
     state.platform.log('warn', '[dsh-companion] daily token budget tripped', {
       dailyTokens: state.budget.dailyTokens,
       limit: dailyLimit,
+      windowTokens,
+      windowLimit,
     });
   } else if (!tripped && was) {
     state.platform.log('info', '[dsh-companion] daily token budget reset', {
@@ -2456,7 +2479,7 @@ function scheduleConsolidation(state, payload, scope = SCOPE) {
     cooldownTurns: config.compact?.cooldownTurns,
     // 没记录过（该 scope 还没压过）时视为冷却已满足，否则新会话要空等 N 轮。
     turnsSinceThreshold:
-      state.thresholdTurnsByScope.get(scope) ?? config.compact?.cooldownTurns ?? 3,
+      thresholdTurnsOf(state, scope, config),
   });
   if (!plan.trigger) return;
   // A2：额度紧张只挡「非 hard」巩固；hard 是安全阀，压缩也不能等。
@@ -2899,6 +2922,25 @@ function maybeRetryConsolidation(state) {
  * @param {string} scope
  * @returns {number|null}
  */
+function thresholdTurnsOf(state, scope, config) {
+  const map = state.thresholdTurnsByScope;
+  const fallback = config?.compact?.cooldownTurns ?? 3;
+  if (map.has(scope)) return map.get(scope);
+  let restored = fallback;
+  try {
+    const raw = state.store?.getMeta?.(`compact_threshold_turns:${scope}`);
+    // getMeta 未命中返回 null，Number(null) 是 0——不能当成「刚压过」
+    if (raw !== null && raw !== undefined && raw !== '') {
+      const value = Number(raw);
+      if (Number.isFinite(value) && value >= 0) restored = value;
+    }
+  } catch {
+    // 读不到按「已满足冷却」处理，保持旧行为。
+  }
+  map.set(scope, restored);
+  return restored;
+}
+
 function compactFloorOf(state, scope) {
   if (state.compactFloorByScope.has(scope)) return state.compactFloorByScope.get(scope);
   const { store, platform, config } = state;

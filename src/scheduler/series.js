@@ -43,7 +43,7 @@ export function nextSeriesFire(input = {}) {
     return { ok: false, reason: 'rrule_invalid', detail: 'anchorAt/afterAt required' };
   }
 
-  const parsed = parseRRule(rrule);
+  const parsed = parseRRule(rrule, { timeZone });
   if (parsed.ok !== true) {
     return { ok: false, reason: parsed.reason ?? 'rrule_invalid', detail: parsed.detail };
   }

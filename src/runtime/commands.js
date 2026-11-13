@@ -573,7 +573,7 @@ function formatTokenUsageLine(usage) {
       return `${label} ${share}%`;
     });
   const cacheHit = Number(usage.cacheHit);
-  const cacheText = Number.isFinite(cacheHit) && cacheHit > 0 ? `｜缓存命中 ${cacheHit}` : '';
+  const cacheText = Number.isFinite(cacheHit) && cacheHit > 0 ? `｜缓存命中 ${cacheHit} tokens` : '';
   return `今日用量：${total} tokens（${parts.join(' / ')}）${cacheText}`;
 }
 
