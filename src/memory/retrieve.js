@@ -47,6 +47,25 @@ export const MIN_QUERY_CHARS = 2;
 export const LEXICAL_MIN_HITS = 2;
 /** V4-M1：或按查询有效 bigram 数的命中比例判定（≥30%）。 */
 export const LEXICAL_MIN_HIT_RATIO = 0.3;
+/**
+ * V74-H1：稀有锚点放行。
+ *
+ * 回放发现 v0.7.4 把分母改成「库里存在的 bigram」后，小库（~143 条）里
+ * presentTokens 常只有 1–2 个，任何含它们的条目都 ≥30% 过门：50 句真实正文
+ * 新增 95 条注入、其中 67% 无关。分母退回查询有效 bigram 数之后，单命中的
+ * 长句会重新被挡掉；这里只对「真的稀有」的锚点开口子——该 bigram 在本 scope
+ * 命中条数 ≤ RARE_ANCHOR_MAX_DF，且不含功能字（我/你/的/了…），拉丁 token
+ * 另要求长度 ≥3 且不是停用词。每次查询最多放行 RARE_ANCHOR_MAX_ITEMS 条。
+ */
+export const RARE_ANCHOR_MAX_DF = 2;
+/** V74-H1：单次查询经稀有锚点放行的候选上限（按 score 取前 N）。 */
+export const RARE_ANCHOR_MAX_ITEMS = 2;
+/** V74-H1：功能字——单个 bigram 含这些字时不足以当锚点（跨词碎片多半含它们）。 */
+const FUNCTION_CHARS = new Set([
+  '我', '你', '他', '她', '它', '的', '了', '吗', '呢', '吧', '啊', '是', '在',
+  '和', '就', '也', '都', '有', '这', '那', '个', '一', '不', '要', '会', '说',
+  '着', '过', '得', '地', '把', '被', '给', '让', '呀', '嘛', '么',
+]);
 /** V3-M3：纯算术/符号查询（卡上给定的形态）。 */
 const ARITHMETIC_ONLY_RE = /^[\d\s+\-*/=？?]+$/u;
 /** V3-M3：常见问候/客套词（归一化后整串匹配）。 */
@@ -366,47 +385,46 @@ function conservativeFidelity(stored, fromR) {
 /**
  * V4-M1：词法命中是否达到相关性门槛。
  *
- * 命中 ≥2 个不同有效 bigram，或命中数 / 分母 ≥30% 即算过门。命中集合为空、
- * 分母为 0（查询没有有效 bigram，或查询里的 bigram 在本 scope 一条都没命中）
- * 时一律不放行。
+ * 命中 ≥2 个不同有效 bigram，或命中数 / 查询有效 bigram 数 ≥30% 即算过门。
+ * 命中集合为空、分母为 0（查询全是停用词）时一律不放行。
  *
- * V73-M1：分母不再是「查询有几个有效 bigram」，而是「这些 bigram 里有多少个
- * 在本 scope 至少命中一条」。长句里必然夹着库里不存在的跨词碎片（我夜、宵吃），
- * 把它们计入分母会把「夜宵」这种单点强证据稀释到门槛以下。
+ * V74-H1：分母回到「查询有效 bigram 数」。v0.7.4 曾把它改成「库里存在的
+ * bigram 数」，在小库里会让 1/1 直接过门，回放新增 95 条注入中 67% 无关；
+ * 单命中的长句改由 isRareAnchorToken 放行，见 RARE_ANCHOR_MAX_DF。
  * @param {{tokens: Set<string>}|undefined} hit
- * @param {number} presentBigramCount 已发出查询且在本 scope 命中 ≥1 条的 bigram 数
+ * @param {number} queryBigramCount 查询的有效 bigram 数
  * @returns {boolean}
  */
-function lexicalHitQualifies(hit, presentBigramCount) {
+function lexicalHitQualifies(hit, queryBigramCount) {
   if (hit === undefined) return false;
   const hits = hit.tokens.size;
   if (hits === 0) return false;
   if (hits >= LEXICAL_MIN_HITS) return true;
-  return presentBigramCount > 0 && hits / presentBigramCount >= LEXICAL_MIN_HIT_RATIO;
+  return queryBigramCount > 0 && hits / queryBigramCount >= LEXICAL_MIN_HIT_RATIO;
 }
 
 /**
- * V73-M1：查询里「一块独立内容完全没被解释」时，要把它算进分母。
+ * V74-H1：单个 bigram 能否作为「稀有锚点」放行一个候选。
  *
- * 分母的主力是「命中过库的 bigram」，但如果查询是「蓝鲸 苹果 香蕉 橘子」这种
- * 并列多词，未命中的词（苹果/香蕉/橘子）并不是跨词碎片，而是真的没解释到，
- * 丢掉它们会把 1/4 变成 1/1、让 V4-M1 的门槛失效。所以按空格/标点切段，
- * 每段只要有一个有效 bigram 却一个都没命中，就补进分母。
- * @param {string} textQuery
- * @param {Set<string>} presentTokens
- * @returns {number}
+ * 三个条件同时成立：
+ *   1) 该 bigram 在本 scope 的命中条数（df）在 1..RARE_ANCHOR_MAX_DF 之间；
+ *   2) 不是拉丁 token，或拉丁 token 长度 ≥3 且不在 STOP_LATIN_WORDS；
+ *   3) 两个字符都不是功能字（我/你/的/了/吗…），否则多半是跨词碎片。
+ *
+ * df 直接取 OR 检索循环里该 token 返回的条数，不额外查库。
+ * @param {string} token
+ * @param {Map<string, number>} tokenDf
+ * @returns {boolean}
  */
-function countUnexplainedSegments(textQuery, presentTokens) {
-  const segments = String(textQuery ?? '').split(/[\s，。！？、；：,.!?;:()（）[\]【】"“”'‘’]+/u);
-  let unexplained = 0;
-  for (const segment of segments) {
-    if (segment === '') continue;
-    const bigrams = contentQueryBigrams(segment);
-    if (bigrams.length === 0) continue;
-    if (bigrams.some((token) => presentTokens.has(token))) continue;
-    unexplained += 1;
+function isRareAnchorToken(token, tokenDf) {
+  const df = tokenDf.get(token) ?? 0;
+  if (df === 0 || df > RARE_ANCHOR_MAX_DF) return false;
+  if (/^[a-z0-9][a-z0-9._-]*$/u.test(token)) {
+    return token.length >= 3 && !STOP_LATIN_WORDS.has(token);
   }
-  return unexplained;
+  const chars = [...token];
+  if (chars.length < 2) return false;
+  return chars.every((char) => !FUNCTION_CHARS.has(char));
 }
 
 /**
@@ -508,9 +526,10 @@ export async function retrieve({
   // 作为「候选有没有足够相关性证据」的判据（任意一个常见 bigram 命中不再放行）。
   /** @type {Map<string, {type:'fact'|'episode', id:string, tokens:Set<string>}>} */
   const lexicalHits = new Map();
-  // V73-M1：分母集合——真发出查询、且在本 scope 至少命中一条的有效 bigram。
-  // 这一步不用额外查库：命中的同时就知道「这个 bigram 库里有」。
-  const presentTokens = new Set();
+  // V74-H1：每个有效 bigram 在本 scope 的命中条数（df）。稀有锚点判定用它，
+  // 直接来自下面 OR 检索循环的返回，不额外查库。
+  /** @type {Map<string, number>} */
+  const tokenDf = new Map();
   if (hasQuery) {
     // Store.searchBigram 的 MATCH 是 AND 语义（toMatchQuery 把每个 bigram 用
     // AND 连接），自然语句「青柠计划的代号是什么」几乎不可能全中；所以这里
@@ -518,9 +537,10 @@ export async function retrieve({
     // 退化成全表扫描。
     for (const token of lexicalTokens.slice(0, LEXICAL_TOKEN_LIMIT)) {
       if (!LEXICAL_TOKEN_RE.test(token)) continue;
+      let df = 0;
       for (const hit of store.searchBigram(token, { scope, limit: searchLimit }) ?? []) {
         if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
-        presentTokens.add(token);
+        df += 1;
         const key = `${hit.type}:${hit.id}`;
         let entry = lexicalHits.get(key);
         if (entry === undefined) {
@@ -529,11 +549,9 @@ export async function retrieve({
         }
         entry.tokens.add(token);
       }
+      if (df > 0) tokenDf.set(token, df);
     }
   }
-  // V73-M1：分母 = 命中过库的 bigram 数 + 完全没被解释的独立内容块数。
-  const lexicalDenominator = presentTokens.size
-    + countUnexplainedSegments(textQuery, presentTokens);
   let vectorScores = new Map();
   if (useVector) {
     // 单独取一次向量命中，用于 /状态 的「最近命中」统计；融合本身走 hybridSearch。
@@ -616,6 +634,8 @@ export async function retrieve({
     ? Math.max(0, ...[...candidates.values()].map((candidate) => Number(candidate.rrf) || 0))
     : 0;
   const scored = [];
+  // V74-H1：本次查询里走稀有锚点放行的候选（key 集合 + 条数上限）。
+  const rareAnchors = new Set();
   for (const candidate of candidates.values()) {
     const row = candidate.type === 'fact'
       ? store.getFact(candidate.id)
@@ -642,8 +662,18 @@ export async function retrieve({
       const vectorScore = candidate.type === 'fact' ? vectorScores.get(candidate.id) : undefined;
       const vectorQualified = Number.isFinite(vectorScore)
         && vectorScore >= recallCfg.minVectorScore;
-      if (!vectorQualified && !lexicalHitQualifies(lexicalHits.get(key), lexicalDenominator)) {
-        continue;
+      if (!vectorQualified) {
+        const hit = lexicalHits.get(key);
+        if (!lexicalHitQualifies(hit, lexicalTokens.length)) {
+          // V74-H1：单命中未过门时，只有「稀有且不含功能字」的锚点能放行。
+          let anchor = false;
+          if (hit !== undefined && hit.tokens.size === 1) {
+            const [only] = hit.tokens;
+            anchor = isRareAnchorToken(only, tokenDf);
+          }
+          if (!anchor) continue;
+          rareAnchors.add(key);
+        }
       }
     }
 
@@ -663,6 +693,7 @@ export async function retrieve({
       id: row.id,
       text,
       fidelity,
+      rare: rareAnchors.has(`${candidate.type}:${candidate.id}`),
       score: (0.6 * rel + 0.4 * R
         + (candidate.vector === true && maxRrf > 0 ? 0.1 * (Number(candidate.rrf) / maxRrf) : 0)) * unusedFactor,
       R,
@@ -674,11 +705,22 @@ export async function retrieve({
     || Number(b.vector) - Number(a.vector)
     || a.id.localeCompare(b.id));
 
+  // V74-H1：稀有锚点每次查询最多放行 RARE_ANCHOR_MAX_ITEMS 条——按 score 取前 N。
+  let rareAnchorPasses = 0;
+  const capped = [];
+  for (const item of scored) {
+    if (item.rare === true) {
+      if (rareAnchorPasses >= RARE_ANCHOR_MAX_ITEMS) continue;
+      rareAnchorPasses += 1;
+    }
+    capped.push(item);
+  }
+
   const items = [];
   const usedIds = [];
   let tokens = 0;
   let truncated = false;
-  for (const item of scored) {
+  for (const item of capped) {
     const cost = Math.ceil(item.text.length / 2);
     if (tokens + cost > budget) {
       truncated = true;
@@ -697,6 +739,7 @@ export async function retrieve({
   }
 
   const result = { items, tokens, usedIds, truncated };
+  if (hasQuery) result.rareAnchorPasses = rareAnchorPasses;
   if (useVector) {
     // V3-M3：只有真正过门（≥ minVectorScore）的向量命中才计入，避免
     // hash 向量对任意查询的非零相似度把 /状态 的 vectorHits 虚增。

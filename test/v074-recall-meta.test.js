@@ -138,14 +138,14 @@ test('V73-M1 纯回忆元语句（全停用）不召回任何条', async (t) => 
   }
 });
 
-test('V73-M1 只撞一个常见 bigram 时放行（已知代价，见 CHANGELOG）', async (t) => {
+test('V73-M1 单命中稀有 bigram 仍放行（v0.7.5 起走稀有锚点，不再是 1/1）', async (t) => {
   const store = openStore(t);
   addEpisode(store, '带货直播', '董宇辉直播带货销量很高。');
   seed(store);
   const result = await recall(store, '你记得董宇辉直播卖什么吗');
   const ids = result.items.map((item) => item.id);
-  // 分母只数「本身库里有」的 bigram：董宇/宇辉/直播 里只有 直播 命中，
-  // 于是 1/1 过门。这是 V73-M1 的已知代价：单点常见 bigram 不再被稀释，
-  // 也无法据此判无关。CHANGELOG 已记录。
+  // v0.7.5：分母回到查询有效 bigram 数（董宇/宇辉/辉直/直播/播卖 → 1/5 不过门），
+  // 「直播」df=1 且不含功能字，走稀有锚点放行——单点稀有证据仍能召回，
+  // 高频词（df>2）则被 RARE_ANCHOR_MAX_DF 挡住。
   assert.equal(ids.length, 1, `只应召回 1 条，实际：${JSON.stringify(ids)}`);
 });
