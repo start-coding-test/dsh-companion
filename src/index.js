@@ -3737,18 +3737,23 @@ function isPluginNotice(message) {
     if (typeof kind === 'string' && kind.startsWith(PLUGIN_NOTICE_SOURCE_PREFIX)
       && source.form === 'notice') return true;
   }
-  const blocks = Array.isArray(message.content) ? message.content : [];
-  for (const block of blocks) {
+  // V72-H1：dsh-im 的 context-enhancement 会把信封拆成独立块，追加在正文块之前
+  // （`[{text: 信封前缀}, ...原 content]`）。必须按整条消息判定：所有文本块都剥空、
+  // 且至少剥掉一个信封，才算「只有信封」；任一文本块仍有正文就不是 notice。
+  const pieces = [];
+  for (const block of Array.isArray(message.content) ? message.content : []) {
     const text = typeof block === 'string' ? block : block?.type === 'text' ? block.text : null;
-    if (typeof text !== 'string') continue;
-    const { text: body, stripped } = stripImEnvelopes(text);
-    if (stripped > 0 && body.trim() === '') return true;
+    if (typeof text === 'string') pieces.push(text);
   }
-  if (typeof message.text === 'string') {
-    const { text: body, stripped } = stripImEnvelopes(message.text);
-    if (stripped > 0 && body.trim() === '') return true;
+  if (typeof message.text === 'string') pieces.push(message.text);
+  if (pieces.length === 0) return false;
+  let stripped = 0;
+  for (const piece of pieces) {
+    const result = stripImEnvelopes(piece);
+    stripped += result.stripped;
+    if (result.text.trim() !== '') return false;
   }
-  return false;
+  return stripped > 0;
 }
 
 /**
