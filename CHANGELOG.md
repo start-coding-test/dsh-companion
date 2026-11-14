@@ -2,6 +2,21 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.3] - 2026-11-14
+
+### Fixed
+
+- **V72-H1 多块 IM 消息任一信封块即整条丢弃**：dsh-im 的 context-enhancement 在引用回复/带附件时
+  把信封拆成独立文本块追加在正文块之前；旧 `isPluginNotice` 逐块判定，任一信封块剥空就返回
+  true，`textRows` 随即整条跳过，正文块丢失（现场：skippedNotices=1、strippedEnvelopes=2、
+  queryLength=0）。现在改为整条判定：所有文本块（含 `message.text`）剥离后全部为空、且至少剥掉
+  一个信封，才算 notice；`source`（`plugin:` + `form:'notice'`）判定不变。
+
+### Tests
+
+- 1436 个用例 / 51 个套件，默认、`TZ=UTC`、`TZ=America/New_York` 三时区全绿；新增
+  `test/v073-im-multiblock.test.js`（9 例，含 3 块现场形状、被引用原文不进转录、mirror debug 计数）。
+
 ## [0.7.2] - 2026-11-14
 
 ### Fixed
