@@ -81,6 +81,10 @@ export const STOP_BIGRAMS = new Set([
   '就是', '还是', '但是', '因为', '所以', '如果', '已经', '然后', '而且', '或者',
   '不过', '其实', '真的', '非常', '比较', '有点', '帮我', '请问', '谢谢', '你好',
   '没有', '不是',
+  // V73-M1：回忆类元语句（「你还记得…吗」「上次跟你说过…」）。这些 bigram 在
+  // 提问里必然出现、在记忆里几乎不出现，留着只会把命中比例压到阈值以下。
+  '上次', '上回', '之前', '记得', '还记', '记不', '说过', '提过',
+  '跟你', '和你', '你说', '我说', '告诉', '得吗',
 ]);
 
 /**
@@ -362,18 +366,47 @@ function conservativeFidelity(stored, fromR) {
 /**
  * V4-M1：词法命中是否达到相关性门槛。
  *
- * 命中 ≥2 个不同有效 bigram，或命中数 / 有效查询 bigram 数 ≥30% 即算过门。
- * 命中集合为空、查询没有有效 bigram（全是停用词）时一律不放行。
+ * 命中 ≥2 个不同有效 bigram，或命中数 / 分母 ≥30% 即算过门。命中集合为空、
+ * 分母为 0（查询没有有效 bigram，或查询里的 bigram 在本 scope 一条都没命中）
+ * 时一律不放行。
+ *
+ * V73-M1：分母不再是「查询有几个有效 bigram」，而是「这些 bigram 里有多少个
+ * 在本 scope 至少命中一条」。长句里必然夹着库里不存在的跨词碎片（我夜、宵吃），
+ * 把它们计入分母会把「夜宵」这种单点强证据稀释到门槛以下。
  * @param {{tokens: Set<string>}|undefined} hit
- * @param {number} queryBigramCount
+ * @param {number} presentBigramCount 已发出查询且在本 scope 命中 ≥1 条的 bigram 数
  * @returns {boolean}
  */
-function lexicalHitQualifies(hit, queryBigramCount) {
+function lexicalHitQualifies(hit, presentBigramCount) {
   if (hit === undefined) return false;
   const hits = hit.tokens.size;
   if (hits === 0) return false;
   if (hits >= LEXICAL_MIN_HITS) return true;
-  return queryBigramCount > 0 && hits / queryBigramCount >= LEXICAL_MIN_HIT_RATIO;
+  return presentBigramCount > 0 && hits / presentBigramCount >= LEXICAL_MIN_HIT_RATIO;
+}
+
+/**
+ * V73-M1：查询里「一块独立内容完全没被解释」时，要把它算进分母。
+ *
+ * 分母的主力是「命中过库的 bigram」，但如果查询是「蓝鲸 苹果 香蕉 橘子」这种
+ * 并列多词，未命中的词（苹果/香蕉/橘子）并不是跨词碎片，而是真的没解释到，
+ * 丢掉它们会把 1/4 变成 1/1、让 V4-M1 的门槛失效。所以按空格/标点切段，
+ * 每段只要有一个有效 bigram 却一个都没命中，就补进分母。
+ * @param {string} textQuery
+ * @param {Set<string>} presentTokens
+ * @returns {number}
+ */
+function countUnexplainedSegments(textQuery, presentTokens) {
+  const segments = String(textQuery ?? '').split(/[\s，。！？、；：,.!?;:()（）[\]【】"“”'‘’]+/u);
+  let unexplained = 0;
+  for (const segment of segments) {
+    if (segment === '') continue;
+    const bigrams = contentQueryBigrams(segment);
+    if (bigrams.length === 0) continue;
+    if (bigrams.some((token) => presentTokens.has(token))) continue;
+    unexplained += 1;
+  }
+  return unexplained;
 }
 
 /**
@@ -475,6 +508,9 @@ export async function retrieve({
   // 作为「候选有没有足够相关性证据」的判据（任意一个常见 bigram 命中不再放行）。
   /** @type {Map<string, {type:'fact'|'episode', id:string, tokens:Set<string>}>} */
   const lexicalHits = new Map();
+  // V73-M1：分母集合——真发出查询、且在本 scope 至少命中一条的有效 bigram。
+  // 这一步不用额外查库：命中的同时就知道「这个 bigram 库里有」。
+  const presentTokens = new Set();
   if (hasQuery) {
     // Store.searchBigram 的 MATCH 是 AND 语义（toMatchQuery 把每个 bigram 用
     // AND 连接），自然语句「青柠计划的代号是什么」几乎不可能全中；所以这里
@@ -484,6 +520,7 @@ export async function retrieve({
       if (!LEXICAL_TOKEN_RE.test(token)) continue;
       for (const hit of store.searchBigram(token, { scope, limit: searchLimit }) ?? []) {
         if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
+        presentTokens.add(token);
         const key = `${hit.type}:${hit.id}`;
         let entry = lexicalHits.get(key);
         if (entry === undefined) {
@@ -494,6 +531,9 @@ export async function retrieve({
       }
     }
   }
+  // V73-M1：分母 = 命中过库的 bigram 数 + 完全没被解释的独立内容块数。
+  const lexicalDenominator = presentTokens.size
+    + countUnexplainedSegments(textQuery, presentTokens);
   let vectorScores = new Map();
   if (useVector) {
     // 单独取一次向量命中，用于 /状态 的「最近命中」统计；融合本身走 hybridSearch。
@@ -602,7 +642,7 @@ export async function retrieve({
       const vectorScore = candidate.type === 'fact' ? vectorScores.get(candidate.id) : undefined;
       const vectorQualified = Number.isFinite(vectorScore)
         && vectorScore >= recallCfg.minVectorScore;
-      if (!vectorQualified && !lexicalHitQualifies(lexicalHits.get(key), lexicalTokens.length)) {
+      if (!vectorQualified && !lexicalHitQualifies(lexicalHits.get(key), lexicalDenominator)) {
         continue;
       }
     }
