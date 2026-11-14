@@ -120,6 +120,21 @@ const STOP_LATIN_WORDS = new Set([
 ]);
 
 /**
+ * V75-H1：回忆意图。
+ *
+ * 稀有锚点（见 RARE_ANCHOR_MAX_DF）本来是给「用户主动问回忆」用的：现场案例是
+ * 「我上次跟你说我夜宵吃了什么你还记得吗」——整句只有「夜宵」一个有效 bigram
+ * 能撞上。但同一句话里的「这是」「好了」「继续改」这类非回忆陈述，也常常只撞
+ * 一个稀有 bigram，于是被一起放进来（v0.7.5 回放：新增 10 条里 6 条无关，全部
+ * 来自三句非回忆陈述）。
+ *
+ * 所以稀有锚点放行只在查询确实在问回忆时启用；未命中时行为等同 v0.7.3，只走
+ * 原来的命中数/命中比例门。匹配对象是归一化后（NFKC）的原始查询，在停用 bigram
+ * 剔除之前——「记得」「上次」这类词本身会被停用词表剔掉，不能拿剔除后的结果判。
+ */
+export const RECALL_INTENT_RE = /(?:记得|记不记得|还记得|上次|上回|之前|以前|说过|提过|聊过|讲过|告诉过|来着|忘了)/u;
+
+/**
  * V4-M1：把查询切成「有效 bigram」，用于词法命中质量判定。
  *
  * 1) 与 toBigrams 同一套归一化（NFKC + 小写）后切 bigram；
@@ -474,6 +489,9 @@ export async function retrieve({
     : DEFAULT_LIMIT;
   const textQuery = typeof query === 'string' ? query : String(query ?? '');
   const hasQuery = textQuery.trim() !== '';
+  // V75-H1：稀有锚点只在「问回忆」时启用。这里用 NFKC 归一化后的原始查询匹配，
+  // 不能等 contentQueryBigrams 把「记得/上次」当停用 bigram 剔掉之后再判。
+  const recallIntent = hasQuery && RECALL_INTENT_RE.test(textQuery.normalize('NFKC'));
   // 查询门在算查询向量、读库之前，避免为「1+1」这类查询做任何召回工作。
   // 空查询不走查询门（保留 recency-only 通道）；门槛长度由 recall.minQueryChars 控制。
   if (hasQuery && recallCfg.skipSmallTalk
@@ -535,10 +553,17 @@ export async function retrieve({
     // AND 连接），自然语句「青柠计划的代号是什么」几乎不可能全中；所以这里
     // 逐 token OR 查，得到候选集合，再按命中质量过门。token 数封顶，避免长句
     // 退化成全表扫描。
+    //
+    // V75-L1：稀有锚点要判「df ≤ RARE_ANCHOR_MAX_DF」。搜索上限若只有
+    // searchLimit（= maxItems*2，闲聊路径 maxItems=1 → 2），df=3 会被截断成 2
+    // 而误判为稀有。这里至少多取一条，让 df 能数到 RARE_ANCHOR_MAX_DF+1。
+    // 代价：maxItems=1 时候选池可能多出 1 条（limit 2→3），但多出来的那条仍要
+    // 过同样的门槛，不会因此注入无关条目。
+    const dfSearchLimit = Math.max(searchLimit, RARE_ANCHOR_MAX_DF + 1);
     for (const token of lexicalTokens.slice(0, LEXICAL_TOKEN_LIMIT)) {
       if (!LEXICAL_TOKEN_RE.test(token)) continue;
       let df = 0;
-      for (const hit of store.searchBigram(token, { scope, limit: searchLimit }) ?? []) {
+      for (const hit of store.searchBigram(token, { scope, limit: dfSearchLimit }) ?? []) {
         if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
         df += 1;
         const key = `${hit.type}:${hit.id}`;
@@ -665,9 +690,10 @@ export async function retrieve({
       if (!vectorQualified) {
         const hit = lexicalHits.get(key);
         if (!lexicalHitQualifies(hit, lexicalTokens.length)) {
-          // V74-H1：单命中未过门时，只有「稀有且不含功能字」的锚点能放行。
+          // V74-H1：单命中未过门时，只有「稀有且不含功能字」的锚点能放行；
+          // V75-H1：且只在查询确实在问回忆时（否则普通陈述句也会被开口子）。
           let anchor = false;
-          if (hit !== undefined && hit.tokens.size === 1) {
+          if (recallIntent && hit !== undefined && hit.tokens.size === 1) {
             const [only] = hit.tokens;
             anchor = isRareAnchorToken(only, tokenDf);
           }
@@ -739,7 +765,12 @@ export async function retrieve({
   }
 
   const result = { items, tokens, usedIds, truncated };
-  if (hasQuery) result.rareAnchorPasses = rareAnchorPasses;
+  if (hasQuery) {
+    result.rareAnchorPasses = rareAnchorPasses;
+    // V75-H1：只在问回忆时开稀有锚点；caller 的 mirror debug 用它区分
+    // 「关着没开」和「开了但没放行」。
+    result.recallIntent = recallIntent;
+  }
   if (useVector) {
     // V3-M3：只有真正过门（≥ minVectorScore）的向量命中才计入，避免
     // hash 向量对任意查询的非零相似度把 /状态 的 vectorHits 虚增。

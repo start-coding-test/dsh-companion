@@ -4,7 +4,15 @@
 
 `dsh-companion` 是 DeepSeek Harness（DSH）的私人管家记忆插件：把对话沉淀为事实、提醒与线程，按遗忘曲线检索，并在合适的时间主动提醒。插件通过平台注入的服务工作，不直接依赖 DSH 内部包。
 
-当前状态：**v0.7.5 已发布**（2026-11-14，tag `v0.7.5`）。`node --test` 全绿：1447 个用例 / 51 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+当前状态：**v0.7.6 已发布**（2026-11-14，tag `v0.7.6`）。`node --test` 全绿：1450 个用例 / 51 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三时区）。
+
+## v0.7.6 变更摘要
+
+- **稀有锚点只对回忆意图开放**：`RECALL_INTENT_RE` 命中（记得/上次/之前/说过/来着…）才开稀有
+  锚点；回放里三句非回忆陈述不再借锚点放行。
+- **df 不再被搜索上限截断**：OR 检索 limit 取 `max(searchLimit, RARE_ANCHOR_MAX_DF + 1)`，
+  闲聊路径 `limit=1` 时也能正确识别 df=3。
+- `/状态`/mirror debug 的 `recall gate` 行增 `recallIntent`。
 
 ## v0.7.5 变更摘要
 

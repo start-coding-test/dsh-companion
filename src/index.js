@@ -3516,9 +3516,11 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
     return null;
   }
   // V74-H1：稀有锚点放行条数（只记计数，不记正文）。
+  // V75-H1：同时记 recallIntent——区分「没有回忆意图所以没开」与「开了但没放行」。
   if (process.env.DSH_COMPANION_MIRROR_DEBUG === '1') {
     platform.log('info', '[dsh-companion] recall gate', {
       rareAnchorPasses: Number.isInteger(recalled.rareAnchorPasses) ? recalled.rareAnchorPasses : 0,
+      recallIntent: recalled.recallIntent === true,
       items: recalled.items.length,
     });
   }
