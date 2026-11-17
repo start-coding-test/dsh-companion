@@ -633,6 +633,58 @@ session:
 - **展示口径**：状态板的提醒行始终用 `next_fire_at`（原定到点时间）显示日期；退避期间在同一条后追加「重试中，下次 HH:MM」（`retry_at`，按 `config.timezone` 格式化），例如 `- 交房租（11-05，重试中，下次 17:02）`。退出重试（成功/过期/过期回收）后附注自动消失，原定时间仍保留。
 - 投递失败、取不到主会话或安静时段内，消息留在 backlog，下个 tick 继续尝试；`/状态` 的积压数与当日计数照常反映这些排队项。
 
+## 完整配置表
+
+顶层 16 个键是安装自检（`scripts/calibrate/run.mjs`）与配置归一化的固定面；其余为可选节，未写时用下列默认值。未知键只在 `config.warnings` 里记一条警告，不阻断启动。
+
+| 配置键 | 默认 | 说明 |
+| --- | --- | --- |
+| `workingMemoryTokens` | `32000` | 工作记忆上限 |
+| `compactAtTokens` | `24000` | 超过即触发压缩与巩固 |
+| `compactHardTokens` | `40000` | 安全阀，必压 |
+| `idleMs` | `1800000` | 闲置多久触发一次巩固（30 分钟） |
+| `retainTokens` | `6144` | 压缩时保留的最近对话 |
+| `threadIdleDays` | `14` | 线程闲置多少天冻结 |
+| `threadMaxActive` | `6` | 同时活跃线程上限 |
+| `proactiveDailyCap` | `3` | 每日主动消息上限，`0` 关闭 |
+| `quietStart` / `quietEnd` | `"23:00"` / `"08:00"` | 安静时段（可跨午夜） |
+| `timezone` | `"Asia/Shanghai"` | 安静时段、日界线、重复提醒都按它算 |
+| `purgeAfterDays` | `7` | 「忘掉」后的冷静期 |
+| `dbPath` | `"./.data/companion.db"` | SQLite 位置 |
+| `rssWarnGiB` / `rssStopGiB` / `rssMainOnlyGiB` | `2.95` / `3` / `3.15` | RSS 三档：告警并拒新线程 / 停派发 / 只留主会话 |
+| `vector.enabled` | `false` | 可选向量召回 |
+| `vector.dim` | `256` | `hash` 投影维度 |
+| `vector.embedder` | `"hash"` | `hash` / `local` / `remote` / `none` |
+| `vector.localModel` | `"Xenova/bge-small-zh-v1.5"` | `local` 用的模型 |
+| `vector.prefixQuery` | `true` | `local` 查询加指令前缀 |
+| `vector.embedderId` | `""` | 指定后只认该 id 的向量行 |
+| `vector.embedTimeoutMs` | `300` | 查询/判定单次超时 |
+| `vector.backfillTimeoutMs` | `30000` | 回填批次超时（与查询超时分离） |
+| `vector.backfillBatchSize` | `8` | 每批回填条数 |
+| `vector.remote.enabled` | `false` | 是否启用远程 embedding |
+| `vector.remote.endpoint` / `apiKeyEnv` / `timeoutMs` | `""` / `""` / `300` | 端点、从环境变量取 key、超时 |
+| `recall.minVectorScore` | `0.35` | 向量路最低相似度 |
+| `recall.skipSmallTalk` | `true` | 闲聊轮跳过重召回 |
+| `recall.minQueryChars` | `2` | 少于该长度不召回 |
+| `recall.chatLimit` | `1` | 闲聊轮生活类召回条数 |
+| `recall.unusedThreshold` / `unusedPenalty` | `3` / `0.85` | 连续注入未用几次后降权、乘数 |
+| `session.mainBinding` | `"latest-user"` | `latest-user` / `first` |
+| `consolidation.model` | `null` | 巩固用模型（`{provider, model}`，空则跟随主模型） |
+| `thread.agentPreset` | `null` | 线程会话的 preset，空则宿主默认 |
+| `timing.compactWarnMs` / `consolidateWarnMs` | `20000` / `60000` | 耗时告警线 |
+| `persona.cardPath` | `null` | 人格卡路径，`null` 用内置「珞然」 |
+| `persona.shadowDeployment` | `"off"` | `off` / `rewrite` / `takeover` |
+| `compact.minIncrementTokens` / `compact.cooldownTurns` | `4096` / `3` | 压缩迟滞：增量门槛与冷却轮数 |
+| `budget.dailyHardLimit` | `3000000` | 每日 token 硬上限 |
+| `budget.window5hLimit` | `null` | 可选 5 小时滑窗上限 |
+| `quota.source` | `"none"` | `none` / `file` |
+| `quota.path` | `null` | `file` 模式下的快照路径 |
+| `quota.reserve` | `{"5h":0.3,"7d":0.2,"month":0.1}` | 各窗口预留比例 |
+| `task.tokenWarn` / `tokenStop` / `sampleMs` | `60000` / `80000` / `5000` | worker 收尾提示、结束线、采样间隔 |
+| `consolidate.existingFactsLimit` | `12` | 去重提示里最多带多少条同主题事实 |
+
+情绪相关配置在人格卡的 `emotion` 块里（`enabled` / `baseline` / `halfLifeHours` / `appraiser` / `appraiseModel` / `appraiseTimeoutMs` / `appraiseMinConfidence`），不在 `config` 里，详见 [persona-card.md](persona-card.md)。
+
 ## 配置示例
 
 默认配置即可启动。下面是几个常见调整。
