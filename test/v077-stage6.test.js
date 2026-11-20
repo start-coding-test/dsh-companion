@@ -8,7 +8,8 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { EventEmitter } from 'node:events';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -23,6 +24,7 @@ import {
   capLogFile,
   launcherKind,
   readExitCode,
+  startBgProcess,
   tailLog,
 } from '../src/task/bg-launcher.js';
 import {
@@ -712,4 +714,128 @@ test('W77-L1：bg.logMaxMB = 0 关闭截断（不调用 capLogFile）', async (t
     },
   });
   assert.equal(called, 0);
+});/** W78-H1 的 spawn 替身：不启动任何进程，按给定事件序列 emit。**非真机证据**。 */
+function fakeSpawner(events) {
+  return () => {
+    const child = new EventEmitter();
+    child.pid = 4242;
+    child.unref = () => {};
+    setImmediate(() => {
+      for (const [name, args] of events) child.emit(name, ...args);
+    });
+    return child;
+  };
+}
+
+test('W78-H1：systemd-run 早退但 code 0 = 启动成功（unit 已拉起，state=running）', async (t) => {
+  const { work } = makeWorkRoot(t);
+  const store = Store.open(':memory:');
+  t.after(() => store.close());
+  const logRoot = mkdtempSync(join(tmpdir(), 'dsh-bglog-'));
+  t.after(() => rmSync(logRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const result = await startBgJob({
+    store,
+    config: bgConfig(work),
+    params: { argv: ['python3', join(work, 'proj', 'train.py')], cwd: 'proj', deadlineMin: 20, label: '训练' },
+    origin: { childSessionId: 'child-1', launchedBy: 'bg_run' },
+    logRoot,
+    nowMs: NOW_MS,
+    launcher: {
+      // 真实 startBgProcess + 替身 spawn：不带 --wait 的 systemd-run 就是这样「启动 unit
+      // 后立即以 0 退出」，W78-H1 之前会被判成 failed。
+      startBgProcess: (spec) => startBgProcess({
+        ...spec,
+        platform: 'linux',
+        launchGraceMs: 30,
+        spawnImpl: fakeSpawner([['exit', [0, null]]]),
+      }),
+    },
+  });
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.job.state, 'running');
+  assert.equal(store.getBgJob(result.job.id).state, 'running');
+});
+
+test('W78-H1：早退带 signal（或非 0）仍是拉起失败', async (t) => {
+  const { work } = makeWorkRoot(t);
+  const logRoot = mkdtempSync(join(tmpdir(), 'dsh-bglog-'));
+  t.after(() => rmSync(logRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const bySignal = await startBgProcess({
+    id: 'bg-sig',
+    argv: ['python3', 'train.py'],
+    cwd: logRoot,
+    workingDirectory: logRoot,
+    deadlineSec: 60,
+    memoryMax: '1G',
+    cpuQuota: '100%',
+    logRoot,
+    platform: 'linux',
+    launchGraceMs: 30,
+    spawnImpl: fakeSpawner([['exit', [null, 'SIGTERM']]]),
+  });
+  assert.equal(bySignal.failure.reason, 'launcher-exited');
+  assert.match(bySignal.failure.message, /SIGTERM/u);
+  const nonZero = await startBgProcess({
+    id: 'bg-code1',
+    argv: ['python3', 'train.py'],
+    cwd: logRoot,
+    workingDirectory: logRoot,
+    deadlineSec: 60,
+    memoryMax: '1G',
+    cpuQuota: '100%',
+    logRoot,
+    platform: 'linux',
+    launchGraceMs: 30,
+    spawnImpl: fakeSpawner([['exit', [1, null]]]),
+  });
+  assert.equal(nonZero.failure.exitCode, 1);
+  assert.ok(work.length > 0);
+});
+
+test('W78-H1：150ms 内没退出也没有 error → 视为已拉起，交给探针', async () => {
+  const logRoot = mkdtempSync(join(tmpdir(), 'dsh-bglog-'));
+  try {
+    const started = await startBgProcess({
+      id: 'bg-noxit',
+      argv: ['python3', 'train.py'],
+      cwd: logRoot,
+      workingDirectory: logRoot,
+      deadlineSec: 60,
+      memoryMax: '1G',
+      cpuQuota: '100%',
+      logRoot,
+      platform: 'linux',
+      launchGraceMs: 20,
+      spawnImpl: fakeSpawner([]),
+    });
+    assert.equal(started.failure, undefined);
+    assert.equal(started.unit, 'dsh-bg-bg-noxit');
+  } finally {
+    rmSync(logRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  }
+});
+
+test('W78-L1：bg.logMaxMB 上限降到 1024，1025 被拒', () => {
+  assert.equal(normalizeBg({ logMaxMB: 1024 }).logMaxMB, 1024);
+  assert.throws(() => normalizeBg({ logMaxMB: 1025 }), /bg\.logMaxMB/u);
+  assert.throws(() => normalizeConfig({ bg: { logMaxMB: 2000 } }), /bg\.logMaxMB/u);
+});
+
+test('W78-L1：分块截断（>1MB 走多块，仍保留尾部与原 inode）', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-bgcap-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const path = join(dir, 'big.log');
+  const chunk = 'A'.repeat(1024 * 1024);
+  const tail = 'TAIL'.repeat(1000);
+  // 3MB 多一点：截到 1.5MB 需要读两块（1MB + 0.5MB）。
+  writeFileSync(path, chunk + chunk + chunk.slice(0, 700 * 1024) + tail);
+  const before = statSync(path);
+  const maxBytes = 1024 * 1024 + 512 * 1024;
+  assert.equal(capLogFile(path, maxBytes), true);
+  const after = statSync(path);
+  assert.equal(after.size, maxBytes);
+  assert.equal(after.ino, before.ino, '原地重写，inode 不变');
+  const text = readFileSync(path, 'utf8');
+  assert.equal(text.length, maxBytes);
+  assert.ok(text.endsWith(tail), '尾部内容保留');
 });

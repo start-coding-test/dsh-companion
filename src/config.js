@@ -1236,8 +1236,8 @@ export function normalizeBg(raw, warnings = []) {
 
   // W77-L1（方案甲）：日志保留上限（MB），0 表示不截断。
   const logMaxMB = raw.logMaxMB === undefined ? defaults.logMaxMB : raw.logMaxMB;
-  if (!Number.isInteger(logMaxMB) || logMaxMB < 0 || logMaxMB > 102_400) {
-    throw new ConfigError('bg.logMaxMB', `must be an integer within 0..102400, got ${JSON.stringify(logMaxMB)}`);
+  if (!Number.isInteger(logMaxMB) || logMaxMB < 0 || logMaxMB > 1_024) {
+    throw new ConfigError('bg.logMaxMB', `must be an integer within 0..1024, got ${JSON.stringify(logMaxMB)}`);
   }
 
   const maxDeadlineMin = raw.maxDeadlineMin === undefined ? defaults.maxDeadlineMin : raw.maxDeadlineMin;

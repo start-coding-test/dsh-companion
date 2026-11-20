@@ -34,6 +34,8 @@ import {
   statSync,
   openSync,
   readSync,
+  writeSync,
+  ftruncateSync,
   closeSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -46,10 +48,18 @@ export const DEFAULT_BG_LOG_ROOT = '/opt/dsh-companion/.data/bg-jobs';
 
 /**
  * W77-M1：拉起后观察 systemd-run 客户端多久，判定「这次启动是否被拒」。
- * systemd-run 会阻塞到 unit 结束，所以正常拉起的退出远迟于此；**早期**非 0
- * 退出（参数非法、unit 名冲突等）才按失败处理。
+ * W78-H1：不带 `--wait` / `--scope` 时它启动 unit 后就**立即以 0 退出**，并不阻塞到
+ * unit 结束（阻塞是 `--wait` 的行为），所以早退本身不是失败信号 —— 要看退出码与
+ * signal：code 0 且无 signal 即启动成功，非 0 或带 signal（参数非法、unit 名冲突等）
+ * 才算失败；窗口内没退出同样视为已拉起。
  */
 export const DEFAULT_LAUNCH_GRACE_MS = 150;
+
+/**
+ * W78-L1：日志截断的分块大小。`bg.logMaxMB` 允许到 1024MB，一次性分配会直接
+ * RangeError（被 catch 吞掉 → 永不截断），所以固定按 1MB 搬运。
+ */
+const LOG_CAP_CHUNK_BYTES = 1024 * 1024;
 
 /** 包装器文件名（<id>/ 目录内）。 */
 const WRAPPER_NAME = 'run.sh';
@@ -311,7 +321,8 @@ export async function startBgProcess({
       envNames,
       wrapperPath,
     });
-    // systemd-run 会阻塞到 unit 结束，所以用 spawn 而不 await；--collect 让它自管。
+    // W78-H1：systemd-run 不带 --wait/--scope 时**启动 unit 后立即以 0 退出**，
+    // 不会阻塞到 unit 结束；这里 spawn 后只观察「是否被拒」，随后就交给探针。
     const child = spawnImpl('systemd-run', args, { cwd, detached: true, stdio: 'ignore' });
     const launch = await watchLaunch(child, launchGraceMs, { exitIsFailure: true });
     if (!launch.ok) {
@@ -338,12 +349,16 @@ export async function startBgProcess({
 }
 
 /**
- * W77-M1：观察子进程的启动结果。
+ * W77-M1 + W78-H1：观察子进程的启动结果。
+ *
+ * **systemd-run 的实际行为**（W78-H1 更正）：不带 `--wait` 也不带 `--scope` 时，
+ * systemd-run 启动 unit 后**立即以 0 退出**，不会阻塞到 unit 结束（阻塞是 `--wait`
+ * 的行为）。所以早退本身不是失败信号，必须看退出码：
  *
  * - `error` 事件（spawn 失败：二进制不存在、权限不足…）→ 失败；
- * - `exitIsFailure` 时（Linux 的 systemd-run），在 `graceMs` 内 `exit` 说明 client
- *   自己拒绝了这次拉起（参数非法、unit 名冲突…）→ 失败；正常 unit 会一直阻塞到结束；
- * - 其它情况 `graceMs` 内没有失败事件 → 认为已拉起。
+ * - `exitIsFailure` 时（Linux 的 systemd-run）：`code === 0` 且没有 signal → 已拉起；
+ *   `code !== 0` 或带 signal → 拉起被拒（参数非法、unit 名冲突…）；
+ * - `graceMs` 内没有退出也没有 error → 已拉起，交给探针判断。
  *
  * @param {import('node:child_process').ChildProcess} child
  * @param {number} graceMs
@@ -376,6 +391,11 @@ function watchLaunch(child, graceMs, { exitIsFailure }) {
         settle({ ok: true });
         return;
       }
+      // W78-H1：systemd-run 正常路径就是「启动 unit 后马上以 0 退出」。
+      if (code === 0 && !signal) {
+        settle({ ok: true });
+        return;
+      }
       settle({
         ok: false,
         failure: {
@@ -397,6 +417,11 @@ function watchLaunch(child, graceMs, { exitIsFailure }) {
  * 直接杀掉，`trap` 不保证执行；监视器每轮对 running 的任务调用一次，长训练日志
  * 最多超出上限「一个轮询间隔」（30 秒）的量。
  *
+ * W78-L1：按 1MB 分块读写，不再一次性 `Buffer.alloc(maxBytes)`。`bg.logMaxMB` 允许
+ * 到 1024MB，一次分配在这种量级会直接抛 RangeError 并被 catch 静默吞掉，结果是
+ * 大日志永远截不断。分块之后任何合法上限都只占 1MB 内存；仍然是原地重写（保留
+ * inode）并保留尾部。
+ *
  * @param {string} logPath
  * @param {number} maxBytes
  * @returns {boolean} 是否真的截断过
@@ -406,16 +431,35 @@ export function capLogFile(logPath, maxBytes) {
   try {
     const stat = statSync(logPath);
     if (stat.size <= maxBytes) return false;
-    const fd = openSync(logPath, 'r');
-    let buffer;
+    const fd = openSync(logPath, 'r+');
     try {
-      buffer = Buffer.alloc(maxBytes);
-      readSync(fd, buffer, 0, maxBytes, stat.size - maxBytes);
+      let readPos = stat.size - maxBytes;
+      let writePos = 0;
+      const chunkBytes = Math.min(LOG_CAP_CHUNK_BYTES, maxBytes);
+      const buffer = Buffer.allocUnsafe(chunkBytes);
+      while (readPos < stat.size) {
+        const want = Math.min(chunkBytes, stat.size - readPos);
+        const read = readSync(fd, buffer, 0, want, readPos);
+        if (read <= 0) break;
+        let written = 0;
+        while (written < read) {
+          const wrote = writeSync(fd, buffer, written, read - written, writePos + written);
+          if (wrote <= 0) throw new Error('[bg-launcher] capLogFile short write');
+          written += wrote;
+        }
+        readPos += read;
+        writePos += read;
+      }
+      if (writePos !== maxBytes) {
+        // 读不满（文件在我们读的期间被追加/截断）时按实际写入量收尾，避免留下尾部残片。
+        ftruncateSync(fd, writePos);
+        return writePos > 0;
+      }
+      ftruncateSync(fd, maxBytes);
+      return true;
     } finally {
       closeSync(fd);
     }
-    writeFileSync(logPath, buffer);
-    return true;
   } catch {
     // 截断是防膨胀的尽力而为，失败不影响监视结论。
     return false;

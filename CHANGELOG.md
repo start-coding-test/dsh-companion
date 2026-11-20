@@ -2,6 +2,31 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.9] - 2026-11-21
+
+阶段 6（后台长任务）的复核修复，只动 `bg_run` 的启动判定与日志截断。
+
+### Fixed
+
+- **W78-H1 `systemd-run` 正常退出被判失败**：不带 `--wait` / `--scope` 时，
+  `systemd-run` 启动 unit 后**立即以 0 退出**，并不阻塞到 unit 结束（阻塞是 `--wait`
+  的行为）。之前的判定把 150ms 内的任何 exit 都算 `launcher-exited`，于是每次正常
+  启动都被记成 `failed` 并发失败回执，而 unit 实际在跑、无人监视。现在：`code === 0`
+  且无 signal → 启动成功（继续交给探针）；非 0 或带 signal → 失败；150ms 内没退出也
+  视为成功。150ms 观察窗本身不变。
+- **W78-L1 大日志上限时截断失效**：`capLogFile` 一次 `Buffer.alloc(maxBytes)`，而
+  `bg.logMaxMB` 允许到 102400，分配失败被 catch 静默吞掉 → 永不截断。现在改为
+  **1MB 分块读写**（原地重写保 inode、保留尾部不变），并把 `bg.logMaxMB` 校验上限
+  降到 **1024**。
+
+### Tests
+
+- `test/v077-stage6.test.js` 28 → 33 例：早退 code 0 → `state=running`、早退带 signal
+  → `launcher-exited`、非 0 退出仍失败（保留原 code 1 用例）、150ms 内不退出 → 已拉起、
+  `logMaxMB=1025` 被拒、3MB 日志分块截到 1.5MB（校验尾部内容与 inode 不变）。
+- **非真机证据**：真实 `systemd-run` 的退出时机仍在云端验证；本机用 spawn 替身覆盖
+  三种退出形态。
+
 ## [0.7.8] - 2026-11-20
 
 阶段 6（后台长任务）的修复版，只动 `bg_run` 这条链，不涉及记忆 / 压缩 / 子代理派活。
