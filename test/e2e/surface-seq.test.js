@@ -117,7 +117,7 @@ test('巩固/压缩按 surface seq 选区：seq 从 7 开始也不当成 log 下
     id: 'session-1',
     events: [userEvent('更早的一轮对话。', 7), userEvent('再早一点。', 8)],
   });
-  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     // turn 1：窗口 = 水位之后到 tail 起点，全部按 surface seq。
     await preStep(ctx, session, 1, '我下周要把预算调到 8000。');
@@ -155,7 +155,7 @@ test('pending 区间被外部压缩替换后丢弃，不重试旧 seq', async ()
   const temp = makeTempStore();
   const { ctx } = makeCtx();
   const session = ctx.addSession({ id: 'session-1', events: [userEvent('更早的一条长消息，足够进入巩固窗口。', 1)] });
-  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     await preStep(ctx, session, 1, '第一条消息，用来触发巩固窗口。');
     await waitFor(() => temp.store.getWatermark('main') === 2, { label: 'consolidation' });
@@ -189,7 +189,7 @@ test('冷启动：索引为空时用 sessionQuery.readSurface 回填正文后照
     id: 'session-1',
     events: [userEvent('历史对话一。', 3), userEvent('历史对话二。', 4)],
   });
-  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     await preStep(ctx, session, 1, '新的一轮。');
     assert.equal(ctx.callsOf('sessionQuery.readSurface').length, 1, '冷启动应回填一次');
@@ -208,7 +208,7 @@ test('正文不可得时降级跳过，不写半截 episode', async () => {
   const temp = makeTempStore();
   const { ctx, streams } = makeCtx({ missing: ['sessionQuery'] }); // 既没有实时事件，也没有回填通道
   const session = ctx.addSession({ id: 'session-1', events: [userEvent('历史。', 1), userEvent('历史二。', 2)] });
-  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     await preStep(ctx, session, 1, '新的一轮。');
     const warn = await waitFor(

@@ -131,7 +131,7 @@ test('apply 生产路径：巩固 → 下一轮 turn 头压缩 → 发布状态�
   const temp = makeTempStore();
   const { ctx, streams, session } = makeApplyCtx();
   // retainTokens 同时是巩固窗口的尾部保留区（H1）；测试用 8 让短消息也能落到窗口内。
-  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     assert.equal(typeof handle?.dispose, 'function');
     // FakeCtx 的 FakeCtx 默认 now 是手动时钟；apply 的 restart 发布在空 staged 上返回 null。
@@ -250,7 +250,7 @@ test('apply 生产路径：deep-sleep 每日补跑执行降级/FTS GC 并写 con
 
   const { ctx } = makeApplyCtx({ now: deepNow });
   // retainTokens 同时是巩固窗口的尾部保留区（H1）；测试用 8 让短消息也能落到窗口内。
-  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     await new Promise((resolve) => setTimeout(resolve, 80));
 

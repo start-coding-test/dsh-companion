@@ -26,6 +26,15 @@ const MAX_RECORDS_PER_SESSION = 5000;
 const MAX_SESSIONS = 32;
 
 /**
+ * C120-H1：索引条目必需字段。
+ *
+ * 旧版本记录（升级前建立的内存索引 / 阶段 2 新增字段）缺任一字段都无法证明
+ * compactRegion 的切口合法，必须用 `readSurface` 全量重读一次。新增字段时只往
+ * 这里加名字，`snapshot()` 的触发逻辑不用改（阶段 2 的 sourceKind 走同一入口）。
+ */
+const REQUIRED_ENTRY_FIELDS = Object.freeze(['toolDelta']);
+
+/**
  * 把 Message / 内容块数组压成纯文本。
  * 只取 `type === 'text'` 的块；工具调用/结果保留一行摘要，方便模型理解上下文。
  * @param {unknown} message
@@ -106,6 +115,96 @@ export function watermarkAfterCompact({ newSeqs = [], oldSeqs = [], startIdx = 0
 }
 
 /**
+ * C120-H1：单条 surface 事件对「未配对工具调用数」的增量。
+ *
+ * 与宿主 `dsh-compaction` 的配平计数完全一致（deepseek-harness
+ * `@deepseek-ai/dsh-compaction/src/tool-pairing.ts:29-38` 的 `eventDelta`）：
+ * - `assistant/message` → 内容里 `tool-call` 块的数量（一次响应可发多个调用，+N）；
+ * - `tool/result` → −1；
+ * - 其它事件 → 0。
+ *
+ * 宿主**不按 callId 配对**（现网 `tool/result` 的 callId 为 undefined），只做计数
+ * 累加，累计回到 0 的切口才允许 `compactRegion` 落刀。这里保持同一口径：块类型
+ * 只认宿主认的 `tool-call` / `tool/result`，其它拼写按 0 计（宿主同样不认）。
+ *
+ * @param {unknown} event `session/event` 或 `sessionQuery.readSurface()` 的条目
+ * @returns {number} 净配对增量（整数，可为负）
+ */
+export function toolDeltaOf(event) {
+  const type = typeof event?.type === 'string' ? event.type : '';
+  if (type === 'assistant/message') {
+    const content = event?.data?.message?.content ?? event?.data?.content;
+    if (!Array.isArray(content)) return 0;
+    let calls = 0;
+    for (const block of content) {
+      if (block !== null && typeof block === 'object' && block.type === 'tool-call') calls += 1;
+    }
+    return calls;
+  }
+  if (type === 'tool/result') return -1;
+  return 0;
+}
+
+/**
+ * C120-H1：配平切口表。
+ *
+ * `cuts[i] === true` 表示「第 i 个节点之前」可落刀：前面所有节点的 toolDelta 累计为 0。
+ * N 个节点有 N+1 个切口（最后一项是 surface 尾之后），与宿主
+ * `tool-pairing.ts:11-24` 的 `cutBalanced` 同构。累计为负（孤儿 tool/result）时该切口
+ * 记为不平衡：宿主遇到这种 surface 会直接抛 `corrupt surface`，我们提前挡掉。
+ *
+ * @param {object[]} records surface 记录（含 toolDelta）
+ * @returns {boolean[]} 长度 = records.length + 1
+ */
+export function toolPairingCuts(records) {
+  const list = Array.isArray(records) ? records : [];
+  const cuts = new Array(list.length + 1).fill(false);
+  let open = 0;
+  cuts[0] = true;
+  for (let index = 0; index < list.length; index += 1) {
+    open += Number(list[index]?.toolDelta) || 0;
+    cuts[index + 1] = open === 0;
+  }
+  return cuts;
+}
+
+/**
+ * @param {object|null} record
+ * @returns {boolean} 是否 tool/result 节点（起点落在它上面会把结果和调用切开）
+ */
+function isToolResultRecord(record) {
+  return normalizeRole(record?.role) === 'tool';
+}
+
+/**
+ * C120-H1：把 `[startIdx, endIdx]` 收紧到合法的配平切口。
+ *
+ * 合法 = 起点之前的累计为 0、起点不是 tool/result、终点之后的累计为 0。做法是只
+ * **收缩**不扩张：起点向后推进到第一个合法切口（丢掉的未配对调用留在下一轮），
+ * 终点向前退到最后一个合法切口（尾部未结束的 tool-call 留在 surface 里等结果）。
+ *
+ * @param {object[]} records
+ * @param {number} startIdx
+ * @param {number} endIdx
+ * @returns {{startIdx: number, endIdx: number, adjusted: boolean}|null}
+ *   `null` 表示收缩后没有可用区间
+ */
+export function alignRegionToToolPairing(records, startIdx, endIdx) {
+  const list = Array.isArray(records) ? records : [];
+  const start = Number(startIdx);
+  const end = Number(endIdx);
+  if (!Number.isInteger(start) || !Number.isInteger(end)) return null;
+  if (start < 0 || end >= list.length || end < start) return null;
+  const cuts = toolPairingCuts(list);
+  let from = start;
+  while (from <= end && (cuts[from] !== true || isToolResultRecord(list[from]))) from += 1;
+  let to = end;
+  while (to >= from && cuts[to + 1] !== true) to -= 1;
+  if (from > to) return null;
+  return { startIdx: from, endIdx: to, adjusted: from !== start || to !== end };
+}
+
+/**
  * 计算巩固窗口：`(afterSeq, endSeq]`。
  *
  * - `afterSeq` 是「水位」seq，**按位置**比较（`indexOf`），不按数值大小；
@@ -116,6 +215,9 @@ export function watermarkAfterCompact({ newSeqs = [], oldSeqs = [], startIdx = 0
  * - V7-M1：surface 的前导系统节点（role=system，宿主 node 0 的系统提示词）不可被
  *   压缩替换。起点落在系统节点上时用 `firstReplaceableIndex` 推进到其后第一个
  *   非系统节点；推进后没有可替换节点则返回 `reason: 'no-replaceable-range'`。
+ * - C120-H1：切口必须配平（累计 toolDelta 为 0）。起点推进到第一个配平切口、终点
+ *   退到最后一个配平切口，尾部未结束的 tool-call 不进窗口；收缩后无区间返回
+ *   `reason: 'unbalanced-boundary'`。
  *
  * @param {{seqs: number[], nodes: object[], records: object[]}} snapshot
  * @param {{afterSeq?: number, budgetTokens?: number}} [options]
@@ -175,6 +277,27 @@ export function planRegion(snapshot, options = {}) {
   if (stopIdx < startIdx) {
     return { region: null, reason: 'no-replaceable-range', tailStartIdx };
   }
+
+  // C120-H1：宿主只接受「累计 toolDelta 为 0」的切口。起点先跳过系统提示词，再
+  // 推到第一个配平切口；终点退回最后一个配平切口（尾部未结束的 tool-call 留在
+  // surface 里等结果）。两者都只收缩，丢了的内容留到下一轮，不会重复巩固。
+  let alignedStart = startIdx;
+  let alignedStop = stopIdx;
+  for (;;) {
+    const aligned = alignRegionToToolPairing(records, alignedStart, alignedStop);
+    if (aligned === null) {
+      return { region: null, reason: 'unbalanced-boundary', tailStartIdx };
+    }
+    const fenced = firstReplaceableIndex(snapshot, aligned.startIdx);
+    if (fenced > aligned.endIdx) {
+      return { region: null, reason: 'no-replaceable-range', tailStartIdx };
+    }
+    if (fenced === alignedStart && aligned.endIdx === alignedStop) break;
+    alignedStart = fenced;
+    alignedStop = aligned.endIdx;
+  }
+  startIdx = alignedStart;
+  stopIdx = alignedStop;
 
   const lines = [];
   let tokens = 0;
@@ -298,7 +421,7 @@ export function createSurfaceIndex({ platform, tailTokens = CONSOLIDATION_TAIL_T
    * @param {object} event
    * @param {number} seq
    * @param {object|null} [message]
-   * @returns {{seq: number, role: string, text: string, tokens: number}|null}
+   * @returns {{seq: number, role: string, text: string, tokens: number, toolDelta: number}|null}
    */
   function entryOf(session, event, seq, message = undefined) {
     let projected = message;
@@ -326,7 +449,8 @@ export function createSurfaceIndex({ platform, tailTokens = CONSOLIDATION_TAIL_T
       }
     }
     if (tokens === 0) tokens = Math.ceil(text.length / 2);
-    return { seq, role, text, tokens };
+    // C120-H1：宿主配平计数，供 planRegion / maybeCompact 选合法切口。
+    return { seq, role, text, tokens, toolDelta: toolDeltaOf(event) };
   }
 
   /**
@@ -385,27 +509,43 @@ export function createSurfaceIndex({ platform, tailTokens = CONSOLIDATION_TAIL_T
   }
 
   /**
+   * C120-H1：这条索引记录缺哪些必需字段（空数组 = 完整）。
+   * @param {object} entry
+   * @returns {string[]}
+   */
+  function missingEntryFields(entry) {
+    const absent = [];
+    if (entry === null || typeof entry !== 'object') return [...REQUIRED_ENTRY_FIELDS];
+    for (const field of REQUIRED_ENTRY_FIELDS) {
+      if (!Object.prototype.hasOwnProperty.call(entry, field)) absent.push(field);
+    }
+    return absent;
+  }
+
+  /**
    * @param {number[]} seqs
    * @param {object} state
    * @param {Map<number, object>|null} measured
-   * @returns {{records: object[], nodes: object[], missing: number}}
+   * @returns {{records: object[], nodes: object[], missing: number, incomplete: number}}
    */
   function build(seqs, state, measured) {
     const records = [];
     const nodes = [];
     let missing = 0;
+    let incomplete = 0;
     for (const seq of seqs) {
       const stored = state.records.get(seq) ?? null;
       const priced = measured?.get(seq) ?? null;
       const tokens = Number(priced?.tokens ?? stored?.tokens ?? 0) || 0;
       const heuristicTokens = Number(priced?.heuristicTokens ?? stored?.tokens ?? 0) || 0;
       if (stored === null) missing += 1;
+      else if (missingEntryFields(stored).length > 0) incomplete += 1;
       nodes.push({ seq, tokens, heuristicTokens });
       records.push(stored === null
         ? { seq, role: 'unknown', text: '', tokens, missing: true }
         : { ...stored, tokens, missing: false });
     }
-    return { records, nodes, missing };
+    return { records, nodes, missing, incomplete };
   }
 
   /**
@@ -449,7 +589,10 @@ export function createSurfaceIndex({ platform, tailTokens = CONSOLIDATION_TAIL_T
 
     let built = build(seqs, state, measured);
     const allowRebuild = options.allowRebuild !== false;
-    const shouldRebuild = built.missing > 0 && allowRebuild
+    // 缺正文（missing）或缺配平字段（incomplete）都说明索引不可信：用
+    // readSurface 全量重读一次，每会话在内存里最多一次（forceRebuild 可再强制）。
+    const needRebuild = built.missing > 0 || built.incomplete > 0;
+    const shouldRebuild = needRebuild && allowRebuild
       && (options.forceRebuild === true || state.rebuilt !== true);
     if (shouldRebuild) {
       try {
@@ -459,7 +602,13 @@ export function createSurfaceIndex({ platform, tailTokens = CONSOLIDATION_TAIL_T
         // 回填失败就保留缺失标记，让调用方降级。
       }
     }
-    return { seqs, nodes: built.nodes, records: built.records, missing: built.missing };
+    return {
+      seqs,
+      nodes: built.nodes,
+      records: built.records,
+      missing: built.missing,
+      incomplete: built.incomplete,
+    };
   }
 
   /**

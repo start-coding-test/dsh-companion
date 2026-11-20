@@ -20,6 +20,7 @@ import { describeAssembly, displaySectionName } from '../persona/assembly-record
 
 import { forgetMemory } from '../memory/forget.js';
 import { describe } from '../persona/emotion.js';
+import { readCompactionFailures, readCompactionLastError } from '../state/compaction-failures.js';
 import { DAILY_TOKEN_LIMIT } from './budget.js';
 import { TOKEN_SOURCE_LABELS } from './token-ledger.js';
 import { formatTimingLines } from './timing.js';
@@ -617,6 +618,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   if (options.timing !== null && options.timing !== undefined && typeof options.timing === 'object') {
     lines.push(...formatTimingLines(options.timing));
   }
+  // C120-M3/L1：巩固记录按状态分档——empty（区间里没有用户/助手正文）不算失败，
+  // 与 failed 分开显示；有未恢复的压缩失败时给出连续次数与最后一条错误原文（不截断）。
+  lines.push(...formatConsolidationHealthLines(store, scope));
   // A6：压缩底只在压过至少一次（有实测样本）时输出；仍超目标时给出 calibrate 提示。
   if (
     options.compact !== null &&
@@ -924,6 +928,45 @@ function formatFailureStatus(store, timeZone) {
     if (lastError !== null && lastRetry !== null && lastJobFailed !== null) break;
   }
   return `最近失败：${lastError ?? '无'}\n最近重试：${lastRetry ?? '无'}\n最近 job 失败：${lastJobFailed ?? '无'}`;
+}
+
+/**
+ * C120-M3 / C120-L1：巩固记录的健康度行。
+ *
+ * - `empty`（区间剔除注入消息后没有用户/助手正文）不是失败，必须与 `failed`
+ *   分开计数，否则空区间会被误读成模型反复出错；两者的条数都来自
+ *   `store.consolidationStatusCounts(scope)`（consolidations.status 聚合）。
+ * - 压缩失败是另一条链路：宿主 compactRegion 抛错时 pending 会被保留重试，
+ *   连续失败次数与最后一条错误由 state/compaction-failures.js 记在 meta 里。
+ *   这里输出的是原文（不截断），否则最关键的括号/边界信息会被切掉。
+ * @param {object} store
+ * @param {string} scope
+ * @returns {string[]}
+ */
+function formatConsolidationHealthLines(store, scope) {
+  const lines = [];
+  let counts = null;
+  try {
+    counts = typeof store?.consolidationStatusCounts === 'function'
+      ? store.consolidationStatusCounts(scope)
+      : null;
+  } catch {
+    counts = null;
+  }
+  if (counts !== null && typeof counts === 'object') {
+    const emptyCount = Number(counts.empty) || 0;
+    const failedCount = Number(counts.failed) || 0;
+    if (emptyCount > 0 || failedCount > 0) {
+      lines.push(`巩固记录：empty ${emptyCount} 条（区间无正文，不算失败） / failed ${failedCount} 条`);
+    }
+  }
+  const failures = readCompactionFailures(store, scope);
+  if (failures > 0) {
+    lines.push(`连续压缩失败：${failures} 次`);
+    const lastError = readCompactionLastError(store, scope);
+    if (lastError !== null) lines.push(`最近压缩错误：${lastError}`);
+  }
+  return lines;
 }
 
 /** @param {object} row @param {object|null} detail @param {string} timeZone @param {string} label */

@@ -195,8 +195,8 @@ test('v14 fixture → v15：版本、facts 计数回填、向量与 FTS rowid �
   const store = Store.open(dbPath);
   track(dir, store);
 
-  assert.equal(SCHEMA_VERSION, '15');
-  assert.equal(store.getMeta('schema_version'), '15');
+  assert.equal(SCHEMA_VERSION, '16');
+  assert.equal(store.getMeta('schema_version'), '16');
 
   const fact = store.getFact('fact-v14');
   assert.equal(fact.recall_count, 7, 'v14 遗留列保留');
@@ -375,7 +375,7 @@ test('v14 fixture → v15：重复打开幂等，不二次回填、不重复 scr
 
   const second = Store.open(dbPath);
   track(dir, second);
-  assert.equal(second.getMeta('schema_version'), '15');
+  assert.equal(second.getMeta('schema_version'), '16');
   assert.equal(second.getFact('fact-v14').used_count, 7, 'used_count 不被二次回填');
   assert.equal(second.listEvents({ limit: 100 }).length, eventsAfterFirst, '不重复写 scrub 事件');
   assert.equal(second.searchBigram('黑咖啡').length, 1);

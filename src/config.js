@@ -250,6 +250,19 @@ Object.defineProperty(DEFAULT_VALUES, 'consolidate', {
   configurable: false,
 });
 
+// v0.7.7 C120-M1：低于该 token 数的巩固区间不登记 pending_compact。
+// 小片段压缩收益低于一次surface replace 的成本，而且更容易踩到宿主「压后不更小」
+// 的确定性失败；保留默认 4096（与 retainTokens 的尾部预算同量级）。
+// 与其它扩展项一致：非枚举，不参与 16 键安装自检。
+const DEFAULT_COMPACT_MIN_REGION_TOKENS = 4_096;
+
+Object.defineProperty(DEFAULT_VALUES, 'compactMinRegionTokens', {
+  value: DEFAULT_COMPACT_MIN_REGION_TOKENS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 export const DEFAULTS = Object.freeze(DEFAULT_VALUES);
 
 const ORDERING_RULE = '0 < retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens';
@@ -1023,6 +1036,13 @@ export function normalizeConfig(raw = {}) {
   if (typeof cfg.dbPath !== 'string' || cfg.dbPath.trim() === '') {
     throw new ConfigError('dbPath', 'must be a non-empty string');
   }
+
+  // v0.7.7 C120-M1：非枚举标量（不在 16 键安装自检里），单独取值与校验。
+  // 0 表示关闭「小片段不登记 pending」的闸门，便于用户回到旧行为。
+  cfg.compactMinRegionTokens = input.compactMinRegionTokens === undefined
+    ? DEFAULTS.compactMinRegionTokens
+    : input.compactMinRegionTokens;
+  requireInteger(cfg, 'compactMinRegionTokens', 0, MAX);
 
   cfg.vector = normalizeVector(input.vector === undefined ? DEFAULTS.vector : input.vector, warnings);
   cfg.recall = normalizeRecall(input.recall === undefined ? DEFAULTS.recall : input.recall, warnings);

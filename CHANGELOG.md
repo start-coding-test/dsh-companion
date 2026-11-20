@@ -2,6 +2,50 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.7] - 2026-11-20
+
+### Fixed
+
+- **C120-H1 压缩区间落在工具配平的切口上**：surface 记录新增 `toolDelta`（与宿主
+  `dsh-compaction/src/tool-pairing.ts` 的 `eventDelta` 同口径：assistant 消息按 `tool-call`
+  块 +N、每条 `tool/result` −1、其它 0，不按 callId 配对）。`planRegion` 现在把区间两端
+  收缩到累计 `toolDelta` 为 0 的切口：起点跳过 tool/result，终点不越过尾部未结束的
+  tool-call。原先 end 落在「带 tool-call 的 assistant」上、start 落在 tool/result 上都会被
+  宿主判为非法边界，压缩必然失败。索引缺字段时会全量重读一次（`REQUIRED_ENTRY_FIELDS`，
+  阶段 2 的 `sourceKind` 走同一入口）。
+- **C120-H2 压缩失败不再无限重试**：pending 区间在真正调用前用同一配平函数再校验一次并
+  收缩（收缩不出合法区间 → 丢弃并计 `compactionDrops`）；确定性错误（边界不合法 /
+  压后不更小）直接丢弃计数；其余错误最多重试 3 次，超限丢弃并计数。修复了「pending 一直
+  留着、每个 turn 都失败一次」的死循环。成功后清零计数与最后一条错误。
+- **C120-M3 空区间不再算失败**：区间剔除注入消息后没有用户/助手正文时，直接记
+  `status='empty'` 不调模型；模型给空草稿时重试一次，仍空也记 `empty`。`empty` 与
+  `failed` 分开统计，`empty` 照常推进巩固游标、允许该区间压缩。数据库 schema 升到
+  v16（consolidations 的 status CHECK 增加 `empty`，旧行保留）。
+- **H2L-L2 插件模型调用带上 `purpose`**：情绪判定为 `companion-appraise`、巩固为
+  `companion-consolidate`；不用 `compaction`，避免宿主把它当成自己的压缩请求（会加
+  `x-deepseek-harness-compact` 头）。
+
+### Added
+
+- **C120-M1 `compactMinRegionTokens`**（默认 `4096`）：巩固出的区间小于它就不登记
+  压缩，避免为几千 token 的小区间反复重建 surface；`0` 关闭闸门。
+- **C120-L1 `/状态` 显示压缩与巩固健康度**：连续压缩失败次数、最后一条错误原文
+  （不截断）、`empty` / `failed` 各自条数。
+
+### Docs
+
+- **H2L-L5**：配置表补 `compactMinRegionTokens`，部署说明补「须在 profile 显式配置
+  `defaultContextWindow`（0.2.2 起未写容量的模型默认 1,000,000）」。
+
+### Tests
+
+- 1469 个用例 / 52 个套件（默认时区）。
+- `test/v077-stage1.test.js`（19 例）：配平纯函数、FakeCtx 的宿主式配平校验、6122 事件
+  构造回放（596 tool-call / 595 tool-result / 尾部一个未结束调用）、pending 收缩成功与
+  丢弃、非确定性错误 3 次上限、`compactMinRegionTokens` 门槛、`empty` 两例、schema
+  v15 → v16 迁移。**构造数据，真快照到达后替换**：50041 surface 快照未到，量级按任务
+  给的 6122 事件铺。
+
 ## [0.7.6] - 2026-11-14
 
 ### Fixed

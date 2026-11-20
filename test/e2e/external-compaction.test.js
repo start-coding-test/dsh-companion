@@ -110,7 +110,7 @@ function promptText(request) {
 test('N-H1：外部压缩后重锚并继续巩固，不重复写平台摘要', async () => {
   const temp = makeTempStore();
   const { ctx, streams, session } = makeApplyCtx();
-  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     // turn 1：正常巩固，水位 = 1。
     await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 1), { kind: 'enter', messages: [] });
@@ -163,7 +163,7 @@ test('N-H1：外部压缩后重锚并继续巩固，不重复写平台摘要', a
 test('R-M1：外部压缩越过水位时，替换节点（平台摘要）进入巩固', async () => {
   const temp = makeTempStore();
   const { ctx, streams, session } = makeApplyCtx();
-  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     // turn 1：巩固 seq1，水位 = 1。
     await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 1), { kind: 'enter', messages: [] });

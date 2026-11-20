@@ -131,7 +131,7 @@ test('schema_version：meta 缺失时回退当前版本而不是旧常量', (t) 
   const payload = JSON.parse(readFileSync(exported.path, 'utf8'));
   // v15 起 export.js 直接复用 store 的 SCHEMA_VERSION（不再写死字面量）。
   // store.js 现已导出 SCHEMA_VERSION，后续卡应让 export.js 直接 import 以消除双写。
-  assert.equal(payload.schema_version, '15');
+  assert.equal(payload.schema_version, '16');
 });
 
 test('导出文件名：秒级时间戳，同一秒重复追加 -2/-3 而不覆盖', (t) => {

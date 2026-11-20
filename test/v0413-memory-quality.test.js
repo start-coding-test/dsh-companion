@@ -63,22 +63,33 @@ describe('A8④：纯工具区间不写占位 episode', () => {
     assert.equal(store.stats().consolidations, 0);
   });
 
-  test('整段空手而归（无 episode、无事实、无提醒）拒绝', async (t) => {
+  test('整段空手而归（无 episode、无事实、无提醒）记 empty：重试一次后落空，不算失败', async (t) => {
+    // C120-M3：空草稿不再是 bad-draft 失败。第一次空草稿触发一次重试，仍然为空就写
+    // status='empty' 的 consolidations 行（既不落 episode 也不落事实），让游标照常推进。
     const store = openStore(t);
-    await assert.rejects(
-      () => consolidate({
-        store,
-        scope: 'main',
-        seqFrom: 1,
-        seqTo: 2,
-        now: NOW,
-        llm: () => ({ episode: null, facts: [] }),
-      }),
-      (error) => error instanceof ConsolidationError
-        && error.code === 'bad-draft'
-        && /draft is empty/u.test(error.message),
-    );
-    assert.equal(store.stats().consolidations, 0);
+    let calls = 0;
+    const result = await consolidate({
+      store,
+      scope: 'main',
+      seqFrom: 1,
+      seqTo: 2,
+      now: NOW,
+      llm: () => {
+        calls += 1;
+        return { episode: null, facts: [] };
+      },
+    });
+    assert.equal(calls, 2, '空草稿应重试一次');
+    assert.equal(result.skipped, false);
+    assert.equal(result.empty, true);
+    assert.equal(result.upto_seq, 2);
+    assert.equal(result.episodeId, null);
+    assert.equal(result.facts, 0);
+    const stats = store.stats();
+    assert.equal(stats.consolidations, 1);
+    assert.equal(stats.episodes, 0);
+    assert.deepEqual(store.consolidationStatusCounts('main'), { empty: 1 });
+    assert.equal(store.getWatermark('main'), 2, 'empty 也推进巩固游标');
   });
 });
 

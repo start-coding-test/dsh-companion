@@ -93,7 +93,7 @@ import { DEFAULT_VECTOR_DIM, hashEmbed } from './vector.js';
  *     时 DROP TABLE 会隐式 DELETE 并级联清空向量行；PRAGMA 在事务内是 no-op，
  *     所以由 migrate() 在 BEGIN 之前关闭、提交/回滚后恢复。
  */
-export const SCHEMA_VERSION = '15';
+export const SCHEMA_VERSION = '16';
 /** v13：存量 episode 脱敏标记；存在即表示一次性 scrub 已完成（幂等跳过）。 */
 const EPISODE_SCRUB_MARKER = 'episode_scrub_v13';
 /** v13 scrub 的 rowid 批大小：大库分批复用同一游标，避免一次读全表。 */
@@ -153,7 +153,9 @@ export const EVENT_ACTIONS = new Set([
   'govern', 'EDIT', 'scrub',
 ]);
 const EVENT_ACTORS = new Set(['consolidator', 'user', 'scheduler', 'migrator']);
-const CONSOLIDATION_STATUSES = new Set(['running', 'written', 'compacted', 'failed']);
+// v16（C120-M3）：`empty` = 区间里没有用户/助手正文，巩固「无事可写」。它不是失败，
+// 与 written/compacted 一样推进水位（见 getWatermark），也允许该区间后续被压缩。
+const CONSOLIDATION_STATUSES = new Set(['running', 'written', 'compacted', 'failed', 'empty']);
 const THREAD_STATUSES = new Set(['active', 'archived', 'retired']);
 
 /** t17：BUSY/locked 事务最多重试 3 次（首次 + 3 次重试）与退避上限。 */
@@ -349,6 +351,35 @@ function memoryEventsTableDdl(table) {
 }
 
 /**
+ * v16：consolidations 的建表语句。
+ *
+ * 与 facts/memory_events 同样的做法：新库建表（SCHEMA_SQL）与 v16 的 status 枚举
+ * 重建（#rebuildConsolidationsForStatusEnum）共用这一份列定义，重建只换表名。
+ * v16 相对 v15 只多了一个合法状态 `empty`：区间里没有用户/助手正文（只有注入消息
+ * 或工具往来）时记 empty，不算失败，且与 written/compacted 一样推进水位。
+ * @param {string} table 表名（仅内部常量，不接受外部输入）
+ */
+function consolidationsTableDdl(table) {
+  return `CREATE TABLE IF NOT EXISTS ${table} (
+  id            TEXT PRIMARY KEY,
+  scope         TEXT NOT NULL,
+  session_id    TEXT NOT NULL,
+  kind          TEXT NOT NULL CHECK (kind IN ('nap','deep','forget_flush')),
+  trigger       TEXT NOT NULL,
+  upto_seq      INTEGER NOT NULL,
+  turn_from     INTEGER,
+  turn_to       INTEGER,
+  tokens_in     INTEGER,
+  tokens_out    INTEGER,
+  status        TEXT NOT NULL CHECK (status IN ('running','written','compacted','failed','empty')),
+  error         TEXT,
+  started_at    INTEGER NOT NULL,
+  finished_at   INTEGER,
+  compaction_start_seq INTEGER
+);`;
+}
+
+/**
  * §8.2 DDL。表按外键依赖排序（consolidations 先于 episodes），
  * 语义与文档一致；CREATE ... IF NOT EXISTS 保证 migrate 幂等。
  */
@@ -375,23 +406,7 @@ CREATE TABLE IF NOT EXISTS entities (
 );
 CREATE INDEX IF NOT EXISTS ix_ent_name ON entities(name);
 
-CREATE TABLE IF NOT EXISTS consolidations (
-  id            TEXT PRIMARY KEY,
-  scope         TEXT NOT NULL,
-  session_id    TEXT NOT NULL,
-  kind          TEXT NOT NULL CHECK (kind IN ('nap','deep','forget_flush')),
-  trigger       TEXT NOT NULL,
-  upto_seq      INTEGER NOT NULL,
-  turn_from     INTEGER,
-  turn_to       INTEGER,
-  tokens_in     INTEGER,
-  tokens_out    INTEGER,
-  status        TEXT NOT NULL CHECK (status IN ('running','written','compacted','failed')),
-  error         TEXT,
-  started_at    INTEGER NOT NULL,
-  finished_at   INTEGER,
-  compaction_start_seq INTEGER
-);
+${consolidationsTableDdl('consolidations')}
 CREATE UNIQUE INDEX IF NOT EXISTS ux_consolidations_scope_upto ON consolidations(scope, upto_seq, kind);
 CREATE INDEX IF NOT EXISTS ix_consolidations_scope ON consolidations(scope, upto_seq);
 
@@ -1301,6 +1316,21 @@ export class Store {
   }
 
   /**
+   * 删除 schema_meta 的一个键（幂等）。
+   *
+   * v0.7.7 C120-L1：压缩失败的诊断信息需要「清零」；`setMeta` 走 requireString，
+   * 拒绝空字符串，写空串会静默失败、旧值残留，所以清零一律走删键。
+   * @param {string} key
+   * @returns {string|null} 被删除的值（键不存在时 null）
+   */
+  deleteMeta(key) {
+    const metaKey = requireString(key, 'schema_meta.key');
+    const row = this.#db.prepare('SELECT value FROM schema_meta WHERE key = ?').get(metaKey);
+    this.#db.prepare('DELETE FROM schema_meta WHERE key = ?').run(metaKey);
+    return row === undefined ? null : String(row.value);
+  }
+
+  /**
    * 给旧 facts 表补 W5/v8/v9 的列（nullable，same_context 有默认值）。逐列检测，
    * 兼容任意旧版本。只新增列，不重建表、不动既有行；旧行 same_context=0，
    * v8 及更早的行 first_used_ 三列与 used_same_context 为 NULL（没有「用上」记录）。
@@ -1403,7 +1433,7 @@ export class Store {
    * @param {string} from 旧版本号
    */
   #migrateFrom(from) {
-    const known = new Set(['3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14']);
+    const known = new Set(['3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13', '14', '15']);
     if (!known.has(from)) {
       throw new StoreError(
         `[store] unsupported schema_version: ${from} (expected ${SCHEMA_VERSION})`,
@@ -1436,6 +1466,8 @@ export class Store {
     }
     // v3..v14 → v15：补列 + 两处 CHECK 枚举重建 + recall_count 回填，全部幂等。
     this.#upgradeToV15();
+    // v15 → v16：consolidations.status 增加合法值 `empty`（整表重建，幂等）。
+    this.#upgradeToV16();
     this.#db
       .prepare("UPDATE schema_meta SET value = ? WHERE key = 'schema_version'")
       .run(SCHEMA_VERSION);
@@ -1459,6 +1491,49 @@ export class Store {
       UPDATE facts
          SET used_count = recall_count
        WHERE used_count = 0 AND recall_count > 0
+    `);
+  }
+
+  /**
+   * v16（C120-M3）：consolidations.status 的 CHECK 增加 `empty`，SQLite 改不了
+   * CHECK，只能整表重建。
+   *
+   * - 幂等：以 sqlite_master 里 consolidations 的 SQL 是否已含 `'empty'` 判定；
+   *   新库由 SCHEMA_SQL 直接建好，直接返回。
+   * - 列集合取 PRAGMA table_info 全量（v3 起列就齐，v4 之后只加过
+   *   compaction_start_seq，旧行该列为 NULL，原样搬过去）。
+   * - episodes.consolidation_id 指向这张表：migrate() 在升级事务期间已关闭
+   *   foreign_keys，DROP/RENAME 不会级联改动 episodes 行。
+   * - 索引随旧表 DROP 消失，按原名字重建（ux 唯一索引重建失败会让存量重复行暴露）。
+   */
+  #upgradeToV16() {
+    this.#rebuildConsolidationsForStatusEnum();
+  }
+
+  /** @see #upgradeToV16 */
+  #rebuildConsolidationsForStatusEnum() {
+    const row = this.#db
+      .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'consolidations'")
+      .get();
+    if (row && String(row.sql).includes("'empty'")) return;
+    const columns = this.#db
+      .prepare("PRAGMA table_info('consolidations')")
+      .all()
+      .map((column) => column.name);
+    if (columns.length === 0) {
+      throw new StoreError('[store] consolidations table missing during v16 rebuild');
+    }
+    const names = columns.join(', ');
+    this.#db.exec('DROP TABLE IF EXISTS consolidations_v16');
+    this.#db.exec(consolidationsTableDdl('consolidations_v16'));
+    this.#db.exec(
+      `INSERT INTO consolidations_v16 (${names}) SELECT ${names} FROM consolidations`,
+    );
+    this.#db.exec('DROP TABLE consolidations');
+    this.#db.exec('ALTER TABLE consolidations_v16 RENAME TO consolidations');
+    this.#db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS ux_consolidations_scope_upto ON consolidations(scope, upto_seq, kind);
+      CREATE INDEX IF NOT EXISTS ix_consolidations_scope ON consolidations(scope, upto_seq);
     `);
   }
 
@@ -3430,10 +3505,12 @@ export class Store {
     // t17：重试失败巩固时，同一 (scope, upto_seq, kind) 的唯一键已存在一行 failed。
     // 就地复用它（改为本次的 running/written/failed），既不新增重复行，也不改 DDL；
     // 非 failed 行（written/compacted）仍按唯一约束抛错，避免静默覆盖已成功区间。
+    // v16（C120-M3）：empty 行同样可被复用——空区间再次被选中（例如水位被外部压缩
+    // 重锚）时应当就地改判，而不是撞唯一约束。
     const existing = this.#db
       .prepare('SELECT id, status FROM consolidations WHERE scope = ? AND upto_seq = ? AND kind = ?')
       .get(scope, uptoSeq, kind);
-    if (existing && existing.status === 'failed') {
+    if (existing && (existing.status === 'failed' || existing.status === 'empty')) {
       this.#db
         .prepare(
           `UPDATE consolidations
@@ -3500,6 +3577,8 @@ export class Store {
    * 取「最新一条」而不是 MAX(upto_seq)：压缩会把区间替换成一个追加在日志末尾的
    * 节点，可见 seq 可能非单调（catalog:627-632），MAX 会跳过刚写入的较低水位。
    * forget_flush 是定向巩固，不代表整段推进，不参与水位。
+   * v16（C120-M3）：`empty`（区间里没有用户/助手正文）同样推进水位——不推进会让
+   * 同一个空区间被反复选中、反复巩固，永远走不到后面的对话。
    * @param {string} scope
    * @returns {number} 无水印时 0
    */
@@ -3508,7 +3587,7 @@ export class Store {
     const row = this.#db
       .prepare(
         `SELECT upto_seq AS watermark FROM consolidations
-          WHERE scope = ? AND status IN ('written','compacted') AND kind <> 'forget_flush'
+          WHERE scope = ? AND status IN ('written','compacted','empty') AND kind <> 'forget_flush'
           ORDER BY started_at DESC, rowid DESC LIMIT 1`,
       )
       .get(scope);
@@ -4193,6 +4272,26 @@ export class Store {
       });
     }
     return { facts: facts.length, episodes: episodes.length };
+  }
+
+  /**
+   * v16（C120-M3）：按状态统计巩固行，供 `/状态` 把 `empty`（无事可写）与 `failed`
+   * （真失败）分开显示。只返回出现过的状态，缺省即 0。
+   * @param {string} [scope] 省略时统计所有 scope
+   * @returns {Record<string, number>}
+   */
+  consolidationStatusCounts(scope) {
+    const rows = scope === undefined || scope === null
+      ? this.#db.prepare('SELECT status, COUNT(*) AS n FROM consolidations GROUP BY status').all()
+      : this.#db
+        .prepare('SELECT status, COUNT(*) AS n FROM consolidations WHERE scope = ? GROUP BY status')
+        .all(requireString(scope, 'consolidationStatusCounts(scope)'));
+    /** @type {Record<string, number>} */
+    const counts = {};
+    for (const row of rows) {
+      counts[String(row.status)] = Number(row.n);
+    }
+    return counts;
   }
 
   /**

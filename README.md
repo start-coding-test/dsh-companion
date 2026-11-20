@@ -109,6 +109,7 @@ persona:
 | `compactAtTokens` | `24000` | 超过即触发压缩与巩固 |
 | `compactHardTokens` | `40000` | 安全阀 |
 | `retainTokens` | `6144` | 压缩时保留的最近对话 |
+| `compactMinRegionTokens` | `4096` | 巩固出的区间小于它就不登记压缩（`0` 关闭闸门） |
 | `timezone` | `Asia/Shanghai` | 安静时段、每日任务、日界线都按它算 |
 | `quietStart` / `quietEnd` | `23:00` / `08:00` | 安静时段 |
 | `proactiveDailyCap` | `3` | 每日主动消息上限，`0` 关闭 |
@@ -121,6 +122,9 @@ persona:
 | `compact.minIncrementTokens` / `compact.cooldownTurns` | `4096` / `3` | 压缩迟滞，防止每轮空转 |
 
 token 四档须满足 `retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`。未知配置键只记警告，不阻断启动。
+
+部署时请在 profile 显式配置 `defaultContextWindow`（0.2.2 起未写容量的模型默认 1,000,000），
+否则压缩阈值会按错误的窗口算：插件用它换算「还剩多少上下文」，不填等于把上限放大到 1M tokens。
 
 ## 人格与情绪
 

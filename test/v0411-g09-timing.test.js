@@ -349,7 +349,7 @@ test('G0-9 e2e：慢巩固只写一条 warn、/状态 标注超阈值，巩固�
   const { ctx, streams, session, settings } = makeApplyCtx();
   // 巩固模型耗时 70s：超过默认 60s 阈值，但不设硬超时。
   settings.streamDelayMs = 70_000;
-  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     const decision = await ctx.dispatch(
       'agent/pre-step',
@@ -383,7 +383,7 @@ test('G0-9 e2e：慢巩固只写一条 warn、/状态 标注超阈值，巩固�
 test('G0-9 e2e：慢压缩只写一条 warn、/状态 标注超阈值，压缩照常完成', async () => {
   const temp = makeTempStore();
   const { ctx, session } = makeApplyCtx();
-  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     // turn 1：正常巩固，登记 pending_compact。
     await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 1, '我下周要把预算调到 8000。'), {
@@ -440,7 +440,7 @@ test('G0-9 e2e：慢压缩只写一条 warn、/状态 标注超阈值，压缩�
 test('G0-9 e2e：压缩失败也记录耗时并保持 pending_compact，不中止后续 pre-step', async () => {
   const temp = makeTempStore();
   const { ctx, session } = makeApplyCtx();
-  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, threadIdleDays: 14, retainTokens: 4, compactMinRegionTokens: 0 });
   try {
     await ctx.dispatch('agent/pre-step', turnPayload(ctx, session, 1, '我下周要把预算调到 8000。'), {
       kind: 'enter',

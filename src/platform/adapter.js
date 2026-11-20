@@ -890,7 +890,14 @@ export function createAdapter(ctx, opts = {}) {
    * `TokenUsage = {inputTokens, outputTokens, totalTokens?, cacheReadTokens?, …}`）时回调。
    * 缺失用法不影响结果（调用方按码点自估）。
    *
-   * @param {{provider: string, model: string, messages: unknown[],
+   * H2L-L2：`request.purpose` 原样透传给宿主 `llm.stream()`。宿主
+   * `@deepseek-ai/dsh-llm/src/types.ts:605`（`GenerateOptions.purpose`，类型是
+   * 可扩展的 `LlmRequestPurpose`，见同文件 :554-558 的空映射接口）不做白名单校验，
+   * 只有 `'compaction'` 有特殊语义（`dsh-llm-deepseek/src/adapter.ts:152` 会给它加
+   * `x-deepseek-harness-compact` 头）。插件只使用 `companion-*` 命名空间，
+   * **绝不复用 `'compaction'`**，避免把插件自己的模型调用标成平台压缩。
+   *
+   * @param {{provider: string, model: string, messages: unknown[], purpose?: string,
    *          signal?: AbortSignal, onUsage?: (usage: object) => void}} request
    * @returns {Promise<string>}
    */
@@ -911,6 +918,10 @@ export function createAdapter(ctx, opts = {}) {
     if (!Array.isArray(request.messages)) {
       throw new TypeError('complete(request): messages must be an array');
     }
+    if (request.purpose !== undefined
+      && (typeof request.purpose !== 'string' || request.purpose === '')) {
+      throw new TypeError('complete(request): purpose must be a non-empty string when present');
+    }
 
     let text = '';
     let failure = null;
@@ -918,6 +929,7 @@ export function createAdapter(ctx, opts = {}) {
       provider: request.provider,
       model: request.model,
       messages: request.messages,
+      ...(request.purpose === undefined ? {} : { purpose: request.purpose }),
       ...(request.signal === undefined ? {} : { signal: request.signal }),
     })) {
       if (chunk === null || typeof chunk !== 'object') continue;

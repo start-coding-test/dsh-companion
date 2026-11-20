@@ -686,11 +686,80 @@ function normalizeRegionText(value) {
   return value.trim() === '' ? null : value;
 }
 
+/** C120-M3：空草稿（normalizeDraft 报的 `draft is empty …`）不是失败，是「没内容可写」。 */
+function isEmptyDraftError(error) {
+  return error instanceof ConsolidationError
+    && error.code === 'bad-draft'
+    && /draft is empty/u.test(String(error.message));
+}
+
+/** 选区文本里 surface 给工具调用/结果留的占位行（见 src/session/surface.js flattenMessage）。 */
+const TOOL_PLACEHOLDER_LINE = /^\[tool (?:call|result)[^\]]*\]$/u;
+
+/**
+ * C120-M3：把一行「role: text」判定为「有实质对话正文」。
+ *
+ * 不算正文的：空/纯空白、工具调用与结果的占位（`[tool call …]` / `[tool result]`）、
+ * 召回快照残留（`[相关记忆]…[/相关记忆]` 整块在调用前已被剥掉，这里兜一次）。
+ * 只有 user / assistant 两个角色算「用户与助手正文」——system、tool 都不算。
+ *
+ * @param {string} role
+ * @param {string} body
+ * @returns {boolean}
+ */
+function lineHasUserOrAssistantText(role, body) {
+  const normalizedRole = String(role ?? '').trim().toLowerCase();
+  if (normalizedRole !== 'user' && normalizedRole !== 'assistant') return false;
+  const text = String(body ?? '').trim();
+  if (text === '') return false;
+  if (TOOL_PLACEHOLDER_LINE.test(text)) return false;
+  return true;
+}
+
+/**
+ * C120-M3：这一段有没有值得交给模型的「用户与助手正文」。
+ *
+ * 注入消息（召回快照、情绪句、过期提醒、运行环境提示等）不是对话内容：全是注入
+ * 或只有工具往来的区间巩固出来必然是空草稿，直接记 `status='empty'` 更准确，
+ * 也不该计入失败。
+ *
+ * @param {{regionText?: string|null, transcript?: object[]}} input
+ * @returns {boolean}
+ */
+export function hasConsolidatableText(input = {}) {
+  const regionText = normalizeRegionText(input.regionText);
+  if (regionText !== null) {
+    const stripped = regionText.replace(/\[相关记忆\][\s\S]*?\[\/相关记忆\]/gu, '');
+    for (const line of stripped.split('\n')) {
+      const match = /^\s*([A-Za-z_-]+)\s*:\s*([\s\S]*)$/u.exec(line);
+      if (match === null) continue;
+      if (lineHasUserOrAssistantText(match[1], match[2])) return true;
+    }
+  }
+  const transcript = Array.isArray(input.transcript) ? input.transcript : [];
+  for (const row of transcript) {
+    if (lineHasUserOrAssistantText(row?.role, row?.text)) return true;
+  }
+  return false;
+}
+
+/**
+ * C120-M3：调用方到底有没有给「可判定的文本来源」。
+ *
+ * 两个来源都缺（既没有选区文本，也没有转录）时不能断定区间为空——那只是没有证据，
+ * 照旧交给模型判断；只有拿到来源且里面没有任何用户/助手正文，才算真正的空区间。
+ * @param {{regionText?: string|null, transcript?: object[]}} input
+ * @returns {boolean}
+ */
+export function hasTextSource(input = {}) {
+  if (normalizeRegionText(input.regionText) !== null) return true;
+  return Array.isArray(input.transcript) && input.transcript.length > 0;
+}
+
 /**
  * 构造巩固模型提示词。N1：优先使用 surface 选区文本（已含 role 标注），
  * 缺失时回退最近转录；选区文本与 seqFrom/seqTo 的对齐由调用方保证。
- *
- * @param {object} input
+ * * @param {object} input
  * @param {string} [input.scope='main']
  * @param {number} [input.seqFrom]
  * @param {number} [input.seqTo]
@@ -807,6 +876,54 @@ export async function consolidate(input = {}) {
   }
   let durationMs = 0;
 
+  /**
+   * C120-M3：把本区间记为 `status='empty'` 并返回统一结果。
+   *
+   * 空不是失败：区间里确实没有可写的内容（只有注入消息/工具往来，或模型两次都判空），
+   * 记一行 empty 让水位正常推进、区间允许后续压缩，不再计入 failed 与失败重试。
+   * @returns {object}
+   */
+  const writeEmpty = () => {
+    const settledMs = epochMs(clock());
+    durationMs = settledMs === null ? 0 : Math.max(0, settledMs - startedMs);
+    store.transaction(() => {
+      store.insertConsolidation({
+        scope,
+        session_id: sessionId,
+        kind,
+        trigger,
+        upto_seq: to,
+        turn_from: from,
+        turn_to: to,
+        compaction_start_seq: from,
+        status: 'empty',
+        started_at: at,
+        finished_at: at,
+      });
+    });
+    return {
+      skipped: false,
+      empty: true,
+      upto_seq: to,
+      textSource,
+      kind,
+      episodeId: null,
+      facts: 0,
+      excluded: 0,
+      sensitive: 0,
+      notice: null,
+      duration_ms: durationMs,
+    };
+  };
+
+  // C120-M3：区间里没有用户/助手正文（全是注入消息或工具往来）时，模型无论怎么问
+  // 都只会给空草稿。直接记 status='empty'：不算失败、不调模型，游标照常推进，
+  // 于是这一区间之后可以正常压缩，也不会计入失败统计。
+  // 只有在拿到文本来源时才敢这么判定；两个来源都缺是「没证据」，照旧交给模型。
+  if (hasTextSource({ regionText, transcript }) && !hasConsolidatableText({ regionText, transcript })) {
+    return writeEmpty();
+  }
+
   // 定向巩固（遗忘闭环）：先把目标事实的 statement 归一化成排除集，
   // 草稿里相同/包含/被包含的事实不写回。目标已 tombstone，getFact 仍可读。
   const excludedStatements = [];
@@ -821,7 +938,7 @@ export async function consolidate(input = {}) {
   const existingFacts = selectExistingFactsFromRegion(store, scope, regionText, transcript, {
     preferenceLimit: normalizeExistingFactsLimit(input.existingFactsLimit),
   });
-  const draft = await llm({
+  const draftInput = {
     scope,
     seqFrom: from,
     seqTo: to,
@@ -829,8 +946,22 @@ export async function consolidate(input = {}) {
     textSource,
     transcript,
     existingFacts,
-  });
-  const { episode, facts: draftedFacts, reminders: draftedReminders } = normalizeDraft(draft);
+  };
+  // C120-M3：空草稿不抛错给调用方，也不当失败——先按同一选区再问一次模型，
+  // 仍然为空就记 status='empty'（见 writeEmpty）。
+  let parsed;
+  try {
+    parsed = normalizeDraft(await llm(draftInput));
+  } catch (error) {
+    if (!isEmptyDraftError(error)) throw error;
+    try {
+      parsed = normalizeDraft(await llm(draftInput));
+    } catch (retryError) {
+      if (!isEmptyDraftError(retryError)) throw retryError;
+      return writeEmpty();
+    }
+  }
+  const { episode, facts: draftedFacts, reminders: draftedReminders } = parsed;
   // V9-M1：episode 四字段（及 topics/entities）落库前逐个脱敏，凭据值不落库；
   // store.insertEpisode 还会再做一次防御性脱敏（任何调用方都不落明文）。
   const safeEpisode = episode === null ? null : redactEpisode(episode);
@@ -1027,6 +1158,7 @@ export async function consolidate(input = {}) {
   // 4) 事务已提交，水位推进到 to。
   return {
     skipped: false,
+    empty: false,
     upto_seq: to,
     textSource,
     kind,

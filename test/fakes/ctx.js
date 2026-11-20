@@ -134,12 +134,19 @@ export class FakeCtx {
         compactRegion: (start, end, agent, signal) => {
           this._record('compaction.compactRegion', [start, end, agent, signal]);
           this._failAt('compaction.compactRegion');
+          const session = agent?.session;
+          // C120-M2：宿主只接受落在「工具配对平衡切口」的区间
+          // （dsh-compaction/src/tool-pairing.ts:112-126 toolPairingBalancedBefore/After）。
+          // 没有 session 的调用（例如 adapter 透传单测）无从校验，直接放行。
+          if (this.sessions.has(session?.id)) {
+            assertBalancedCut(this.sessions.get(session.id), start, 'start');
+            assertBalancedCut(this.sessions.get(session.id), end, 'end');
+          }
           const fallback = {
             compactionId: `compact-fake-${this.calls.length}`,
             start,
             end,
           };
-          const session = agent?.session;
           if (this.returns['compaction.compactRegion'] === undefined && this.sessions.has(session?.id)) {
             // 平台语义：压缩后原区间从 surface 消失；默认追加一个 seq 最大的替换节点。
             this.compactSession(session.id, start, end);
@@ -651,5 +658,59 @@ export class FakeCtx {
 
   _value(key, fallback) {
     return Object.hasOwn(this.returns, key) ? this.returns[key] : fallback;
+  }
+}
+
+/**
+ * C120-M2：与宿主同一个计数法（dsh-compaction/src/tool-pairing.ts:29-38 `eventDelta`）。
+ *
+ * assistant/message 按其中的 tool-call 块数 +N，tool/result 固定 −1，其它事件 0；
+ * **不按 callId 配对**（现网 tool/result 的 callId 是 undefined），
+ * 所以只能用累计和判断切口是否闭合。
+ * @param {object} event
+ * @returns {number}
+ */
+export function eventToolDelta(event) {
+  const type = String(event?.type ?? '');
+  if (type === 'assistant/message') {
+    const content = event?.data?.message?.content;
+    if (!Array.isArray(content)) return 0;
+    return content.filter((block) => block?.type === 'tool-call').length;
+  }
+  if (type === 'tool/result') return -1;
+  return 0;
+}
+
+/**
+ * C120-M2：切口配平校验，对应宿主 toolPairingBalancedBefore / toolPairingBalancedAfter
+ * （dsh-compaction/src/tool-pairing.ts:112-126）。
+ *
+ * before：seq 之前累计为 0；after：seq（含）之后累计为 0。累计出现负数说明
+ * tool/result 没有对应的 tool-call，宿主视为 surface 损坏（同 extendCache :41-69）。
+ * 错误文案里带 `balanced boundary`，供 index.js 的确定性错误分类（不重试、直接丢弃）。
+ * @param {object} session
+ * @param {number} seq
+ * @param {'start'|'end'} which
+ */
+export function assertBalancedCut(session, seq, which) {
+  const events = Array.isArray(session?.events) ? session.events : [];
+  const target = Number(seq);
+  let total = 0;
+  for (const event of events) {
+    const eventSeq = Number(event?.seq);
+    if (!Number.isFinite(eventSeq)) continue;
+    const included = which === 'start' ? eventSeq < target : eventSeq <= target;
+    if (!included) continue;
+    total += eventToolDelta(event);
+    if (total < 0) {
+      throw new Error(
+        `compaction ${which} ${seq} is not on a balanced boundary: tool/result has no matching tool-call at seq ${eventSeq}`,
+      );
+    }
+  }
+  if (total !== 0) {
+    throw new Error(
+      `compaction ${which} ${seq} is not on a balanced boundary: ${total} tool call(s) still open`,
+    );
   }
 }

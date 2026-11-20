@@ -119,6 +119,14 @@ import { createProactive } from './runtime/proactive.js';
 import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
 import { createTools } from './runtime/tools.js';
 import {
+  clearCompactionAttempts,
+  clearCompactionFailures,
+  MAX_COMPACTION_RETRIES,
+  readCompactionAttempts,
+  recordCompactionAttempt,
+  recordCompactionFailure,
+} from './state/compaction-failures.js';
+import {
   createPendingCompacts,
   peekPendingCompact,
   recoverPendingCompacts,
@@ -126,6 +134,7 @@ import {
   takePendingCompact,
 } from './state/pending-compact.js';
 import {
+  alignRegionToToolPairing,
   createSurfaceIndex,
   firstReplaceableIndex,
   planRegion,
@@ -2567,6 +2576,23 @@ function warnSkipOnce(state, reason, message, meta) {
 }
 
 /**
+ * C120-M1：选区太小就不登记 pending_compact。
+ *
+ * 0（或非法值）表示关闭闸门；token 数未知时按「够大」处理——宁可多登记一次
+ * pending，也不要因为拿不到度量而丢掉本该压缩的区间。
+ * @param {number|null} regionTokens
+ * @param {number} minTokens  config.compactMinRegionTokens
+ * @returns {boolean}
+ */
+function belowCompactMinRegion(regionTokens, minTokens) {
+  const min = Number(minTokens);
+  if (!Number.isFinite(min) || min <= 0) return false;
+  const tokens = Number(regionTokens);
+  if (!Number.isFinite(tokens)) return false;
+  return tokens < min;
+}
+
+/**
  * 真正执行一次巩固：水位判断 → 模型草稿 → 单事务写库，成功才登记 pending_compact。
  * @param {object} state
  * @param {{scope:string, trigger:string, sessionId:string, snapshot:object|null,
@@ -2582,6 +2608,8 @@ async function executeConsolidationJob(state, job) {
   let startSeq;
   let endSeq;
   let regionText;
+  // C120-M1：本步选区的 token 数（重试分支复用首次登记时的区间，闸门已在首次判定过）。
+  let regionTokens = null;
   if (retrying) {
     // t17：重试固定使用首次登记的区间，不再按已变化的 surface 重选，
     // 否则会与 failed 行的 (scope, upto_seq, kind) 不匹配。
@@ -2628,6 +2656,7 @@ async function executeConsolidationJob(state, job) {
     const sameRegion = job.regionStartSeq === region.startSeq && job.regionEndSeq === region.endSeq;
     startSeq = region.startSeq;
     endSeq = region.endSeq;
+    regionTokens = region.tokens;
     regionText = sameRegion && typeof job.regionText === 'string' && job.regionText !== ''
       ? job.regionText
       : region.text;
@@ -2683,12 +2712,24 @@ async function executeConsolidationJob(state, job) {
     }
 
     const consolidation = findConsolidation(store, job.scope, Number(result.upto_seq));
-    setPendingCompact(state.pendingCompact, {
-      id: consolidation?.id ?? null,
-      startSeq,
-      endSeq,
-      scope: job.scope,
-    });
+    // C120-M1：太小的区间不登记 pending——压缩收益抵不过一次 surface replace 的成本，
+    // 也更容易撞上宿主「压后不更小」的确定性拒绝。0 表示关闭闸门。
+    if (belowCompactMinRegion(regionTokens, config.compactMinRegionTokens)) {
+      platform.log('debug', '[dsh-companion] pending compaction skipped: region below compactMinRegionTokens', {
+        scope: job.scope,
+        startSeq,
+        endSeq,
+        tokens: regionTokens,
+        min: config.compactMinRegionTokens,
+      });
+    } else {
+      setPendingCompact(state.pendingCompact, {
+        id: consolidation?.id ?? null,
+        startSeq,
+        endSeq,
+        scope: job.scope,
+      });
+    }
     // r2 M-1：pendingCompact 不保存 trigger，所以冷却归零必须在这里按 job.trigger 做，
     // 否则 recordCompactionFloor 里的 threshold 分支永远不可达，计数只增不减。
     if (job.trigger === 'threshold') resetThresholdCooldown(state, job.scope);
@@ -2698,21 +2739,33 @@ async function executeConsolidationJob(state, job) {
     metrics.inc('consolidations');
     const sensitive = Number(result.sensitive) || 0;
     const notice = typeof result.notice === 'string' && result.notice !== '' ? result.notice : null;
+    const empty = result.empty === true;
     state.lastConsolidationResult = {
       ok: true,
+      empty,
       scope: job.scope,
       trigger: job.trigger,
       upto_seq: result.upto_seq,
       sensitive,
       notice,
     };
-    platform.log(sensitive > 0 ? 'warn' : 'info', '[dsh-companion] consolidation written', {
-      upto_seq: result.upto_seq,
-      facts: result.facts ?? 0,
-      sensitive,
-      notice,
-      trigger: job.trigger,
-    });
+    if (empty) {
+      // C120-M3：区间里没有用户/助手正文（只有注入或工具消息）——记 status='empty'，
+      // 不算失败：游标已推进、区间允许压缩，只是没有可写的内容。
+      platform.log('info', '[dsh-companion] consolidation empty: no user/assistant text in region', {
+        scope: job.scope,
+        upto_seq: result.upto_seq,
+        trigger: job.trigger,
+      });
+    } else {
+      platform.log(sensitive > 0 ? 'warn' : 'info', '[dsh-companion] consolidation written', {
+        upto_seq: result.upto_seq,
+        facts: result.facts ?? 0,
+        sensitive,
+        notice,
+        trigger: job.trigger,
+      });
+    }
     if (notice !== null) {
       // V7-M3：凭据类内容未落库，回执里给用户同一句建议。
       platform.log('info', '[dsh-companion] credential content skipped', {
@@ -3026,6 +3079,46 @@ function recordCompactionFloor(state, payload, scope) {
   }
 }
 
+/**
+ * C120-H2：宿主判定「再试也不会成功」的压缩错误。命中即丢弃 pending，
+ * 不再每 turn 重试（宿主原文见 D:\dsh\resources\app.asar\dsh\node_modules\
+ * @deepseek-ai\dsh-compaction\src\tool-pairing.ts:52-60 的 `tool-pairing balance:`
+ * 与 `... has no matching ... (corrupt surface)`，以及压缩后「不更小」的拒绝）。
+ */
+const DETERMINISTIC_COMPACTION_FAILURE = /balanced boundary|not smaller|tool-pairing balance|corrupt surface|no matching tool-call|no matching session event/i;
+
+/**
+ * C120-H2：pending 区间在真正调用 compactRegion 之前，用与 planRegion 相同的两条
+ * 规则再校验一次（旧 pending 是上一版代码登记的，可能落在不合法切口上）：
+ *
+ * 1. 起点跳过系统提示词（V7-M1 的 firstReplaceableIndex）；
+ * 2. 起止都收缩到工具配对平衡的切口（C120-H1 的 alignRegionToToolPairing）。
+ *
+ * 只收缩不扩张，因此收缩后的区间仍是原 pending 区间的子集。
+ * @param {{records?: Array<{toolDelta?: number, role?: string}>, nodes?: Array<object>|null}} snapshot
+ * @param {number} startIdx
+ * @param {number} endIdx
+ * @returns {{startIdx: number, endIdx: number}|null} null = 无法落在合法切线上，调用方丢弃
+ */
+function alignPendingRegion(snapshot, startIdx, endIdx) {
+  const records = Array.isArray(snapshot?.records) ? snapshot.records : null;
+  if (records === null) return null;
+  let from = firstReplaceableIndex(snapshot, startIdx);
+  let to = endIdx;
+  if (from > to) return null;
+  // 每轮至少收缩一个节点，因此最多 records.length + 1 轮必收敛（防御性兜底）。
+  for (let guard = 0; guard <= records.length + 1; guard += 1) {
+    const aligned = alignRegionToToolPairing(records, from, to);
+    if (aligned === null) return null;
+    const fenced = firstReplaceableIndex(snapshot, aligned.startIdx);
+    if (fenced > aligned.endIdx) return null;
+    if (fenced === from && aligned.endIdx === to) return { startIdx: from, endIdx: to };
+    from = fenced;
+    to = aligned.endIdx;
+  }
+  return null;
+}
+
 async function maybeCompact(state, payload, scope = SCOPE) {
   const { platform, store, config } = state;
   const pending = peekPendingCompact(state.pendingCompact, scope);
@@ -3052,11 +3145,12 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     return;
   }
 
-  // V7-M1：旧 pending 可能把起点记在 surface 节点 0（系统提示词）上，宿主会拒绝
-  // 替换。所有 compactRegion 调用点都先做同一道收紧：跳过系统节点，区间为空就丢弃。
-  const fencedIdx = firstReplaceableIndex(snapshot, startIdx);
-  if (fencedIdx > endIdx) {
-    platform.log('warn', '[dsh-companion] pending compaction region has no replaceable node; dropping', {
+  // V7-M1 + C120-H2：旧 pending 可能把起点记在 surface 节点 0（系统提示词）上，或
+  // 落在工具调用/结果之间——宿主都会拒绝替换。所有 compactRegion 调用点都先做同一道
+  // 收紧：跳过系统节点、收缩到工具配对平衡切口，区间为空就丢弃。
+  const aligned = alignPendingRegion(snapshot, startIdx, endIdx);
+  if (aligned === null) {
+    platform.log('warn', '[dsh-companion] pending compaction region has no replaceable node or no balanced boundary; dropping', {
       startSeq: pending.startSeq,
       endSeq: pending.endSeq,
       nodes: seqs.length,
@@ -3065,10 +3159,11 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     state.metrics.inc('compactionDrops');
     return;
   }
-  startIdx = fencedIdx;
+  startIdx = aligned.startIdx;
+  const stopIdx = aligned.endIdx;
 
   const start = seqs[startIdx];
-  const end = seqs[endIdx];
+  const end = seqs[stopIdx];
   // V7-L2：压缩耗时用平台毫秒时钟单独计时；事件时间戳仍是秒级。
   const startedMs = platform.now();
   try {
@@ -3077,6 +3172,9 @@ async function maybeCompact(state, payload, scope = SCOPE) {
       store.markConsolidated(pending.id, { status: 'compacted' });
     }
     state.metrics.inc('compactions');
+    // C120-H2/L1：成功后清掉连续失败与区间尝试计数（`/状态` 只显示未恢复的失败）。
+    clearCompactionFailures(store, scope);
+    clearCompactionAttempts(store, scope);
 
     // 压缩把区间替换成追加在日志末尾的节点（seq 最大），旧水位在新空间失效：
     // 重读 surface，水位记为「替换节点 / 位置水位」并在库内重写，保证自洽。
@@ -3139,10 +3237,33 @@ async function maybeCompact(state, payload, scope = SCOPE) {
       ok: false,
       warnMs: config.timing?.compactWarnMs,
     });
+    const message = error instanceof Error ? error.message : String(error);
+    const deterministic = DETERMINISTIC_COMPACTION_FAILURE.test(message);
+    const attempts = deterministic
+      ? Math.max(1, readCompactionAttempts(store, scope, start, end))
+      : recordCompactionAttempt(store, scope, start, end);
+    const failures = recordCompactionFailure(store, scope, message);
+    if (deterministic || attempts >= MAX_COMPACTION_RETRIES) {
+      // C120-H2：确定性失败（边界不合法 / 压后不更小）与超过上限的非确定性失败，
+      // 继续留 pending 只会在每个 turn 重复失败：丢弃并计数，交给下一轮巩固重新规划。
+      takePendingCompact(state.pendingCompact, scope);
+      state.metrics.inc('compactionDrops');
+      platform.log('warn', '[dsh-companion] compaction dropped after failure', {
+        start,
+        end,
+        attempts,
+        failures,
+        deterministic,
+        message,
+      });
+      return;
+    }
     platform.log('warn', '[dsh-companion] compactRegion failed; keeping pending_compact', {
       start,
       end,
-      message: error instanceof Error ? error.message : String(error),
+      attempts,
+      failures,
+      message,
     });
   }
 }
@@ -3341,6 +3462,9 @@ function ensureAppraiserQueue(state) {
         provider: route.provider,
         model: route.model,
         messages,
+        // H2L-L2：插件自己的模型调用用 companion-* 命名空间标记来源；不能复用
+        // 'compaction'（宿主 llm-deepseek 会给它加压缩头）。
+        purpose: 'companion-appraise',
         onUsage: (value) => {
           usage = value;
         },
@@ -4155,6 +4279,8 @@ async function resolveConsolidationLlm(state) {
       provider,
       model,
       messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+      // H2L-L2：巩固调用单独标记来源（companion-* 命名空间，不是 'compaction'）。
+      purpose: 'companion-consolidate',
       onUsage: (value) => {
         usage = value;
       },
@@ -4294,16 +4420,24 @@ async function deepConsolidate(state) {
     });
     if (result?.skipped) return { written: false, reason: 'skipped' };
     const row = findConsolidation(store, SCOPE, Number(result.upto_seq));
-    setPendingCompact(state.pendingCompact, {
-      id: row?.id ?? null,
-      startSeq: region.startSeq,
-      endSeq: region.endSeq,
-      scope: SCOPE,
-    });
+    // C120-M1：与 nap 路径同一道闸门。
+    if (!belowCompactMinRegion(region.tokens, state.config.compactMinRegionTokens)) {
+      setPendingCompact(state.pendingCompact, {
+        id: row?.id ?? null,
+        startSeq: region.startSeq,
+        endSeq: region.endSeq,
+        scope: SCOPE,
+      });
+    }
     setWatermark(state, SCOPE, region.endSeq);
     clearWatermarkAnchor(state.store, SCOPE);
     state.metrics.inc('consolidations');
-    return { written: true, upto_seq: result.upto_seq, facts: result.facts ?? 0 };
+    return {
+      written: true,
+      empty: result?.empty === true,
+      upto_seq: result.upto_seq,
+      facts: result.facts ?? 0,
+    };
   } catch (error) {
     state.metrics.inc('consolidationFailures');
     platform.log('warn', '[dsh-companion] deep-sleep consolidation failed', {
