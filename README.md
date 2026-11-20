@@ -130,6 +130,8 @@ persona:
 | `bg.workRoot` | `""` | 后台长任务的工作根；留空则 `bg_run` 直接返回不可用（建议 `/opt/dsh-companion/.data/work/`） |
 | `bg.interpreters` | `[python3, bash, node]` | `bg_run` 允许的解释器白名单（只比 `argv[0]`，不看脚本内容） |
 | `bg.runAs` | `""` | 后台任务的运行身份；空 = 与 50041 相同（即 root），可配为专用用户 |
+| `bg.env` | `[]` | 额外从 50041 进程透传给后台任务的变量名（`PATH` / `HOME` 恒透传） |
+| `bg.logMaxMB` | `50` | 后台任务日志保留上限（MB），超出只留尾部；`0` 关闭 |
 | `bg.maxDeadlineMin` | `360` | 后台任务时长上限（分钟），超时由 `RuntimeMaxSec` 主杀、插件兜底 TERM→KILL |
 | `bg.memoryMax` / `bg.cpuQuota` | `4G` / `200%` | 后台任务的 cgroup 资源上限（2 核） |
 | `bg.minFreeDiskMB` | `1024` | workRoot 剩余空间低于它就拒绝启动 |

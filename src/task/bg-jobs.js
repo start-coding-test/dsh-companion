@@ -17,6 +17,7 @@ import { readFileSync, realpathSync, statSync, statfsSync } from 'node:fs';
 import { isAbsolute, basename, relative, resolve } from 'node:path';
 import {
   DEFAULT_BG_LOG_ROOT,
+  capLogFile,
   jobDir,
   probeBgProcess,
   readExitCode,
@@ -39,6 +40,8 @@ export const BG_JOB_STATES = Object.freeze({
   running: 'running',
   woken: 'woken',
   wokenFallback: 'woken-fallback',
+  // W77-M1：拉起就被 systemd-run 拒绝（或 spawn 失败），从未真正跑起来。
+  failed: 'failed',
   timeout: 'timeout',
   lost: 'lost',
 });
@@ -221,7 +224,10 @@ export function validateBgRun({ argv, cwd, deadlineMin, label, config, store, fs
   return {
     ok: true,
     plan: {
-      argv: argv.slice(),
+      // W77-H1：argv[1] 换成 realpath 之后的绝对路径。systemd 的瞬态 service 自己
+      // 有一套 cwd（由 --working-directory 给），相对路径在那边解析会指向别的文件；
+      // 校验、sha256 与实际执行必须是同一个绝对路径。
+      argv: [argv[0], realScript, ...argv.slice(2)],
       cwd: realCwd,
       scriptPath: realScript,
       scriptSha256,
@@ -312,6 +318,10 @@ export async function startBgJob({
     id,
     argv: plan.argv,
     cwd: plan.cwd,
+    // W77-H1：service 自己的工作目录（不是 spawn 客户端的 cwd）。
+    workingDirectory: plan.cwd,
+    // W77-M2：PATH/HOME 由 launcher 默认透传，这里只补 bg.env 列出的变量。
+    envNames: Array.isArray(config?.bg?.env) ? config.bg.env : [],
     deadlineSec: plan.deadlineSec,
     memoryMax: config?.bg?.memoryMax ?? '4G',
     cpuQuota: config?.bg?.cpuQuota ?? '200%',
@@ -319,6 +329,58 @@ export async function startBgJob({
     logRoot,
   });
   const logPath = started.logPath ?? bgLogPath(id, logRoot);
+  const startedAt = Math.floor(nowMs / 1000);
+
+  // W77-M1：拉起被拒（systemd-run 早退 / spawn 失败）→ 记 failed 行 + 审计，
+  // 由调用方（tools 的 bg_run）沿 SA-B3 回执一句，不再静默丢在后台。
+  if (started.failure !== undefined && started.failure !== null) {
+    const failure = started.failure;
+    const failedJob = store.insertBgJob({
+      id,
+      label: plan.label,
+      argv: plan.argv,
+      cwd: plan.cwd,
+      script_sha256: plan.scriptSha256,
+      child_agent_name: origin?.childAgentName ?? null,
+      child_session_id: origin?.childSessionId,
+      root_session_id: origin?.rootSessionId ?? null,
+      pid_or_unit: started.unit ?? null,
+      started_at: startedAt,
+      deadline: startedAt + plan.deadlineSec,
+      state: BG_JOB_STATES.failed,
+      log_path: logPath.replace(/\\/gu, '/'),
+      exit_code: failure.exitCode ?? null,
+      finished_at: startedAt,
+      launched_by: origin?.launchedBy ?? null,
+    });
+    try {
+      store.appendEvent({
+        action: 'ADD',
+        actor: 'scheduler',
+        table_name: 'bg_jobs',
+        row_id: id,
+        reason: 'bg_run',
+        detail_json: {
+          kind: 'bg_job_failed',
+          label: plan.label,
+          argv: plan.argv,
+          cwd: plan.cwd,
+          failure: failure.reason,
+          message: failure.message,
+          child_session_id: origin?.childSessionId ?? null,
+          log_path: failedJob.log_path,
+        },
+      });
+    } catch {
+      // 同 W-1e：审计失败不影响失败回执本身。
+    }
+    return {
+      ok: false,
+      reason: 'launch-failed',
+      message: `后台任务拉起失败（${failure.reason}）：${failure.message}`,
+      job: failedJob,
+    };
+  }
 
   const job = store.insertBgJob({
     id,
@@ -330,8 +392,8 @@ export async function startBgJob({
     child_session_id: origin?.childSessionId,
     root_session_id: origin?.rootSessionId ?? null,
     pid_or_unit: started.unit ?? (started.pid === null || started.pid === undefined ? null : String(started.pid)),
-    started_at: Math.floor(nowMs / 1000),
-    deadline: Math.floor(nowMs / 1000) + plan.deadlineSec,
+    started_at: startedAt,
+    deadline: startedAt + plan.deadlineSec,
     state: BG_JOB_STATES.running,
     log_path: logPath.replace(/\\/gu, '/'),
     launched_by: origin?.launchedBy ?? null,
@@ -452,11 +514,18 @@ export async function monitorBgJobs({
   const probe = launcher.probeBgProcess ?? probeBgProcess;
   const signal = launcher.signalBgProcess ?? signalBgProcess;
   const readTail = launcher.tailLog ?? tailLog;
+  const capLog = launcher.capLogFile ?? capLogFile;
   const jobs = store.listBgJobs({ state: BG_JOB_STATES.running, limit: 100 });
   const summary = { checked: jobs.length, woken: 0, timedOut: 0, lost: 0, running: 0 };
   const nowSec = Math.floor(nowMs / 1000);
+  // W77-L1（方案甲）：日志按 bg.logMaxMB 保留尾部。包装器可能被 RuntimeMaxSec 的
+  // SIGKILL 直接杀掉（trap 不保证执行），所以截断放在监视器里每轮做一次，
+  // 长任务日志最多超出「一个轮询间隔」的量。
+  const logMaxMB = Number.isFinite(config?.bg?.logMaxMB) ? config.bg.logMaxMB : 50;
+  const logMaxBytes = Math.max(0, Math.floor(logMaxMB * 1024 * 1024));
 
   for (const job of jobs) {
+    if (logMaxBytes > 0) capLog(job.log_path, logMaxBytes);
     const kind = job.pid_or_unit !== null && String(job.pid_or_unit).startsWith('dsh-bg-') ? 'linux' : 'portable';
     const pid = kind === 'portable' && job.pid_or_unit !== null ? Number.parseInt(String(job.pid_or_unit), 10) : null;
     const exitPath = `${String(job.log_path).replace(/\/output\.log$/u, '')}/exit`;

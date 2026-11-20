@@ -187,6 +187,11 @@ reminderTodoStaleDays: 7
 #   cpuQuota: "200%"
 #   minFreeDiskMB: 1024
 #   wakeBudgetPerAgent: 3
+#   # v0.7.8 W77-M2：额外从 50041 进程透传给瞬态 service 的变量名。
+#   # PATH / HOME 恒透传（否则 venv、conda、代理变量与珞然的 bash 不一致）。
+#   env: []
+#   # v0.7.8 W77-L1：output.log 保留上限（MB），超出只留尾部；0 关闭。
+#   logMaxMB: 50
 #
 # 同时运行的后台任务上限（平铺键，默认 1 = 训练这类任务不并行）。
 # bgConcurrency: 1

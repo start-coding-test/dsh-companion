@@ -335,6 +335,10 @@ const BG_DEFAULTS = Object.freeze({
   workRoot: '',
   interpreters: Object.freeze(['python3', 'bash', 'node']),
   runAs: '',
+  // W77-M2：额外从 50041 进程透传给瞬态 service 的环境变量名（PATH/HOME 恒透传）。
+  env: Object.freeze([]),
+  // W77-L1（方案甲）：output.log 保留上限（MB），超出保留尾部。
+  logMaxMB: 50,
   maxDeadlineMin: 360,
   memoryMax: '4G',
   cpuQuota: '200%',
@@ -1184,6 +1188,8 @@ export function normalizeBg(raw, warnings = []) {
     'workRoot',
     'interpreters',
     'runAs',
+    'env',
+    'logMaxMB',
     'maxDeadlineMin',
     'memoryMax',
     'cpuQuota',
@@ -1212,6 +1218,26 @@ export function normalizeBg(raw, warnings = []) {
   const runAs = raw.runAs === undefined ? defaults.runAs : raw.runAs;
   if (typeof runAs !== 'string') {
     throw new ConfigError('bg.runAs', `must be a string, got ${typeof runAs}`);
+  }
+
+  // W77-M2：额外透传的环境变量名（PATH/HOME 由 launcher 恒透传，这里只列附加项）。
+  const env = raw.env === undefined ? defaults.env : raw.env;
+  if (!Array.isArray(env)) {
+    throw new ConfigError('bg.env', `must be an array of variable names, got ${typeof env}`);
+  }
+  for (const entry of env) {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      throw new ConfigError('bg.env', `entries must be non-empty strings, got ${JSON.stringify(entry)}`);
+    }
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/u.test(entry.trim())) {
+      throw new ConfigError('bg.env', `entries must be environment variable names, got ${JSON.stringify(entry)}`);
+    }
+  }
+
+  // W77-L1（方案甲）：日志保留上限（MB），0 表示不截断。
+  const logMaxMB = raw.logMaxMB === undefined ? defaults.logMaxMB : raw.logMaxMB;
+  if (!Number.isInteger(logMaxMB) || logMaxMB < 0 || logMaxMB > 102_400) {
+    throw new ConfigError('bg.logMaxMB', `must be an integer within 0..102400, got ${JSON.stringify(logMaxMB)}`);
   }
 
   const maxDeadlineMin = raw.maxDeadlineMin === undefined ? defaults.maxDeadlineMin : raw.maxDeadlineMin;
@@ -1245,6 +1271,8 @@ export function normalizeBg(raw, warnings = []) {
     workRoot: workRoot.trim(),
     interpreters: Object.freeze(interpreters.map((entry) => entry.trim())),
     runAs: runAs.trim(),
+    env: Object.freeze(env.map((entry) => entry.trim())),
+    logMaxMB,
     maxDeadlineMin,
     memoryMax: memoryMax.trim(),
     cpuQuota: cpuQuota.trim(),

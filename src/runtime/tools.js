@@ -220,6 +220,10 @@ export function createTools({
   // bgConfig 可以是配置对象或返回配置的函数；缺省视为「未配置 bg.workRoot」。
   bgConfig,
   mainSessionId,
+  // W77-M3（v0.7.8）：日志根与 launcher 的注入点。生产走模块默认值/真实
+  // systemd-run；单测注入临时目录 + startBgProcess 替身，不碰真实 /opt 与真实 systemd。
+  bgLogRoot,
+  bgLauncher,
   currentScope,
   budgetGate,
   metrics,
@@ -1053,7 +1057,33 @@ export function createTools({
             rootSessionId,
             launchedBy: 'bg_run',
           },
+          // W77-M3：日志根与 launcher 都可注入（单测用临时目录 + startBgProcess 替身，
+          // 不碰真实 /opt 与真实 systemd-run）。
+          ...(typeof bgLogRoot === 'string' && bgLogRoot !== '' ? { logRoot: bgLogRoot } : {}),
+          ...(bgLauncher !== null && typeof bgLauncher === 'object' ? { launcher: bgLauncher } : {}),
         });
+        if (started.ok !== true && started.reason === 'launch-failed') {
+          // W77-M1：拉起被拒也沿 SA-B3 回执一句，不让它静默消失在后台。
+          if (typeof taskReceipt === 'function') {
+            try {
+              await taskReceipt({
+                title: label ?? '后台任务',
+                status: 'error',
+                receipt: `[任务] 后台任务拉起失败：${started.message}`,
+                taskId: started.job?.id ?? null,
+                sessionId: senderSessionId,
+              });
+            } catch {
+              // 回执失败不改变工具返回。
+            }
+          }
+          return {
+            ok: false,
+            reason: started.reason,
+            message: started.message,
+            ...(started.job !== undefined ? { id: started.job.id } : {}),
+          };
+        }
         if (started.ok !== true) {
           return {
             ok: false,

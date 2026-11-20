@@ -2,6 +2,48 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.8] - 2026-11-20
+
+阶段 6（后台长任务）的修复版，只动 `bg_run` 这条链，不涉及记忆 / 压缩 / 子代理派活。
+
+### Fixed
+
+- **W77-H1 `bg_run` 的瞬态 service 工作目录是 `/`**：`systemd-run --working-directory`
+  之前没传，`spawn` 的 `cwd` 只作用于 `systemd-run` 客户端，service 自己在 `/` 下跑；
+  `argv[1]` 为相对路径时，校验与算 sha256 的 `realpath` 和实际执行的不是同一个文件，
+  脚本里的相对路径读写还会落到根目录。现在参数带 `--working-directory=<realCwd>`，
+  且计划里的 `argv[1]` 统一替换成 realpath 之后的绝对路径。
+- **W77-M1 `systemd-run` 拉起失败无人接**：之前 `spawn('systemd-run')` 没有 `error`
+  监听，拉起失败会变成宿主进程的未捕获异常；也不看 `systemd-run` 自身退出码。现在
+  监听 `error` 与早期 `exit`，失败时把任务记为 `failed`（不进 `running`，避免监视器
+  去探一个不存在的 unit），并经 SA-B3 通道回执一句「后台任务拉起失败：…」。
+- **W77-M2 service 环境与珞然的 bash 不一致**：瞬态 service 只有 systemd 默认环境，
+  `PATH` 精简、没有 venv / conda / 代理变量。现在默认透传 `-E PATH -E HOME`，并新增
+  `bg.env`（变量名列表）把列出的变量一并透传。
+- **W77-L1 包装器日志只追加不截断**：新增 `bg.logMaxMB`（默认 50），超出只保留尾部。
+  截断放在监视器里每轮做一次（包装器可能被 `RuntimeMaxSec` 的 SIGKILL 直接杀掉，
+  `trap` 不保证执行），因此日志最多超出上限「一个轮询间隔」（30 秒）的量；
+  `BG_TAIL_BYTES=2048` 的唤醒消息尾部与 `tailLog()` 语义不变。
+- **W77-M3 测试走了真实路径**：`bg_run` 用例之前建了 logRoot 却没注入，走真实
+  `DEFAULT_BG_LOG_ROOT`（Linux 非 root 直接 `EACCES`）。`createTools` 现在支持注入
+  `bgLogRoot` 与 `bgLauncher`，用例全部改用临时目录 + launcher 替身，不再碰真实
+  `/opt` 与真实 `systemd-run`。
+
+### Added
+
+- 配置 `bg.env`（默认 `[]`）与 `bg.logMaxMB`（默认 `50`，`0` 关闭）——非枚举，不参与
+  16 键安装自检；README 配置表、`config.example.yml`、校验（`bg.env` 的名字格式、
+  `bg.logMaxMB` 的 0..102400 整数）同步。
+
+### Tests
+
+- `test/v077-stage6.test.js` 扩到 28 例：新增 `--working-directory` / `-E` 透传与去重、
+  相对 `argv[1]` 出绝对路径、拉起失败落 `failed` + 审计 + SA-B3 回执、`capLogFile` 保留
+  尾部、监视器按 `bg.logMaxMB` 调用截断（`0` 关闭）；原 `bg_run` 与监视器用例改为注入
+  logRoot 与 launcher 替身。
+- **非真机证据**：真实 `systemd-run` / `RuntimeMaxSec` / 20 分钟脚本 + 重启补投仍在云端
+  验证；本机（Windows）只覆盖纯函数与状态机。
+
 ## [0.7.7] - 2026-11-20
 
 ### Fixed

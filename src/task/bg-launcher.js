@@ -25,7 +25,17 @@
 
 import { spawn } from 'node:child_process';
 import { execFile } from 'node:child_process';
-import { mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
+import {
+  mkdirSync,
+  writeFileSync,
+  existsSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  openSync,
+  readSync,
+  closeSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -33,6 +43,13 @@ const execFileAsync = promisify(execFile);
 
 /** 用户《修订一》W-1d 原文固定值：日志根。 */
 export const DEFAULT_BG_LOG_ROOT = '/opt/dsh-companion/.data/bg-jobs';
+
+/**
+ * W77-M1：拉起后观察 systemd-run 客户端多久，判定「这次启动是否被拒」。
+ * systemd-run 会阻塞到 unit 结束，所以正常拉起的退出远迟于此；**早期**非 0
+ * 退出（参数非法、unit 名冲突等）才按失败处理。
+ */
+export const DEFAULT_LAUNCH_GRACE_MS = 150;
 
 /** 包装器文件名（<id>/ 目录内）。 */
 const WRAPPER_NAME = 'run.sh';
@@ -68,11 +85,30 @@ export function launcherKind(platform = process.platform) {
 /**
  * **纯函数**：拼 `systemd-run` 参数（单测直接断言，不需真机）。
  *
+ * W77-H1：`--working-directory` 必须显式给出。`spawn` 的 `cwd` 只作用于
+ * systemd-run **客户端**，瞬态 service 自身的无 cwd 时落在 `/`——脚本里的相对
+ * 路径读写就会落到根目录，且 `argv[1]` 若为相对路径会在 `/` 下解析。调用方
+ * 传入 realpath 之后的工作目录与绝对脚本路径，二者一致。
+ *
+ * W77-M2：瞬态 service 只有 systemd 默认环境（PATH 精简、没有 venv/conda/代理
+ * 变量），所以默认透传 `PATH` 与 `HOME`（取 50041 进程即调用方的值），
+ * 其余变量由 `bg.env` 列表逐项透传（systemd-run `-E NAME` 无值 = 从调用方环境
+ * 取值；`--setenv=` 的透传形态见 systemd-run(1)）。
+ *
  * @param {{unit: string, deadlineSec: number, memoryMax: string, cpuQuota: string,
- *   runAs?: string, wrapperPath: string}} input
+ *   runAs?: string, workingDirectory?: string, envNames?: string[], wrapperPath: string}} input
  * @returns {string[]}
  */
-export function buildSystemdRunArgs({ unit, deadlineSec, memoryMax, cpuQuota, runAs, wrapperPath }) {
+export function buildSystemdRunArgs({
+  unit,
+  deadlineSec,
+  memoryMax,
+  cpuQuota,
+  runAs,
+  workingDirectory,
+  envNames = [],
+  wrapperPath,
+}) {
   if (typeof unit !== 'string' || unit === '') {
     throw new TypeError('[bg-launcher] buildSystemdRunArgs() requires a unit name');
   }
@@ -82,6 +118,9 @@ export function buildSystemdRunArgs({ unit, deadlineSec, memoryMax, cpuQuota, ru
   if (typeof wrapperPath !== 'string' || wrapperPath === '') {
     throw new TypeError('[bg-launcher] buildSystemdRunArgs() requires a wrapper path');
   }
+  if (typeof workingDirectory !== 'string' || workingDirectory === '') {
+    throw new TypeError('[bg-launcher] buildSystemdRunArgs() requires a working directory');
+  }
   const args = [
     '--unit', unit,
     // --collect：unit 结束后自动 GC，避免 `systemctl list-units` 堆垃圾。
@@ -89,7 +128,17 @@ export function buildSystemdRunArgs({ unit, deadlineSec, memoryMax, cpuQuota, ru
     '-p', `RuntimeMaxSec=${deadlineSec}`,
     '-p', `MemoryMax=${memoryMax}`,
     '-p', `CPUQuota=${cpuQuota}`,
+    // W77-H1：service 自己的工作目录（spawn 的 cwd 只影响 systemd-run 客户端）。
+    `--working-directory=${workingDirectory}`,
   ];
+  // W77-M2：环境透传。PATH/HOME 是默认项，其余来自 bg.env。
+  const seen = new Set();
+  for (const name of ['PATH', 'HOME', ...envNames]) {
+    const key = typeof name === 'string' ? name.trim() : '';
+    if (key === '' || seen.has(key)) continue;
+    seen.add(key);
+    args.push('-E', key);
+  }
   // 用户《修订二》W-1c：运行身份取 bg.runAs（默认空 = 与 50041 相同，即 root）。
   if (typeof runAs === 'string' && runAs.trim() !== '') {
     args.push('--uid', runAs.trim());
@@ -201,11 +250,22 @@ export async function systemdUnitActive(unit, run = execFileAsync) {
 /**
  * 拉起一个后台任务。
  *
+ * W77-H1：`workingDirectory` 交给 systemd-run 的 `--working-directory`，与
+ * `spawn` 的 `cwd`（只作用于 `systemd-run` 客户端）分离——瞬态 service 默认在
+ * `/` 下运行，不显式给工作目录就会把脚本里的相对路径读写落到根目录。
+ *
+ * W77-M1：监听 `error` 与早期 `exit`，拉起被拒（binary 不存在 / 参数非法 /
+ * unit 冲突）时返回 `failure`，由调用方落库为 `failed` 并经 SA-B3 回执一句；
+ * 不再让 `systemd-run` 的 spawn 错误变成宿主进程的未捕获异常。
+ *
  * @param {{id: string, argv: string[], cwd: string, deadlineSec: number,
- *   memoryMax: string, cpuQuota: string, runAs?: string,
+ *   memoryMax: string, cpuQuota: string, runAs?: string, envNames?: string[],
+ *   workingDirectory?: string, launchGraceMs?: number,
  *   logRoot?: string, platform?: string, run?: typeof execFileAsync,
  *   spawnImpl?: typeof spawn}} input
- * @returns {Promise<{unit: string|null, pid: number|null, logPath: string, exitPath: string, wrapperPath: string, kind: 'linux'|'portable'}>}
+ * @returns {Promise<{unit: string|null, pid: number|null, logPath: string, exitPath: string,
+ *   wrapperPath: string, kind: 'linux'|'portable',
+ *   failure?: {reason: string, message: string, exitCode?: number|null}}>}
  */
 export async function startBgProcess({
   id,
@@ -215,6 +275,9 @@ export async function startBgProcess({
   memoryMax,
   cpuQuota,
   runAs = '',
+  envNames = [],
+  workingDirectory,
+  launchGraceMs = DEFAULT_LAUNCH_GRACE_MS,
   logRoot = DEFAULT_BG_LOG_ROOT,
   platform = process.platform,
   run = execFileAsync,
@@ -231,12 +294,30 @@ export async function startBgProcess({
   if (existsSync(exitPath)) rmSync(exitPath, { force: true });
   const kind = launcherKind(platform);
   const wrapperPath = writeWrapper({ dir, kind, logPath, exitPath, argv });
+  // W77-H1：service 自己的工作目录（spawn 的 cwd 只影响 systemd-run 客户端）。
+  const serviceCwd = typeof workingDirectory === 'string' && workingDirectory !== ''
+    ? workingDirectory
+    : cwd;
 
   if (kind === 'linux') {
     const unit = `dsh-bg-${id}`;
-    const args = buildSystemdRunArgs({ unit, deadlineSec, memoryMax, cpuQuota, runAs, wrapperPath });
+    const args = buildSystemdRunArgs({
+      unit,
+      deadlineSec,
+      memoryMax,
+      cpuQuota,
+      runAs,
+      workingDirectory: serviceCwd,
+      envNames,
+      wrapperPath,
+    });
     // systemd-run 会阻塞到 unit 结束，所以用 spawn 而不 await；--collect 让它自管。
-    spawnImpl('systemd-run', args, { cwd, detached: true, stdio: 'ignore' }).unref?.();
+    const child = spawnImpl('systemd-run', args, { cwd, detached: true, stdio: 'ignore' });
+    const launch = await watchLaunch(child, launchGraceMs, { exitIsFailure: true });
+    if (!launch.ok) {
+      return { unit, pid: null, logPath, exitPath, wrapperPath, kind, failure: launch.failure };
+    }
+    child.unref?.();
     return { unit, pid: null, logPath, exitPath, wrapperPath, kind };
   }
 
@@ -247,8 +328,98 @@ export async function startBgProcess({
     stdio: 'ignore',
     windowsHide: true,
   });
+  // 替身里「脚本跑得快」不是启动失败：早退按正常结束处理，交给监视器读退出码。
+  const launch = await watchLaunch(child, launchGraceMs, { exitIsFailure: false });
+  if (!launch.ok) {
+    return { unit: null, pid: child.pid ?? null, logPath, exitPath, wrapperPath, kind, failure: launch.failure };
+  }
   child.unref?.();
   return { unit: null, pid: child.pid ?? null, logPath, exitPath, wrapperPath, kind };
+}
+
+/**
+ * W77-M1：观察子进程的启动结果。
+ *
+ * - `error` 事件（spawn 失败：二进制不存在、权限不足…）→ 失败；
+ * - `exitIsFailure` 时（Linux 的 systemd-run），在 `graceMs` 内 `exit` 说明 client
+ *   自己拒绝了这次拉起（参数非法、unit 名冲突…）→ 失败；正常 unit 会一直阻塞到结束；
+ * - 其它情况 `graceMs` 内没有失败事件 → 认为已拉起。
+ *
+ * @param {import('node:child_process').ChildProcess} child
+ * @param {number} graceMs
+ * @param {{exitIsFailure: boolean}} options
+ * @returns {Promise<{ok: boolean, failure?: {reason: string, message: string, exitCode?: number|null}}>}
+ */
+function watchLaunch(child, graceMs, { exitIsFailure }) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const timer = setTimeout(() => settle({ ok: true }), Math.max(0, Number(graceMs) || 0));
+    timer.unref?.();
+    child.once('error', (error) => {
+      settle({
+        ok: false,
+        failure: {
+          reason: 'spawn-failed',
+          message: String(error?.message ?? error),
+          exitCode: null,
+        },
+      });
+    });
+    child.once('exit', (code, signal) => {
+      if (!exitIsFailure) {
+        settle({ ok: true });
+        return;
+      }
+      settle({
+        ok: false,
+        failure: {
+          reason: 'launcher-exited',
+          message: `systemd-run exited early with code ${code ?? 'null'}${signal ? ` (${signal})` : ''}`,
+          exitCode: typeof code === 'number' ? code : null,
+        },
+      });
+    });
+    // 迟到（grace 之后）的 error 也吞掉，避免成为宿主进程的未捕获异常。
+    child.on('error', () => {});
+  });
+}
+
+/**
+ * W77-L1（方案甲）：把日志文件截到「保留尾部」≤ `maxBytes`。
+ *
+ * 直接改文件而不是靠包装器里的 `tail`：包装器可能被 `RuntimeMaxSec` 的 SIGKILL
+ * 直接杀掉，`trap` 不保证执行；监视器每轮对 running 的任务调用一次，长训练日志
+ * 最多超出上限「一个轮询间隔」（30 秒）的量。
+ *
+ * @param {string} logPath
+ * @param {number} maxBytes
+ * @returns {boolean} 是否真的截断过
+ */
+export function capLogFile(logPath, maxBytes) {
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) return false;
+  try {
+    const stat = statSync(logPath);
+    if (stat.size <= maxBytes) return false;
+    const fd = openSync(logPath, 'r');
+    let buffer;
+    try {
+      buffer = Buffer.alloc(maxBytes);
+      readSync(fd, buffer, 0, maxBytes, stat.size - maxBytes);
+    } finally {
+      closeSync(fd);
+    }
+    writeFileSync(logPath, buffer);
+    return true;
+  } catch {
+    // 截断是防膨胀的尽力而为，失败不影响监视结论。
+    return false;
+  }
 }
 
 /**

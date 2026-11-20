@@ -8,7 +8,7 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -20,6 +20,7 @@ import {
   buildPosixWrapper,
   buildSystemdRunArgs,
   buildWindowsWrapper,
+  capLogFile,
   launcherKind,
   readExitCode,
   tailLog,
@@ -62,6 +63,32 @@ function bgConfig(workRoot, overrides = {}) {
   return normalizeConfig({
     bg: { workRoot, ...overrides },
   });
+}
+
+/**
+ * W77-M3：launcher 替身——不 spawn 任何进程，只返回一份「已拉起」的结果
+ * （或注入的 `failure`）。所有形如真实 systemd 的输出都由这里构造，
+ * **非真机证据**：真实的 systemd-run / RuntimeMaxSec 未在本机验证。
+ */
+function fakeLauncher(logRoot, overrides = {}) {
+  const calls = [];
+  return {
+    calls,
+    async startBgProcess(spec) {
+      calls.push(spec);
+      const dir = join(logRoot, spec.id);
+      mkdirSync(dir, { recursive: true });
+      return {
+        unit: `dsh-bg-${spec.id}`,
+        pid: null,
+        logPath: join(dir, 'output.log'),
+        exitPath: join(dir, 'exit'),
+        wrapperPath: join(dir, 'run.sh'),
+        kind: 'linux',
+        ...overrides,
+      };
+    },
+  };
 }
 
 test('W-1：bg.workRoot 未配置 → 工具报不可用，不猜路径', () => {
@@ -199,12 +226,30 @@ test('W-1：合法请求返回执行计划（realpath 后的 cwd、脚本 sha256
   assert.equal(isInsideRoot(work, verdict.plan.scriptPath), true);
 });
 
+test('W77-H1：相对 argv[1] 的计划输出绝对路径（校验、sha256 与实际执行是同一文件）', (t) => {
+  const { work } = makeWorkRoot(t);
+  const verdict = validateBgRun({
+    argv: ['python3', 'train.py', '--epochs', '3'],
+    cwd: 'proj',
+    deadlineMin: 20,
+    config: bgConfig(work),
+  });
+  assert.equal(verdict.ok, true);
+  // 瞬态 service 自己有一套 cwd，相对路径在那边解析会指向别的文件。
+  assert.equal(verdict.plan.argv[0], 'python3');
+  assert.equal(verdict.plan.argv[1], verdict.plan.scriptPath);
+  assert.equal(isInsideRoot(work, verdict.plan.argv[1]), true);
+  assert.ok(!verdict.plan.argv[1].includes('..'));
+  assert.deepEqual(verdict.plan.argv.slice(2), ['--epochs', '3']);
+});
+
 test('W-1c：systemd-run 参数（RuntimeMaxSec / MemoryMax / CPUQuota / --collect；runAs 空不加 --uid）', () => {
   const base = {
     unit: 'dsh-bg-abc',
     deadlineSec: 1200,
     memoryMax: '4G',
     cpuQuota: '200%',
+    workingDirectory: '/opt/dsh-companion/.data/work/proj',
     wrapperPath: '/opt/logs/abc/run.sh',
   };
   const asRoot = buildSystemdRunArgs({ ...base, runAs: '' });
@@ -214,12 +259,35 @@ test('W-1c：systemd-run 参数（RuntimeMaxSec / MemoryMax / CPUQuota / --colle
     '-p', 'RuntimeMaxSec=1200',
     '-p', 'MemoryMax=4G',
     '-p', 'CPUQuota=200%',
+    // W77-H1：service 的工作目录（spawn 的 cwd 只影响 systemd-run 客户端）。
+    '--working-directory=/opt/dsh-companion/.data/work/proj',
+    // W77-M2：PATH/HOME 恒透传，避免 venv/conda/代理环境与珞然的 bash 不一致。
+    '-E', 'PATH',
+    '-E', 'HOME',
     '/bin/sh', '/opt/logs/abc/run.sh',
   ]);
   const asUser = buildSystemdRunArgs({ ...base, runAs: 'trainer' });
   assert.deepEqual(asUser.slice(asUser.indexOf('--uid')), ['--uid', 'trainer', '/bin/sh', '/opt/logs/abc/run.sh']);
+  assert.throws(() => buildSystemdRunArgs({ ...base, workingDirectory: undefined }), /working directory/u);
   assert.equal(launcherKind('linux'), 'linux');
   assert.equal(launcherKind('win32'), 'portable');
+});
+
+test('W77-M2：bg.env 列出的变量在 -E 后透传，PATH/HOME 去重不重复', () => {
+  const args = buildSystemdRunArgs({
+    unit: 'dsh-bg-env',
+    deadlineSec: 60,
+    memoryMax: '2G',
+    cpuQuota: '100%',
+    workingDirectory: '/opt/work',
+    envNames: ['PYTHONPATH', 'PATH', 'HTTP_PROXY', '  '],
+    wrapperPath: '/opt/logs/env/run.sh',
+  });
+  const envPairs = [];
+  for (let i = 0; i < args.length - 1; i += 1) {
+    if (args[i] === '-E') envPairs.push(args[i + 1]);
+  }
+  assert.deepEqual(envPairs, ['PATH', 'HOME', 'PYTHONPATH', 'HTTP_PROXY']);
 });
 
 test('W-1b/d：包装器按 argv 逐项单引号包裹（不经 shell 拼接），并写日志与退出码', () => {
@@ -318,6 +386,8 @@ test('W-2/W-3：已退出 → 原子迁移 woken 并投递一次；再跑一轮�
     probeBgProcess: async () => ({ running: false, exited: true, exitCode: 0 }),
     signalBgProcess: async () => true,
     tailLog: () => 'epoch 3/3 loss=0.1',
+    // W77-M3：不碰真实路径（截断由单独用例覆盖）。
+    capLogFile: () => false,
   };
   const first = await monitorBgJobs({
     store,
@@ -361,6 +431,7 @@ test('W-2：超 deadline → 状态 timeout，先 TERM 再 KILL（RuntimeMaxSec 
         return true;
       },
       tailLog: () => 'still running',
+      capLogFile: () => false,
       readExitCode: () => null,
     },
     nowMs: 1_700_000_700_000,
@@ -388,6 +459,7 @@ test('W-4：进程不在了又没有退出码文件 → lost 并仍然唤醒（�
       probeBgProcess: async () => ({ running: false, exited: false, exitCode: null }),
       signalBgProcess: async () => true,
       tailLog: () => 'tail-before-crash',
+      capLogFile: () => false,
     },
     nowMs: NOW_MS,
   });
@@ -416,6 +488,7 @@ test('W-3：唤醒预算耗尽 → woken-fallback（不再唤醒，直接投主�
       probeBgProcess: async () => ({ running: false, exited: true, exitCode: 2 }),
       signalBgProcess: async () => true,
       tailLog: () => 'boom',
+      capLogFile: () => false,
     },
     nowMs: NOW_MS,
   });
@@ -485,9 +558,11 @@ test('W-1/W-5：bg_run 正常启动返回 id 并沿 SA-B3 告知一句；并发�
   const store = Store.open(':memory:');
   t.after(() => store.close());
   const logRoot = mkdtempSync(join(tmpdir(), 'dsh-bglog-'));
-  t.after(() => rmSync(logRoot, { recursive: true, force: true }));
+  t.after(() => rmSync(logRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
   const config = bgConfig(work);
   const notices = [];
+  // W77-M3：注入 logRoot + launcher 替身，用例不再走真实 /opt 与真实 systemd-run。
+  const launcher = fakeLauncher(logRoot);
   const tools = createTools({
     store,
     retrieve: async () => ({ items: [] }),
@@ -497,6 +572,8 @@ test('W-1/W-5：bg_run 正常启动返回 id 并沿 SA-B3 告知一句；并发�
     bgConfig: config,
     mainSessionId: () => 'main-session',
     taskReceipt: async (info) => notices.push(info),
+    bgLogRoot: logRoot,
+    bgLauncher: launcher,
   });
   const tool = tools.find((entry) => entry.name === 'bg_run');
   const exec = { agent: { id: 'child-session-1', name: 'agent-1' } };
@@ -504,13 +581,16 @@ test('W-1/W-5：bg_run 正常启动返回 id 并沿 SA-B3 告知一句；并发�
     { argv: ['python3', join(work, 'proj', 'train.py')], cwd: 'proj', deadline_min: 20, label: '训练' },
     exec,
   );
-  // 真实 launcher 在 Windows 上走 detached `.cmd` 替身：先接受成功，随后把行清掉，
-  // 避免后台进程残留在测试目录里（脚本本身只 print 一行）。
   assert.equal(started.ok, true, JSON.stringify(started));
   assert.match(started.id, /^bg-/u);
   assert.equal(store.getBgJob(started.id).child_session_id, 'child-session-1');
   assert.equal(notices.length, 1);
   assert.match(notices[0].receipt, /^\[任务\] /u);
+  // W77-H1/M2：拉起时把 service 工作目录与 bg.env 透传给 launcher。
+  assert.equal(launcher.calls.length, 1);
+  assert.equal(launcher.calls[0].workingDirectory, join(work, 'proj'));
+  assert.deepEqual(launcher.calls[0].envNames, []);
+  assert.equal(launcher.calls[0].logRoot, logRoot);
 
   store.updateBgJob(started.id, { state: 'woken', exit_code: 0, finished_at: 1 });
   // 并发：默认 1，塞一条 running 后必须 busy。
@@ -522,4 +602,114 @@ test('W-1/W-5：bg_run 正常启动返回 id 并沿 SA-B3 告知一句；并发�
   assert.equal(busy.ok, false);
   assert.equal(busy.reason, 'busy');
   assert.equal(busy.running.length, 1);
+});
+
+test('W77-M1：systemd-run 拉起被拒 → 记 failed 行 + 审计，并经 SA-B3 回执一句', async (t) => {
+  const { work } = makeWorkRoot(t);
+  const store = Store.open(':memory:');
+  t.after(() => store.close());
+  const logRoot = mkdtempSync(join(tmpdir(), 'dsh-bglog-'));
+  t.after(() => rmSync(logRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const notices = [];
+  const launcher = fakeLauncher(logRoot, {
+    failure: { reason: 'launcher-exited', message: 'systemd-run exited early with code 1', exitCode: 1 },
+  });
+  const tools = createTools({
+    store,
+    retrieve: async () => ({ items: [] }),
+    registry: {},
+    platform: {},
+    clock: () => NOW_MS,
+    bgConfig: bgConfig(work),
+    mainSessionId: () => 'main-session',
+    taskReceipt: async (info) => notices.push(info),
+    bgLogRoot: logRoot,
+    bgLauncher: launcher,
+  });
+  const tool = tools.find((entry) => entry.name === 'bg_run');
+  const exec = { agent: { id: 'child-session-1', name: 'agent-1' } };
+  const result = await tool.execute(
+    { argv: ['python3', join(work, 'proj', 'train.py')], cwd: 'proj', deadline_min: 20, label: '训练' },
+    exec,
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'launch-failed');
+  assert.match(result.message, /后台任务拉起失败/u);
+  // 落库为 failed（不是 running），否则下一轮监视器会去探一个不存在的 unit。
+  const job = store.getBgJob(result.id);
+  assert.equal(job.state, 'failed');
+  assert.equal(job.exit_code, 1);
+  assert.equal(job.finished_at, job.started_at);
+  // 审计行 + SA-B3 回执各一条。
+  const events = store.listEvents({ limit: 10 }).filter((row) => row.table_name === 'bg_jobs');
+  const failedEvent = events.find((row) => String(row.detail_json).includes('bg_job_failed'));
+  assert.ok(failedEvent, '应写一条 bg_job_failed 审计');
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0].status, 'error');
+  assert.match(notices[0].receipt, /^\[任务\] 后台任务拉起失败/u);
+  assert.equal(notices[0].sessionId, 'child-session-1');
+});
+test('W77-L1：capLogFile 超限只保留尾部，未超限不动文件', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-bgcap-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+  const path = join(dir, 'output.log');
+  const body = 'HEAD'.repeat(250) + 'TAIL'.repeat(25);
+  writeFileSync(path, body);
+  assert.equal(capLogFile(path, body.length + 10), false);
+  assert.equal(readFileSync(path, 'utf8'), body);
+  assert.equal(capLogFile(path, 100), true);
+  const capped = readFileSync(path, 'utf8');
+  assert.equal(capped.length, 100);
+  assert.equal(capped, body.slice(body.length - 100));
+  // 0 / 非法值表示不截断。
+  assert.equal(capLogFile(path, 0), false);
+  assert.equal(capLogFile(join(dir, 'missing.log'), 10), false);
+});
+
+test('W77-L1：监视器每轮按 bg.logMaxMB 截一次日志（截断放监视器，包装器被 SIGKILL 时也会执行）', async (t) => {
+  const store = Store.open(':memory:');
+  t.after(() => store.close());
+  const capped = [];
+  seedRunning(store, { id: 'bg-cap' });
+  const summary = await monitorBgJobs({
+    store,
+    config: bgConfig('/opt/work', { logMaxMB: 7 }),
+    wake: async () => ({ delivered: true }),
+    nowMs: NOW_MS,
+    launcher: {
+      probeBgProcess: async () => ({ running: true, exited: false, exitCode: null }),
+      signalBgProcess: async () => true,
+      tailLog: () => '',
+      capLogFile: (path, maxBytes) => {
+        capped.push({ path, maxBytes });
+        return true;
+      },
+    },
+  });
+  assert.equal(summary.running, 1);
+  assert.equal(capped.length, 1);
+  assert.equal(capped[0].maxBytes, 7 * 1024 * 1024);
+});
+
+test('W77-L1：bg.logMaxMB = 0 关闭截断（不调用 capLogFile）', async (t) => {
+  const store = Store.open(':memory:');
+  t.after(() => store.close());
+  let called = 0;
+  seedRunning(store, { id: 'bg-nocap' });
+  await monitorBgJobs({
+    store,
+    config: bgConfig('/opt/work', { logMaxMB: 0 }),
+    wake: async () => ({ delivered: true }),
+    nowMs: NOW_MS,
+    launcher: {
+      probeBgProcess: async () => ({ running: true, exited: false, exitCode: null }),
+      signalBgProcess: async () => true,
+      tailLog: () => '',
+      capLogFile: () => {
+        called += 1;
+        return true;
+      },
+    },
+  });
+  assert.equal(called, 0);
 });
