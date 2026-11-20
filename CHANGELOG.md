@@ -77,6 +77,61 @@
 - `test/subagent-isolation.test.js`（3 例）：settled 通知与 agent relay 两条链的函数面
   ＋真实 `apply()`/pre-step 行为面（不注入召回、不重绑 main）、线程归属与遮蔽跳过。
   **非真机证据**：消息形状按宿主源码构造，未在真机子代理会话回放。
+### Added（阶段 4）
+
+- **SA-B1 `task_run` / `thread_run` 改走宿主子代理**：新增 `src/task/subagent-runner.js`，
+  按宿主 `subagents.startActivation()` 起一个 `spawn` provider、`delivery: 'caller'`、
+  `agentPreset: 'minimal'`、`maxDepth: 1` 的子代理，父 Agent 取工具执行上下文
+  `exec.agent`（宿主先例 `dsh-tool-subagent-control/src/index.ts:73-80`）。子代理看不到
+  父对话（`inheritsParentContext = false`），完成后回一条 ≤300 字回执；
+  `src/task/worker.js` 的老路径（`createSession` + `prompt`）保留为回退，宿主没有子代理
+  能力或没有 `exec.agent` 时自动用它，行为与 0.7.6 一致。
+- **SA-B1 回执 ≤300 字**：宿主 JSON Schema 子集没有 `maxLength`
+  （`dsh-tools/src/json-schema.ts:267`），所以 schema 只声明 `receipt` / `status` /
+  `artifacts` 三个字段，长度由 `src/task/receipt.js` 的 `RECEIPT_MAX_CHARS=300` 截断兜底。
+- **SA-B1 五态映射**：宿主 `stopReason` 的 `completed` / `aborted` / `error` /
+  `max-tokens` / `refusal` 依次映射成 成功 / 失败 / 失败 / 部分完成 / 失败（`refusal`
+  单独标记），`structured` 缺失时降级取正文截断，`structured` 解析失败按失败处理。
+- **SA-B2 线程续跑锚**：`threads` 表新增 `child_session_id`（按需补列，不改 schema
+  版本号）。新建线程派子代理时把 `childId` 写进该列；之后 `thread_run` 复用同一线程会把
+  消息 `sendToSubagent()` 给这个子代理（运行中下一 step 收、空闲开新 turn、冷目标在运行时
+  树根下恢复），不再反复 `createSession`。续跑失败（目标不可恢复）时保守地重建会话并把锚
+  更新到新会话，回执注明「已重建」。`getThreadBySessionId()` 同时按 `session_id` /
+  `child_session_id` 匹配，兼容只有旧列的历史行。
+- **SA-B3 任务回执投回主会话**：子代理完成后把 ≤300 字回执经既有主动消息通道
+  （`proactive.enqueue` + `flush`）投回主会话，前缀 `[任务] `、`source.kind =
+  'companion-task-receipt'`，`requestId = companion-task-receipt:<taskId>`（同一任务重复
+  投递会被去重）。回执同时进「三处排除集」（`hasRealUserInput` / `isInjectedMessage` /
+  `lastUserText`），不会被当成用户发言、召回查询或情绪判定输入。**提醒触发逻辑未改**：
+  到期提醒仍由原路径投递，本阶段只复用了它的投递管道。
+- **SA-B3 投递日志**：dsh-im 没有出站日志，插件自己记一条
+  `task_receipt_delivered` / `task_receipt_failed`（时间、回执 id、任务 id、成功位、
+  会话 id、失败原因）到 `memory_events`，便于事后核对。
+- **D6 子代理并发 2**：执行槽从 1 提到 2（`src/task/run.js` 的 `MAX_EXEC_SLOTS`），
+  第 3 个任务排队（队列上限 2），`task_run` 描述同步改写。新增配置
+  `subagent.concurrency`（默认 `2`，1–8）在启动时生效。
+- **`subagent.model`**（默认空）：空表示沿用主会话路由（不传 `agentOptions.model`）；
+  显式配置且命中 profile 允许集（`magpie/opencode-go/deepseek-v4.1-flash`、
+  `magpie/opencode-go/glm-5.3`）才透传，越界只 warn 并回落到默认。
+- **A12 子代理命名**：线程 key 是中文短名，转成 `t<utf8-hex>`（同 key 幂等稳定、
+  截断到 32 位内），原名放 `label`；任务用 `task-<base36>`。`lead` 是宿主保留名，不占用。
+
+### Tests（阶段 4）
+
+- `test/subagent-runner.test.js`（14 例）：`startActivation` 规格断言（provider /
+  delivery / preset / maxDepth / parent 同一引用 / signal / outputSchema 键）、默认不传
+  `agentOptions` 与 allowlist 越界回落、五态映射、`structured` 缺失与坏 JSON、
+  回执 ≤300、命名规则、parent 非存活 → 错误回执不崩、并发 2 槽、线程新建写锚 /
+  续跑走 `sendToSubagent` / 失败重建 / 无 `exec.agent` 回退旧路、回执投递与去重、
+  投递日志形状、`config.subagent` 默认值与校验。
+- 旧断言按计划口径改写：`test/task-run.test.js`（`maxExec: 1→2`、单槽排队用例改为
+  2 槽）、`test/tools.test.js`（共用执行槽改为占满 2 槽）、`test/platform.test.js`
+  （`capabilities` 增加 `subagents` / `subagentMessages` / `agents` 三个探测位）。
+- 1528 个用例 / 61 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三遍全绿）。
+- **非真机证据**：子代理消息与 activation 形状按宿主源码
+  （`dsh-subagent/src/index.ts:267-292`、`types.ts:49-66/144-191`）构造，未在真机
+  子代理会话回放。
+
 ### Fixed（阶段 2）
 
 - **L120-H2 提醒有截止时间却不触发**：巩固抽出的提醒只有 `due_at`、没有 `next_fire_at`

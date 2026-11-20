@@ -1,10 +1,13 @@
 /**
- * `task_run` 执行器（08 H6、05 §6.4）：全局单执行槽 + 排队 + 软/硬超时 + 回执。
+ * `task_run` 执行器（08 H6、05 §6.4）：执行槽 + 排队 + 软/硬超时 + 回执。
  *
  * 与 worker.js 的分工：
  * - worker.js 是「一次 worker 会话」的生命周期（createSession → prompt →
  *   whenIdle → 两段式取消），不关心并发；
- * - 本模块在它外面加**进程级串行执行槽**：同一时刻最多 1 个 worker，
+ * - SA-B1（v0.7.7 阶段 4）起，宿主有子代理服务时改由
+ *   `src/task/subagent-runner.js` 派活（拿到结构化结果、宿主级深度/并发约束），
+ *   worker.js 保留为兼容回退路径，本文件只在「没有子代理能力」时用它；
+ * - 本模块在它外面加**进程级执行槽**：同一时刻最多 `MAX_EXEC_SLOTS` 个执行，
  *   忙时最多排队 2 个，再多的请求直接 `{ok:false, reason:'busy', queue:2}`，
  *   避免上游一次 fan-out 把宿主拖垮（H6 的「无并发锁」缺陷）。
  *
@@ -26,6 +29,7 @@
  */
 
 import { formatReceipt, writeReceipt } from './receipt.js';
+import { runSubagentTask } from './subagent-runner.js';
 import {
   DEFAULT_HARD_MS,
   DEFAULT_SAMPLE_MS,
@@ -37,8 +41,13 @@ import { WORKER_STOP_TOKENS, WORKER_WARN_TOKENS } from './limits.js';
 
 export { DEFAULT_HARD_MS, DEFAULT_SAMPLE_MS, DEFAULT_SOFT_MS };
 
-/** 并发上限：同一时刻只允许一个 worker 会话（H6）。 */
-export const MAX_EXEC_SLOTS = 1;
+/**
+ * 并发上限（D6，v0.7.7 阶段 4）：2。
+ *
+ * 阶段 1 前的口径是 1（「全局单槽」）；D6 裁决把它改成 2 并同步 config 的
+ * `subagentConcurrency`。槽位仍然是有界队列（`MAX_QUEUE`），不是无限制并发。
+ */
+export const MAX_EXEC_SLOTS = 2;
 
 /** 排队上限：槽位忙时最多再排 2 个，超出的直接拒绝。 */
 export const MAX_QUEUE = 2;
@@ -78,6 +87,9 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
     throw new TypeError('createTaskRunner: maxQueue must be a non-negative integer');
   }
 
+  // D6：槽位数由 config.subagent.concurrency 驱动，但只在空闲时改（改动时若有
+  // 在跑的任务，槽位账本会错位）。
+  let slots = maxExec;
   let active = 0;
   const waiting = [];
   let sequence = 0;
@@ -89,7 +101,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
    * @returns {Promise<boolean>}
    */
   async function acquire() {
-    if (active < maxExec) {
+    if (active < slots) {
       active += 1;
       return true;
     }
@@ -151,6 +163,9 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
       agentPreset,
       claimKey,
       scope = 'main',
+      agent = null,
+      subagent = null,
+      onReceipt = null,
     } = options;
 
     const goalText = normalizeGoal(goal);
@@ -168,29 +183,57 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
 
     try {
       let workerResult;
+      // SA-B1（阶段 4）：有子代理能力且有存活 parent 时走派活路径；否则回退
+      // worker 的 createSession + prompt（保留原行为，兼容不支持子代理的宿主）。
+      const useSubagent = subagent !== null && typeof subagent === 'object'
+        && subagent.enabled === true
+        && platform?.capabilities?.subagents === true
+        && agent !== null && typeof agent === 'object';
       try {
-        workerResult = await runWorkerTask({
-          platform,
-          task: {
-            id: taskId,
-            scope: receiptScope,
-            prompt: goalText,
-            summary: titleText,
-            ...(typeof claimKey === 'string' && claimKey !== ''
-              ? { requestId: `companion-task:${taskId}:${claimKey}` }
-              : {}),
-            ...(agentPreset === undefined ? {} : { agentPreset }),
-            ...(cwd === undefined ? {} : { cwd }),
-          },
-          // 回执由本模块写（需要 title/status 映射），worker 不再写第二条。
-          store: null,
-          now: clock,
-          softMs,
-          hardMs,
-          tokenWarn,
-          tokenStop,
-          sampleMs,
-        });
+        if (useSubagent) {
+          workerResult = await runSubagentTask({
+            platform,
+            task: {
+              id: taskId,
+              scope: receiptScope,
+              prompt: goalText,
+              ...(agentPreset === undefined ? {} : { agentPreset }),
+              ...(cwd === undefined ? {} : { cwd }),
+            },
+            parent: agent,
+            name: subagent.name,
+            label: subagent.label ?? (titleText ?? taskId),
+            model: subagent.model ?? null,
+            now: clock,
+            ...(subagent.hardMs === undefined ? {} : { hardMs: subagent.hardMs }),
+            ...(subagent.signal === undefined ? {} : { signal: subagent.signal }),
+            ...(typeof subagent.onChildId === 'function' ? { onChildId: subagent.onChildId } : {}),
+            logger: subagent.logger,
+          });
+        } else {
+          workerResult = await runWorkerTask({
+            platform,
+            task: {
+              id: taskId,
+              scope: receiptScope,
+              prompt: goalText,
+              summary: titleText,
+              ...(typeof claimKey === 'string' && claimKey !== ''
+                ? { requestId: `companion-task:${taskId}:${claimKey}` }
+                : {}),
+              ...(agentPreset === undefined ? {} : { agentPreset }),
+              ...(cwd === undefined ? {} : { cwd }),
+            },
+            // 回执由本模块写（需要 title/status 映射），worker 不再写第二条。
+            store: null,
+            now: clock,
+            softMs,
+            hardMs,
+            tokenWarn,
+            tokenStop,
+            sampleMs,
+          });
+        }
       } catch (error) {
         // 参数/适配器异常：worker 尚未接管，直接收敛成 failed 回执。
         workerResult = {
@@ -213,12 +256,17 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
         ? `${titleText}\n${TOKEN_LIMIT_NOTE}`
         : baseSummary;
       const reason = status === 'partial' ? workerResult.reason ?? 'token_limit' : undefined;
-      const receipt = formatReceipt({
-        status: RECEIPT_STATUS[status],
-        summary: status === 'failed' ? defaultSummary(status, workerResult.error) : summary,
-        artifacts: [],
-        durationMs,
-      });
+      // SA-B1：子代理路径已经用结构化结果收过 ≤300 字回执（A1），没有显式
+      // title 时直接用它（保持「回执只说结论」的口径），否则沿用 title 口径。
+      const receipt = titleText === undefined
+        && typeof workerResult.receipt === 'string' && workerResult.receipt !== ''
+        ? workerResult.receipt
+        : formatReceipt({
+          status: RECEIPT_STATUS[status],
+          summary: status === 'failed' ? defaultSummary(status, workerResult.error) : summary,
+          artifacts: [],
+          durationMs,
+        });
 
       writeAudit({
         platform,
@@ -233,6 +281,25 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
         atSeconds: Math.floor(startedAt / 1000),
         reason,
       });
+
+      // SA-B3（阶段 4）：回执投递是旁路——失败只 warn，不影响任务终态。
+      if (typeof onReceipt === 'function') {
+        try {
+          await onReceipt({
+            taskId,
+            status,
+            receipt,
+            title: titleText ?? null,
+            sessionId: workerResult.sessionId ?? null,
+            ...(reason === undefined ? {} : { reason }),
+          });
+        } catch (error) {
+          safeLog(platform, 'warn', '[dsh-companion] task receipt delivery failed', {
+            taskId,
+            error: messageOf(error),
+          });
+        }
+      }
 
       finished += 1;
       const result = {
@@ -262,7 +329,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
    * @returns {boolean}
    */
   function tryAcquire() {
-    if (active < maxExec) {
+    if (active < slots) {
       active += 1;
       return true;
     }
@@ -271,10 +338,27 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
 
   /** 只读槽位统计（测试与诊断用）。 */
   function stats() {
-    return { active, queued: waiting.length, finished, maxExec, maxQueue };
+    return { active, queued: waiting.length, finished, maxExec: slots, maxQueue };
   }
 
-  return { runTask, stats, tryAcquire, release };
+  /**
+   * D6：把槽位数改成配置值（config.subagent.concurrency）。
+   *
+   * 只允许在完全空闲时改：改成 1 而此刻有 2 个任务在跑，会让 `release()` 的
+   * 计数失去意义（active 可能永远大于 slots）。
+   * @param {number} next
+   * @returns {boolean} 是否生效
+   */
+  function setMaxExec(next) {
+    if (!Number.isInteger(next) || next < 1) {
+      throw new TypeError('setMaxExec: next must be a positive integer');
+    }
+    if (active !== 0 || waiting.length !== 0) return false;
+    slots = next;
+    return true;
+  }
+
+  return { runTask, stats, tryAcquire, release, setMaxExec };
 }
 
 const defaultRunner = createTaskRunner();
@@ -290,6 +374,16 @@ export function runTask(options) {
 /** 单例槽位统计。 */
 export function taskRunnerStats() {
   return defaultRunner.stats();
+}
+
+/**
+ * D6（阶段 4）：按配置调整全局执行槽数（config.subagent.concurrency）。
+ * 只允许在空闲时生效；改动被忽略时返回 false（下一次 apply 再试）。
+ * @param {number} concurrency
+ * @returns {boolean}
+ */
+export function configureTaskConcurrency(concurrency) {
+  return defaultRunner.setMaxExec(concurrency);
 }
 
 /**

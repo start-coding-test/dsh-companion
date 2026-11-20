@@ -305,6 +305,22 @@ Object.defineProperty(DEFAULT_VALUES, 'reminderTodoStaleDays', {
   configurable: false,
 });
 
+// v0.7.7 SA-B1/SA-B4（阶段 4）：子代理派活。
+// - model：默认空 = 沿用主会话路由（计划原文「模型可配（默认沿用主会话路由）」）；
+//   只有显式配置且命中插件 allowlist 才经 agentOptions 传给宿主；
+// - concurrency：task_run 执行槽上限（D6 把「全局单槽」改成 2）。
+const SUBAGENT_DEFAULTS = Object.freeze({
+  model: '',
+  concurrency: 2,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'subagent', {
+  value: SUBAGENT_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 // v0.7.7 C120-M1：低于该 token 数的巩固区间不登记 pending_compact。
 // 小片段压缩收益低于一次surface replace 的成本，而且更容易踩到宿主「压后不更小」
 // 的确定性失败；保留默认 4096（与 retainTokens 的尾部预算同量级）。
@@ -1074,6 +1090,41 @@ export function normalizeDecay(raw, warnings = []) {
 }
 
 /**
+ * 合并子代理节（v0.7.7 SA-B1/SA-B4，阶段 4）并校验。
+ *
+ * `model` 默认空字符串 = 沿用主会话路由（计划原文口径）；非空值只是候选，
+ * 还需命中工具层的 allowlist 才会真正传给宿主，否则 warn 后回落。
+ * `concurrency` 是 task_run 的执行槽上限：1..8，默认 2（D6）。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{model: string, concurrency: number}>}
+ */
+export function normalizeSubagent(raw, warnings = []) {
+  const defaults = DEFAULTS.subagent;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('subagent', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['model', 'concurrency']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "subagent.${key}" ignored`);
+  }
+  const model = raw.model === undefined ? defaults.model : raw.model;
+  if (typeof model !== 'string') {
+    throw new ConfigError('subagent.model', `must be a string, got ${typeof model}`);
+  }
+  const concurrency = raw.concurrency === undefined ? defaults.concurrency : raw.concurrency;
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 8) {
+    throw new ConfigError(
+      'subagent.concurrency',
+      `must be an integer within 1..8, got ${JSON.stringify(concurrency)}`,
+    );
+  }
+  return Object.freeze({ model: model.trim(), concurrency });
+}
+
+/**
  * 合并任务 token 预算节并校验；未知子字段 warn，越界抛 ConfigError。
  *
  * 语义：tokenWarn 是「投递一次收尾提示」的软线，tokenStop 是「结束等待」的硬线，
@@ -1223,6 +1274,7 @@ export function normalizeConfig(raw = {}) {
   cfg.consolidate = normalizeConsolidate(input.consolidate, warnings);
   cfg.govern = normalizeGovern(input.govern, warnings);
   cfg.decay = normalizeDecay(input.decay, warnings);
+  cfg.subagent = normalizeSubagent(input.subagent, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

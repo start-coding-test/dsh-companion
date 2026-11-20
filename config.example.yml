@@ -96,6 +96,57 @@ rssMainOnlyGiB: 3.15
 # persona:
 #   cardPath: persona.json
 
+# ── 巩固出区间的压缩下限（C120-M1，默认 4096 token）─────────────────
+# 一次巩固产出的区间小于该值时不登记压缩（区间太小，压了也省不下上下文）。
+# 0 = 关闭闸门；小于它只写一条 debug 日志，不登记 pending_compact。
+# 下面这行直接可用（平铺键，不是段）：
+compactMinRegionTokens: 4096
+
+# ── 巩固写库前的近似查重与抽取上限（L120-H1/H3，可选段，
+#    不参与 16 键安装自检）──────────────────────────────────────────
+# dedupeSkip / dedupeAsk：草稿事实与库里同类事实的 bigram Jaccard 相似度。
+#   ≥ dedupeSkip：只强化旧条（reinforce），不新增；
+#   dedupeAsk..dedupeSkip：交给模型判 same / update / new；
+#   < dedupeAsk：直接新增。必须 0 < dedupeAsk < dedupeSkip < 1。
+# maxProjectFacts：单次巩固新增 project + knowledge 事实的上限；0 表示不写工程类事实。
+# 需要覆盖时把下面四行去掉注释并入 config.yml：
+#
+# consolidate:
+#   existingFactsLimit: 12
+#   dedupeSkip: 0.85
+#   dedupeAsk: 0.5
+#   maxProjectFacts: 5
+
+# ── deep-sleep 自动去重（L120-M1，可选段，不参与 16 键安装自检）─────
+# 同 kind 事实两两相似度达到该值才配对，再由模型判 same/update，判中只
+# supersede（不物理删）。0 = 关掉自动配对。
+#
+# govern:
+#   autoDedupeThreshold: 0.6
+
+# ── dormant 衰减的工程类天数（L120-H3c，可选段，不参与 16 键安装自检）──
+# project / knowledge 事实多久没被召回或强化就转 dormant（0 关闭）。
+#
+# decay:
+#   projectDormantDays: 30
+
+# ── 提醒过期（L120-M3，平铺键）────────────────────────────────────
+# 无到期时间的承诺 / 待办多久没更新就置 expired（只改状态，不物理删）。
+# 到期时间已过的提醒按 24 小时宽限处理，与下面两键无关。
+reminderStaleDays: 30
+reminderTodoStaleDays: 7
+
+# ── 子代理派活（SA-B1/B4，可选段，不参与 16 键安装自检）──────────────
+# model：task_run / thread_run 交给宿主子代理时使用的模型；留空（默认）表示
+#   沿用主会话路由，只有显式配置才经 agentOptions 传下去。取值必须在 profile
+#   允许集内（magpie/opencode-go/deepseek-v4.1-flash、magpie/opencode-go/glm-5.3），
+#   越界只会 warn 并回落到「沿用主会话路由」。
+# concurrency：同时运行的子代理任务上限（1–8），超出排队。
+#
+# subagent:
+#   model: ""
+#   concurrency: 2
+
 # ── 宿主压缩服务（compaction-basic）────────────────────────────────
 # 下面不是本插件的配置键，而是 cordis.patch.yml 里 compaction-basic 的写法；
 # 不要写进 config.yml。

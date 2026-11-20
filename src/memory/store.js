@@ -543,6 +543,9 @@ CREATE TABLE IF NOT EXISTS threads (
   key             TEXT PRIMARY KEY,
   name            TEXT NOT NULL,
   session_id      TEXT NOT NULL,
+  -- SA-B2（v0.7.7 阶段 4）：子代理会话 id（宿主 SubagentActivation.childId）。
+  -- 续派锚用它走 sendMessage；旧库由 #ensureThreadChildSessionColumn 就地补列。
+  child_session_id TEXT,
   description     TEXT NOT NULL,
   last_progress   TEXT,
   last_active_at  INTEGER NOT NULL,
@@ -1278,6 +1281,9 @@ export class Store {
       // L120-M4：episodes.domain（life / work）。旧库 NULL、不提升 schema_version，
       // 所以必须放在「每次 open 都跑」的通用段（见回报「与计划不一致」清单）。
       this.#ensureEpisodeDomainColumn();
+      // SA-B2（阶段 4）：threads.child_session_id（续派锚）。同 L120-M4 口径，
+      // 旧库就地补列、不提升 schema_version。
+      this.#ensureThreadChildSessionColumn();
       this.#db.exec(`
         CREATE INDEX IF NOT EXISTS ix_fact_vectors_embedder ON fact_vectors(embedder_id);
         CREATE INDEX IF NOT EXISTS ix_facts_reneed ON facts(scope, first_reneed_at);
@@ -1917,6 +1923,21 @@ export class Store {
     const rows = this.#db.prepare('PRAGMA table_info(episodes)').all();
     if (rows.some((row) => row.name === 'domain')) return false;
     this.#db.exec("ALTER TABLE episodes ADD COLUMN domain TEXT CHECK (domain IN ('life','work'))");
+    return true;
+  }
+
+  /**
+   * SA-B2（v0.7.7 阶段 4）：给旧库补 `threads.child_session_id`（续派锚）。
+   *
+   * **不提升 schema_version**：与 `#ensureEpisodeDomainColumn` 同范式，挂在
+   * migrate() 的「每次 open 都跑」通用段；没有该列的旧库就地补上，值取 NULL
+   * （旧线程首次续派时由工具层回写，见 src/runtime/tools.js 的 thread_run）。
+   * @returns {boolean} 是否真的补了列
+   */
+  #ensureThreadChildSessionColumn() {
+    const rows = this.#db.prepare('PRAGMA table_info(threads)').all();
+    if (rows.some((row) => row.name === 'child_session_id')) return false;
+    this.#db.exec('ALTER TABLE threads ADD COLUMN child_session_id TEXT');
     return true;
   }
 
@@ -3445,11 +3466,12 @@ export class Store {
     }
     this.#db
       .prepare(
-        `INSERT INTO threads (key, name, session_id, description, last_progress, last_active_at, status)
-         VALUES (?,?,?,?,?,?,?)
+        `INSERT INTO threads (key, name, session_id, child_session_id, description, last_progress, last_active_at, status)
+         VALUES (?,?,?,?,?,?,?,?)
          ON CONFLICT(key) DO UPDATE SET
            name = excluded.name,
            session_id = excluded.session_id,
+           child_session_id = excluded.child_session_id,
            description = excluded.description,
            last_progress = excluded.last_progress,
            last_active_at = excluded.last_active_at,
@@ -3459,6 +3481,9 @@ export class Store {
         key,
         requireString(input.name, 'threads.name'),
         requireString(input.session_id, 'threads.session_id'),
+        typeof input.child_session_id === 'string' && input.child_session_id !== ''
+          ? input.child_session_id
+          : null,
         requireString(input.description, 'threads.description'),
         input.last_progress ?? null,
         epochOr(input.last_active_at, nowSeconds()),
@@ -3477,12 +3502,19 @@ export class Store {
 
   /**
    * H3：按平台 session id 反查线程目录行（用于 pre-step 路由）。
+   *
+   * SA-B2（阶段 4）：同时匹配 `child_session_id`。子代理会话 id 与平台会话 id
+   * 在同一 id 空间（宿主 `dsh-subagent/src/continuation-messages.ts:133/:173`
+   * 明确通知的 `senderSessionId` 就是 `childId`），所以续派产生的子会话也应能
+   * 反查到同一条线程行；双列匹配对旧数据无副作用（旧行 child_session_id 为 NULL）。
    * @param {string} sessionId
    * @returns {object|null}
    */
   getThreadBySessionId(sessionId) {
     if (typeof sessionId !== 'string' || sessionId === '') return null;
-    return this.#db.prepare('SELECT * FROM threads WHERE session_id = ?').get(sessionId) ?? null;
+    return this.#db
+      .prepare('SELECT * FROM threads WHERE session_id = ? OR child_session_id = ?')
+      .get(sessionId, sessionId) ?? null;
   }
 
   /**

@@ -381,6 +381,11 @@ test('capabilities 反映宿主能力', () => {
     tools: false,
     unarchive: false,
     llm: false,
+    // SA-B1/SA-B2（阶段 4）：FakeCtx 默认没有 subagents/agents 服务，
+    // 派活与续派能力位都应为 false（工具层据此回退 worker 直投）。
+    subagents: false,
+    subagentMessages: false,
+    agents: false,
   });
 
   const partial = createAdapter(new FakeCtx({ missing: ['compaction', 'tokenMeter'] }));

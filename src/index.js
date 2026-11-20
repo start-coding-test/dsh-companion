@@ -125,6 +125,8 @@ import { createMetrics } from './runtime/metrics.js';
 import { createProactive } from './runtime/proactive.js';
 import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
 import { createTools } from './runtime/tools.js';
+// SA-B1/D6（v0.7.7 阶段 4）：task_run 执行槽上限由 config.subagent.concurrency 驱动。
+import { configureTaskConcurrency } from './task/run.js';
 import {
   clearCompactionAttempts,
   clearCompactionFailures,
@@ -267,6 +269,19 @@ const COMPANION_RPC_PREFIX = 'companion-';
 
 /** C5-H1a：提醒正文前缀（surface 记录没有 source，按正文兜底识别）。 */
 const REMINDER_TEXT_PREFIX = '[提醒] ';
+
+/**
+ * SA-B3（v0.7.7 阶段 4）：子代理回执投回主会话时的正文前缀与 source.kind。
+ *
+ * 回执沿既有 proactive 投递路径（`runtime/proactive.js` 的 enqueue → flush →
+ * `platform.prompt`）进主会话，由主会话那一轮转述给用户；宿主会把它记成
+ * `source.kind='user'`，所以必须同时被三处排除集认出来（hasRealUserInput /
+ * isInjectedMessage / lastUserText），否则回执会被当作用户发言参与巩固、
+ * 主会话重绑与召回查询。前缀与 kind 两条冗余口径各管一处：surface 记录没有
+ * source，只能按正文前缀兜底。
+ */
+const REMINDER_TASK_PREFIX = '[任务] ';
+const TASK_RECEIPT_SOURCE_KIND = 'companion-task-receipt';
 
 /**
  * A7（U13-H1）：IM 插件的来源/引用信封。
@@ -457,6 +472,16 @@ export function apply(ctx, rawConfig, hooks = {}) {
   }
   const metrics = createMetrics({ clock: platform.now });
   const state = createWiringState({ platform, store, config, metrics, embedder, seats });
+  // SA-B1/D6（阶段 4）：把配置里的并发上限交给进程级执行槽（空闲时生效；
+  // 启动瞬间必然空闲，被忽略只会是重复 apply 的极端情形，下一次 apply 再试）。
+  try {
+    configureTaskConcurrency(config.subagent?.concurrency ?? 2);
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] failed to configure task concurrency', {
+      concurrency: config.subagent?.concurrency ?? null,
+      message: errorMessage(error),
+    });
+  }
   // v0.4.12：人格卡只在 apply 时加载一次（不做热加载）；失败回落内置卡并 warn。
   applyPersonaCard(state, hooks);
   // V3-H2：先把上次进程崩溃时残留的 delivering 提醒收回 pending，避免永久卡住。
@@ -557,6 +582,10 @@ export function apply(ctx, rawConfig, hooks = {}) {
       vectorConfig(state),
       // A1（v0.4.13）：worker 会话的 token 估算按 task 来源入账。
       (entry) => recordModelUsage(state, entry),
+      // SA-B3（v0.7.7 阶段 4）：task_run 的 ≤300 字回执投回主会话。
+      (info) => deliverTaskReceipt(state, info),
+      // SA-B1/D3（v0.7.7 阶段 4）：子代理模型（默认空 = 沿用主会话路由）。
+      config.subagent?.model ?? '',
     );
     track(startScheduler(state));
   } catch (error) {
@@ -1140,8 +1169,11 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
  * @param {{inc:Function}} [metrics] 计数器（thread_run 槽位日志/兜底）
  * @param {(input: object) => Promise<object>} [retrieveFn] 带 embedder 的召回入口（缺省用 retrieve）
  * @param {object} [vectorCfg] 召回用的 vector 配置（embedder 不可用时 enabled=false）
+ * @param {(entry: object) => void} [recordTokenUsage] worker/subagent 用量的记账入口
+ * @param {(info: object) => object} [taskReceipt] SA-B3：回执投递入口
+ * @param {string} [subagentModel] SA-B1/D3：子代理模型（空 = 沿用主会话路由）
  */
-function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg, recordTokenUsage) {
+function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg, recordTokenUsage, taskReceipt, subagentModel) {
   // V7-H1 审计：tools 是声明的 inject，apply 前就绪；工具注册只能在 apply
   // 阶段完成，故保留 apply 时判断。线程能力见下方 execute 内的调用时判断。
   if (!platform.capabilities.tools) return;
@@ -1162,6 +1194,10 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     metrics,
     // A1：task_run 结束后把 worker 用量送回账本。
     recordTokenUsage: typeof recordTokenUsage === 'function' ? recordTokenUsage : undefined,
+    // SA-B3（阶段 4）：回执投递入口（缺省 undefined → 不投递，测试可直接跳过）。
+    ...(typeof taskReceipt === 'function' ? { taskReceipt } : {}),
+    // SA-B1/D3（阶段 4）：子代理模型；空串由 tools 层归一成「不传 agentOptions」。
+    ...(typeof subagentModel === 'string' ? { subagentModel } : {}),
     vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
@@ -1238,6 +1274,8 @@ function hasRealUserInput(messages) {
     // SA-H1：子代理结案通知与 agent 间 relay 消息由宿主以 user/message 投递，
     // 同样不是用户真实输入（latest-user 重绑因此不会被子代理事件抢占）。
     if (sourceKind === SUBAGENT_SETTLED_SOURCE_KIND || sourceKind === AGENT_MESSAGE_SOURCE_KIND) continue;
+    // SA-B3（阶段 4）：子代理回执也是插件投递，不算用户发言。
+    if (sourceKind === TASK_RECEIPT_SOURCE_KIND) continue;
     // C5-H1a：插件主动投递（提醒/任务/线程）被宿主记成 user，不重绑主会话。
     if (isCompanionMessage(message)) continue;
     const blocks = Array.isArray(message.content)
@@ -3887,6 +3925,7 @@ function isInjectedMessage(message) {
   if (message === null || typeof message !== 'object') return false;
   const kind = message.source?.kind;
   return kind === RECALL_SOURCE_KIND
+    || kind === TASK_RECEIPT_SOURCE_KIND
     || kind === SUBAGENT_SETTLED_SOURCE_KIND
     || kind === AGENT_MESSAGE_SOURCE_KIND
     || kind === EMOTION_SOURCE_KIND
@@ -3983,6 +4022,8 @@ function isCompanionMessage(message) {
   for (const block of blocks) {
     const text = typeof block === 'string' ? block : block?.type === 'text' ? block.text : null;
     if (typeof text === 'string' && text.trimStart().startsWith(REMINDER_TEXT_PREFIX)) return true;
+    // SA-B3（阶段 4）：子代理回执前缀同样是插件投递。
+    if (typeof text === 'string' && text.trimStart().startsWith(REMINDER_TASK_PREFIX)) return true;
   }
   return false;
 }
@@ -3994,9 +4035,9 @@ function isCompanionMessage(message) {
  * @returns {boolean}
  */
 function isCompanionRecord(record) {
-  return record?.role === 'user'
-    && typeof record.text === 'string'
-    && record.text.trimStart().startsWith(REMINDER_TEXT_PREFIX);
+  if (record?.role !== 'user' || typeof record.text !== 'string') return false;
+  const text = record.text.trimStart();
+  return text.startsWith(REMINDER_TEXT_PREFIX) || text.startsWith(REMINDER_TASK_PREFIX);
 }
 
 /**
@@ -5005,6 +5046,108 @@ function fireDueReminders(state) {
   return queued;
 }
 
+/**
+ * SA-B3（v0.7.7 阶段 4）：把子代理的 ≤300 字回执投回主会话。
+ *
+ * 为什么要绕这一圈：宿主没有 `dsh-im` 出站接口，插件唯一能「说话」的通道是
+ * 既有 proactive 投递路径——`proactive.enqueue` → `flush` → 主会话一轮
+ * （用户真机已确认这类非 IM 发起的主会话 turn 能回到 QQ）。回执不新建通道：
+ * 复用 `task_report` 类别（proactive.js:33 `KIND_CAPS`），正文加
+ * `[任务] ` 前缀供 surface/回放侧兜底识别。
+ *
+ * 为什么不改提醒触发逻辑：SA-B3 原文只要求「沿现有提醒投递路径」投回执；
+ * `fireDueReminders`（提醒到点）完全不动，只在它旁边复用同一个 outbox。
+ *
+ * 投递日志（计划明确要求）：`dsh-im` 没有出站日志，插件自记一条才能核对
+ * 「回执 id / 时间 / 投递成功与否」，落 memory_events（kind=task_receipt_delivery）。
+ *
+ * @param {object} state
+ * @param {{taskId: string, status?: string, receipt: string, title?: string|null,
+ *   sessionId?: string|null, reason?: string}} info
+ * @returns {{queued: boolean, duplicate?: boolean}}
+ */
+function deliverTaskReceipt(state, info) {
+  const { store, platform } = state;
+  const taskId = typeof info?.taskId === 'string' ? info.taskId : '';
+  const body = typeof info?.receipt === 'string' ? info.receipt.trim() : '';
+  if (taskId === '' || body === '') return { queued: false };
+
+  // 回执 id 与 taskId 同源：一个任务只有一条回执（重投走 dedupeKey，不产生新 id）。
+  const receiptId = taskId;
+  const atSeconds = Math.floor(platform.now() / 1000);
+  let queued = false;
+  try {
+    const result = state.proactive?.enqueue({
+      kind: 'task_report',
+      text: `${REMINDER_TASK_PREFIX}${body}`,
+      dedupeKey: `task-receipt:${receiptId}`,
+      // requestId 与回执 id 同源 → 宿主按 rpcId 去重，重试不会重复投递；
+      // 同时被 isCompanionMessage 的 `companion-` 前缀兜底识别为插件投递。
+      requestId: `companion-task-receipt:${receiptId}`,
+      at: platform.now(),
+      onSent: () => recordTaskReceiptDelivery(state, { ...info, receiptId, atSeconds, delivered: true }),
+      onFailed: () => recordTaskReceiptDelivery(state, { ...info, receiptId, atSeconds, delivered: false }),
+    });
+    queued = result?.duplicate !== true;
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] task receipt enqueue failed', {
+      taskId,
+      message: errorMessage(error),
+    });
+    recordTaskReceiptDelivery(state, { ...info, receiptId, atSeconds, delivered: false });
+    return { queued: false };
+  }
+
+  // 立刻推一轮：回执有时效，等下一个 tick 可能已经过时。失败不影响调用方。
+  try {
+    Promise.resolve(state.proactive?.flush?.())
+      .then((report) => {
+        if (report === undefined) return;
+        recordChatDelivery(state, report);
+        logDeliveryReport(state, report);
+      })
+      .catch(() => {});
+  } catch {
+    // flush 失败保留 backlog，等待下一次 tick 重试（proactive 自带退避）。
+  }
+  return { queued };
+}
+
+/**
+ * SA-B3：回执投递日志（时间 / 回执 id / 成功位）。写库失败只 warn，不影响任务终态。
+ * @param {object} state
+ * @param {object} info
+ * @returns {void}
+ */
+function recordTaskReceiptDelivery(state, info) {
+  const { store, platform } = state;
+  try {
+    store.appendEvent({
+      at: Number.isFinite(info.atSeconds) ? info.atSeconds : Math.floor(platform.now() / 1000),
+      action: 'USED',
+      actor: 'scheduler',
+      table_name: 'threads',
+      row_id: String(info.receiptId),
+      reason: info.delivered === true ? 'task_receipt_delivered' : 'task_receipt_failed',
+      detail_json: {
+        kind: 'task_receipt_delivery',
+        receiptId: info.receiptId,
+        taskId: info.taskId ?? null,
+        status: info.status ?? null,
+        delivered: info.delivered === true,
+        title: info.title ?? null,
+        sessionId: info.sessionId ?? null,
+        reason: info.reason ?? null,
+      },
+    });
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] failed to write task receipt delivery log', {
+      receiptId: info.receiptId,
+      message: errorMessage(error),
+    });
+  }
+}
+
 /* ------------------------------------------------------------------------- */
 /* P1-b：承诺跟进 + 轻量闲聊                                                   */
 /* ------------------------------------------------------------------------- */
@@ -5696,6 +5839,8 @@ function lastUserText(messages) {
     // SA-H1：子代理结案通知 / agent relay 消息没有前缀特征，只能按 source.kind 排除，
     // 否则它们会变成情绪判定与召回的 query 取值。前缀回退保持不动。
     if (row.sourceKind === SUBAGENT_SETTLED_SOURCE_KIND || row.sourceKind === AGENT_MESSAGE_SOURCE_KIND) continue;
+    // SA-B3（阶段 4）：子代理回执投回主会话，同样不是用户发言。
+    if (row.sourceKind === TASK_RECEIPT_SOURCE_KIND) continue;
     const text = row.text.trim();
     // C5-H1a：主动投递的提醒正文没有 source 可查，按正文前缀兜底排除，
     // 避免它被当成召回查询（lastUserText）或交互日记录的唯一输入。
@@ -5704,6 +5849,7 @@ function lastUserText(messages) {
       || text.startsWith(RECALL_MARKER)
       || text.startsWith(EMOTION_PROMPT_PREFIX)
       || text.startsWith(REMINDER_TEXT_PREFIX)
+      || text.startsWith(REMINDER_TASK_PREFIX)
     ) continue;
     return text;
   }

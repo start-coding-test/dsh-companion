@@ -94,10 +94,10 @@ test('成功路径：createSession → prompt → whenIdle，返回 done 与 ≤
   assert.equal(runEvent.detail_json.status, 'done');
   assert.equal(runEvent.detail_json.title, '周报');
   assert.equal(runEvent.detail_json.taskId, result.taskId);
-  assert.deepEqual(runner.stats(), { active: 0, queued: 0, finished: 1, maxExec: 1, maxQueue: 2 });
+  assert.deepEqual(runner.stats(), { active: 0, queued: 0, finished: 1, maxExec: 2, maxQueue: 2 });
 });
 
-test('全局单槽：忙时排队，不并发创建第二个 worker', async () => {
+test('并发上限 2（D6）：第 2 个立即开跑，第 3 个排队', async () => {
   const ctx = new FakeCtx({ deferIdle: true });
   const platform = makePlatform(ctx);
   const runner = createTaskRunner();
@@ -108,8 +108,13 @@ test('全局单槽：忙时排队，不并发创建第二个 worker', async () =
 
   const second = runner.runTask({ platform, goal: '任务二' });
   await tick();
-  // 第二件还在队列里：没有创建新会话
-  assert.equal(ctx.callsOf('sessionController.createSession').length, 1);
+  // 并发上限 2：第二件拿到第二个槽位，直接开跑
+  assert.equal(ctx.callsOf('sessionController.createSession').length, 2);
+
+  const third = runner.runTask({ platform, goal: '任务三' });
+  await tick();
+  // 槽位已满：第三件在队列里，没有创建新会话
+  assert.equal(ctx.callsOf('sessionController.createSession').length, 2);
   assert.equal(runner.stats().queued, 1);
 
   ctx.releaseIdle('session-fake-1');
@@ -117,21 +122,28 @@ test('全局单槽：忙时排队，不并发创建第二个 worker', async () =
   assert.equal(firstResult.status, 'done');
 
   await tick();
-  assert.equal(ctx.callsOf('sessionController.createSession').length, 2);
+  assert.equal(ctx.callsOf('sessionController.createSession').length, 3);
   ctx.releaseIdle('session-fake-2');
+  ctx.releaseIdle('session-fake-3');
   const secondResult = await second;
+  const thirdResult = await third;
   assert.equal(secondResult.status, 'done');
+  assert.equal(thirdResult.status, 'done');
   assert.equal(runner.stats().active, 0);
-  assert.equal(runner.stats().finished, 2);
+  assert.equal(runner.stats().finished, 3);
 });
 
-test('队列上限 2：第 4 个请求直接 busy，不建会话', async () => {
+test('队列上限 2：槽位满且队列满后第 5 个请求直接 busy，不建会话', async () => {
   const ctx = new FakeCtx({ deferIdle: true });
   const platform = makePlatform(ctx);
   const runner = createTaskRunner();
 
-  const running = runner.runTask({ platform, goal: '运行中' });
+  const runningA = runner.runTask({ platform, goal: '运行中 A' });
   await tick();
+  const runningB = runner.runTask({ platform, goal: '运行中 B' });
+  await tick();
+  assert.equal(runner.stats().active, 2);
+
   const queuedA = runner.runTask({ platform, goal: '排队 A' });
   const queuedB = runner.runTask({ platform, goal: '排队 B' });
   await tick();
@@ -139,16 +151,19 @@ test('队列上限 2：第 4 个请求直接 busy，不建会话', async () => {
 
   const rejected = await runner.runTask({ platform, goal: '被拒绝' });
   assert.deepEqual(rejected, { ok: false, reason: 'busy', queue: 2 });
-  assert.equal(ctx.callsOf('sessionController.createSession').length, 1);
+  assert.equal(ctx.callsOf('sessionController.createSession').length, 2);
 
   // 收尾：依次放行，避免悬挂的 promise。
   ctx.releaseIdle('session-fake-1');
-  await running;
+  await runningA;
   await tick();
   ctx.releaseIdle('session-fake-2');
-  await queuedA;
+  await runningB;
   await tick();
   ctx.releaseIdle('session-fake-3');
+  await queuedA;
+  await tick();
+  ctx.releaseIdle('session-fake-4');
   await queuedB;
 });
 

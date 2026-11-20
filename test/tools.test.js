@@ -38,7 +38,10 @@ function makeHarness() {
     unarchived: [],
     async createSession(request) {
       this.sessions.push(request);
-      return { sessionId: 'sess-created', agent: { id: 'sess-created' } };
+      // 每次新建返回不同的会话 id：真实宿主每 create 一次就是一个新会话，
+      // 而 threads.session_id 上有唯一索引（D6 允许并发 2 个线程后必须区分）。
+      const sessionId = this.sessions.length === 1 ? 'sess-created' : `sess-created-${this.sessions.length}`;
+      return { sessionId, agent: { id: sessionId } };
     },
     async prompt(request) {
       this.prompts.push(request);
@@ -254,20 +257,27 @@ test('thread_run 与 task_run 共用执行槽（N-M2）', async () => {
     });
     assert.equal(first.ok, true);
 
+    // D6（v0.7.7 阶段 4）：并发上限 2，第二个线程还能拿到第二个槽位。
     const second = await harness.byName.thread_run.execute({
       key: 'new', name: '第二个线程', goal: '查一下预算',
     });
-    assert.deepEqual([second.ok, second.reason], [false, 'busy'], '执行槽被占时应立即 busy');
-    assert.equal(harness.platform.sessions.length, 1, 'busy 时不应创建会话');
+    assert.equal(second.ok, true, '并发上限 2 时第二个线程仍应执行');
+
+    // 槽位满：第三个立即 busy，不建会话（非阻塞取槽，不排队）。
+    const third = await harness.byName.thread_run.execute({
+      key: 'new', name: '第三个线程', goal: '查一下预算',
+    });
+    assert.deepEqual([third.ok, third.reason], [false, 'busy'], '执行槽被占时应立即 busy');
+    assert.equal(harness.platform.sessions.length, 2, 'busy 时不应创建会话');
   } finally {
     releaseIdle();
     await new Promise((resolve) => setTimeout(resolve, 0));
   }
 
-  const third = await harness.byName.thread_run.execute({
+  const fourth = await harness.byName.thread_run.execute({
     key: first.key, goal: '继续查预算',
   });
-  assert.equal(third.ok, true, 'whenIdle 之后槽应释放');
+  assert.equal(fourth.ok, true, 'whenIdle 之后槽应释放');
 });
 
 test('thread_run：活跃线程达上限时拒绝新建', async () => {

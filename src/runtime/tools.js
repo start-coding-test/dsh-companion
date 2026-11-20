@@ -23,6 +23,12 @@ import { summarizeCost } from './commands.js';
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
 import { nextOccurrence, parseRRule } from '../scheduler/recurrence.js';
 import { FACT_KINDS as STORE_FACT_KINDS } from '../memory/store.js';
+// SA-B1/SA-B2（v0.7.7 阶段 4）：子代理命名与模型 allowlist 与 runner 共用一份口径。
+import {
+  SUBAGENT_MODEL_ALLOWLIST,
+  normalizeSubagentName,
+  threadSubagentName,
+} from '../task/subagent-runner.js';
 
 const FACT_KINDS = new Set(STORE_FACT_KINDS);
 const SALIENCE = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
@@ -197,8 +203,11 @@ export function createTools({
   cwd,
   timeZone = DEFAULT_TIMEZONE,
   threadAgentPreset,
+  subagentModel,
   taskLimits,
   recordTokenUsage,
+  // SA-B3（v0.7.7 阶段 4）：task_run 收尾后的回执投递回调（接线层注入；缺省不投递）。
+  taskReceipt,
   currentScope,
   budgetGate,
   metrics,
@@ -220,6 +229,26 @@ export function createTools({
   const threadPreset = typeof threadAgentPreset === 'string' && threadAgentPreset.trim() !== ''
     ? threadAgentPreset.trim()
     : null;
+
+  /**
+   * D3（SA-B4，v0.7.7 阶段 4）：`subagent.model` 的裁决结果。
+   *
+   * **默认空 = 沿用主会话路由**（计划原文「模型可配（默认沿用主会话路由）」）；
+   * 只有显式配置且命中 allowlist 才经 `agentOptions` 传到宿主，越界 warn 后回落。
+   * @returns {string|null}
+   */
+  const subagentModelResolved = (() => {
+    const raw = typeof subagentModel === 'string' ? subagentModel.trim() : '';
+    if (raw === '') return null;
+    if (SUBAGENT_MODEL_ALLOWLIST.includes(raw)) return raw;
+    if (typeof platform?.log === 'function') {
+      platform.log('warn', '[dsh-companion] subagent.model is not in the allowlist; using the main route', {
+        model: raw,
+        allowlist: SUBAGENT_MODEL_ALLOWLIST,
+      });
+    }
+    return null;
+  })();
 
   /**
    * 当前会话 scope：undefined=尚未路由（兼容旧调用，按 main）；null=subagent，
@@ -522,7 +551,7 @@ export function createTools({
         required: ['key'],
         additionalProperties: false,
       },
-      async execute(args = {}) {
+      async execute(args = {}, exec = {}) {
         assertArgs(args, 'thread_run');
         const key = requireString(args.key, 'thread_run', 'key');
         const name = optionalString(args.name, 'thread_run', 'name');
@@ -536,6 +565,14 @@ export function createTools({
         if (plan.action === 'reject') {
           return { ok: false, action: 'reject', key: plan.key ?? key, reason: plan.reason };
         }
+
+        // SA-B1/SA-B2（阶段 4）：宿主子代理能力 + 存活 parent。
+        // 宿主 UNAUTHORIZED 守卫要求 parent 是精确存活的 Agent 对象
+        // （`dsh-subagent/src/index.ts:275-277`），所以只认 `exec.agent`；
+        // 拿不到就走旧路径（createSession / prompt），不猜 parent。
+        const sender = exec?.agent !== null && typeof exec?.agent === 'object' ? exec.agent : null;
+        const subagentsReady = platform?.capabilities?.subagents === true && sender !== null;
+        const canContinue = platform?.capabilities?.subagentMessages === true && sender !== null;
 
         // 新建分支返回的句柄直接用于 whenIdle，避免线程尚未进入 ctx.agents 时退化。
         let createdHandle = null;
@@ -551,6 +588,56 @@ export function createTools({
             if (!thread) {
               return { ok: false, action: 'reuse', key: plan.key, reason: 'thread-row-missing' };
             }
+            // SA-B2：有续派锚 → 走宿主 sendMessage（运行中下一 step 收、空闲开新
+            // turn、冷目标在树根下恢复，`dsh-subagent/src/index.ts:356-375`）。
+            const anchor = typeof thread.child_session_id === 'string' && thread.child_session_id !== ''
+              ? thread.child_session_id
+              : null;
+            if (anchor !== null && canContinue) {
+              let continued = false;
+              if (goal !== undefined) {
+                try {
+                  await platform.sendToSubagent(
+                    sender,
+                    anchor,
+                    [{ type: 'text', text: goal }],
+                    exec?.signal === undefined ? {} : { signal: exec.signal },
+                  );
+                  continued = true;
+                } catch (error) {
+                  // 保守默认：目标已不可恢复（UNAVAILABLE 等）→ 重建会话并更新锚，
+                  // 回执里注明「已重建」（可逆，见回报「与计划不一致」清单）。
+                  if (typeof platform?.log === 'function') {
+                    platform.log('warn', '[dsh-companion] thread continuation failed; rebuilding', {
+                      key: plan.key,
+                      anchor,
+                      error: errorMessage(error),
+                    });
+                  }
+                  const rebuilt = await createThreadSession({ goal, name, key: plan.key, nowSec, requestId, sender });
+                  if (rebuilt.ok !== true) return rebuilt;
+                  return { ...rebuilt, action: 'reuse', reactivated: false, rebuilt: true, prompted: true };
+                }
+              }
+              const updated = store.upsertThread({
+                ...thread,
+                status: 'active',
+                child_session_id: anchor,
+                last_progress: goal ?? thread.last_progress,
+                last_active_at: nowSec,
+              });
+              return {
+                ok: true,
+                action: 'reuse',
+                key: plan.key,
+                sessionId: anchor,
+                reactivated: false,
+                continued,
+                prompted: continued,
+                thread: updated,
+              };
+            }
+            // 旧线程（无锚）：先按旧路径恢复/打开会话并投递一次，首续派时建立锚。
             let reactivated = false;
             if (thread.status !== 'active') {
               if (typeof platform?.unarchiveSession !== 'function') {
@@ -597,7 +684,12 @@ export function createTools({
               prompted,
             };
           }
-  
+
+          // 新建分支：有子代理能力且给了目标 → 走 startActivation（拿 childId 当锚）；
+          // 没有目标或没有能力 → 旧 createSession 路径（与历史行为一致）。
+          if (subagentsReady && goal !== undefined) {
+            return createThreadSession({ goal, name, key: plan.key, nowSec, requestId, sender });
+          }
           if (typeof platform?.createSession !== 'function') {
             return { ok: false, action: 'create', key: plan.key, reason: 'session-unavailable' };
           }
@@ -628,7 +720,7 @@ export function createTools({
           if (sessionId === null) {
             throw new Error('[tools] thread_run: createSession() returned no session id');
           }
-  
+
           const thread = store.upsertThread({
             key: plan.key,
             name: name ?? plan.key,
@@ -638,7 +730,7 @@ export function createTools({
             last_active_at: nowSec,
             status: 'active',
           });
-  
+
           let prompted = false;
           if (goal !== undefined) {
             await platform.prompt({
@@ -657,6 +749,73 @@ export function createTools({
             thread,
           };
         };
+
+        /**
+         * SA-B1/SA-B2（阶段 4）：用宿主 startActivation 新建线程会话。
+         *
+         * 线程 key 是中文短名，直接当宿主 name 会被拒（1-32 位 `[a-z0-9-]`、
+         * 首字符字母、`lead` 保留，见 `dsh-subagent/src/types.ts:29-46`）；
+         * A12 的口径是 `t` + key 的 UTF-8 hex，原名放 label。
+         * childId 回写 `threads.child_session_id` 作为续派锚。
+         *
+         * @param {{goal: string, name?: string, key: string, nowSec: number,
+         *   requestId: string, sender: object}} input
+         * @returns {Promise<object>}
+         */
+        async function createThreadSession({ goal: threadGoal, name: threadName, key: threadKey, nowSec, requestId, sender }) {
+          const hostName = normalizeSubagentName(threadSubagentName(threadKey));
+          let activation;
+          try {
+            activation = await platform.startSubagent({
+              provider: 'spawn',
+              delivery: 'caller',
+              agentPreset: threadPreset ?? 'minimal',
+              maxDepth: 1,
+              label: threadName ?? threadKey,
+              ...(hostName === null ? {} : { name: hostName }),
+              prompt: [{ type: 'text', text: threadGoal }],
+              parent: sender,
+              signal: exec?.signal ?? new AbortController().signal,
+              ...(subagentModelResolved === null ? {} : { agentOptions: { model: subagentModelResolved } }),
+              ...(defaultCwd === undefined ? {} : { cwd: defaultCwd }),
+            });
+          } catch (error) {
+            if (!isUnknownAgentPresetError(error)) throw error;
+            return {
+              ok: false,
+              action: 'create',
+              key: threadKey,
+              reason: 'preset_unknown',
+              message: errorMessage(error),
+            };
+          }
+          const sessionId = typeof activation?.childId === 'string' ? activation.childId : null;
+          if (sessionId === null) {
+            throw new Error('[tools] thread_run: startActivation() returned no child id');
+          }
+          const thread = store.upsertThread({
+            key: threadKey,
+            name: threadName ?? threadKey,
+            session_id: sessionId,
+            child_session_id: sessionId,
+            description: threadGoal ?? `线程：${threadKey}`,
+            last_progress: threadGoal ?? null,
+            last_active_at: nowSec,
+            status: 'active',
+          });
+          // 结果消息由宿主交给 IM/会话通道；这里只把 anchor 记下来，避免激活
+          // 之后的网络/模型往返阻塞 thread_run 工具本身。
+          Promise.resolve(activation.result).catch(() => {});
+          return {
+            ok: true,
+            action: 'create',
+            key: threadKey,
+            sessionId,
+            prompted: true,
+            thread,
+            requestId,
+          };
+        }
 
         // N-M2：thread_run 会真正驱动一个会话执行，必须与 task_run 共用执行槽；
         // 没有 goal 只是复用/新建线程行，不占槽。
@@ -689,9 +848,9 @@ export function createTools({
     {
       name: 'task_run',
       description:
-        '把一件独立任务交给串行 worker 执行：全局单槽（同一时刻 1 个），'
+        '把一件独立任务交给子代理执行：并发上限 2（subagentConcurrency），'
         + '忙时排队最多 2 个，超出直接返回 busy；软超时 600s 只告警，'
-        + '硬超时 900s 两段式取消。返回 ≤300 字回执。',
+        + '硬超时 900s 中止。返回 ≤300 字回执。',
       parameters: {
         type: 'object',
         properties: {
@@ -710,7 +869,7 @@ export function createTools({
         required: ['goal'],
         additionalProperties: false,
       },
-      async execute(args = {}) {
+      async execute(args = {}, exec = {}) {
         assertArgs(args, 'task_run');
         const goal = requireString(args.goal, 'task_run', 'goal');
         const title = optionalString(args.title, 'task_run', 'title');
@@ -718,9 +877,14 @@ export function createTools({
         if (gate !== null && gate.allowTask === false) {
           return { ok: false, reason: gate.taskReason ?? 'daily_budget_exceeded' };
         }
-        if (typeof platform?.createSession !== 'function'
-          || typeof platform?.prompt !== 'function'
-          || typeof platform?.whenIdle !== 'function') {
+        // SA-B1（阶段 4）：宿主有子代理服务时走派活路径（不需要 sessionController
+        // 的 createSession/prompt/whenIdle）；没有则回退 worker 直投路径。
+        const subagentsReady = platform?.capabilities?.subagents === true
+          && exec?.agent !== null && typeof exec?.agent === 'object';
+        if (!subagentsReady
+          && (typeof platform?.createSession !== 'function'
+            || typeof platform?.prompt !== 'function'
+            || typeof platform?.whenIdle !== 'function')) {
           return { ok: false, reason: 'session-unavailable' };
         }
         const scope = scopeNow();
@@ -737,7 +901,23 @@ export function createTools({
           scope: typeof scope === 'string' && scope !== '' ? scope : 'main',
           cwd: defaultCwd,
           claimKey,
+          // SA-B1：派活所需的存活 parent（宿主 UNAUTHORIZED 守卫要求精确对象，
+          // 见 dsh-subagent/src/index.ts:275-277）+ D3 的模型裁决结果。
+          agent: subagentsReady ? exec.agent : null,
+          subagent: subagentsReady
+            ? {
+              enabled: true,
+              model: subagentModel,
+              label: title ?? goal.slice(0, 32),
+              ...(exec?.signal === undefined ? {} : { signal: exec.signal }),
+              logger: typeof platform?.log === 'function'
+                ? (message, meta) => platform.log('warn', message, meta)
+                : undefined,
+            }
+            : null,
           ...(taskLimits === undefined ? {} : { limits: taskLimits }),
+          // SA-B3（阶段 4）：回执投回主会话由接线层决定（tools 不认识 proactive）。
+          ...(typeof taskReceipt === 'function' ? { onReceipt: taskReceipt } : {}),
         });
         // A1（v0.4.13）：worker 会话的 token 估算按 task 来源入账；记账是旁路。
         Promise.resolve(pending).then(

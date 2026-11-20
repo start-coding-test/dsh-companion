@@ -125,6 +125,8 @@ persona:
 | `govern.autoDedupeThreshold` | `0.6` | deep-sleep 自动去重的配对下限（判 same 才 supersede，不物理删） |
 | `decay.projectDormantDays` | `30` | project / knowledge 事实多久没被召回或强化就转 dormant（`0` 关闭） |
 | `reminderStaleDays` / `reminderTodoStaleDays` | `30` / `7` | 无到期时间的承诺 / 待办多久没更新就置 expired（只改状态不删） |
+| `subagent.model` | `""` | `task_run` / `thread_run` 交给子代理时使用的模型；空表示沿用主会话路由（仅允许 profile 白名单内的两项） |
+| `subagent.concurrency` | `2` | 同时运行的子代理任务上限，超出排队 |
 
 token 四档须满足 `retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`。未知配置键只记警告，不阻断启动。
 

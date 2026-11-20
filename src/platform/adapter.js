@@ -346,6 +346,35 @@ export function createAdapter(ctx, opts = {}) {
     get llm() {
       return typeof service('llm')?.stream === 'function';
     },
+    /**
+     * SA-B1（v0.7.7 阶段 4）：子代理派活能力。
+     *
+     * 宿主入口是 `ctx.subagents.startActivation(spec)`
+     * （`dsh-subagent/src/index.ts:259`，实现 :267-292）；续派走
+     * `sendMessage(sender, targetId, content, {signal})`（同文件 :368-375）。
+     * 缺 `startActivation` 即视为不支持，工具层回退 `src/task/worker.js` 的
+     * createSession+prompt 直投路径（该文件本阶段不动）。
+     * @returns {boolean}
+     */
+    get subagents() {
+      return typeof service('subagents')?.startActivation === 'function';
+    },
+    /**
+     * SA-B2（阶段 4）：续派能力。`sendMessage` 是宿主「运行中下一 step 收、
+     * 空闲开新 turn、冷目标在树根下恢复」的唯一入口（`dsh-subagent/src/index.ts:356-366`）。
+     * @returns {boolean}
+     */
+    get subagentMessages() {
+      return typeof service('subagents')?.sendMessage === 'function';
+    },
+    /**
+     * SA-B1：按会话 id 取存活 agent 句柄（定时器/主动路径没有 `exec.agent` 时
+     * 用它兜底定位 parent）。宿主 `ctx.agents.get(id)`（`dsh-agent/src/index.ts:580-582`）。
+     * @returns {boolean}
+     */
+    get agents() {
+      return typeof service('agents')?.get === 'function';
+    },
   });
 
   /**
@@ -959,6 +988,96 @@ export function createAdapter(ctx, opts = {}) {
     return text;
   }
 
+  /**
+   * SA-B1（v0.7.7 阶段 4）：派一个子代理。
+   *
+   * 宿主契约（`dsh-subagent/src/index.ts`）：
+   * - `startActivation(spec)` :259，实现 :267-292；**parent 必须是精确存活的
+   *   Agent 对象**，宿主自己用 `ctx.get('agents')?.get(spec.parent.id) !== spec.parent`
+   *   校验（:275-277，抛 `UNAUTHORIZED`）。
+   * - `spec` 形状见 `types.ts:144-191`：`provider`/`prompt`/`parent`/`signal`
+   *   必填；`agentPreset`/`agentOptions`/`outputSchema`/`maxDepth`/`cwd` 需
+   *   provider 声明对应能力（spawn provider 四项全开，
+   *   `dsh-subagent-spawn-in-process/src/index.ts:39-44`）。
+   * - 返回 `SubagentActivation`（`types.ts:49-66`）：`{childId, name, messageId?,
+   *   result: Promise<SubagentResult>, dispose()}`；`result` **不 reject** 而是
+   *   以 `stopReason` 收尾，调用方按五态映射。
+   *
+   * @param {object} spec 宿主 SubagentActivationSpec（插件侧组装，见 src/task/subagent-runner.js）
+   * @returns {Promise<object>} SubagentActivation
+   */
+  async function startSubagent(spec) {
+    const impl = service('subagents');
+    if (typeof impl?.startActivation !== 'function') {
+      throw unavailable('no-subagents', 'ctx.subagents.startActivation()');
+    }
+    if (spec === null || typeof spec !== 'object') {
+      throw new TypeError('startSubagent(spec): spec must be an object');
+    }
+    if (typeof spec.provider !== 'string' || spec.provider.length === 0) {
+      throw new TypeError('startSubagent(spec): provider must be a non-empty string');
+    }
+    if (spec.parent === null || typeof spec.parent !== 'object') {
+      throw new TypeError('startSubagent(spec): parent must be a live agent handle');
+    }
+    if (!Array.isArray(spec.prompt) || spec.prompt.length === 0) {
+      throw new TypeError('startSubagent(spec): prompt must be a non-empty content block array');
+    }
+    const activation = await impl.startActivation(spec);
+    if (activation === null || typeof activation !== 'object'
+      || typeof activation.childId !== 'string' || activation.childId === '') {
+      throw new Error('startSubagent(spec): startActivation() returned no child id');
+    }
+    return activation;
+  }
+
+  /**
+   * SA-B1/SA-B2（阶段 4）：向已有子代理投递消息（线程续派）。
+   *
+   * 宿主 `sendMessage(sender, targetId, content, options)`（`dsh-subagent/src/index.ts:368-375`）：
+   * sender 必须是精确存活的 root 或 resident continuable Agent；`options` 只有
+   * `signal`（`types.ts:86-89`），**没有 requestId**。语义见 :356-366：运行中的
+   * 目标在下一 step 收到，空闲目标开新 turn，冷目标在其运行时子代理树根下恢复。
+   *
+   * @param {object} sender 存活 agent 句柄
+   * @param {string} targetId 目标会话 id（即 activation.childId）
+   * @param {object[]} content ContentBlock 数组
+   * @param {{signal?: AbortSignal}} [options]
+   * @returns {Promise<string>} messageId
+   */
+  async function sendToSubagent(sender, targetId, content, options = {}) {
+    const impl = service('subagents');
+    if (typeof impl?.sendMessage !== 'function') {
+      throw unavailable('no-subagents', 'ctx.subagents.sendMessage()');
+    }
+    if (sender === null || typeof sender !== 'object') {
+      throw new TypeError('sendToSubagent(sender): sender must be a live agent handle');
+    }
+    if (typeof targetId !== 'string' || targetId.length === 0) {
+      throw new TypeError('sendToSubagent(targetId): targetId must be a non-empty string');
+    }
+    if (!Array.isArray(content) || content.length === 0) {
+      throw new TypeError('sendToSubagent(content): content must be a non-empty content block array');
+    }
+    return impl.sendMessage(sender, targetId, content, {
+      ...(options?.signal === undefined ? {} : { signal: options.signal }),
+    });
+  }
+
+  /**
+   * SA-B1：同步取存活 agent 句柄（`ctx.agents.get`，`dsh-agent/src/index.ts:580-582`）。
+   * 定时器/主动路径没有 `exec.agent`，用它按主会话 id 找到 parent。
+   * @param {string} sessionId
+   * @returns {object|null}
+   */
+  function liveAgent(sessionId) {
+    if (typeof sessionId !== 'string' || sessionId === '') return null;
+    const agents = service('agents');
+    if (typeof agents?.get !== 'function') return null;
+    const agent = agents.get(sessionId);
+    return agent === null || typeof agent !== 'object' ? null : agent;
+  }
+
   return {
     now,
     cwd,
@@ -987,6 +1106,9 @@ export function createAdapter(ctx, opts = {}) {
     listProviders,
     listModels,
     complete,
+    startSubagent,
+    sendToSubagent,
+    agentBySessionId: liveAgent,
     capabilities,
   };
 }

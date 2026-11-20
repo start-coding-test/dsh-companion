@@ -210,15 +210,26 @@ test('renderSuggestedYaml：provenance 含换行也不会破坏注释结构', ()
   assert.equal(Object.keys(parsed).length, 16);
 });
 
-test('config.example.yml：16 个键齐全且与 DEFAULTS 一致', () => {
+test('config.example.yml：16 个安装键齐全且与 DEFAULTS 一致', () => {
   const text = readFileSync(resolve(REPO_ROOT, 'config.example.yml'), 'utf8');
   const parsed = parseExampleConfig(text);
-  assert.deepEqual(Object.keys(parsed).sort(), Object.keys(DEFAULTS).sort());
-  for (const [key, value] of Object.entries(parsed)) {
-    assert.deepEqual(value, DEFAULTS[key], `${key} 示例值应与默认值一致`);
+  const installKeys = Object.keys(DEFAULTS).sort();
+  // 16 个可枚举安装键必须齐、值必须等于默认值（安装面自检）。
+  for (const key of installKeys) {
+    assert.ok(Object.hasOwn(parsed, key), `config.example.yml 缺少 ${key}`);
+    assert.deepEqual(parsed[key], DEFAULTS[key], `${key} 示例值应与默认值一致`);
+  }
+  // v0.7.7 起允许额外写出非枚举扩展键（compactMinRegionTokens / reminderStaleDays /
+  // reminderTodoStaleDays 等平铺键）：只要求它确实是真配置键且值等于默认值，
+  // 段式配置仍按既有风格留在注释里，不参与这里的解析。
+  for (const key of Object.keys(parsed)) {
+    if (installKeys.includes(key)) continue;
+    assert.ok(Object.hasOwn(DEFAULTS, key), `config.example.yml 出现未知键 ${key}`);
+    assert.deepEqual(parsed[key], DEFAULTS[key], `${key} 示例值应与默认值一致`);
   }
   assert.match(text, /timezone: "Asia\/Shanghai"/);
   assert.match(text, /idleMs: 1800000/);
+  assert.match(text, /compactMinRegionTokens: 4096/);
 });
 
 /**
