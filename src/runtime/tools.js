@@ -24,11 +24,16 @@ import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
 import { nextOccurrence, parseRRule } from '../scheduler/recurrence.js';
 import { FACT_KINDS as STORE_FACT_KINDS } from '../memory/store.js';
 // SA-B1/SA-B2（v0.7.7 阶段 4）：子代理命名与模型 allowlist 与 runner 共用一份口径。
+// T120-M1（v0.7.7 阶段 5）：线程回执要取「结论首句」回写 last_progress。
 import {
   SUBAGENT_MODEL_ALLOWLIST,
+  buildSubagentReceipt,
+  mapStopReason,
   normalizeSubagentName,
+  outputText,
   threadSubagentName,
 } from '../task/subagent-runner.js';
+import { progressFromReceipt } from '../task/receipt.js';
 
 const FACT_KINDS = new Set(STORE_FACT_KINDS);
 const SALIENCE = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
@@ -539,7 +544,10 @@ export function createTools({
 
     {
       name: 'thread_run',
-      description: '复用或新建一个线程会话，并把目标投递进去。',
+      description:
+        '需要多天反复推进、同类事沿用的用这个：复用或新建一个线程会话，并把目标投递进去；'
+        + '一次性的活直接用 task_run。新建之前先用 thread_list 找同类 key，'
+        + '已有同类线程就复用（key 传已有 key），确实没有再用 key=new 新建。',
       parameters: {
         type: 'object',
         properties: {
@@ -805,7 +813,36 @@ export function createTools({
           });
           // 结果消息由宿主交给 IM/会话通道；这里只把 anchor 记下来，避免激活
           // 之后的网络/模型往返阻塞 thread_run 工具本身。
-          Promise.resolve(activation.result).catch(() => {});
+          //
+          // T120-M1（v0.7.7 阶段 5）：回执落地后把「结论首句」写回
+          // `threads.last_progress`，状态板线程目录才能显示真实进展而不是一句
+          // 当初的 goal。不 await、失败只打日志（工具调用已返回）。
+          Promise.resolve(activation.result)
+            .then((result) => {
+              try {
+                const outcome = mapStopReason(result?.stopReason);
+                const receipt = buildSubagentReceipt({
+                  status: outcome.status,
+                  structured: result?.structured,
+                  text: outputText(result?.output),
+                  durationMs: 0,
+                });
+                const progress = progressFromReceipt(receipt);
+                if (progress === null) return;
+                const latest = store.getThread(threadKey) ?? thread;
+                store.upsertThread({
+                  ...latest,
+                  last_progress: progress,
+                  last_active_at: Math.floor(nowMs() / 1000),
+                });
+              } catch (error) {
+                platform.log('warn', '[dsh-companion] thread progress update failed', {
+                  key: threadKey,
+                  message: error instanceof Error ? error.message : String(error),
+                });
+              }
+            })
+            .catch(() => {});
           return {
             ok: true,
             action: 'create',
@@ -848,9 +885,10 @@ export function createTools({
     {
       name: 'task_run',
       description:
-        '把一件独立任务交给子代理执行：并发上限 2（subagentConcurrency），'
-        + '忙时排队最多 2 个，超出直接返回 busy；软超时 600s 只告警，'
-        + '硬超时 900s 中止。返回 ≤300 字回执。',
+        '一次性的活用这个：把一件独立任务交给子代理执行，跑完就结束。'
+        + '需要多天反复推进、同类事沿用的用 thread_run。'
+        + '并发上限 2（subagentConcurrency），忙时排队最多 2 个，超出直接返回 busy；'
+        + '软超时 600s 只告警，硬超时 900s 中止。返回 ≤300 字回执。',
       parameters: {
         type: 'object',
         properties: {

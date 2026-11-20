@@ -132,6 +132,36 @@
   （`dsh-subagent/src/index.ts:267-292`、`types.ts:49-66/144-191`）构造，未在真机
   子代理会话回放。
 
+### Added（阶段 5）
+
+- **T120-M2 召回范围按作用域设计（05 A5）**：主会话召回 `main` + 各活跃线程的事实
+  （**不限 kind**，线程里巩固出的 project/knowledge 事实要能在主会话召回），情景仍只取
+  `main`（线程情景原文不外泄）；线程会话召回本线程 + `main`，但来自 `main` 的候选只放行
+  `identity` / `preference`（用户称呼与偏好跨线程可见），情景只取本线程。
+  `src/memory/retrieve.js` 新增 `factScopes` / `episodeScopes` / `attachedScopes` +
+  `attachedKinds` 行级过滤，`src/index.js` 新增 `recallScopes()` 按会话作用域算可见范围。
+- **`Store.searchBigram` / `Store.listEpisodes` 接受 scope 集合**：`string | string[]`，
+  数组展开为 `IN (…)`，单值仍走 `= ?` 快路径（旧调用零变化），空集合返回零行。
+  `src/memory/vector.js` 的 `searchVector` 同步支持集合（向量通道口径一致，否则开启向量
+  后主会话仍看不到线程事实）。
+- **T120-M1 线程进展**：`thread_run` 新建线程的回执落地后，把回执「结论」段首句
+  （≤120 码点，取不到则降级整段截断）回写 `threads.last_progress`，状态板线程目录显示的
+  是真实进展而不是当初的 goal。新增 `src/task/receipt.js` 的 `progressFromReceipt()` /
+  `PROGRESS_MAX_CHARS`。
+- **T120-L1 工具文案**：`task_run` / `thread_run` 描述写清「一次性的活用 task_run；需要
+  多天反复推进、同类事沿用的用 thread_run，先 `thread_list` 找同类 key 再决定新建」。
+
+### Tests（阶段 5）
+
+- `test/v077-stage5.test.js`（10 例）：scope 集合 API（含空集合与单值兼容）、验收①线程
+  project 事实回主会话、`recallScopes()` 范围形状、验收②线程召回 `main` 的 identity /
+  preference 而行级过滤掉 project / knowledge、验收③主会话不含线程情景原文、验收④回执首句
+  与降级截断、验收⑤工具描述文案。
+- `test/store.test.js` 的「searchBigram 按 scope 隔离」追加集合用例（含 `scope: []`）。
+- 1538 个用例 / 67 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三遍全绿）。
+- **非真机证据**：事实 / 情景 / 线程行全部构造，未回放 50041 云端快照；宿主子代理与模型
+  调用均为 mock。
+
 ### Fixed（阶段 2）
 
 - **L120-H2 提醒有截止时间却不触发**：巩固抽出的提醒只有 `due_at`、没有 `next_fire_at`

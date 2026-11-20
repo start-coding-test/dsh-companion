@@ -707,6 +707,27 @@ function normalizeEpisodeDomain(value) {
 }
 
 /**
+ * v0.7.7 阶段 5（T120-M2）：scope 条件同时接受单值与集合。
+ *
+ * 单值保持原来的 `= ?` 快路径（旧调用零语义变化）；数组展开成
+ * `IN (?, ?)`，去重并丢弃非字符串/空串。空集合返回 `AND 0`
+ * （没有任何行命中），避免拼出 `IN ()` 这种语法错误。
+ *
+ * @param {string} column 列名（可带表别名，如 'f.scope'）
+ * @param {string|string[]|undefined} scope
+ * @returns {{sql: string, args: string[]}}
+ */
+function scopeCondition(column, scope) {
+  if (scope === undefined) return { sql: '', args: [] };
+  if (Array.isArray(scope)) {
+    const values = [...new Set(scope.filter((value) => typeof value === 'string' && value !== ''))];
+    if (values.length === 0) return { sql: ' AND 0', args: [] };
+    return { sql: ` AND ${column} IN (${values.map(() => '?').join(', ')})`, args: values };
+  }
+  return { sql: ` AND ${column} = ?`, args: [scope] };
+}
+
+/**
  * V9-M1：episode 文本字段的防御性脱敏（任何调用方都不落明文）。
  *
  * 巩固层写库前已按字段脱敏一次，这里再对 title/summary/evidence/
@@ -2165,15 +2186,18 @@ export class Store {
 
   /**
    * 按作用域列出情景（默认排除已标记删除的行）。
-   * @param {{scope?: string, status?: string, includeDeleted?: boolean, limit?: number, offset?: number}} [options]
+   *
+   * v0.7.7 阶段 5（T120-M2）：`scope` 接受 `string | string[]`。
+   * @param {{scope?: string|string[], status?: string, includeDeleted?: boolean, limit?: number, offset?: number}} [options]
    * @returns {object[]}
    */
   listEpisodes(options = {}) {
     const where = [];
     const args = [];
-    if (options.scope !== undefined) {
-      where.push('scope = ?');
-      args.push(options.scope);
+    const scoped = scopeCondition('scope', options.scope);
+    if (scoped.sql !== '') {
+      where.push(scoped.sql.slice(' AND '.length));
+      args.push(...scoped.args);
     }
     if (options.status !== undefined) {
       where.push('status = ?');
@@ -3919,8 +3943,11 @@ export class Store {
 
   /**
    * bigram 全文检索：联查 fts_facts/fts_episodes 与主表，只返回未删除行。
+   *
+   * v0.7.7 阶段 5（T120-M2）：`scope` 接受 `string | string[]`
+   * （主会话召回 main + 各线程时用集合）。
    * @param {string} query
-   * @param {{scope?: string, limit?: number}} [options]
+   * @param {{scope?: string|string[], limit?: number}} [options]
    * @returns {object[]} 统一形状 { type:'fact'|'episode', id, scope, ... , rank }
    */
   searchBigram(query, options = {}) {
@@ -3929,27 +3956,27 @@ export class Store {
     const limit = clampLimit(options.limit, 20);
     const scope = options.scope;
 
-    const scopeClause = scope === undefined ? '' : ' AND f.scope = ?';
-    const factArgs = [match, ...(scope === undefined ? [] : [scope]), limit];
+    const factScoped = scopeCondition('f.scope', scope);
+    const factArgs = [match, ...factScoped.args, limit];
     const factRows = this.#db
       .prepare(
         `SELECT f.id, f.scope, f.kind, f.statement, f.subject_text, f.predicate,
                 f.object_text, f.salience, f.status, bm25(fts_facts) AS rank
            FROM fts_facts JOIN facts f ON f.rowid = fts_facts.rowid
-          WHERE fts_facts MATCH ? AND f.deleted_at IS NULL${scopeClause}
+          WHERE fts_facts MATCH ? AND f.deleted_at IS NULL${factScoped.sql}
           ORDER BY rank ASC
           LIMIT ?`,
       )
       .all(...factArgs);
 
-    const episodeScopeClause = scope === undefined ? '' : ' AND e.scope = ?';
-    const episodeArgs = [match, ...(scope === undefined ? [] : [scope]), limit];
+    const episodeScoped = scopeCondition('e.scope', scope);
+    const episodeArgs = [match, ...episodeScoped.args, limit];
     const episodeRows = this.#db
       .prepare(
         `SELECT e.id, e.scope, e.title, e.summary, e.topics_json, e.salience,
                 e.status, bm25(fts_episodes) AS rank
            FROM fts_episodes JOIN episodes e ON e.rowid = fts_episodes.rowid
-          WHERE fts_episodes MATCH ? AND e.deleted_at IS NULL${episodeScopeClause}
+          WHERE fts_episodes MATCH ? AND e.deleted_at IS NULL${episodeScoped.sql}
           ORDER BY rank ASC
           LIMIT ?`,
       )

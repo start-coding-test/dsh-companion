@@ -9,6 +9,12 @@
 /** 回执字数上限（05 §6.4：「≤300 字回执」）。 */
 export const RECEIPT_MAX_CHARS = 300;
 
+/**
+ * 线程进展串（`threads.last_progress`）的长度上限（v0.7.7 阶段 5 / T120-M1）。
+ * 状态板线程目录一行展示，取回执结论首句即可，余下的靠 last_active_at。
+ */
+export const PROGRESS_MAX_CHARS = 120;
+
 /** 产物区最多占用的字数（给结论留预算）。 */
 const ARTIFACTS_BUDGET_MAX = 80;
 
@@ -19,6 +25,30 @@ const STATUS_LABELS = Object.freeze({
   partial: '部分完成',
   error: '失败',
 });
+
+/**
+ * 从回执里取「进展首句」，供 `threads.last_progress`（v0.7.7 阶段 5 / T120-M1）。
+ *
+ * 回执固定形状是「状态：X｜结论：…｜产物：…｜耗时：…」。这里取「结论」段
+ * 的第一句（。！？/ 换行切句；逗号、分号、冒号也视为小句边界，进展串要短）；没有结论段时降级为整条回执的首句，再降级为
+ * 整条回执截断。返回值已压过空白，长度 ≤ `PROGRESS_MAX_CHARS`。
+ *
+ * @param {unknown} receipt 回执文本
+ * @returns {string|null} 进展首句；空回执返回 null
+ */
+export function progressFromReceipt(receipt) {
+  const raw = typeof receipt === 'string' ? receipt.trim() : '';
+  if (raw === '') return null;
+  const conclusionMatch = /结论：([\s\S]*?)(?:｜产物：|｜耗时：|$)/u.exec(raw);
+  const segment = conclusionMatch === null ? raw : conclusionMatch[1];
+  const firstSentence = segment
+    .split(/[。！？!?\r\n，,；;：:]/u)
+    .map((part) => normalizeSummary(part))
+    .find((part) => part !== '');
+  const text = normalizeSummary(firstSentence ?? segment);
+  if (text === '') return null;
+  return charLength(text) > PROGRESS_MAX_CHARS ? truncate(text, PROGRESS_MAX_CHARS) : text;
+}
 
 /**
  * 生成一条 ≤300 字的中文回执。

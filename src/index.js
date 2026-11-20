@@ -182,6 +182,15 @@ const SCOPE = MAIN_SCOPE;
 const RECALL_BUDGET_TOKENS = 2050;
 
 /**
+ * v0.7.7 阶段 5（T120-M2）：线程会话召回 main 事实时放行的 kind 白名单。
+ *
+ * 口径 = 计划原文「线程召回本线程 + main 的身份偏好」：用户怎么被称呼、
+ * 喜欢什么，跨线程要可见；main 的 project / knowledge 属于别的战线，
+ * 不往线程里灌（线程自己要用的工程事实一律落在本线程 scope）。
+ */
+const RECALL_MAIN_THREAD_FACT_KINDS = Object.freeze(['identity', 'preference']);
+
+/**
  * 召回注入消息的 `source.kind`（v0.4.4 / V3-H1）。
  *
  * 平台把 `decision.messages` 的每一项都当**完整消息**处理：
@@ -3651,6 +3660,57 @@ function emotionContextText(state, context) {
  * @param {string} [scope] 当前会话作用域
  * @returns {Promise<object|null>}
  */
+/**
+ * v0.7.7 阶段 5（T120-M2，依据设计 05 A5）：按会话作用域算召回可见范围。
+ *
+ * - 主会话（scope='main'）：facts 可见 main + 各活跃线程（**不限 kind**，
+ *   线程里巩固出的 project/knowledge 事实要能在主会话召回）；episodes 只可见
+ *   main（线程情景原文不外泄）。
+ * - 线程（scope='thread:<key>'）：facts 可见本线程 + main，但来自 main 的候选
+ *   只放行身份偏好类（identity / preference）；episodes 只可见本线程。
+ * - 其它自定义 scope：保持单值行为。
+ *
+ * @param {Store} store
+ * @param {string} scope
+ * @returns {{factScopes: string[]|null, episodeScopes: string[]|null,
+ *   attachedScopes: string[]|null, attachedKinds: string[]|null}}
+ */
+export function recallScopes(store, scope) {
+  const threadKeyOf = (value) => (typeof value === 'string' ? value.slice('thread:'.length) : '');
+  if (scope === undefined || scope === null || scope === SCOPE) {
+    let threadScopes = [];
+    try {
+      const rows = store.listThreads({ status: 'active', limit: 50 }) ?? [];
+      threadScopes = rows
+        .map((row) => (typeof row?.key === 'string' && row.key !== '' ? threadScope(row.key) : null))
+        .filter((value) => value !== null);
+    } catch {
+      threadScopes = [];
+    }
+    return {
+      factScopes: [...new Set([SCOPE, ...threadScopes])],
+      episodeScopes: [SCOPE],
+      attachedScopes: null,
+      attachedKinds: null,
+    };
+  }
+  const text = String(scope);
+  if (text.startsWith('thread:') && threadKeyOf(text) !== '') {
+    return {
+      factScopes: [text, SCOPE],
+      episodeScopes: [text],
+      attachedScopes: [SCOPE],
+      attachedKinds: [...RECALL_MAIN_THREAD_FACT_KINDS],
+    };
+  }
+  return {
+    factScopes: [text],
+    episodeScopes: [text],
+    attachedScopes: null,
+    attachedKinds: null,
+  };
+}
+
 async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
   const { store, platform, metrics, config } = state;
   const key = `${sessionIdOf(payload) ?? scope}:${turnKey ?? `step:${String(payload?.step ?? 'unknown')}`}`;
@@ -3695,10 +3755,16 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
 
   let recalled;
   try {
+    // v0.7.7 阶段 5（T120-M2）：跨作用域召回范围（main ↔ 活跃线程）。
+    const scopes = recallScopes(store, scope);
     recalled = await retrieveVectors(state, {
       store,
       query,
       scope,
+      factScopes: scopes.factScopes,
+      episodeScopes: scopes.episodeScopes,
+      attachedScopes: scopes.attachedScopes,
+      attachedKinds: scopes.attachedKinds,
       now: platform.now(),
       budgetTokens: RECALL_BUDGET_TOKENS,
       vector: vectorConfig(state),

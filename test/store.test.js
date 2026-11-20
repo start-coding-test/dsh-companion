@@ -126,6 +126,14 @@ test('searchBigram 按 scope 隔离，不串线程', () => {
   // 不传 scope 时两个 scope 都返回
   const allHits = store.searchBigram('生日');
   assert.ok(allHits.some((hit) => hit.id === threadFact.id));
+
+  // v0.7.7 阶段 5（T120-M2）：scope 接受集合。
+  const setHits = store.searchBigram('生日', { scope: ['main', 'thread:housing'] });
+  assert.ok(setHits.some((hit) => hit.type === 'fact' && hit.id === threadFact.id));
+  const otherSet = store.searchBigram('生日', { scope: ['main'] });
+  assert.equal(otherSet.some((hit) => hit.id === threadFact.id), false);
+  // 空集合不返回任何行，也不抛错。
+  assert.deepEqual(store.searchBigram('生日', { scope: [] }), []);
 });
 
 test('pin 与 deleted 过滤：pinned 不衰减，删除标记后检索不到', () => {

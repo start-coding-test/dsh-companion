@@ -499,10 +499,22 @@ export function looksTechnicalText(text) {
 /**
  * 四档检索入口。
  *
+ * v0.7.7 阶段 5（T120-M2）：`scope` 仍可传单值（旧调用零变化）；
+ * 需要跨线程召回时改传 `factScopes` / `episodeScopes`：
+ * - `factScopes`：事实的 scope 集合（主会话 = main + 各活跃线程；线程 = 本线程 + main）。
+ * - `episodeScopes`：情景的 scope 集合（主会话只含 main，线程只含本线程）。
+ *   facts 与 episodes 分开是为了「主会话召回不出现线程情景原文」。
+ * - `attachedScopes` + `attachedKinds`：行级过滤——候选来自这些「被附加」的
+ *   scope 且 kind 不在放行集时直接跳过（线程召回 main 只放 identity/preference）。
+ *
  * @param {{
  *   store: import('./store.js').Store,
  *   query?: string,
- *   scope?: string,
+ *   scope?: string|string[],
+ *   factScopes?: string[],
+ *   episodeScopes?: string[],
+ *   attachedScopes?: string[],
+ *   attachedKinds?: string[],
  *   now?: number|Date,
  *   budgetTokens?: number,
  *   limit?: number,
@@ -517,6 +529,10 @@ export async function retrieve({
   store,
   query = '',
   scope = 'main',
+  factScopes = null,
+  episodeScopes = null,
+  attachedScopes = null,
+  attachedKinds = null,
   now = Date.now(),
   budgetTokens = DEFAULT_BUDGET_TOKENS,
   limit = DEFAULT_LIMIT,
@@ -592,6 +608,46 @@ export async function retrieve({
     ? () => queryVec
     : (text) => hashEmbed(text, vectorDim);
 
+  // v0.7.7 阶段 5（T120-M2）：scope 集合解析。
+  //
+  // 旧的单值 `scope` 仍是默认来源；`factScopes` / `episodeScopes` 分别覆盖
+  // 事实与情景的可见范围（主会话：facts = main + 各活跃线程，episodes = main；
+  // 线程：facts = 本线程 + main，episodes = 本线程）。单 scope 时把字符串原样
+  // 交给 Store（保持 `= ?` 快路径），多 scope 时传数组走 `IN (…)`。
+  const normalizeScopeSet = (value, fallback) => {
+    if (Array.isArray(value)) {
+      const list = [...new Set(value.filter((item) => typeof item === 'string' && item !== ''))];
+      return list.length > 0 ? list : fallback;
+    }
+    if (typeof value === 'string' && value !== '') return [value];
+    return fallback;
+  };
+  const baseScopeSet = normalizeScopeSet(scope, ['main']);
+  const factScopeSet = normalizeScopeSet(factScopes, baseScopeSet);
+  const episodeScopeSet = normalizeScopeSet(episodeScopes, baseScopeSet);
+  const searchScopeSet = [...new Set([...factScopeSet, ...episodeScopeSet])];
+  const searchScope = searchScopeSet.length === 1 ? searchScopeSet[0] : searchScopeSet;
+  // 行级「被附加 scope 的 kind 放行集」：线程召回 main 时只放身份偏好类。
+  const attachedScopeSet = new Set(
+    Array.isArray(attachedScopes) ? attachedScopes.filter((item) => typeof item === 'string') : [],
+  );
+  const attachedKindSet = new Set(
+    Array.isArray(attachedKinds) ? attachedKinds.filter((item) => typeof item === 'string') : [],
+  );
+  /**
+   * @param {'fact'|'episode'} type
+   * @param {string} rowScope
+   * @param {string} [rowKind]
+   * @returns {boolean}
+   */
+  const scopeAllows = (type, rowScope, rowKind) => {
+    const allowed = type === 'fact' ? factScopeSet : episodeScopeSet;
+    if (!allowed.includes(rowScope)) return false;
+    if (type !== 'fact' || attachedScopeSet.size === 0) return true;
+    if (!attachedScopeSet.has(rowScope)) return true;
+    return attachedKindSet.has(rowKind);
+  };
+
   /** @type {Map<string, {type:'fact'|'episode', id:string, rrf?:number, vector?:boolean}>} */
   const candidates = new Map();
   const searchLimit = Math.max(1, maxItems * 2);
@@ -618,8 +674,10 @@ export async function retrieve({
     for (const token of lexicalTokens.slice(0, LEXICAL_TOKEN_LIMIT)) {
       if (!LEXICAL_TOKEN_RE.test(token)) continue;
       let df = 0;
-      for (const hit of store.searchBigram(token, { scope, limit: dfSearchLimit }) ?? []) {
+      for (const hit of store.searchBigram(token, { scope: searchScope, limit: dfSearchLimit }) ?? []) {
         if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
+        // df 只统计本轮可见范围内的行，否则跨线程命中会把「稀有」判成「常见」。
+        if (!scopeAllows(hit.type, hit.scope, hit.kind)) continue;
         df += 1;
         const key = `${hit.type}:${hit.id}`;
         let entry = lexicalHits.get(key);
@@ -638,7 +696,7 @@ export async function retrieve({
     vectorScores = new Map(
       searchVector({
         store,
-        scope,
+        scope: searchScope,
         query: textQuery,
         embed,
         embedderId,
@@ -648,7 +706,7 @@ export async function retrieve({
     );
     for (const hit of hybridSearch({
       store,
-      scope,
+      scope: searchScope,
       query: textQuery,
       embed,
       embedderId,
@@ -685,16 +743,23 @@ export async function retrieve({
   if (!hasQuery) {
     const recent = [];
     const listLimit = Math.max(10, maxItems * 2);
-    for (const row of store.listFacts({ scope, limit: listLimit }) ?? []) {
-      const ts = toMillis(row.observed_at);
-      if (ts !== null && ts >= nowMs - RECENT_WINDOW_MS) {
-        recent.push({ type: 'fact', id: row.id, ts });
+    // v0.7.7 阶段 5：recency 补位按各自 scope 集逐个取，facts 与 episodes 不同集合。
+    for (const listScope of factScopeSet) {
+      for (const row of store.listFacts({ scope: listScope, limit: listLimit }) ?? []) {
+        if (!scopeAllows('fact', row.scope, row.kind)) continue;
+        const ts = toMillis(row.observed_at);
+        if (ts !== null && ts >= nowMs - RECENT_WINDOW_MS) {
+          recent.push({ type: 'fact', id: row.id, ts });
+        }
       }
     }
-    for (const row of store.listEpisodes({ scope, limit: listLimit }) ?? []) {
-      const ts = toMillis(row.started_at);
-      if (ts !== null && ts >= nowMs - RECENT_WINDOW_MS) {
-        recent.push({ type: 'episode', id: row.id, ts });
+    for (const listScope of episodeScopeSet) {
+      for (const row of store.listEpisodes({ scope: listScope, limit: listLimit }) ?? []) {
+        if (!scopeAllows('episode', row.scope)) continue;
+        const ts = toMillis(row.started_at);
+        if (ts !== null && ts >= nowMs - RECENT_WINDOW_MS) {
+          recent.push({ type: 'episode', id: row.id, ts });
+        }
       }
     }
     recent.sort((a, b) => b.ts - a.ts || a.id.localeCompare(b.id));
@@ -724,6 +789,11 @@ export async function retrieve({
     if (row.deleted_at !== null && row.deleted_at !== undefined) continue;
     if (row.status === 'tombstoned' || row.status === 'superseded') continue;
     if (row.privacy === 'secret') continue;
+    // v0.7.7 阶段 5（T120-M2）：行级 scope 过滤。
+    // - 主会话：facts 允许 main + 各活跃线程，episodes 只允许 main（线程情景不外泄）；
+    // - 线程：facts 允许本线程 + main，但来自 main 的候选只放身份偏好类
+    //   （attachedScopes/attachedKinds），episodes 只允许本线程。
+    if (!scopeAllows(candidate.type, row.scope, row.kind)) continue;
 
     const pinned = row.salience === 'pinned'
       || row.strength_days === null || row.strength_days === undefined;

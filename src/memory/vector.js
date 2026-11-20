@@ -204,14 +204,27 @@ export function searchVector({
     ? ' AND fv.embedder_id = ?'
     : '';
 
-  const params = embedderFilter === '' ? [scope, queryVec.length] : [scope, embedderId, queryVec.length];
+  // v0.7.7 阶段 5（T120-M2）：scope 支持集合（主会话 = main + 各活跃线程）。
+  // 单值仍走 `= ?` 快路径；数组展开成 `IN (?, ?)`。
+  const scopeSet = Array.isArray(scope)
+    ? [...new Set(scope.filter((item) => typeof item === 'string' && item !== ''))]
+    : [scope];
+  const scopeClause = scopeSet.length === 0
+    ? ' AND 0'
+    : scopeSet.length === 1
+      ? ' AND f.scope = ?'
+      : ` AND f.scope IN (${scopeSet.map(() => '?').join(', ')})`;
+
+  const params = embedderFilter === ''
+    ? [...scopeSet, queryVec.length]
+    : [...scopeSet, embedderId, queryVec.length];
   const rows = store.db
     .prepare(
       `SELECT fv.fact_id, fv.vec, fv.dim, f.strength_days,
               f.last_reinforced_at, f.salience
          FROM fact_vectors fv
          JOIN facts f ON f.id = fv.fact_id
-        WHERE f.scope = ?
+        WHERE 1 = 1${scopeClause}
           AND f.status = 'active'
           AND f.deleted_at IS NULL
           AND f.privacy = 'normal'
