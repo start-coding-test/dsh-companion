@@ -120,6 +120,11 @@ persona:
 | `budget.dailyHardLimit` | `3000000` | 每日 token 硬上限 |
 | `quota.source` | `none` | 设为 `file` 时读额度快照，额度紧张只停后台 |
 | `compact.minIncrementTokens` / `compact.cooldownTurns` | `4096` / `3` | 压缩迟滞，防止每轮空转 |
+| `consolidate.dedupeSkip` / `consolidate.dedupeAsk` | `0.85` / `0.5` | 巩固写库前的近似查重：≥ skip 只强化旧条，ask–skip 之间交模型判定 same/update/new |
+| `consolidate.maxProjectFacts` | `5` | 每次巩固新增 project + knowledge 事实的上限（`0` 表示不写工程类事实） |
+| `govern.autoDedupeThreshold` | `0.6` | deep-sleep 自动去重的配对下限（判 same 才 supersede，不物理删） |
+| `decay.projectDormantDays` | `30` | project / knowledge 事实多久没被召回或强化就转 dormant（`0` 关闭） |
+| `reminderStaleDays` / `reminderTodoStaleDays` | `30` / `7` | 无到期时间的承诺 / 待办多久没更新就置 expired（只改状态不删） |
 
 token 四档须满足 `retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`。未知配置键只记警告，不阻断启动。
 

@@ -239,12 +239,67 @@ Object.defineProperty(DEFAULT_VALUES, 'task', {
 // v0.7.1 V70-M2：同义偏好去重。preference / lifestyle 类事实按 kind 取最近 N 条活跃
 // 事实交给模型改写（不再要求 subject_text 在对话里字面出现）；该节同样不参与 16 键
 // 安装自检（与 compact/quota/budget/task 一致）。
+//
+// v0.7.7 L120-H1/H3：写库前的近似查重与降量阈值。
+// - dedupeSkip：同 kind 事实 bigram Jaccard ≥ 它即视为同一条，不新写只强化；
+// - dedupeAsk ：≥ 它且 < dedupeSkip 的交模型裁决 same/update/new；
+// - maxProjectFacts：单次巩固 project + knowledge 的新增上限（超出的丢尾部）。
 const CONSOLIDATE_DEFAULTS = Object.freeze({
   existingFactsLimit: 12,
+  dedupeSkip: 0.85,
+  dedupeAsk: 0.5,
+  maxProjectFacts: 5,
 });
 
 Object.defineProperty(DEFAULT_VALUES, 'consolidate', {
   value: CONSOLIDATE_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
+// v0.7.7 L120-M1：deep-sleep 自动去重的候选门槛（同 kind 事实两两 bigram Jaccard）。
+// 比治理/手动路径的 0.92 宽：自动步骤只对「明显换说法」的对子交模型判定，判 same
+// 才 supersede，其余原样保留，所以门槛可以放低。
+const GOVERN_DEFAULTS = Object.freeze({
+  autoDedupeThreshold: 0.6,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'govern', {
+  value: GOVERN_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
+// v0.7.7 L120-H3c：衰减阈值。project / knowledge 事实连续 projectDormantDays 天
+// 既没被召回也没被强化 → dormant（不删）。与既有 strength_days 规则叠加。
+const DECAY_DEFAULTS = Object.freeze({
+  projectDormantDays: 30,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'decay', {
+  value: DECAY_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
+// v0.7.7 L120-M3：提醒生命周期（平键，按计划字面命名）。
+// - reminderStaleDays：commitment 类、无到期时间、这么久没更新 → expired；
+// - reminderTodoStaleDays：todo 类、无到期时间、这么久没更新 → expired。
+const DEFAULT_REMINDER_STALE_DAYS = 30;
+const DEFAULT_REMINDER_TODO_STALE_DAYS = 7;
+
+Object.defineProperty(DEFAULT_VALUES, 'reminderStaleDays', {
+  value: DEFAULT_REMINDER_STALE_DAYS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'reminderTodoStaleDays', {
+  value: DEFAULT_REMINDER_TODO_STALE_DAYS,
   enumerable: false,
   writable: false,
   configurable: false,
@@ -902,7 +957,7 @@ export function normalizeConsolidate(raw, warnings = []) {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ConfigError('consolidate', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
   }
-  const allowed = new Set(['existingFactsLimit']);
+  const allowed = new Set(['existingFactsLimit', 'dedupeSkip', 'dedupeAsk', 'maxProjectFacts']);
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) warnings.push(`unknown config field "consolidate.${key}" ignored`);
   }
@@ -915,7 +970,107 @@ export function normalizeConsolidate(raw, warnings = []) {
       `must be an integer within 1..50, got ${JSON.stringify(existingFactsLimit)}`,
     );
   }
-  return Object.freeze({ existingFactsLimit });
+  // v0.7.7 L120-H1：近似查重两档阈值。数域 0 < dedupeAsk < dedupeSkip < 1——
+  // 区间为空会让「交模型裁决」永远不触发，退化回精确去重，所以按错误处理而不是静默。
+  const dedupeSkip = raw.dedupeSkip === undefined ? defaults.dedupeSkip : raw.dedupeSkip;
+  const dedupeAsk = raw.dedupeAsk === undefined ? defaults.dedupeAsk : raw.dedupeAsk;
+  if (typeof dedupeSkip !== 'number' || !Number.isFinite(dedupeSkip) || dedupeSkip <= 0 || dedupeSkip >= 1) {
+    throw new ConfigError(
+      'consolidate.dedupeSkip',
+      `must be a number within (0,1), got ${JSON.stringify(dedupeSkip)}`,
+    );
+  }
+  if (typeof dedupeAsk !== 'number' || !Number.isFinite(dedupeAsk) || dedupeAsk <= 0 || dedupeAsk >= 1) {
+    throw new ConfigError(
+      'consolidate.dedupeAsk',
+      `must be a number within (0,1), got ${JSON.stringify(dedupeAsk)}`,
+    );
+  }
+  if (!(dedupeAsk < dedupeSkip)) {
+    throw new ConfigError(
+      'consolidate.dedupeAsk',
+      `must be strictly below consolidate.dedupeSkip (${dedupeSkip}), got ${dedupeAsk}`,
+    );
+  }
+  const maxProjectFacts = raw.maxProjectFacts === undefined
+    ? defaults.maxProjectFacts
+    : raw.maxProjectFacts;
+  if (!Number.isInteger(maxProjectFacts) || maxProjectFacts < 0 || maxProjectFacts > 100) {
+    throw new ConfigError(
+      'consolidate.maxProjectFacts',
+      `must be an integer within 0..100, got ${JSON.stringify(maxProjectFacts)}`,
+    );
+  }
+  return Object.freeze({ existingFactsLimit, dedupeSkip, dedupeAsk, maxProjectFacts });
+}
+
+/**
+ * 合并自动去重节（v0.7.7 L120-M1）并校验；未知子字段 warn，越界抛 ConfigError。
+ *
+ * 只放「deep-sleep 自动去重」的候选门槛；治理手动路径的 0.92 仍写死在
+ * `govern.js` 的 `DUPLICATE_THRESHOLD`，两者语义不同不能共用。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{autoDedupeThreshold: number}>}
+ */
+export function normalizeGovern(raw, warnings = []) {
+  const defaults = DEFAULTS.govern;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('govern', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['autoDedupeThreshold']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "govern.${key}" ignored`);
+  }
+  const autoDedupeThreshold = raw.autoDedupeThreshold === undefined
+    ? defaults.autoDedupeThreshold
+    : raw.autoDedupeThreshold;
+  if (
+    typeof autoDedupeThreshold !== 'number'
+    || !Number.isFinite(autoDedupeThreshold)
+    || autoDedupeThreshold <= 0
+    || autoDedupeThreshold >= 1
+  ) {
+    throw new ConfigError(
+      'govern.autoDedupeThreshold',
+      `must be a number within (0,1), got ${JSON.stringify(autoDedupeThreshold)}`,
+    );
+  }
+  return Object.freeze({ autoDedupeThreshold });
+}
+
+/**
+ * 合并衰减节（v0.7.7 L120-H3c）并校验。
+ *
+ * `projectDormantDays` 是 project / knowledge 事实「连续未被召回且未被强化」
+ * 多少天后转 dormant 的阈值；0 表示关闭这条规则（仍受 strength_days 约束）。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{projectDormantDays: number}>}
+ */
+export function normalizeDecay(raw, warnings = []) {
+  const defaults = DEFAULTS.decay;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('decay', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['projectDormantDays']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "decay.${key}" ignored`);
+  }
+  const projectDormantDays = raw.projectDormantDays === undefined
+    ? defaults.projectDormantDays
+    : raw.projectDormantDays;
+  if (!Number.isInteger(projectDormantDays) || projectDormantDays < 0 || projectDormantDays > 3650) {
+    throw new ConfigError(
+      'decay.projectDormantDays',
+      `must be an integer within 0..3650, got ${JSON.stringify(projectDormantDays)}`,
+    );
+  }
+  return Object.freeze({ projectDormantDays });
 }
 
 /**
@@ -1044,6 +1199,16 @@ export function normalizeConfig(raw = {}) {
     : input.compactMinRegionTokens;
   requireInteger(cfg, 'compactMinRegionTokens', 0, MAX);
 
+  // v0.7.7 L120-M3：提醒生命周期的两个平键（同为非枚举标量，按计划字面命名）。
+  cfg.reminderStaleDays = input.reminderStaleDays === undefined
+    ? DEFAULTS.reminderStaleDays
+    : input.reminderStaleDays;
+  requireInteger(cfg, 'reminderStaleDays', 1, MAX);
+  cfg.reminderTodoStaleDays = input.reminderTodoStaleDays === undefined
+    ? DEFAULTS.reminderTodoStaleDays
+    : input.reminderTodoStaleDays;
+  requireInteger(cfg, 'reminderTodoStaleDays', 1, MAX);
+
   cfg.vector = normalizeVector(input.vector === undefined ? DEFAULTS.vector : input.vector, warnings);
   cfg.recall = normalizeRecall(input.recall === undefined ? DEFAULTS.recall : input.recall, warnings);
   cfg.session = normalizeSession(input.session, warnings);
@@ -1056,6 +1221,8 @@ export function normalizeConfig(raw = {}) {
   cfg.quota = normalizeQuota(input.quota, warnings);
   cfg.task = normalizeTask(input.task, warnings);
   cfg.consolidate = normalizeConsolidate(input.consolidate, warnings);
+  cfg.govern = normalizeGovern(input.govern, warnings);
+  cfg.decay = normalizeDecay(input.decay, warnings);
 
   return Object.freeze({ ...cfg, warnings });
 }

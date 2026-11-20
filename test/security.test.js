@@ -337,7 +337,12 @@ test('memory_events：ADD/USED/PURGED 只留元数据，不落正文', async (t)
   assert.equal(add.row_id, written.episodeId);
   const addDetail = parseDetail(add.detail_json);
   // V7-L2：detail 额外带 kind 与毫秒 duration_ms，两者都只是元数据。
-  assert.deepEqual(Object.keys(addDetail).sort(), ['duration_ms', 'facts', 'kind', 'reminders', 'upto_seq']);
+  // L120-H1/H3/M2：再带 dedupe（近似去重判定计数）与 dropped（过程状态/瞬时
+  // 状态/提醒自查与重复的丢弃计数），同样是计数与枚举，不含任何正文。
+  assert.deepEqual(
+    Object.keys(addDetail).sort(),
+    ['dedupe', 'dropped', 'duration_ms', 'facts', 'kind', 'reminders', 'upto_seq'],
+  );
   assert.equal(addDetail.kind, 'consolidation');
   assert.ok(Number.isInteger(addDetail.duration_ms) && addDetail.duration_ms >= 0);
   assert.equal(addDetail.upto_seq, 9);

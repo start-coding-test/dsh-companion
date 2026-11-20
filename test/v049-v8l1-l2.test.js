@@ -127,7 +127,7 @@ test('V8-L1：v11 旧库（无 retry_at、带 ix_rm_fire）打开时就地补建
       const names = reminderIndexes(store).map((row) => row.name);
       assert.ok(names.includes('ix_rm_due'), `第 ${pass} 次打开应有 ix_rm_due：${names.join(',')}`);
       assert.ok(!names.includes('ix_rm_fire'), `第 ${pass} 次打开后旧索引必须已删除`);
-      assert.equal(store.getMeta('schema_version'), '16', '不因索引迁移提升版本');
+      assert.equal(store.getMeta('schema_version'), '16', '索引迁移不改变版本号（仍为当前 SCHEMA_VERSION）');
       const columns = store.db
         .prepare("PRAGMA table_info('reminders')")
         .all()

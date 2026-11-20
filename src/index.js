@@ -25,7 +25,7 @@ import { basename, dirname, join } from 'node:path';
 
 import { isQuietAt, normalizeConfig } from './config.js';
 import { REMINDER_MAX_DELIVERY_ATTEMPTS, Store, reminderDueAt } from './memory/store.js';
-import { retrieve } from './memory/retrieve.js';
+import { hasToolActivity, looksTechnicalText, retrieve } from './memory/retrieve.js';
 import { nextSeriesFire } from './scheduler/series.js';
 import { createEmbedder } from './memory/embedders/index.js';
 import { assemble } from './memory/assemble.js';
@@ -38,6 +38,13 @@ import {
   overlapRatio,
 } from './memory/reinforce.js';
 import { buildConsolidationPrompt, consolidate, planConsolidation } from './memory/consolidate.js';
+import {
+  applyAutoDedupe,
+  buildAutoDedupePrompt,
+  parseAutoDedupeVerdicts,
+  planAutoDedupe,
+} from './memory/govern-auto.js';
+import { buildWeeklyMemoryReport } from './memory/weekly-report.js';
 import { backoffAfter429 } from './runtime/quota.js';
 import { deferBackground, isQuotaError, readQuotaFile } from './runtime/quota-gate.js';
 import {
@@ -301,7 +308,7 @@ const COMMAND_ALIASES = Object.freeze([
   Object.freeze({
     name: 'memory',
     definitionId: 'dsh-companion/command-memory',
-    description: '查看或管理长期记忆（对应 /记忆）',
+    description: '查看或管理长期记忆（对应 /记忆；子命令 列表|改|治理|导出|周报）',
     prefix: '/记忆',
   }),
   Object.freeze({
@@ -1343,7 +1350,8 @@ const WATERMARK_ANCHOR_PREFIX = 'watermark_anchor:';
  * 读持久化的水位锚点（N-H1/R-L2）。
  *
  * 约定：正数 = 重锚到的 surface seq；-1 = 已重锚到起点（内存水位 0）。
- * 0 同时被 sleep 写路径用作「清空」（Store 没有 deleteMeta），所以「有效锚点 0」
+ * 0 同时被 sleep 写路径用作「清空」的历史写法（v0.7.7 C120-L1 起 Store 有
+ * deleteMeta，新清理路径优先删键，但既有的 '0' 清零口径仍兼容），所以「有效锚点 0」
  * 必须用哨兵 -1 落库，否则重启后会回退到旧 upto_seq，再次 stale、再次归零。
  *
  * @param {{getMeta: Function}} store
@@ -2608,7 +2616,9 @@ async function executeConsolidationJob(state, job) {
   let startSeq;
   let endSeq;
   let regionText;
-  // C120-M1：本步选区的 token 数（重试分支复用首次登记时的区间，闸门已在首次判定过）。
+  // C120-M1：本步选区的 token 数。首次执行由 planRegion 给出；重试分支沿用
+  // 首次登记时带下来的值（见下方 catch 里的 regionTokens），保证重试成功路径
+  // 的闸门与首次一致。两者都没有（旧 retry job）时保持 null → 不拦。
   let regionTokens = null;
   if (retrying) {
     // t17：重试固定使用首次登记的区间，不再按已变化的 surface 重选，
@@ -2621,6 +2631,9 @@ async function executeConsolidationJob(state, job) {
       return;
     }
     regionText = typeof job.regionText === 'string' && job.regionText !== '' ? job.regionText : null;
+    // 交付项 C120-M1（阶段 2 补）：重试分支同样要知道区间大小，否则成功后会
+    // 无条件登记 pending（旧实现 regionTokens 恒 null → 闸门恒不拦）。
+    if (Number.isFinite(job.regionTokens)) regionTokens = Number(job.regionTokens);
     platform.log('info', '[dsh-companion] consolidation retry attempt', {
       attempt: job.attempts ?? 1,
       startSeq,
@@ -2692,6 +2705,14 @@ async function executeConsolidationJob(state, job) {
       sessionId: job.sessionId,
       // V70-M2：偏好/生活类候选上限（config.consolidate.existingFactsLimit）。
       existingFactsLimit: state.config?.consolidate?.existingFactsLimit,
+      // L120-H1/H3：近似查重两档阈值 + project/knowledge 单次上限。
+      dedupeSkip: state.config?.consolidate?.dedupeSkip,
+      dedupeAsk: state.config?.consolidate?.dedupeAsk,
+      maxProjectFacts: state.config?.consolidate?.maxProjectFacts,
+      // 0.5–0.85 档的批量模型裁决（与巩固同一 purpose，不新开通道）。
+      judge: (prompt) => judgeFactDuplicates(state, prompt),
+      // L120-H2：day 粒度补 next_fire_at 时需要当地时区。
+      timeZone: config.timezone,
       // 窗口已在 surface 层选好；水位推进允许跨过旧值。
       guardWatermark: false,
     });
@@ -2831,6 +2852,9 @@ async function executeConsolidationJob(state, job) {
           regionStartSeq: startSeq,
           regionEndSeq: endSeq,
           regionText,
+          // 交付项 C120-M1（阶段 2 补）：把首次选区的 token 数带进重试 job，
+          // 否则重试成功路径的闸门拿到 null（恒 false）就会无条件登记 pending。
+          regionTokens,
         },
         nextAt,
         scope: job.scope,
@@ -3627,6 +3651,11 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
       now: platform.now(),
       budgetTokens: RECALL_BUDGET_TOKENS,
       vector: vectorConfig(state),
+      // L120-M4：闲聊轮里 project/knowledge（以及 work 领域情景）必须命中稀有
+      // 锚点才注入。口径：本轮无工具调用，且用户这句话没有工程味信号
+      // （代码块/路径/文件名/URL/连续拉丁字母 ≥4）；提到「LoRA」这类英文标识符
+      // 的轮次不算闲聊，门不生效，照常召回。
+      casualChat: !hasToolActivity(messages) && !looksTechnicalText(query),
     });
   } catch (error) {
     platform.log('warn', '[dsh-companion] recall injection failed', {
@@ -4292,6 +4321,37 @@ async function resolveConsolidationLlm(state) {
 }
 
 /**
+ * L120-H1：0.5–0.85 档的批量查重裁决。
+ *
+ * 与巩固共用一条模型通道（`purpose: 'companion-consolidate'`，见阶段 1 的
+ * H2L-L2 接线），只换 prompt；返回解析后的 JSON，让 consolidate 自己读
+ * `items[].verdict`。模型不可用或调用失败时抛错——上层按「该批全部按 new
+ * 保守写入并计数」处理，不会吞掉整次巩固。
+ *
+ * @param {object} state
+ * @param {string} prompt
+ * @returns {Promise<object>}
+ */
+async function judgeFactDuplicates(state, prompt) {
+  const route = await resolveLlmRoute(state);
+  if (route === null || typeof route.provider !== 'string') {
+    throw new Error('no llm route for fact dedupe judge');
+  }
+  let usage = null;
+  const text = await state.platform.complete({
+    provider: route.provider,
+    model: route.model,
+    messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+    purpose: 'companion-consolidate',
+    onUsage: (value) => {
+      usage = value;
+    },
+  });
+  recordModelUsage(state, { source: 'consolidate-dedupe', usage });
+  return parseDraftJson(text);
+}
+
+/**
  * 解析模型返回的草稿 JSON；容忍 ```json 代码块包裹。
  * @param {string} text
  * @returns {object}
@@ -4329,6 +4389,10 @@ async function runDeepSleep(state) {
   const now = platform.now();
   const consolidated = await deepConsolidate(state);
   const dormant = decayFacts(state, now);
+  // L120-M1：自动去重（同 kind 近似事实 → 模型判 same → supersede 旧条）。
+  const dedupe = await governDedupeAuto(state, now);
+  // L120-M3：提醒生命周期清理（只改状态，不推送；告知复用 expired-notice）。
+  const remindersExpired = expireStaleReminders(state, now);
   const gc = gcFtsOrphans(state);
   const board = renderBoard({
     recent: store.listEpisodes({ scope: SCOPE, limit: 6 }),
@@ -4369,10 +4433,16 @@ async function runDeepSleep(state) {
     table_name: 'facts',
     actor: 'consolidator',
     reason: 'deep-sleep',
-    detail_json: { day, dormant, gc, consolidated, board: 'staged' },
+    detail_json: { day, dormant, gc, consolidated, board: 'staged', dedupe, remindersExpired },
   });
-  platform.log('info', '[dsh-companion] deep-sleep done', { dormant, gc, consolidated });
-  return { consolidated, dormant, gc };
+  platform.log('info', '[dsh-companion] deep-sleep done', {
+    dormant,
+    gc,
+    consolidated,
+    dedupeSuperseded: dedupe?.superseded ?? 0,
+    remindersExpired,
+  });
+  return { consolidated, dormant, gc, dedupe, remindersExpired };
 }
 
 /**
@@ -4416,6 +4486,13 @@ async function deepConsolidate(state) {
       trigger: 'deep-sleep',
       sessionId: SCOPE,
       existingFactsLimit: state.config?.consolidate?.existingFactsLimit,
+      // L120-H1/H3：与 nap 路径同一套去重与降量参数。
+      dedupeSkip: state.config?.consolidate?.dedupeSkip,
+      dedupeAsk: state.config?.consolidate?.dedupeAsk,
+      maxProjectFacts: state.config?.consolidate?.maxProjectFacts,
+      judge: (prompt) => judgeFactDuplicates(state, prompt),
+      // L120-H2：day 粒度的当地 09:00 依赖 config.timezone。
+      timeZone: state.config?.timezone,
       guardWatermark: false,
     });
     if (result?.skipped) return { written: false, reason: 'skipped' };
@@ -4481,29 +4558,193 @@ function decayFacts(state, nowMs) {
   const { store, platform } = state;
   const pageSize = 200;
   let dormant = 0;
+  // L120-H3c：project / knowledge 事实的「长期没被用」降级天数（0 = 关闭该规则）。
+  const projectDormantDays = Number(state.config?.decay?.projectDormantDays);
   for (let offset = 0; ; offset += pageSize) {
     const page = store.listFacts({ scope: SCOPE, status: 'active', limit: pageSize, offset });
     for (const fact of page) {
       if (fact.salience === 'pinned') continue;
-      const strengthDays = Number(fact.strength_days);
-      if (!Number.isFinite(strengthDays) || strengthDays <= 0) continue;
       const last = toMillis(fact.last_reinforced_at);
       if (last === null) continue;
-      if ((nowMs - last) / DAY_MS >= strengthDays) {
-        try {
-          store.updateFact(fact.id, { status: 'dormant' });
-          dormant += 1;
-        } catch (error) {
-          platform.log('warn', '[dsh-companion] fact decay failed', {
-            id: fact.id,
-            message: error instanceof Error ? error.message : String(error),
-          });
-        }
+      const idleDays = (nowMs - last) / DAY_MS;
+      // L120-H3c：project/knowledge 按「连续未召回且未强化」降级。
+      // 召回被用上时 reinforceOnUse → store.reinforceFact 推进 last_reinforced_at，
+      // 所以单看这一列就是「未被召回且未被强化」的代理，不需要新列。
+      // strength_days IS NULL 的行按既有约定视同 pinned → 豁免。
+      const projectKind = fact.kind === 'project' || fact.kind === 'knowledge';
+      const decayByProject = projectKind
+        && Number.isFinite(projectDormantDays)
+        && projectDormantDays > 0
+        && fact.strength_days !== null
+        && fact.strength_days !== undefined
+        && idleDays >= projectDormantDays;
+      // 既有规则：按 strength_days 的遗忘曲线阈值。
+      const strengthDays = Number(fact.strength_days);
+      const decayByStrength = Number.isFinite(strengthDays)
+        && strengthDays > 0
+        && idleDays >= strengthDays;
+      if (!decayByStrength && !decayByProject) continue;
+      try {
+        store.updateFact(fact.id, { status: 'dormant' });
+        dormant += 1;
+      } catch (error) {
+        platform.log('warn', '[dsh-companion] fact decay failed', {
+          id: fact.id,
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
     }
     if (page.length < pageSize) break;
   }
   return dormant;
+}
+
+/**
+ * L120-M1：deep-sleep 自动去重。
+ *
+ * 流程：同 kind、bigram Jaccard ≥ `config.govern.autoDedupeThreshold` 的对子 →
+ * 一次批量交模型判 same/update/new → 只有 same/update 才 supersede 旧条。
+ *
+ * 失败语义（计划硬要求）：模型不可用、调用失败、判定 JSON 坏 → 只 warn 并跳过
+ * 本夜的 supersede（候选留到次夜），**绝不让 deep-sleep 整体失败**。
+ *
+ * 结果写 `govern_last_run` meta（/状态 新增一行读它），并进 deep-sleep 审计。
+ *
+ * @param {object} state
+ * @param {number} nowMs
+ * @returns {Promise<{candidates:number, judgedSame:number, superseded:number, skipped:string|null}>}
+ */
+async function governDedupeAuto(state, nowMs) {
+  const { store, platform, config } = state;
+  const threshold = Number(config?.govern?.autoDedupeThreshold);
+  const empty = { candidates: 0, judgedSame: 0, superseded: 0, skipped: null };
+  if (!Number.isFinite(threshold) || threshold <= 0) return empty;
+  const { pairs, scanned } = planAutoDedupe({ store, scope: SCOPE, threshold });
+  if (pairs.length === 0) return { ...empty, scanned };
+  const route = await resolveLlmRoute(state);
+  if (route === null) {
+    platform.log('debug', '[dsh-companion] govern dedupe skipped: no llm route', { pairs: pairs.length });
+    return { ...empty, candidates: pairs.length, scanned, skipped: 'no-llm' };
+  }
+  let verdicts = null;
+  try {
+    const prompt = buildAutoDedupePrompt(pairs);
+    const text = await state.platform.complete({
+      provider: route.provider,
+      model: route.model,
+      messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+      // 复用阶段 1 落地的 purpose 接线，不发明第三个值（llm-deepseek 只对
+      // 'compaction' 加压缩头，见宿主 dsh-llm-deepseek/src/adapter.ts:152）。
+      purpose: 'companion-consolidate',
+      onUsage: (usage) => recordModelUsage(state, { purpose: 'govern-dedupe', usage }),
+    });
+    verdicts = parseAutoDedupeVerdicts(parseDraftJson(text), pairs.length);
+    if (verdicts === null) throw new Error('govern dedupe verdict JSON is invalid');
+  } catch (error) {
+    noteQuota429(state, error);
+    platform.log('warn', '[dsh-companion] govern dedupe judge failed; retry next night', {
+      pairs: pairs.length,
+      message: errorMessage(error),
+    });
+    return { ...empty, candidates: pairs.length, scanned, skipped: 'judge-failed' };
+  }
+  const judgedSame = verdicts.filter((verdict) => verdict === 'same' || verdict === 'update').length;
+  const applied = applyAutoDedupe({ store, scope: SCOPE, pairs, verdicts, now: nowMs });
+  const summary = {
+    at: Math.floor(nowMs / 1000),
+    threshold,
+    scanned,
+    candidates: pairs.length,
+    judgedSame,
+    superseded: applied.superseded,
+    skipped: null,
+  };
+  try {
+    store.setMeta('govern_last_run', JSON.stringify(summary));
+  } catch (error) {
+    platform.log('debug', '[dsh-companion] govern_last_run meta write failed', {
+      message: errorMessage(error),
+    });
+  }
+  return {
+    candidates: pairs.length,
+    judgedSame,
+    superseded: applied.superseded,
+    skipped: null,
+    scanned,
+    applied: true,
+  };
+}
+
+/**
+ * L120-M3：提醒生命周期清理（deep-sleep 一步）。
+ *
+ * 规则（只改状态、不删、不推送）：
+ * - 非 repeat 且 `due_at` 已过 24 小时仍 pending/snoozed → expired；
+ * - `todo` 且无 `due_at`、创建满 `config.reminderTodoStaleDays`（默认 7 天）没更新 → expired；
+ * - `commitment` 且无 `due_at`、创建满 `config.reminderStaleDays`（默认 30 天）没更新 → expired。
+ *
+ * 「合并告知一次」零新代码：`expireReminder` 不写 `expired_notified_at`，新过期行会
+ * 被下一次真实用户发言时的 `expired-notice.js` 一次性合并告知。
+ *
+ * @param {object} state
+ * @param {number} nowMs
+ * @returns {number} 过期条数
+ */
+function expireStaleReminders(state, nowMs) {
+  const { store, platform, config } = state;
+  const nowSeconds = Math.floor(nowMs / 1000);
+  const todoDays = Number(config?.reminderTodoStaleDays);
+  const staleDays = Number(config?.reminderStaleDays);
+  let expired = 0;
+  const pageSize = 100;
+  // 只清 pending：snoozed 是用户主动「稍后再说」，年龄规则不该把它一起清掉
+  // （计划原文也只写到「仍 pending」）。
+  for (const status of ['pending']) {
+    for (let offset = 0; ; offset += pageSize) {
+      const page = store.listReminders({ scope: SCOPE, status, limit: pageSize, offset });
+      for (const row of page) {
+        const kind = String(row.kind ?? '');
+        const dueAt = toMillis(row.due_at);
+        // 1) 有截止时间且已过 24 小时（repeat 例外：周期事项继续按计划触发）。
+        if (kind !== 'repeat' && dueAt !== null && nowMs - dueAt >= DAY_MS) {
+          if (expireOne(store, platform, row.id)) expired += 1;
+          continue;
+        }
+        if (dueAt !== null) continue;
+        // 2) 无截止时间的 todo / commitment：按「多久没更新」清掉。
+        const updatedAt = toMillis(row.updated_at ?? row.created_at);
+        if (updatedAt === null) continue;
+        const idleDays = (nowMs - updatedAt) / DAY_MS;
+        const staleLimit = kind === 'todo'
+          ? (Number.isFinite(todoDays) ? todoDays : 7)
+          : (kind === 'commitment' ? (Number.isFinite(staleDays) ? staleDays : 30) : null);
+        if (staleLimit === null || idleDays < staleLimit) continue;
+        if (expireOne(store, platform, row.id)) expired += 1;
+      }
+      if (page.length < pageSize) break;
+    }
+  }
+  return expired;
+}
+
+/**
+ * @param {object} store
+ * @param {object} platform
+ * @param {string} id
+ * @returns {boolean}
+ */
+function expireOne(store, platform, id) {
+  try {
+    const row = store.expireReminder(id);
+    return row !== null && row !== undefined;
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] reminder expiry failed', {
+      id,
+      message: errorMessage(error),
+    });
+    return false;
+  }
 }
 
 // ------------------------------------------------------------ 调度与备份
@@ -5934,6 +6175,16 @@ export function handleMemoryCommand({
       `文件：${result.path}`,
     ].join('\n');
   }
+  // L120-L1：周报改由插件出数（事实/情景/提醒/巩固状态直接查库），模型只做解读。
+  if (verb === '周报' || verb === 'weekly') {
+    const report = buildWeeklyMemoryReport({
+      store,
+      scope,
+      timeZone: timeZone ?? 'Asia/Shanghai',
+      now: toMillis(now),
+    });
+    return report.text;
+  }
   if (LEGACY_MEMORY_VERBS.includes(verb)) return null;
   return formatMemoryList({ store, scope, text: body, timeZone: timeZone ?? 'Asia/Shanghai' });
 }
@@ -5970,7 +6221,9 @@ function renderToolValue(value) {
 
 export {
   captureTranscript,
+  expireStaleReminders,
   formatChatStatus,
+  governDedupeAuto,
   handleChatCommand,
   isPluginNotice,
   lastUserText,

@@ -443,6 +443,60 @@ function isRareAnchorToken(token, tokenDf) {
 }
 
 /**
+ * L120-M4：本轮对话里是否出现过工具调用（`tool-call` / `tool-result` 块）。
+ *
+ * 「闲聊判定」的第一个信号：有工具活动的轮次几乎都是工程/操作语境，此时
+ * project / knowledge 类事实照常召回，`casualChat` 门直接不生效。
+ *
+ * 入参是 DSH 的 messages 数组（每项 `{role, content}`），content 既可能是
+ * 块数组也可能是字符串；两种都按「有没有 tool-call/tool-result 块」处理。
+ *
+ * @param {unknown} messages
+ * @returns {boolean}
+ */
+export function hasToolActivity(messages) {
+  if (!Array.isArray(messages)) return false;
+  for (const message of messages) {
+    if (!message || typeof message !== 'object') continue;
+    const blocks = Array.isArray(message.content)
+      ? message.content
+      : (typeof message.content === 'string' ? [] : []);
+    for (const block of blocks) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.type === 'tool-call' || block.type === 'tool-result') return true;
+      // 宿主也把工具结果挂在 message.toolResults / toolCalls 上（部分 provider 形态）。
+    }
+    if (Array.isArray(message.toolResults) && message.toolResults.length > 0) return true;
+    if (Array.isArray(message.toolCalls) && message.toolCalls.length > 0) return true;
+  }
+  return false;
+}
+
+/**
+ * L120-M4：文本里是否有「工程味」信号（代码块/反引号、路径、文件名、URL、
+ * 连续拉丁字母 ≥4）。
+ *
+ * 与计划的字面冲突（「闲聊=无英文标识符」vs「闲聊里提到 LoRA 仍能召回」）在这
+ * 里消解：只要查询本身带这些信号，就不算闲聊，`casualChat` 门不生效，那条
+ * LoRA 事实照常召回。稀有锚点门因此只对「纯中文闲聊句」起作用。
+ *
+ * @param {unknown} text
+ * @returns {boolean}
+ */
+export function looksTechnicalText(text) {
+  const value = typeof text === 'string' ? text : String(text ?? '');
+  if (value === '') return false;
+  if (/```/u.test(value)) return true; // 代码块
+  if (/`[^`]+`/u.test(value)) return true; // 行内代码
+  if (/(?:[A-Za-z]:[\\/]|(?:^|\s)~?\/[\w.-]+\/)/u.test(value)) return true; // Windows / POSIX 路径
+  if (/\b[\w-]+\.(?:js|mjs|cjs|ts|tsx|json|ya?ml|toml|md|py|rs|go|java|sql|db|exe|zip|png|jpg)\b/iu.test(value)) {
+    return true; // 文件名形态
+  }
+  if (/\bhttps?:\/\/|www\./iu.test(value)) return true; // URL
+  return /[A-Za-z]{4,}/u.test(value); // 连续拉丁字母 ≥4
+}
+
+/**
  * 四档检索入口。
  *
  * @param {{
@@ -470,6 +524,7 @@ export async function retrieve({
   embedder = null,
   recall = null,
   config = null,
+  casualChat = false,
 } = {}) {
   if (!store || typeof store.searchBigram !== 'function'
     || typeof store.getFact !== 'function' || typeof store.getEpisode !== 'function') {
@@ -679,6 +734,37 @@ export async function retrieve({
       pinned,
     });
     if (R < MIN_RECALL_R) continue;
+
+    // L120-M4：闲聊轮里工程配置类记忆必须命中稀有锚点才能注入。
+    // - 目标口径是「闲聊句不再带出工程配置类事实」，因此 fact 侧只对
+    //   `project` 与「正文本身是技术形态」的 `knowledge`（looksTechnicalText，
+    //   例如 `compactMinRegionTokens=4096`）设门；普通知识事实（蓝鲸是海洋
+    //   哺乳动物）不受限，否则 V4-M1「2-3 字实体仍命中」会被一并砍掉。
+    // - episode 侧看 domain='work'（L120-M4 巩固时标注）。
+    // - 不做硬过滤：命中稀有锚点仍可注入（「还记得 flux 数据集那事吗」）；
+    // - 放行的条目计入既有 RARE_ANCHOR_MAX_ITEMS 配额，与 V74-H1 同一条通道；
+    // - `casualChat` 由调用方给（injectRecall 用 hasToolActivity + looksTechnicalText 算）。
+    if (casualChat === true && hasQuery) {
+      const technicalKnowledge = row.kind === 'knowledge' && looksTechnicalText(row.statement);
+      const engineering = candidate.type === 'fact'
+        ? (row.kind === 'project' || technicalKnowledge)
+        : row.domain === 'work';
+      if (engineering) {
+        const key = `${candidate.type}:${candidate.id}`;
+        const hit = lexicalHits.get(key);
+        let anchored = false;
+        if (hit !== undefined) {
+          for (const token of hit.tokens) {
+            if (isRareAnchorToken(token, tokenDf)) {
+              anchored = true;
+              break;
+            }
+          }
+        }
+        if (!anchored) continue;
+        rareAnchors.add(key);
+      }
+    }
 
     // V4-M1 候选门：非空查询必须有「有效词法命中」（≥2 个不同 bigram，或
     // 命中比例 ≥30%），或向量余弦 ≥ minVectorScore。

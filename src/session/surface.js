@@ -26,13 +26,64 @@ const MAX_RECORDS_PER_SESSION = 5000;
 const MAX_SESSIONS = 32;
 
 /**
- * C120-H1：索引条目必需字段。
+ * C120-H1 / L120-H1：索引条目必需字段。
  *
- * 旧版本记录（升级前建立的内存索引 / 阶段 2 新增字段）缺任一字段都无法证明
- * compactRegion 的切口合法，必须用 `readSurface` 全量重读一次。新增字段时只往
- * 这里加名字，`snapshot()` 的触发逻辑不用改（阶段 2 的 sourceKind 走同一入口）。
+ * 旧版本记录（升级前建立的内存索引 / 新增字段）缺任一字段都无法证明
+ * compactRegion 的切口合法、也无法判断这条消息是不是插件注入，必须用
+ * `readSurface` 全量重读一次。新增字段时只往这里加名字，`snapshot()` 的触发逻辑
+ * 不用改：
+ * - `toolDelta`（阶段 1）配平计数；
+ * - `sourceKind`（阶段 2）区分用户正文与插件注入（召回/提醒/命令提示等）。
  */
-const REQUIRED_ENTRY_FIELDS = Object.freeze(['toolDelta']);
+const REQUIRED_ENTRY_FIELDS = Object.freeze(['toolDelta', 'sourceKind']);
+
+/**
+ * C120-H1 / L120-H1：这条索引记录缺哪些必需字段（空数组 = 完整）。
+ *
+ * 导出的是纯判断：`snapshot()` 用它决定要不要 `rebuild()` 一次，测试也直接用它
+ * 证明「新增字段必须进 {@link REQUIRED_ENTRY_FIELDS}」这条约束仍然生效。
+ * @param {object} entry
+ * @returns {string[]}
+ */
+export function missingEntryFields(entry) {
+  const absent = [];
+  if (entry === null || typeof entry !== 'object') return [...REQUIRED_ENTRY_FIELDS];
+  for (const field of REQUIRED_ENTRY_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(entry, field)) absent.push(field);
+  }
+  return absent;
+}
+
+/**
+ * L120-H1：插件注入消息的 `source.kind` 全集（与 `src/index.js` 的
+ * `isInjectedMessage` 六 kind 一一对应，值为常量真实取值）。
+ *
+ * 这些消息不是用户发言：巩固选区文本**不拼进** `region.text`（否则模型会把
+ * 召回快照当成「用户说过的话」，而 `selectExistingFactsFromRegion` 见到快照就
+ * 拒绝给候选，去重永远失效）。token 数照常累加——预算与压缩口径不变，只是正文
+ * 变干净。
+ *
+ * 刻意不含 `plugin:` 前缀的 IM 信封：信封由 index.js 按块剥离正文，其 source.kind
+ * 不是固定常量，这里不做白名单匹配。
+ */
+export const INJECTED_SOURCE_KINDS = Object.freeze(new Set([
+  'companion-recall',
+  'companion-expired',
+  'companion-emotion',
+  'companion-command-hint',
+  'companion-privacy-hint',
+  'runtime-context',
+]));
+
+/**
+ * L120-H1：这条索引记录是否为插件注入（不进选区文本）。
+ * @param {{sourceKind?: string|null}|null|undefined} record
+ * @returns {boolean}
+ */
+export function isInjectedRecord(record) {
+  const kind = record?.sourceKind;
+  return typeof kind === 'string' && INJECTED_SOURCE_KINDS.has(kind);
+}
 
 /**
  * 把 Message / 内容块数组压成纯文本。
@@ -302,11 +353,18 @@ export function planRegion(snapshot, options = {}) {
   const lines = [];
   let tokens = 0;
   let missing = 0;
+  let injected = 0;
   for (let index = startIdx; index <= stopIdx; index += 1) {
     const record = records[index] ?? null;
     const text = typeof record?.text === 'string' ? record.text : '';
     if (record === null || record?.missing === true) missing += 1;
-    if (text !== '') lines.push(`${record?.role ?? 'unknown'}: ${text}`);
+    // L120-H1：插件注入（召回/提醒/命令提示/runtime-context）不是用户发言，
+    // 不拼进选区正文；token 仍按节点累加，预算与压缩口径不变。
+    if (isInjectedRecord(record)) {
+      injected += 1;
+    } else if (text !== '') {
+      lines.push(`${record?.role ?? 'unknown'}: ${text}`);
+    }
     tokens += Number(nodes[index]?.tokens) || Number(record?.tokens) || 0;
   }
 
@@ -320,6 +378,7 @@ export function planRegion(snapshot, options = {}) {
       count: stopIdx - startIdx + 1,
       text: lines.join('\n'),
       missing,
+      injected,
     },
     reason: 'ok',
     tailStartIdx,
@@ -421,7 +480,8 @@ export function createSurfaceIndex({ platform, tailTokens = CONSOLIDATION_TAIL_T
    * @param {object} event
    * @param {number} seq
    * @param {object|null} [message]
-   * @returns {{seq: number, role: string, text: string, tokens: number, toolDelta: number}|null}
+   * @returns {{seq: number, role: string, text: string, tokens: number,
+   *            toolDelta: number, sourceKind: string|null}|null}
    */
   function entryOf(session, event, seq, message = undefined) {
     let projected = message;
@@ -438,6 +498,9 @@ export function createSurfaceIndex({ platform, tailTokens = CONSOLIDATION_TAIL_T
     const source = projected ?? event?.data?.message ?? event?.data ?? null;
     const text = flattenMessage(source);
     const role = normalizeRole(projected?.role ?? event?.type?.split('/')?.[0]);
+    // L120-H1：注入消息的标记在 `message.source.kind`（见 index.js
+    // `isInjectedMessage`）；普通对话消息这里是宿主的 form/sections 或 undefined。
+    const sourceKind = typeof source?.source?.kind === 'string' ? source.source.kind : null;
     let tokens = 0;
     if (projected !== null && projected !== undefined
       && typeof platform.estimateMessage === 'function') {
@@ -450,7 +513,15 @@ export function createSurfaceIndex({ platform, tailTokens = CONSOLIDATION_TAIL_T
     }
     if (tokens === 0) tokens = Math.ceil(text.length / 2);
     // C120-H1：宿主配平计数，供 planRegion / maybeCompact 选合法切口。
-    return { seq, role, text, tokens, toolDelta: toolDeltaOf(event) };
+    // L120-H1：sourceKind 供选区拼装剔除注入块（同一 rebuild 入口扩字段）。
+    return {
+      seq,
+      role,
+      text,
+      tokens,
+      toolDelta: toolDeltaOf(event),
+      sourceKind,
+    };
   }
 
   /**
@@ -506,20 +577,6 @@ export function createSurfaceIndex({ platform, tailTokens = CONSOLIDATION_TAIL_T
     state.records = filled;
     state.rebuilt = true;
     return surface;
-  }
-
-  /**
-   * C120-H1：这条索引记录缺哪些必需字段（空数组 = 完整）。
-   * @param {object} entry
-   * @returns {string[]}
-   */
-  function missingEntryFields(entry) {
-    const absent = [];
-    if (entry === null || typeof entry !== 'object') return [...REQUIRED_ENTRY_FIELDS];
-    for (const field of REQUIRED_ENTRY_FIELDS) {
-      if (!Object.prototype.hasOwnProperty.call(entry, field)) absent.push(field);
-    }
-    return absent;
   }
 
   /**

@@ -424,6 +424,8 @@ CREATE TABLE IF NOT EXISTS episodes (
   entities_json       TEXT NOT NULL DEFAULT '[]',
   mood                TEXT CHECK (mood IN ('positive','neutral','tired','anxious','low','excited')),
   mood_evidence       TEXT,
+  -- L120-M4：情景领域（life / work）。旧行为 NULL（不门控），新行由巩固写入。
+  domain              TEXT CHECK (domain IN ('life','work')),
   salience            TEXT NOT NULL CHECK (salience IN ('trivial','normal','notable','explicit','pinned')),
   privacy             TEXT NOT NULL DEFAULT 'normal' CHECK (privacy IN ('normal','sensitive','secret')),
   strength_days       REAL,
@@ -688,6 +690,17 @@ function toJsonArray(value) {
   if (Array.isArray(value)) return JSON.stringify(value);
   if (typeof value === 'string' && value.trim() !== '') return value;
   return '[]';
+}
+
+/**
+ * L120-M4：episode 领域归一化（life / work）；其它值落 NULL（列上有 CHECK 兜底）。
+ * @param {unknown} value
+ * @returns {'life'|'work'|null}
+ */
+function normalizeEpisodeDomain(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  return trimmed === 'life' || trimmed === 'work' ? trimmed : null;
 }
 
 /**
@@ -1262,6 +1275,9 @@ export class Store {
       // v15：facts 计数三列（injected_count / used_count / unused_streak）。
       this.#ensureFactsCounterColumns();
       this.#ensureReneedKindTriggers();
+      // L120-M4：episodes.domain（life / work）。旧库 NULL、不提升 schema_version，
+      // 所以必须放在「每次 open 都跑」的通用段（见回报「与计划不一致」清单）。
+      this.#ensureEpisodeDomainColumn();
       this.#db.exec(`
         CREATE INDEX IF NOT EXISTS ix_fact_vectors_embedder ON fact_vectors(embedder_id);
         CREATE INDEX IF NOT EXISTS ix_facts_reneed ON facts(scope, first_reneed_at);
@@ -1885,6 +1901,25 @@ export class Store {
     `);
   }
 
+  /**
+   * L120-M4：给旧库补 `episodes.domain`（life / work）。
+   *
+   * **不提升 schema_version**：这一步挂在 migrate() 的「每次 open 都跑」通用段，
+   * v16 及更早的库都在这里就地补列；否则只有新建库才有该列，老 profile 的
+   * episodes 永远读不到 domain。`ALTER TABLE … ADD COLUMN` 带 CHECK 是允许的，
+   * 存量行取 NULL——旧情景没有领域，召回时按「不门控」处理（见 retrieve.js）。
+   *
+   * 幂等：先 `PRAGMA table_info(episodes)` 探列，已存在直接返回 false。
+   * 范式同 `govern.js` 的 `ensureSensitiveColumn`。
+   * @returns {boolean} 是否真的补了列
+   */
+  #ensureEpisodeDomainColumn() {
+    const rows = this.#db.prepare('PRAGMA table_info(episodes)').all();
+    if (rows.some((row) => row.name === 'domain')) return false;
+    this.#db.exec("ALTER TABLE episodes ADD COLUMN domain TEXT CHECK (domain IN ('life','work'))");
+    return true;
+  }
+
   close() {
     this.#db.close();
   }
@@ -2064,10 +2099,10 @@ export class Store {
       .prepare(
         `INSERT INTO episodes (
            id, scope, session_id, consolidation_id, started_at, ended_at, title, summary,
-           evidence, topics_json, entities_json, mood, mood_evidence, salience, privacy,
-           strength_days, last_reinforced_at, recall_count, fidelity, status, deleted_at,
-           purge_payload
-         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+           evidence, topics_json, entities_json, mood, mood_evidence, domain, salience,
+           privacy, strength_days, last_reinforced_at, recall_count, fidelity, status,
+           deleted_at, purge_payload
+         ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         id,
@@ -2083,6 +2118,8 @@ export class Store {
         toJsonArray(redactEpisodeInput(input.entities ?? input.entities_json)),
         input.mood ?? null,
         redactEpisodeInput(input.mood_evidence ?? null),
+        // L120-M4：领域（life / work）；非法值落 NULL，不抛错（DDL 的 CHECK 兜底）。
+        normalizeEpisodeDomain(input.domain),
         salience,
         input.privacy ?? 'normal',
         strengthDays,

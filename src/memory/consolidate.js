@@ -20,9 +20,16 @@ import {
   CREDENTIAL_HINT, REDACTED_CREDENTIAL, hasUnredactedCredentialValue, isSensitiveText,
   redactSensitiveValues,
 } from './govern.js';
+import {
+  DEFAULT_DEDUPE_ASK, DEFAULT_DEDUPE_SKIP, buildDedupeJudgePrompt,
+  classifyDraftFact, collectActiveFactsByKind, parseDedupeVerdicts,
+} from './dedupe.js';
 import { decayOf } from './reinforce.js';
+import { textBigrams, jaccard } from './similarity.js';
 import { FACT_KINDS as STORE_FACT_KINDS } from './store.js';
 import { renderBoard, stageBoard } from './state-board.js';
+import { backfillNextFireAt } from '../reminder/next-fire.js';
+import { INJECTED_SOURCE_KINDS } from '../session/surface.js';
 
 /** 硬阈值：活跃 turn 中到 40k token 也必须巩固（安全阀）。 */
 export const DEFAULT_HARD_TOKENS = 40_000;
@@ -38,11 +45,42 @@ export const DEFAULT_THRESHOLD_COOLDOWN_TURNS = 3;
 /** 去重扫描的事实分页大小（Store 单页上限远大于此值）。 */
 const FACT_PAGE_SIZE = 200;
 
+/** L120-M2：提醒查重的分页大小（Store.listReminders 的 limit clamp 是 100）。 */
+const REMINDER_PAGE_SIZE = 100;
+
 /** v0.7.1 V70-M2：按 kind 取候选的「偏好/生活」类（同义说法多、subject 多为「用户」）。 */
 const PREFERENCE_KINDS = new Set(['preference', 'lifestyle']);
 
 /** v0.7.1 V70-M2：偏好类候选的默认上限（可由 config.consolidate.existingFactsLimit 覆盖）。 */
 export const DEFAULT_EXISTING_FACTS_LIMIT = 12;
+
+/**
+ * L120-H1②：`statement` 与选区文本的 bigram 相似度下限——达到它就把旧事实当作
+ * 可改写候选交给模型（字面 subject 命中之外的补充路径）。计划未给键名，按保守
+ * 常量处理（待用户裁决；见回报「13 项默认」第 10 条）。
+ */
+export const REGION_SIMILARITY_THRESHOLD = 0.3;
+
+/** L120-M2：提醒标题 bigram 相似度达到它就视为同一件事，跳过重复写入。 */
+export const REMINDER_DEDUPE_SKIP = 0.8;
+
+/** L120-H3b：单次巩固 project + knowledge 类事实的新增上限默认值。 */
+export const DEFAULT_MAX_PROJECT_FACTS = 5;
+
+/** L120-H3c：project / knowledge 事实多久没被召回/强化就算 dormant（天）。 */
+export const DEFAULT_PROJECT_DORMANT_DAYS = 30;
+
+/** L120-H3a：一次性过程状态（状态码/进度/临时路径/命令结果）的特征。 */
+const EPHEMERAL_PERCENT = /\d+(?:\.\d+)?\s*[%％]/u;
+const EPHEMERAL_STEP_COUNT = /\b\d+\s*\/\s*\d+\b/u;
+const EPHEMERAL_TEMP_PATH = /(?:[A-Za-z]:)?[\\/](?:temp|tmp)[\\/]/iu;
+const EPHEMERAL_COMMAND_OUTPUT = /\b(?:exit\s*code|stdout|stderr|traceback)\b/iu;
+const EPHEMERAL_HTTP = /\b(?:http|https)\b|\bstatus\b|状态码/iu;
+const EPHEMERAL_HTTP_CODE = /\b(?:[1-5]\d{2})\b/u;
+
+/** L120-H4：助手自己「接下来要做的事」的常见起手式。 */
+const ASSISTANT_SELF_ACTION_VERB = /^(?:回答|重启|查看|检查|验证|确认|整理|继续|处理|跟踪|修复|部署|更新|排查|统计|生成|导出)/u;
+const ASSISTANT_SELF_ACTION_CONTEXT = /助手|能否|是否|结果|服务|dsh|插件|构建|测试/iu;
 
 const FACT_KINDS = new Set(STORE_FACT_KINDS);
 const SALIENCE_VALUES = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
@@ -56,8 +94,72 @@ const REMINDER_STATUSES = new Set([
 ]);
 const CONSOLIDATION_KINDS = new Set(['nap', 'deep', 'forget_flush']);
 
+/** L120-M4：情景领域（life / work）；旧行为 NULL，不门控。 */
+const EPISODE_DOMAINS = new Set(['life', 'work']);
+
 /** 语句归一化：去掉空白/标点，供遗忘排除做保守比对。 */
 const STATEMENT_NOISE = /[\s\p{P}\p{S}]+/gu;
+
+/**
+ * L120-H3a：这条草稿事实是不是「一次性过程状态」（不该进长期记忆）。
+ *
+ * 只对 project / knowledge 生效：生活类事实里出现百分比（「体脂率 18%」）是正当
+ * 内容，不能一刀切。判定都要求有上下文词，避免把「这是第 3 步」之外的正常数字
+ * （版本号 0.7.7、端口 8080）误杀——状态码必须同时出现 HTTP/状态码字样。
+ *
+ * @param {{kind?: string, statement?: string, object_text?: string}} fact
+ * @returns {boolean}
+ */
+export function isEphemeralFactText(fact) {
+  const kind = typeof fact?.kind === 'string' ? fact.kind : '';
+  if (kind !== 'project' && kind !== 'knowledge') return false;
+  const text = `${fact?.statement ?? ''}\n${fact?.object_text ?? ''}`;
+  if (text.trim() === '') return false;
+  if (EPHEMERAL_PERCENT.test(text)) return true;
+  if (EPHEMERAL_STEP_COUNT.test(text)) return true;
+  if (EPHEMERAL_TEMP_PATH.test(text)) return true;
+  if (EPHEMERAL_COMMAND_OUTPUT.test(text)) return true;
+  if (EPHEMERAL_HTTP.test(text) && EPHEMERAL_HTTP_CODE.test(text)) return true;
+  return false;
+}
+
+/**
+ * L120-H4：这条草稿提醒是不是「助手自己接下来要做的事」。
+ *
+ * 现网 52 条 pending 里大量是助手自己的下一步（「回答助手能否区分 QQ 和微信消息」
+ * 「重启 dsh web 服务」「查看本次训练结果」），与用户无关。只记两类：用户明确
+ * 要求提醒的；用户本人的待办/承诺。
+ *
+ * 首版保守：宁可漏拦（多写一条会被 M2 去重/M3 过期兜底），不可误拦用户的真事。
+ * 因此要求「起手动词 + 助手语境词」同时命中，或「我 + 助手动作动词」。
+ *
+ * @param {{title?: string, detail?: string}} reminder
+ * @returns {boolean}
+ */
+export function isAssistantSelfActionReminder(reminder) {
+  const title = String(reminder?.title ?? '').trim();
+  const detail = String(reminder?.detail ?? '').trim();
+  const head = title === '' ? detail : title;
+  if (head === '') return false;
+  if (ASSISTANT_SELF_ACTION_VERB.test(head) && ASSISTANT_SELF_ACTION_CONTEXT.test(`${title}\n${detail}`)) {
+    return true;
+  }
+  if (/^我(?:去|来|得|要)?(?:回答|重启|查看|检查|验证|确认|整理|继续|处理|跟进|排查|修复)/u.test(head)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * L120-M3 / H3b：把配置里「天数」类阈值夹到合法区间。
+ * @param {unknown} value
+ * @param {number} fallback
+ * @returns {number}
+ */
+function normalizeDays(value, fallback) {
+  if (!Number.isFinite(value) || value <= 0) return fallback;
+  return Math.trunc(value);
+}
 
 /** @param {unknown} value @returns {string} */
 function normalizeStatement(value) {
@@ -291,6 +393,10 @@ function normalizeEpisode(raw) {
   if (mood !== null && !MOOD_VALUES.has(mood)) {
     throw badDraft(`episode.mood invalid: ${String(mood)}`);
   }
+  // L120-M4：情景记忆也分领域（life / work），供召回在闲聊时不带出工程内容。
+  // 模型偶尔写别的词：不抛 bad-draft（一处小瑕疵不该让整段巩固失败），落 null。
+  const rawDomain = typeof raw.domain === 'string' ? raw.domain.trim().toLowerCase() : '';
+  const domain = EPISODE_DOMAINS.has(rawDomain) ? rawDomain : null;
   return {
     title,
     summary,
@@ -299,6 +405,7 @@ function normalizeEpisode(raw) {
     entities: raw.entities ?? raw.entities_json ?? [],
     mood,
     mood_evidence: optionalString(raw.mood_evidence),
+    domain,
     salience,
     privacy,
     fidelity,
@@ -400,26 +507,39 @@ function recallSnapshotText(text) {
 }
 
 /**
- * A8③：选区优先、转录兜底，并在匹配前剔除召回快照。
+ * A8③ / L120-H1：选区优先、转录兜底；召回快照只是「历史回显」，匹配前先剥掉。
+ *
+ * V4-L2 时代只要段内出现召回快照就整段不给候选，理由是「无法区分用户又提到 vs
+ * 召回带进来」。但召回在主会话几乎每段都注入，于是「同主题改写」提示永远缺席，
+ * 模型只能不停新写——这正是 L120-H1 的第一个成因。现在改为**只剔除快照正文本身**
+ * （`[相关记忆]…[/相关记忆]` 标记块由 surface 层 `isInjectedRecord` 先行去掉，
+ * 这里再兜一层，兼容旧 transcript 与外部拼装文本），其余用户发言照常匹配。
+ *
  * @param {object} store
  * @param {string} scope
  * @param {string|null} regionText
  * @param {object[]} transcript
  * @returns {{id: string, subject_text: string, statement: string}[]}
  */
-function selectExistingFactsFromRegion(store, scope, regionText, transcript, options = {}) {
-  const body = promptBody(regionText, transcript);
+export function selectExistingFactsFromRegion(store, scope, regionText, transcript, options = {}) {
+  const body = stripRecallSnapshots(promptBody(regionText, transcript));
   if (body === '') return [];
-  // 段内只要出现召回快照，就不做「同主题改写」提示：快照里的旧事实与本次发言
-  // 混在一起时无法可靠区分「用户又提到」还是「召回带进来的」，宁可不给模型
-  // 改写建议，也不把历史快照当成新话题（V4-L2）。
-  if (recallSnapshotText(body) !== '') return [];
-  // 压缩摘要（宿主或平台生成的历史跨度）本身可能夹带召回快照，正文没有
-  // [相关记忆] 标记也无法区分新旧；这类段同样不注入「可改写事实」（V4-L2）。
+  // 压缩摘要（宿主或平台生成的历史跨度）里的事实无从判断新旧，仍然不注入候选。
   if (/<compacted-summary>/u.test(body) || /automatically generated checkpoint/u.test(body)) {
     return [];
   }
-  return selectExistingFacts(store, scope, body, options);
+  const recallText = recallSnapshotText(promptBody(regionText, transcript));
+  return selectExistingFacts(store, scope, body, recallText === '' ? options : { ...options, recallText });
+}
+
+/**
+ * L120-H1：剥掉 `[相关记忆]…[/相关记忆]` 块，只留用户真实发言。
+ * @param {string} text
+ * @returns {string}
+ */
+function stripRecallSnapshots(text) {
+  if (typeof text !== 'string' || text === '') return '';
+  return text.replace(/\[相关记忆\][\s\S]*?\[\/相关记忆\]/gu, ' ');
 }
 
 function promptBody(regionText, transcript) {
@@ -429,16 +549,21 @@ function promptBody(regionText, transcript) {
 }
 
 /**
- * A8③（v0.4.13）：挑出「本段对话里提到过 subject」的既有活跃事实，交给模型
+ * A8③（v0.4.13）/ L120-H1：挑出「本段对话里提到过」的既有活跃事实，交给模型
  * 做整条改写（supersede）而不是再写一条同义事实。
  *
- * 只做字面包含匹配（不调 embedder、不做余弦），符合 v0.4.13 的「embedder=hash
- * 时不引入余弦」约束；同一 subject 只取最近强化的一条，最多 limit 条。
+ * 只做字面匹配（不调 embedder、不做余弦），符合 v0.4.13 的「embedder=hash
+ * 时不引入余弦」约束。L120-H1 两处修正：
+ * - 同一 subject 的多条活跃事实**全部**进候选（原先只留最近强化的一条，同 subject
+ *   一旦有两条旧值，模型就只能看到一条，改写另一条时必然留下孤儿事实）；
+ * - 除 subject 字面命中外，`statement` 与选区文本的 bigram Jaccard ≥
+ *   {@link REGION_SIMILARITY_THRESHOLD} 也算候选——同一件事换个主语写法
+ *   （「用户」写给「我」、「项目 A」写成「A 项目」）时字面匹配必然漏。
  *
  * @param {object} store
  * @param {string} scope
  * @param {string} text
- * @param {{limit?: number}} [options]
+ * @param {{limit?: number, recallText?: string}} [options]
  * @returns {{id: string, subject_text: string, statement: string}[]}
  */
 export function selectExistingFacts(store, scope, text, options = {}) {
@@ -447,6 +572,7 @@ export function selectExistingFacts(store, scope, text, options = {}) {
   const recallText = typeof options.recallText === 'string' ? options.recallText : '';
   const body = typeof text === 'string' ? text.toLowerCase() : '';
   if (body === '') return [];
+  const bodyTokens = textBigrams(body);
   const limit = Number.isInteger(options.limit) && options.limit > 0 ? options.limit : 12;
   const preferenceLimit = Number.isInteger(options.preferenceLimit) && options.preferenceLimit > 0
     ? options.preferenceLimit
@@ -457,7 +583,7 @@ export function selectExistingFacts(store, scope, text, options = {}) {
     rows.push(...page);
     if (page.length < FACT_PAGE_SIZE) break;
   }
-  const bySubject = new Map();
+  const literal = [];
   const preferences = [];
   for (const row of rows) {
     if (row.status !== 'active') continue;
@@ -472,13 +598,15 @@ export function selectExistingFacts(store, scope, text, options = {}) {
       continue;
     }
     const subject = typeof row.subject_text === 'string' ? row.subject_text : '';
-    if (subject === '' || !body.includes(subject.toLowerCase())) continue;
-    const kept = bySubject.get(subject);
-    if (kept === undefined || Number(row.last_reinforced_at) > Number(kept.last_reinforced_at)) {
-      bySubject.set(subject, row);
+    const subjectHit = subject !== '' && body.includes(subject.toLowerCase());
+    if (!subjectHit) {
+      // L120-H1：主体写法不同但内容高度重合时同样要给模型改写机会。
+      if (bodyTokens.size === 0) continue;
+      if (jaccard(textBigrams(row.statement), bodyTokens) < REGION_SIMILARITY_THRESHOLD) continue;
     }
+    literal.push(row);
   }
-  const literal = [...bySubject.values()]
+  const literalRows = literal
     .sort((a, b) => Number(b.last_reinforced_at) - Number(a.last_reinforced_at))
     .slice(0, limit);
   const preferred = preferences
@@ -486,7 +614,7 @@ export function selectExistingFacts(store, scope, text, options = {}) {
     .slice(0, preferenceLimit);
   const seen = new Set();
   const merged = [];
-  for (const row of [...literal, ...preferred].sort(
+  for (const row of [...literalRows, ...preferred].sort(
     (a, b) => Number(b.last_reinforced_at) - Number(a.last_reinforced_at),
   )) {
     if (seen.has(row.id)) continue;
@@ -697,10 +825,35 @@ function isEmptyDraftError(error) {
 const TOOL_PLACEHOLDER_LINE = /^\[tool (?:call|result)[^\]]*\]$/u;
 
 /**
+ * L120-H1（阶段 2 收口）：插件注入行的**正文特征**。
+ *
+ * surface 层现在按 `source.kind`（`src/session/surface.js` 的 `isInjectedRecord`，
+ * 六 kind 与 `src/index.js` `isInjectedMessage` 一致）直接不把注入消息拼进选区，
+ * 所以这里的匹配主要是兜底：外部拼装的区间文本、旧 transcript、以及绕过 surface
+ * 的调用方仍可能把注入正文当作「用户说过的话」，让本来空的区间白跑 1–2 次模型。
+ *
+ * 只匹配插件自己写死的前缀措辞，避免误杀用户真的说「提醒我」这类句子。
+ */
+const INJECTED_LINE_PATTERNS = [
+  // src/index.js recallMessage：召回快照整块（正常已被剥掉，这里兜底）
+  /^\[相关记忆\]/u,
+  /^\[\/相关记忆\]/u,
+  // src/reminder/expired-notice.js：过期提醒合并告知
+  /^\[提醒\]/u,
+  // src/persona/emotion-wiring.js：情绪判定的注入句
+  /^\[情绪\]/u,
+  // src/runtime/commands.js：命令提示
+  /^\[命令提示\]/u,
+  // src/index.js：运行环境 / 隐私提示注入
+  /^\[运行环境\]/u,
+  /^\[隐私提示\]/u,
+];
+
+/**
  * C120-M3：把一行「role: text」判定为「有实质对话正文」。
  *
  * 不算正文的：空/纯空白、工具调用与结果的占位（`[tool call …]` / `[tool result]`）、
- * 召回快照残留（`[相关记忆]…[/相关记忆]` 整块在调用前已被剥掉，这里兜一次）。
+ * 召回快照残留、以及插件注入行的已知前缀（见 {@link INJECTED_LINE_PATTERNS}）。
  * 只有 user / assistant 两个角色算「用户与助手正文」——system、tool 都不算。
  *
  * @param {string} role
@@ -713,15 +866,16 @@ function lineHasUserOrAssistantText(role, body) {
   const text = String(body ?? '').trim();
   if (text === '') return false;
   if (TOOL_PLACEHOLDER_LINE.test(text)) return false;
+  if (INJECTED_LINE_PATTERNS.some((pattern) => pattern.test(text))) return false;
   return true;
 }
 
 /**
- * C120-M3：这一段有没有值得交给模型的「用户与助手正文」。
+ * C120-M3 / L120-H1：这一段有没有值得交给模型的「用户与助手正文」。
  *
  * 注入消息（召回快照、情绪句、过期提醒、运行环境提示等）不是对话内容：全是注入
  * 或只有工具往来的区间巩固出来必然是空草稿，直接记 `status='empty'` 更准确，
- * 也不该计入失败。
+ * 也不该计入失败。调用方若给出带 `sourceKind` 的 row，直接按 kind 判定。
  *
  * @param {{regionText?: string|null, transcript?: object[]}} input
  * @returns {boolean}
@@ -738,9 +892,20 @@ export function hasConsolidatableText(input = {}) {
   }
   const transcript = Array.isArray(input.transcript) ? input.transcript : [];
   for (const row of transcript) {
+    // 带 sourceKind 的行（surface snapshot 的记录）直接按注入判定。
+    if (isInjectedSourceKind(row?.sourceKind)) continue;
     if (lineHasUserOrAssistantText(row?.role, row?.text)) return true;
   }
   return false;
+}
+
+/**
+ * L120-H1：这个 source.kind 是不是插件注入（与 surface.js 的白名单同源）。
+ * @param {unknown} kind
+ * @returns {boolean}
+ */
+function isInjectedSourceKind(kind) {
+  return typeof kind === 'string' && INJECTED_SOURCE_KINDS.has(kind);
 }
 
 /**
@@ -795,11 +960,187 @@ export function buildConsolidationPrompt(input = {}) {
     '这一段如果只是工具调用、命令与它们的输出，没有值得记住的对话内容，"episode" 写 null，不要编造情景。',
     '生活类信息也要抽：作息（几点睡/起）、饮食（口味/忌口/常吃）、兴趣（最近在看/在玩/在读）、情绪事件（为什么高兴或低落）、人际关系（家人朋友同事的近况），分别用 lifestyle / mood / relation / preference 等 kind。',
     '同一对象（例如「咖啡」）已有事实时，subject_text 保持一致（用同一个词），只输出这次新增或变化的部分，不要换词重写同一条。',
+    '不要记录一次性的过程状态：HTTP 状态码、训练进度与步数（如 45/100）、临时文件路径、命令的输出或退出码、「已完成某一步」。这些不是长期事实。',
+    'project 与 knowledge 类事实最多 5 条，只留真正长期有效的结论；一条事实换个说法重复出现时，只输出一次。',
+    '此刻的瞬时状态（当下心情、此刻想聊轻松一点）只写进 episode 的情绪字段，不要写成 facts。',
+    '只为两类记 reminders：用户明确要求提醒的；用户本人的待办或承诺。助手自己接下来要做的动作（如「回答某问题」「重启服务」「查看结果」「继续排查」）不要写提醒；已经由日程或周期安排覆盖的事项，也不要写 todo。',
+    'episode 的 domain 标 "life"（生活、情绪、人际）或 "work"（工作、项目、技术）。',
     `scope=${scope} seq=${input.seqFrom}-${input.seqTo}`,
     ...existingLines,
     '对话：',
     body,
   ].join('\n');
+}
+
+/**
+ * L120-H1/H3：把草稿事实整理成「写库决策」。
+ *
+ * 顺序即计划顺序：先按 H3a/H3d 丢一次性过程状态与瞬时情绪，再按 H3b 卡 project
+ * +knowledge 的新增条数上限，最后做 H1 近似查重（同 kind active 事实比 bigram
+ * Jaccard）：≥ dedupeSkip 直接强化旧条；dedupeAsk..dedupeSkip 之间**合成一次**
+ * 模型裁决；低于 dedupeAsk 或没有同类事实就新写。
+ *
+ * 裁决调用失败（抛错/超时/不可解析）时该批按 new 保守写入并计数：宁可多一条，
+ * 也不能因为一次判定失败丢掉整段巩固。
+ *
+ * @param {object} input
+ * @param {object} input.store
+ * @param {string} input.scope
+ * @param {object[]} input.facts 已过敏感/遗忘过滤的草稿事实
+ * @param {{dedupeSkip?: number, dedupeAsk?: number, maxProjectFacts?: number,
+ *          judge?: Function}} [input.options]
+ * @returns {Promise<{plans: object[], dropped: object, judged: object}>}
+ */
+async function planFactWrites(input) {
+  const { store, scope, facts } = input;
+  const options = input.options ?? {};
+  const dedupeSkip = Number.isFinite(options.dedupeSkip) ? options.dedupeSkip : DEFAULT_DEDUPE_SKIP;
+  const dedupeAsk = Number.isFinite(options.dedupeAsk) ? options.dedupeAsk : DEFAULT_DEDUPE_ASK;
+  const maxProjectFacts = Number.isFinite(options.maxProjectFacts) && options.maxProjectFacts >= 0
+    ? Math.trunc(options.maxProjectFacts)
+    : DEFAULT_MAX_PROJECT_FACTS;
+
+  const dropped = { ephemeral: 0, mood: 0, capped: 0 };
+  const kept = [];
+  for (const fact of facts) {
+    // L120-H3d：瞬时情绪只进 episode，不进 facts。
+    if (fact.kind === 'mood') {
+      dropped.mood += 1;
+      continue;
+    }
+    // L120-H3a：状态码/进度/临时路径/命令输出不是长期事实。
+    if (isEphemeralFactText(fact)) {
+      dropped.ephemeral += 1;
+      continue;
+    }
+    kept.push(fact);
+  }
+  // L120-H3b：单次巩固的 project+knowledge 新增上限（超出丢尾部）。
+  const allowed = [];
+  let projectCount = 0;
+  for (const fact of kept) {
+    if (fact.kind === 'project' || fact.kind === 'knowledge') {
+      // 0 = 一条都不写（  关闭工程类事实写入）。
+    if (maxProjectFacts >= 0 && projectCount >= maxProjectFacts) {
+        dropped.capped += 1;
+        continue;
+      }
+      projectCount += 1;
+    }
+    allowed.push(fact);
+  }
+
+  const byKind = collectActiveFactsByKind(store, scope);
+  const plans = [];
+  const askIndexes = [];
+  for (const fact of allowed) {
+    const verdict = classifyDraftFact(fact, byKind, { dedupeSkip, dedupeAsk });
+    if (verdict.verdict === 'skip') {
+      plans.push({
+        fact,
+        mode: 'reinforce',
+        targetId: verdict.match.id,
+        score: verdict.score,
+      });
+      continue;
+    }
+    if (verdict.verdict === 'ask') {
+      plans.push({
+        fact,
+        mode: 'ask',
+        targetId: verdict.match.id,
+        targetStatement: verdict.match.statement,
+        score: verdict.score,
+      });
+      askIndexes.push(plans.length - 1);
+      continue;
+    }
+    plans.push({ fact, mode: 'insert', targetId: null, score: verdict.score });
+  }
+
+  const judged = {
+    asked: askIndexes.length, same: 0, update: 0, repl: 0, failed: 0,
+  };
+  if (askIndexes.length > 0) {
+    let verdicts = null;
+    if (typeof options.judge === 'function') {
+      try {
+        const prompt = buildDedupeJudgePrompt(askIndexes.map((planIndex) => ({
+          fact: plans[planIndex].fact.statement,
+          existing: plans[planIndex].targetStatement ?? '',
+        })));
+        verdicts = parseDedupeVerdicts(await options.judge(prompt), askIndexes.length);
+      } catch {
+        verdicts = null;
+      }
+    }
+    if (verdicts === null) {
+      // 判定不可用：全部按 new 保守写入，只计数（不影响整次巩固）。
+      judged.failed = askIndexes.length;
+      for (const planIndex of askIndexes) plans[planIndex].mode = 'insert';
+    } else {
+      askIndexes.forEach((planIndex, offset) => {
+        const verdict = verdicts[offset];
+        if (verdict === 'same') {
+          plans[planIndex].mode = 'reinforce';
+          judged.same += 1;
+        } else if (verdict === 'update') {
+          plans[planIndex].mode = 'supersede';
+          judged.update += 1;
+        } else {
+          plans[planIndex].mode = 'insert';
+          judged.repl += 1;
+        }
+      });
+    }
+  }
+
+  return { plans, dropped, judged };
+}
+
+/**
+ * L120-H4/M2/H2：提醒的去重、过滤与触发点补齐。
+ *
+ * @param {object} input
+ * @param {object} input.store
+ * @param {string} input.scope
+ * @param {object[]} input.reminders 已过敏感过滤的草稿提醒
+ * @param {string} [input.timeZone] 用于 day 粒度补当地 09:00
+ * @returns {{kept: object[], dropped: object}}
+ */
+function planReminderWrites(input) {
+  const { store, scope, reminders } = input;
+  const dropped = { selfAction: 0, duplicate: 0 };
+  // M2：同 scope 的 pending / snoozed 标题做近似查重（一次分页拉全，避免每条提醒查库）。
+  const existing = [];
+  for (const status of ['pending', 'snoozed']) {
+    for (let offset = 0; ; offset += REMINDER_PAGE_SIZE) {
+      const page = store.listReminders({ scope, status, limit: REMINDER_PAGE_SIZE, offset });
+      for (const row of page) existing.push({ id: row.id, tokens: textBigrams(row.title) });
+      if (page.length < REMINDER_PAGE_SIZE) break;
+    }
+  }
+  const kept = [];
+  for (const reminder of reminders) {
+    // H4：助手自己的下一步不该变成用户的待办。
+    if (isAssistantSelfActionReminder(reminder)) {
+      dropped.selfAction += 1;
+      continue;
+    }
+    const tokens = textBigrams(reminder.title);
+    if (tokens.size > 0
+      && existing.some((row) => jaccard(tokens, row.tokens) >= REMINDER_DEDUPE_SKIP)) {
+      dropped.duplicate += 1;
+      continue;
+    }
+    if (tokens.size > 0) existing.push({ id: null, tokens });
+    // H2：只有 due_at 没有 next_fire_at 的提醒永远扫不到，补触发点。
+    kept.push({
+      ...reminder,
+      next_fire_at: reminder.next_fire_at ?? backfillNextFireAt(reminder, { timeZone: input.timeZone }),
+    });
+  }
+  return { kept, dropped };
 }
 
 /**
@@ -972,11 +1313,32 @@ export async function consolidate(input = {}) {
     (fact) => !isSensitiveText(rowSensitiveText(fact, ['statement', 'subject_text', 'object_text'])),
   );
   const excludedFacts = draftedFacts.length - matchedFacts.length;
-  const reminders = draftedReminders.filter(
+  const safeReminders = draftedReminders.filter(
     (reminder) => !isSensitiveText(rowSensitiveText(reminder, ['title', 'detail'])),
   );
   const sensitiveCount =
-    (matchedFacts.length - facts.length) + (draftedReminders.length - reminders.length);
+    (matchedFacts.length - facts.length) + (draftedReminders.length - safeReminders.length);
+
+  // L120-H1/H3：写库前的过滤链（H3a 一次性过程状态、H3d 瞬时情绪、H3b 上限、
+  // H1 近似查重）与 L120-H2/M2/H4 的提醒处理。模型裁决必须在事务外完成。
+  const factPlan = await planFactWrites({
+    store,
+    scope,
+    facts,
+    options: {
+      dedupeSkip: input.dedupeSkip,
+      dedupeAsk: input.dedupeAsk,
+      maxProjectFacts: input.maxProjectFacts,
+      judge: input.judge,
+    },
+  });
+  const reminderPlan = planReminderWrites({
+    store,
+    scope,
+    reminders: safeReminders,
+    timeZone: input.timeZone,
+  });
+  const reminders = reminderPlan.kept;
 
   // 3) 单事务写库（含水位 consolidations.upto_seq）；抛错整体回滚。
   const written = store.transaction(() => {
@@ -1010,6 +1372,7 @@ export async function consolidate(input = {}) {
         entities: safeEpisode.entities,
         mood: safeEpisode.mood,
         mood_evidence: safeEpisode.mood_evidence,
+        domain: safeEpisode.domain,
         salience: safeEpisode.salience,
         privacy: safeEpisode.privacy,
         fidelity: safeEpisode.fidelity,
@@ -1044,9 +1407,20 @@ export async function consolidate(input = {}) {
     }
     let insertedFacts = 0;
     let supersededFacts = 0;
+    let reinforcedFacts = 0;
     // A8③：只允许改写本段候选中出现过的旧事实。
     const candidateIds = new Set(existingFacts.map((row) => row.id));
-    for (const fact of facts) {
+    for (const plan of factPlan.plans) {
+      const { fact } = plan;
+      // L120-H1：高相似 / 模型判 same —— 不新写一行，只强化旧条（used_count 与
+      // last_reinforced_at 前进，召回排序跟着涨），保持「一条事实只有一个正本」。
+      if (plan.mode === 'reinforce') {
+        if (plan.targetId && typeof store.reinforceFact === 'function') {
+          store.reinforceFact({ id: plan.targetId, scope, at });
+          reinforcedFacts += 1;
+        }
+        continue;
+      }
       const key = factKey(fact);
       const existing = byKey.get(key);
       if (existing) {
@@ -1074,15 +1448,19 @@ export async function consolidate(input = {}) {
         valid_to: fact.valid_to,
         fidelity: fact.fidelity,
       });
-      // A8③（v0.4.13）：模型按 prompt 里的 id 指定 supersedes 时，把旧行标为
-      // superseded 并指向新行。只接受本段候选集里的 id，避免误伤其它 scope。
-      if (fact.supersedes !== null && candidateIds.has(fact.supersedes)) {
+      // 需要被新行取代的旧事实有两类来源：
+      // - A8③（v0.4.13）：模型按 prompt 里的 id 指定 supersedes（只接受本段候选）；
+      // - L120-H1：近似查重判定 update，把最相似的旧行整条取代。
+      const targets = new Set();
+      if (plan.mode === 'supersede' && plan.targetId) targets.add(plan.targetId);
+      if (fact.supersedes !== null && candidateIds.has(fact.supersedes)) targets.add(fact.supersedes);
+      for (const targetId of targets) {
         const info = store.db
           .prepare(
             `UPDATE facts SET status = 'superseded', superseded_by = ?, updated_at = ?
               WHERE id = ? AND scope = ? AND status = 'active'`,
           )
-          .run(inserted.id, at, fact.supersedes, scope);
+          .run(inserted.id, at, targetId, scope);
         supersededFacts += Number(info.changes) || 0;
       }
       insertedFacts += 1;
@@ -1144,6 +1522,23 @@ export async function consolidate(input = {}) {
         upto_seq: to,
         facts: insertedFacts,
         reminders: reminders.length,
+        // L120-H1/H3/H4/M2：写库前的取舍全部可查（审计 + 云端对账口径）。
+        dedupe: {
+          reinforced: reinforcedFacts,
+          superseded: supersededFacts,
+          asked: factPlan.judged.asked,
+          judgedSame: factPlan.judged.same,
+          judgedUpdate: factPlan.judged.update,
+          judgedNew: factPlan.judged.repl,
+          judgeFailed: factPlan.judged.failed,
+        },
+        dropped: {
+          ephemeral: factPlan.dropped.ephemeral,
+          mood: factPlan.dropped.mood,
+          capped: factPlan.dropped.capped,
+          reminderSelfAction: reminderPlan.dropped.selfAction,
+          reminderDuplicate: reminderPlan.dropped.duplicate,
+        },
         duration_ms: durationMs,
       },
     });
@@ -1151,6 +1546,8 @@ export async function consolidate(input = {}) {
     return {
       episodeId: episodeRow === null ? undefined : episodeRow.id,
       facts: insertedFacts,
+      reinforced: reinforcedFacts,
+      superseded: supersededFacts,
       sensitive: sensitiveCount,
     };
   });
@@ -1164,8 +1561,14 @@ export async function consolidate(input = {}) {
     kind,
     episodeId: written.episodeId,
     facts: written.facts,
+    reminders: reminderPlan.kept.length,
+    reinforced: written.reinforced,
+    superseded: written.superseded,
     excluded: excludedFacts,
     sensitive: written.sensitive,
+    // L120-H1/H3/H4/M2：本次巩固的取舍计数（结果透出，便于 /状态 与审计对账）。
+    dedupe: factPlan.judged,
+    dropped: { ...factPlan.dropped, ...reminderPlan.dropped },
     notice: written.sensitive > 0 ? CREDENTIAL_HINT : null,
     duration_ms: durationMs,
   };

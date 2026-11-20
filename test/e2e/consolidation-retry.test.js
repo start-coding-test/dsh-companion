@@ -182,3 +182,61 @@ test('MISSING_CREDENTIAL 不重试，失败永久可观察', async (t) => {
   assert.equal(permanent.length, 1);
   assert.ok(ctx.logs.some((entry) => /failed permanently/u.test(entry.message)));
 });
+
+test('重试成功也过 compactMinRegionTokens 闸门：小 token 区间不登记 pending', async (t) => {
+  // C120-M1：首次失败的巩固不登记 pending（只有成功路径登记）；重试成功时
+  // region.tokens 必须从 retry job 里带回来，否则 belowCompactMinRegion(null) 恒 false
+  // → 小 token 区间会被无条件登记，maybeCompact 立刻压缩一段没有价值的区间。
+  const run = async ({ minRegionTokens }) => {
+    const temp = makeTempStore();
+    let calls = 0;
+    const ctx = makeApplyCtx(async function* stream(request) {
+      const prompt = request?.messages?.[0]?.content?.[0]?.text ?? '';
+      if (!prompt.includes('记忆巩固器')) {
+        yield { type: 'text-delta', text: 'ok' };
+        yield { type: 'finish', reason: { kind: 'ok' } };
+        return;
+      }
+      calls += 1;
+      if (calls === 1) throw new Error('temporary model outage');
+      yield { type: 'text-delta', text: JSON.stringify(DRAFT) };
+      yield { type: 'finish', reason: { kind: 'ok' } };
+    });
+    const session = ctx.addSession({
+      id: 'session-1',
+      events: [userEvent('更早的一轮对话。', 7), userEvent('再早一点。', 8)],
+    });
+    const handle = apply(ctx, {
+      dbPath: temp.dbPath,
+      retainTokens: 4,
+      compactMinRegionTokens: minRegionTokens,
+    });
+    try {
+      await ctx.dispatch('agent/pre-step', preStepPayload(session, 1, '我下周要把预算调到 8000。'), {
+        kind: 'enter',
+        messages: [],
+      });
+      await waitFor(() => consolidationRows(temp.store).length === 1, { label: 'failed row' });
+      ctx.advance(60_000);
+      await ctx.fireTimers(1);
+      await waitFor(() => temp.store.getWatermark('main') === 7, { label: 'retry consolidation' });
+      // 压缩在一次新的 pre-step 里发生（maybeCompact 只在 turn 边界跑）。
+      await ctx.dispatch('agent/pre-step', preStepPayload(session, 2, '现在额度是多少？'), {
+        kind: 'enter',
+        messages: [],
+      });
+      await settle(50);
+      return { compactions: ctx.callsOf('compaction.compactRegion').length };
+    } finally {
+      handle.dispose();
+      temp.cleanup();
+    }
+  };
+
+  // 区间只有 ~4 tokens：下限 12 时不该登记 pending，因此不会压缩。
+  const gated = await run({ minRegionTokens: 12 });
+  assert.equal(gated.compactions, 0, '小 token 区间不得登记 pending');
+  // 闸门关掉（0）时同一路径照常登记并压缩，证明上面是闸门在起作用。
+  const open = await run({ minRegionTokens: 0 });
+  assert.equal(open.compactions, 1, '闸门关闭时应登记 pending 并压缩');
+});

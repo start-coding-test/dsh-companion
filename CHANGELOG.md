@@ -31,6 +31,58 @@
   压缩，避免为几千 token 的小区间反复重建 surface；`0` 关闭闸门。
 - **C120-L1 `/状态` 显示压缩与巩固健康度**：连续压缩失败次数、最后一条错误原文
   （不截断）、`empty` / `failed` 各自条数。
+- **L120-H1 巩固去重（近似查重 + 模型判定）**：写库前把每条新事实与同 scope、同 kind
+  的 active 事实比 bigram Jaccard —— ≥ `consolidate.dedupeSkip`（默认 `0.85`）不写新行、
+  只 `reinforceFact` 强化旧条；`consolidate.dedupeAsk`–`dedupeSkip`（默认 `0.5`–`0.85`）
+  合成一次模型调用判 same / update / new，`update` 走 supersede。判定失败或超时按 `new`
+  保守写入并计数，不吞整次巩固。精确 `factKey` 去重仍是第一道。
+- **L120-H1② 候选不再被召回快照整段放弃**：`selectExistingFactsFromRegion` 先剥掉
+  `[相关记忆]…[/相关记忆]` 再匹配（原先见到召回快照就直接返回空候选），project /
+  knowledge / other 分支同时接受「subject 字面命中」与「statement 与区间文本
+  Jaccard ≥ 0.3」；同一 subject 多条全部进候选，不再只留最新一条。
+- **L120-H1① 区间正文剔除注入消息**：production surface 记录新增 `sourceKind`，
+  `companion-recall` / `companion-expired` / `companion-emotion` / `companion-command-hint` /
+  `companion-privacy-hint` / `runtime-context` 这些注入行不再拼进区间正文（token 预算和
+  压缩口径照旧，只让模型看到干净的对话）。
+- **L120-M1 deep-sleep 自动去重**：同 kind、Jaccard ≥ `govern.autoDedupeThreshold`
+  （默认 `0.6`）的对交一次模型判定，判 `same` 才把旧条置 `superseded`（pinned 与较新者
+  保留，不物理删）；结果写 `govern_last_run` meta，`/状态` 增加一行「自动去重（上次
+  deep-sleep）」。判定失败只 warn 并跳过当夜 supersede，候选留到下次。
+- **L120-L1 `/记忆 周报`**：直接查库给出事实（按 status × kind）、情景、本周新增、
+  本周 superseded、待处理与过期提醒、pinned 数量、本周巩固 `written` / `empty` / `failed`
+  次数。数字不再由模型估算，「本周」按滚动 7 天（`unixepoch` 比较，与 TZ 无关）。
+- **新增配置**：`consolidate.dedupeSkip`（`0.85`）、`consolidate.dedupeAsk`（`0.5`）、
+  `consolidate.maxProjectFacts`（`5`）、`govern.autoDedupeThreshold`（`0.6`）、
+  `decay.projectDormantDays`（`30`）、`reminderStaleDays`（`30`）、
+  `reminderTodoStaleDays`（`7`），全部进配置表与启动校验（`0 < dedupeAsk < dedupeSkip < 1`）。
+
+### Fixed（阶段 2）
+
+- **L120-H2 提醒有截止时间却不触发**：巩固抽出的提醒只有 `due_at`、没有 `next_fire_at`
+  时既不会触发也不会过期。现在 `exact` 粒度用 `due_at` 补 `next_fire_at`，`day` 粒度补
+  当地 09:00（按 `timezone` 换算，DST 自适应；当天 09:00 已过也取当天补投），
+  `week` / `month` 粒度不自动触发但保留 `due_at` 作过期依据。
+- **L120-M2 同一件事反复写提醒**：写库前比对同 scope `pending` / `snoozed` 提醒标题的
+  bigram Jaccard，≥ 0.8 视为已有同类提醒直接跳过。
+- **L120-M3 提醒没有生命周期**：deep-sleep 增加 `expireStaleReminders` —— 非 repeat 且
+  `due_at` 已过 24 小时的 `pending` 置 `expired`；无到期时间的 `todo` 创建满
+  `reminderTodoStaleDays`、`commitment` 满 `reminderStaleDays` 未更新也置 `expired`。
+  `snoozed`（用户主动「稍后再说」）不动，不物理删、不推送，下次真实对话时由既有的
+  expired-notice 一次性合并告知。
+- **L120-M4 召回不分领域**：本轮判为闲聊（无工具调用、正文也没有代码块/路径/URL/连续
+  拉丁标识符）时，`project` 与「技术形态的 knowledge」事实必须命中稀有锚点（df ≤ 2 的
+  token）才允许注入；`work` 域的 episode 同样处理。不做硬过滤 —— 闲聊里明确提到
+  「LoRA」这类稀有标识符仍可召回。episode 新增 `domain`（`life` / `work`，旧行为 `NULL`），
+  按需补列、不改 schema 版本号。
+- **L120-H3 抽取降量**：巩固提示词写明不记一次性过程状态，写库前再用规则拦一次
+  （HTTP 状态码、百分比进度、`x/y` 步数、`temp`/`tmp` 临时路径、`exit code`/`stdout`/
+  `stderr` 这类命令输出），且每次巩固 project + knowledge 新增上限
+  `consolidate.maxProjectFacts`；`mood` 类瞬时状态不再写 facts（只进 episode）；
+  project / knowledge 事实满 `decay.projectDormantDays` 没被召回也没被强化就转 `dormant`
+  （deep-sleep 执行，与既有 `strength_days` 衰减叠加，`strength_days IS NULL` 的行豁免）。
+- **L120-H4 提醒只记用户的事**：巩固提示词改为只写两类提醒（用户明确要求提醒的、用户
+  本人的待办或承诺），助手自己下一步（「回答助手能否…」「重启 dsh web 服务」「查看本次
+  训练结果」）不再写；写库前再有规则兜底拦一次，并跳过已由宿主周期安排覆盖的 todo。
 
 ### Docs
 
@@ -45,6 +97,16 @@
   丢弃、非确定性错误 3 次上限、`compactMinRegionTokens` 门槛、`empty` 两例、schema
   v15 → v16 迁移。**构造数据，真快照到达后替换**：50041 surface 快照未到，量级按任务
   给的 6122 事件铺。
+- `test/v077-stage2.test.js`（19 例）：区间注入剔除与 `sourceKind` 触发重建、候选不再
+  被召回快照放弃、近似查重四分支（强化 / 判 same / 判 update 走 supersede / 判定失败
+  保守写入）、`next_fire_at` 补偿、一次性过程状态拦截、自查提醒丢弃、提醒去重、三类
+  过期、周报计数与直接 SQL 对账。
+- `test/v077-stage2-reminder.test.js`（22 例）：`backfillNextFireAt` 三时区 +
+  春/秋令 DST 固定用例、过期清理与合并告知、闲聊门（稀有锚点放行与 2 条配额）、
+  自动去重三类结果与 `govern_last_run` 记账。
+- `test/e2e/consolidation-retry.test.js` 追加「重试成功也过 `compactMinRegionTokens`
+  闸门」。
+- 以上均为构造数据：50041 云端 surface / 提醒快照未到，**真快照到达后替换**。
 
 ## [0.7.6] - 2026-11-14
 

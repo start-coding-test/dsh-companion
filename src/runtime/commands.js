@@ -966,7 +966,44 @@ function formatConsolidationHealthLines(store, scope) {
     const lastError = readCompactionLastError(store, scope);
     if (lastError !== null) lines.push(`最近压缩错误：${lastError}`);
   }
+  // L120-M1：deep-sleep 自动去重的最近一次结果（govern_last_run meta，JSON）。
+  // 没有跑过就不出这一行；解析失败也只跳过本行，不影响 /状态 其它内容。
+  const governLine = formatGovernAutoLine(store);
+  if (governLine !== null) lines.push(governLine);
   return lines;
+}
+
+/**
+ * L120-M1：把 `govern_last_run` meta 渲染成一行。
+ * @param {object} store
+ * @returns {string|null}
+ */
+function formatGovernAutoLine(store) {
+  if (typeof store?.getMeta !== 'function') return null;
+  let raw = null;
+  try {
+    raw = store.getMeta('govern_last_run');
+  } catch {
+    return null;
+  }
+  if (typeof raw !== 'string' || raw.trim() === '') return null;
+  let parsed = null;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const candidates = Number(parsed.candidates) || 0;
+  const superseded = Number(parsed.superseded) || 0;
+  const judgedSame = Number(parsed.judgedSame) || 0;
+  const skipped = typeof parsed.skipped === 'string' && parsed.skipped !== '' ? parsed.skipped : null;
+  const threshold = Number(parsed.threshold);
+  const tail = skipped === null
+    ? `判 same/update ${judgedSame} 条，已 supersede ${superseded} 条`
+    : `跳过（${skipped}）`;
+  return `自动去重（上次 deep-sleep）：候选 ${candidates} 对 · ${tail}`
+    + (Number.isFinite(threshold) ? ` · 门槛 ${threshold}` : '');
 }
 
 /** @param {object} row @param {object|null} detail @param {string} timeZone @param {string} label */

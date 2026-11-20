@@ -223,7 +223,7 @@ test('FakeCtx 配平校验与宿主 assertBalancedCut 判定一致', () => {
 
 // ---------------------------------------------------------------- 6122 事件回放
 
-test('构造数据回放：6122 事件 / 596 tool-call / 595 tool-result，尾部一个未结束调用（一次压缩成功）', () => {
+test('构造数据回放：6122 事件 / 596 tool-call / 595 tool-result，尾部一个未结束调用（区间边界合法）', () => {
   // 真快照（50041 surface 事件）未到达，这里按任务给的量级造数据：
   // 先铺 595 组「assistant tool-call + tool/result」，再放尾部一个未闭合的 tool-call。
   const events = [];
