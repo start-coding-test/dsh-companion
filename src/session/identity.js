@@ -160,10 +160,8 @@ export function classifySession(agent, options = {}) {
   const sessionId = sessionIdOfAgent(agent);
   const header = agent?.session?.header ?? agent?.header ?? null;
 
-  if (isSubagentHeader(header)) {
-    return { kind: 'subagent', scope: null, sessionId };
-  }
-
+  // SA-L1（v0.7.7）：线程登记优先于子代理判定 —— 线程会话派生子代理后会回到同一
+  // session id，threads 表里有登记就该按线程记账；没有登记时仍按 header 判 subagent。
   if (sessionId !== null && typeof store?.getThreadBySessionId === 'function') {
     let thread = null;
     try {
@@ -182,6 +180,10 @@ export function classifySession(agent, options = {}) {
         key: thread.key,
       };
     }
+  }
+
+  if (isSubagentHeader(header)) {
+    return { kind: 'subagent', scope: null, sessionId };
   }
 
   if (sessionId !== null && typeof store?.getMeta === 'function') {

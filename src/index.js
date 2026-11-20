@@ -239,6 +239,14 @@ const COMMAND_HINT_TEXT_PREFIX = '宿主只注册 ASCII 命令名';
 const PRIVACY_HINT_SOURCE_KIND = 'companion-privacy-hint';
 const PRIVACY_HINT_TEXT_PREFIX = '用户消息里含凭据类信息';
 
+// SA-H1（v0.7.7）：宿主子代理消息的 source.kind —— 见 dsh-subagent 的
+// continuation-messages.ts:14-20（agent-message）与 :29-39（subagent-settled）。
+// 安装路径：D:\dsh\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-subagent\src\continuation-messages.ts
+// 这两类是「另一个 agent 说的话」与「运行时对子代理的结案通知」，既不是用户发言，
+// 也不属于插件注入，所以不进 surface.js 的 INJECTED_SOURCE_KINDS。
+const AGENT_MESSAGE_SOURCE_KIND = 'agent-message';
+const SUBAGENT_SETTLED_SOURCE_KIND = 'subagent-settled';
+
 /** 召回块文本标记（assemble 渲染）；surface 记录只有 role/text，没有 source。 */
 const RECALL_MARKER = '[相关记忆]';
 
@@ -522,7 +530,7 @@ export function apply(ctx, rawConfig, hooks = {}) {
     }
     // P2（v0.5.0）：遮蔽宿主默认人设。off 时连监听器都不注册，默认路径与旧版
     // 完全一致；失败只 warn，不挡装配。
-    state.shadowMode = registerDeploymentShadow(platform, config, track, state.card, state.assembly);
+    state.shadowMode = registerDeploymentShadow(platform, config, track, state.card, state.assembly, store);
     // V7-H1 审计：pre-step 是事件钩子注册（只能在 apply 阶段完成），能力位来自
     // Context 事件 API 而非晚挂载 service，故保留 apply 时判断。
     if (platform.capabilities.preStep) {
@@ -924,7 +932,7 @@ function registerSections(platform, store, track, card, record) {
  * @param {Readonly<object>} card 启动时加载一次的人格卡（state.card）
  * @returns {'off'|'rewrite'|'takeover'} 实际生效的模式（注册失败回落 'off'）
  */
-function registerDeploymentShadow(platform, config, track, card, record) {
+function registerDeploymentShadow(platform, config, track, card, record, store = null) {
   const mode = config.persona?.shadowDeployment ?? 'off';
   if (mode === 'off') return 'off';
   if (typeof platform.onAssemble !== 'function') {
@@ -941,6 +949,8 @@ function registerDeploymentShadow(platform, config, track, card, record) {
   const handler = createAssembleHandler({
     mode,
     personaText,
+    // SA-L1：把 store 交给遮蔽判定，线程会话（kind='thread'）因此不遮蔽。
+    store,
     warn: (message, meta) => platform.log('warn', message, meta),
     onApplied: (info) => recordShadow(record, { ...info, nowMs: platform.now() }),
   });
@@ -1225,6 +1235,9 @@ function hasRealUserInput(messages) {
     if (sourceKind === COMMAND_HINT_SOURCE_KIND) continue;
     // V7-M3：凭据提示是插件注入，不算用户真实输入。
     if (sourceKind === PRIVACY_HINT_SOURCE_KIND) continue;
+    // SA-H1：子代理结案通知与 agent 间 relay 消息由宿主以 user/message 投递，
+    // 同样不是用户真实输入（latest-user 重绑因此不会被子代理事件抢占）。
+    if (sourceKind === SUBAGENT_SETTLED_SOURCE_KIND || sourceKind === AGENT_MESSAGE_SOURCE_KIND) continue;
     // C5-H1a：插件主动投递（提醒/任务/线程）被宿主记成 user，不重绑主会话。
     if (isCompanionMessage(message)) continue;
     const blocks = Array.isArray(message.content)
@@ -3874,6 +3887,8 @@ function isInjectedMessage(message) {
   if (message === null || typeof message !== 'object') return false;
   const kind = message.source?.kind;
   return kind === RECALL_SOURCE_KIND
+    || kind === SUBAGENT_SETTLED_SOURCE_KIND
+    || kind === AGENT_MESSAGE_SOURCE_KIND
     || kind === EMOTION_SOURCE_KIND
     || kind === COMMAND_HINT_SOURCE_KIND
     || kind === PRIVACY_HINT_SOURCE_KIND
@@ -5644,20 +5659,25 @@ function textRows(messages) {
     // 召回/命令提示注入块回灌后也是 user/message，但不是用户发言（V3-H1 + V3-L3）。
     if (isInjectedMessage(message)) continue;
     const role = typeof message.role === 'string' ? message.role : 'user';
+    // SA-H1：子代理消息只透传 source.kind（不扩行结构），供 lastUserText 精确跳过。
+    const sourceKind = message.source?.kind === SUBAGENT_SETTLED_SOURCE_KIND
+      || message.source?.kind === AGENT_MESSAGE_SOURCE_KIND
+      ? message.source.kind
+      : null;
     if (Array.isArray(message.content)) {
       for (const block of message.content) {
         if (block?.type !== 'text' || typeof block.text !== 'string') continue;
         // V71-H1：IM 合并消息把信封和正文放在同一条 user 消息里，入行前先剥信封。
         const text = role === 'user' ? stripImEnvelopes(block.text).text : block.text;
         if (text.trim() === '') continue;
-        rows.push({ role, text });
+        rows.push(sourceKind === null ? { role, text } : { role, text, sourceKind });
       }
       continue;
     }
     if (message.type === 'text' && typeof message.text === 'string') {
       const text = role === 'user' ? stripImEnvelopes(message.text).text : message.text;
       if (text.trim() === '') continue;
-      rows.push({ role, text });
+      rows.push(sourceKind === null ? { role, text } : { role, text, sourceKind });
     }
   }
   return rows;
@@ -5673,6 +5693,9 @@ function lastUserText(messages) {
   for (let index = rows.length - 1; index >= 0; index -= 1) {
     const row = rows[index];
     if (row.role !== 'user') continue;
+    // SA-H1：子代理结案通知 / agent relay 消息没有前缀特征，只能按 source.kind 排除，
+    // 否则它们会变成情绪判定与召回的 query 取值。前缀回退保持不动。
+    if (row.sourceKind === SUBAGENT_SETTLED_SOURCE_KIND || row.sourceKind === AGENT_MESSAGE_SOURCE_KIND) continue;
     const text = row.text.trim();
     // C5-H1a：主动投递的提醒正文没有 source 可查，按正文前缀兜底排除，
     // 避免它被当成召回查询（lastUserText）或交互日记录的唯一输入。
@@ -6225,6 +6248,9 @@ export {
   formatChatStatus,
   governDedupeAuto,
   handleChatCommand,
+  // SA-H1（v0.7.7）：子代理消息隔离的三处判定，仅为单测可达（非公开 API）。
+  hasRealUserInput,
+  isInjectedMessage,
   isPluginNotice,
   lastUserText,
   runCommitmentFollowups,

@@ -56,6 +56,27 @@
   `decay.projectDormantDays`（`30`）、`reminderStaleDays`（`30`）、
   `reminderTodoStaleDays`（`7`），全部进配置表与启动校验（`0 < dedupeAsk < dedupeSkip < 1`）。
 
+### Added（阶段 3）
+
+- **SA-H1**：子代理消息不算用户发言。宿主以 `user/message` 投递的子代理结案通知
+  （`source.kind='subagent-settled'`，见 dsh-subagent 的 `continuation-messages.ts:29-39`）
+  与 agent 间 relay 消息（`source.kind='agent-message'`，同文件 `:14-20`）现在同时被
+  `hasRealUserInput()`、`isInjectedMessage()` 与 `lastUserText()` 排除：既不抢
+  `main_session_id` 的 latest-user 重绑，也不会被当成召回查询或情绪判定输入。
+  `lastUserText()` 走 `textRows()` 的行级 `sourceKind` 透传，原有前缀兜底
+  （`[相关记忆]` / 情绪前缀 / `[提醒] `）不变。
+- **SA-L1**：`classifySession()` 把 threads 登记查询提到子代理判定之前，线程会话
+  （`threads.session_id` 命中）即使在子代理上下文里也按 `thread:<key>` 记账，不会落到
+  `subagent` 分支；`createAssembleHandler()` 的遮蔽跳过条件由 `kind === 'subagent'`
+  扩为 `kind !== 'main'`（线程会话有自己的 preset，插件不覆盖），未传 `store` 时
+  线程判定退化为 `main`，与旧行为一致。
+
+### Tests（阶段 3）
+
+- 1514 个用例 / 61 个套件（默认、`TZ=UTC`、`TZ=America/New_York` 三遍全绿）。
+- `test/subagent-isolation.test.js`（3 例）：settled 通知与 agent relay 两条链的函数面
+  ＋真实 `apply()`/pre-step 行为面（不注入召回、不重绑 main）、线程归属与遮蔽跳过。
+  **非真机证据**：消息形状按宿主源码构造，未在真机子代理会话回放。
 ### Fixed（阶段 2）
 
 - **L120-H2 提醒有截止时间却不触发**：巩固抽出的提醒只有 `due_at`、没有 `next_fire_at`

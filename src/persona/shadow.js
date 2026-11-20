@@ -132,13 +132,14 @@ export function applyDeploymentShadow(sections, options = {}) {
  *
  * @param {{mode: 'off'|'rewrite'|'takeover', personaText?: string,
  *          warn?: (message: string, meta?: object) => void,
- *          onApplied?: (info: {mode: string, rewritten: boolean}) => void}} options
+ *          onApplied?: (info: {mode: string, rewritten: boolean}) => void,
+ *          store?: object|null}} options
  *   `onApplied` 只在**真的改动了**装配结果时调用（V50-L3 的 `/状态` 装配记录用）：
  *   它不参与装配决策，抛错也吞掉，避免排障信息反过来打断对话。
  * @returns {(assembly: object, context: object, next: Function) => Promise<object>}
  */
 export function createAssembleHandler(options = {}) {
-  const { mode, personaText = '', warn = () => {}, onApplied = null } = options;
+  const { mode, personaText = '', warn = () => {}, onApplied = null, store = null } = options;
   const warned = new Set();
   /** 去重后的告警：同一原因在进程生命周期内最多一条。 */
   const warnOnce = (message, meta = {}) => {
@@ -161,8 +162,9 @@ export function createAssembleHandler(options = {}) {
       if (agent === null || agent === undefined) return resolved;
       // 只有 agent scope 才遮蔽；宿主实测 scope 就是 agent 实例本身。
       if (context.scope !== agent) return resolved;
-      // 子代理不遮蔽：沿用 /状态 与会话路由同一套判定。
-      if (classifySession(agent).kind === 'subagent') return resolved;
+      // 子代理与线程会话都不遮蔽：沿用 /状态 与会话路由同一套判定（SA-L1：线程会话
+      // 有自己的 preset，插件不覆盖）。没有传 store 时线程判定退化为 main，与旧行为一致。
+      if (classifySession(agent, { store }).kind !== 'main') return resolved;
       const sections = resolved?.sections;
       if (!Array.isArray(sections)) return resolved;
       const transformed = applyDeploymentShadow(sections, { mode, personaText, warn: warnOnce });
