@@ -44,6 +44,7 @@ const THREADS_UNSUPPORTED = '线程：宿主不支持（无 sessionController，
 const PRIVACY_KIND = 'companion-privacy-hint';
 
 const ALL_TOOL_NAMES = [
+  'bg_run',
   'cost_report',
   'memory_forget',
   'memory_search',
@@ -168,8 +169,8 @@ test('v0.4.9 集成：宿主晚挂载 sessionController 前后，线程工具与
     temp.cleanup();
   });
 
-  // apply 时没有 sessionController：仍然注册全部 10 个工具。
-  assert.equal(ctx.tools.registrations.length, 10);
+  // apply 时没有 sessionController：仍然注册全部 11 个工具。
+  assert.equal(ctx.tools.registrations.length, 11);
   assert.deepEqual(ctx.tools.registrations.map((entry) => entry.name).sort(), ALL_TOOL_NAMES);
 
   // 调用时判能力：三个线程/任务工具返回稳定错误对象。

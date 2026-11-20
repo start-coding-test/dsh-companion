@@ -36,6 +36,7 @@ const THREADS_UNSUPPORTED = '线程：宿主不支持（无 sessionController，
 const THREAD_TOOL_NAMES = ['thread_list', 'thread_run', 'task_run'];
 
 const ALL_TOOL_NAMES = [
+  'bg_run',
   'cost_report',
   'memory_forget',
   'memory_search',
@@ -88,12 +89,12 @@ function commandText(ctx, name) {
   return definition.handler({ rawInput: '' }).text;
 }
 
-test('V7-H1：apply 时无 sessionController 也注册全部 10 个工具', (t) => {
+test('V7-H1：apply 时无 sessionController 也注册全部 11 个工具', (t) => {
   const ctx = makeCtx();
   const handle = apply(ctx, { dbPath: ':memory:' });
   t.after(() => handle.dispose());
 
-  assert.equal(ctx.tools.registrations.length, 10);
+  assert.equal(ctx.tools.registrations.length, 11);
   assert.deepEqual(
     ctx.tools.registrations.map((entry) => entry.name).sort(),
     ALL_TOOL_NAMES,

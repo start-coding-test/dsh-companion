@@ -78,10 +78,12 @@ function makeJobs() {
   return { jobs, calls };
 }
 
-test('内置 6 个 job：id、节奏与每日本地时刻符合 06 §9', () => {
+test('内置 7 个 job：id、节奏与每日本地时刻符合 06 §9（bg-jobs 见 W-2）', () => {
   assert.deepEqual(JOB_IDS, [
     'idle-probe',
     'reminders',
+    // W-2（v0.7.7 阶段 6）：后台长任务监视 tick，与 reminders 同为 30s。
+    'bg-jobs',
     'deep-sleep',
     's2-purge',
     'backup',
@@ -91,6 +93,7 @@ test('内置 6 个 job：id、节奏与每日本地时刻符合 06 §9', () => {
   assert.equal(byId.get('idle-probe').kind, 'interval');
   assert.equal(byId.get('idle-probe').intervalMs, 60_000);
   assert.equal(byId.get('reminders').intervalMs, 30_000);
+  assert.equal(byId.get('bg-jobs').intervalMs, 30_000);
   assert.deepEqual(
     ['deep-sleep', 's2-purge', 'backup', 'thread-freeze'].map((id) => byId.get(id).at),
     ['03:00', '03:30', '04:00', '03:00'],
@@ -110,15 +113,15 @@ test('间隔任务按 60s / 30s 触发，手动时钟可复现', (t) => {
   // 10:00:30：间隔任务刚建立基线，每日任务均已超出补扫窗口（>6h）→ 无触发
   assert.deepEqual(scheduler.runDue(now).ran, []);
 
-  now = local(15, 10, 1); // 10:01:00，reminders 满 30s
-  assert.deepEqual(scheduler.runDue(now).ran, ['reminders']);
+  now = local(15, 10, 1); // 10:01:00，reminders / bg-jobs 满 30s
+  assert.deepEqual(scheduler.runDue(now).ran.sort(), ['bg-jobs', 'reminders']);
 
-  now = local(15, 10, 2); // 10:02:00，reminders 再满 30s、idle-probe 满 60s
-  assert.deepEqual(scheduler.runDue(now).ran.sort(), ['idle-probe', 'reminders']);
+  now = local(15, 10, 2); // 10:02:00，两个 30s 任务再满 30s、idle-probe 满 60s
+  assert.deepEqual(scheduler.runDue(now).ran.sort(), ['bg-jobs', 'idle-probe', 'reminders']);
 
   assert.deepEqual(
     calls.map((call) => call.id),
-    ['reminders', 'idle-probe', 'reminders'],
+    ['reminders', 'bg-jobs', 'idle-probe', 'reminders', 'bg-jobs'],
   );
 });
 

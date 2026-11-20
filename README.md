@@ -127,8 +127,18 @@ persona:
 | `reminderStaleDays` / `reminderTodoStaleDays` | `30` / `7` | 无到期时间的承诺 / 待办多久没更新就置 expired（只改状态不删） |
 | `subagent.model` | `""` | `task_run` / `thread_run` 交给子代理时使用的模型；空表示沿用主会话路由（仅允许 profile 白名单内的两项） |
 | `subagent.concurrency` | `2` | 同时运行的子代理任务上限，超出排队 |
+| `bg.workRoot` | `""` | 后台长任务的工作根；留空则 `bg_run` 直接返回不可用（建议 `/opt/dsh-companion/.data/work/`） |
+| `bg.interpreters` | `[python3, bash, node]` | `bg_run` 允许的解释器白名单（只比 `argv[0]`，不看脚本内容） |
+| `bg.runAs` | `""` | 后台任务的运行身份；空 = 与 50041 相同（即 root），可配为专用用户 |
+| `bg.maxDeadlineMin` | `360` | 后台任务时长上限（分钟），超时由 `RuntimeMaxSec` 主杀、插件兜底 TERM→KILL |
+| `bg.memoryMax` / `bg.cpuQuota` | `4G` / `200%` | 后台任务的 cgroup 资源上限（2 核） |
+| `bg.minFreeDiskMB` | `1024` | workRoot 剩余空间低于它就拒绝启动 |
+| `bg.wakeBudgetPerAgent` | `3` | 每个发起子代理最多被唤醒几次，超预算直接投主会话 |
+| `bgConcurrency` | `1` | 同时运行的后台任务上限；训练这类占资源的任务默认不并行 |
 
 token 四档须满足 `retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`。未知配置键只记警告，不阻断启动。
+
+**后台长任务的安全边界**：50041 以 root 运行（珞然作为管家需要 root），`bg_run` 不改变这一点；安全边界靠工作目录（`bg.workRoot` 内、realpath 校验）、解释器白名单、时长与资源上限和审计记录（`bg_jobs` 表 + `memory_events`）。`bg_run` 不审脚本内容（脚本由珞然自建，如训练脚本），只限制工作目录、解释器、时长与资源；`bg.workRoot` 未配置时工具返回不可用。预计 10 分钟内结束的事不用 `bg_run`，用 `task_run` / `thread_run`。
 
 部署时请在 profile 显式配置 `defaultContextWindow`（0.2.2 起未写容量的模型默认 1,000,000），
 否则压缩阈值会按错误的窗口算：插件用它换算「还剩多少上下文」，不填等于把上限放大到 1M tokens。

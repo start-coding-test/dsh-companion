@@ -321,6 +321,44 @@ Object.defineProperty(DEFAULT_VALUES, 'subagent', {
   configurable: false,
 });
 
+// v0.7.7 W-1..W-5（阶段 6）：后台长任务（bg_run）。
+// 口径来自用户《修订一》/《修订二》原文：
+// - workRoot：脚本与工作目录根；空 = bg_run 工具不可用（不猜路径）；
+// - interpreters：argv[0] 白名单（python3/bash/node），不做 shell 拼接；
+// - runAs：进程运行身份，**默认空 = 与 50041 相同（root）**；非空时 Linux 侧
+//   systemd-run 加 --uid=<runAs>（《修订二》W-1c 原文保留该控制项）；
+// - maxDeadlineMin：deadline 上限（分钟，默认 360）；
+// - memoryMax / cpuQuota：systemd-run 的 MemoryMax / CPUQuota 取值（用户裁决 4G / 200%）；
+// - minFreeDiskMB：workRoot 剩余空间下限（默认 1024）；
+// - wakeBudgetPerAgent：每个发起子代理的唤醒预算（默认 3，超预算只投主会话）。
+const BG_DEFAULTS = Object.freeze({
+  workRoot: '',
+  interpreters: Object.freeze(['python3', 'bash', 'node']),
+  runAs: '',
+  maxDeadlineMin: 360,
+  memoryMax: '4G',
+  cpuQuota: '200%',
+  minFreeDiskMB: 1_024,
+  wakeBudgetPerAgent: 3,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'bg', {
+  value: BG_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
+// W-5：同一时刻允许运行的后台任务数（训练脚本占资源，默认 1，不并行）。
+const DEFAULT_BG_CONCURRENCY = 1;
+
+Object.defineProperty(DEFAULT_VALUES, 'bgConcurrency', {
+  value: DEFAULT_BG_CONCURRENCY,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 // v0.7.7 C120-M1：低于该 token 数的巩固区间不登记 pending_compact。
 // 小片段压缩收益低于一次surface replace 的成本，而且更容易踩到宿主「压后不更小」
 // 的确定性失败；保留默认 4096（与 retainTokens 的尾部预算同量级）。
@@ -1125,6 +1163,97 @@ export function normalizeSubagent(raw, warnings = []) {
 }
 
 /**
+ * 合并后台长任务节（bg）并校验；未知子字段 warn，越界抛 ConfigError。
+ *
+ * 语义见 DEFAULT_VALUES.bg 的注释：workRoot 空表示工具不可用；runAs 空表示
+ * 与主进程同身份（root）；interpreters 是 argv[0] 白名单，必须非空且元素非空串。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{workRoot: string, interpreters: ReadonlyArray<string>, runAs: string,
+ *   maxDeadlineMin: number, memoryMax: string, cpuQuota: string,
+ *   minFreeDiskMB: number, wakeBudgetPerAgent: number}>}
+ */
+export function normalizeBg(raw, warnings = []) {
+  const defaults = DEFAULTS.bg;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('bg', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set([
+    'workRoot',
+    'interpreters',
+    'runAs',
+    'maxDeadlineMin',
+    'memoryMax',
+    'cpuQuota',
+    'minFreeDiskMB',
+    'wakeBudgetPerAgent',
+  ]);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "bg.${key}" ignored`);
+  }
+
+  const workRoot = raw.workRoot === undefined ? defaults.workRoot : raw.workRoot;
+  if (typeof workRoot !== 'string') {
+    throw new ConfigError('bg.workRoot', `must be a string, got ${typeof workRoot}`);
+  }
+
+  const interpreters = raw.interpreters === undefined ? defaults.interpreters : raw.interpreters;
+  if (!Array.isArray(interpreters) || interpreters.length === 0) {
+    throw new ConfigError('bg.interpreters', 'must be a non-empty array of program names');
+  }
+  for (const entry of interpreters) {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      throw new ConfigError('bg.interpreters', `entries must be non-empty strings, got ${JSON.stringify(entry)}`);
+    }
+  }
+
+  const runAs = raw.runAs === undefined ? defaults.runAs : raw.runAs;
+  if (typeof runAs !== 'string') {
+    throw new ConfigError('bg.runAs', `must be a string, got ${typeof runAs}`);
+  }
+
+  const maxDeadlineMin = raw.maxDeadlineMin === undefined ? defaults.maxDeadlineMin : raw.maxDeadlineMin;
+  if (!Number.isInteger(maxDeadlineMin) || maxDeadlineMin < 1 || maxDeadlineMin > 10_080) {
+    throw new ConfigError('bg.maxDeadlineMin', `must be an integer within 1..10080, got ${JSON.stringify(maxDeadlineMin)}`);
+  }
+
+  const memoryMax = raw.memoryMax === undefined ? defaults.memoryMax : raw.memoryMax;
+  if (typeof memoryMax !== 'string' || memoryMax.trim() === '') {
+    throw new ConfigError('bg.memoryMax', 'must be a non-empty systemd size string (e.g. 4G)');
+  }
+
+  const cpuQuota = raw.cpuQuota === undefined ? defaults.cpuQuota : raw.cpuQuota;
+  if (typeof cpuQuota !== 'string' || cpuQuota.trim() === '') {
+    throw new ConfigError('bg.cpuQuota', 'must be a non-empty systemd CPUQuota string (e.g. 200%)');
+  }
+
+  const minFreeDiskMB = raw.minFreeDiskMB === undefined ? defaults.minFreeDiskMB : raw.minFreeDiskMB;
+  if (!Number.isInteger(minFreeDiskMB) || minFreeDiskMB < 0 || minFreeDiskMB > 10_000_000) {
+    throw new ConfigError('bg.minFreeDiskMB', `must be an integer within 0..10000000, got ${JSON.stringify(minFreeDiskMB)}`);
+  }
+
+  const wakeBudgetPerAgent = raw.wakeBudgetPerAgent === undefined
+    ? defaults.wakeBudgetPerAgent
+    : raw.wakeBudgetPerAgent;
+  if (!Number.isInteger(wakeBudgetPerAgent) || wakeBudgetPerAgent < 0 || wakeBudgetPerAgent > 100) {
+    throw new ConfigError('bg.wakeBudgetPerAgent', `must be an integer within 0..100, got ${JSON.stringify(wakeBudgetPerAgent)}`);
+  }
+
+  return Object.freeze({
+    workRoot: workRoot.trim(),
+    interpreters: Object.freeze(interpreters.map((entry) => entry.trim())),
+    runAs: runAs.trim(),
+    maxDeadlineMin,
+    memoryMax: memoryMax.trim(),
+    cpuQuota: cpuQuota.trim(),
+    minFreeDiskMB,
+    wakeBudgetPerAgent,
+  });
+}
+
+/**
  * 合并任务 token 预算节并校验；未知子字段 warn，越界抛 ConfigError。
  *
  * 语义：tokenWarn 是「投递一次收尾提示」的软线，tokenStop 是「结束等待」的硬线，
@@ -1275,6 +1404,13 @@ export function normalizeConfig(raw = {}) {
   cfg.govern = normalizeGovern(input.govern, warnings);
   cfg.decay = normalizeDecay(input.decay, warnings);
   cfg.subagent = normalizeSubagent(input.subagent, warnings);
+  cfg.bg = normalizeBg(input.bg, warnings);
+
+  // W-5：非枚举标量，与 bg 节同批；默认 1 = 训练脚本不并行。
+  cfg.bgConcurrency = input.bgConcurrency === undefined
+    ? DEFAULTS.bgConcurrency
+    : input.bgConcurrency;
+  requireInteger(cfg, 'bgConcurrency', 1, 16);
 
   return Object.freeze({ ...cfg, warnings });
 }

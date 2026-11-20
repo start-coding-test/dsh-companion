@@ -33,6 +33,9 @@ import {
 export const JOB_SPECS = Object.freeze([
   Object.freeze({ id: 'idle-probe', kind: 'interval', intervalMs: 60_000 }),
   Object.freeze({ id: 'reminders', kind: 'interval', intervalMs: 30_000 }),
+  // W-2（v0.7.7 阶段 6）：后台长任务的监视 tick。与 reminders 同 30s 节奏：
+  // 查退出文件与 unit/pid 状态，超 deadline 兜底 TERM→KILL，退出后原子迁移唤醒。
+  Object.freeze({ id: 'bg-jobs', kind: 'interval', intervalMs: 30_000 }),
   Object.freeze({ id: 'deep-sleep', kind: 'daily', at: '03:00', atMinutes: 3 * 60 }),
   Object.freeze({ id: 's2-purge', kind: 'daily', at: '03:30', atMinutes: 3 * 60 + 30 }),
   Object.freeze({ id: 'backup', kind: 'daily', at: '04:00', atMinutes: 4 * 60 }),

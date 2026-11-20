@@ -685,6 +685,55 @@ function normalizeIdList(value) {
 }
 
 /**
+ * W-1e（v0.7.7 阶段 6）：可选文本列归一——undefined/null/空白 → null。
+ * @param {unknown} value
+ * @returns {string|null}
+ */
+function optionalText(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') {
+    throw new TypeError('[store] expected a string or null');
+  }
+  return value === '' ? null : value;
+}
+
+/**
+ * W-1e：bg_jobs 行 → 对外的对象形状（argv 解成数组、notice_sent 布尔化）。
+ * @param {object} row
+ * @returns {object}
+ */
+function hydrateBgJob(row) {
+  let argv = [];
+  try {
+    const parsed = JSON.parse(String(row.argv_json ?? '[]'));
+    if (Array.isArray(parsed)) argv = parsed;
+  } catch {
+    // argv_json 损坏时退回空数组：监视器只看退出码与状态，不因历史坏行崩。
+    argv = [];
+  }
+  return {
+    id: row.id,
+    label: row.label,
+    argv,
+    cwd: row.cwd,
+    script_sha256: row.script_sha256,
+    child_agent_name: row.child_agent_name,
+    child_session_id: row.child_session_id,
+    root_session_id: row.root_session_id,
+    pid_or_unit: row.pid_or_unit,
+    started_at: row.started_at,
+    deadline: row.deadline,
+    state: row.state,
+    log_path: row.log_path,
+    exit_code: row.exit_code,
+    finished_at: row.finished_at,
+    wake_count: Number(row.wake_count ?? 0),
+    notice_sent: Number(row.notice_sent ?? 0) === 1,
+    launched_by: row.launched_by,
+  };
+}
+
+/**
  * 数组/JSON 字符串统一成 JSON 数组文本。
  * @param {unknown} value
  * @returns {string}
@@ -1305,6 +1354,9 @@ export class Store {
       // SA-B2（阶段 4）：threads.child_session_id（续派锚）。同 L120-M4 口径，
       // 旧库就地补列、不提升 schema_version。
       this.#ensureThreadChildSessionColumn();
+      // W-1e（阶段 6）：后台长任务表 bg_jobs。与上面两处同口径：每次 open 幂等
+      // 建表/补索引，不动 user_version（state 用自由 TEXT，不引入 CHECK 枚举）。
+      this.#ensureBgJobsTable();
       this.#db.exec(`
         CREATE INDEX IF NOT EXISTS ix_fact_vectors_embedder ON fact_vectors(embedder_id);
         CREATE INDEX IF NOT EXISTS ix_facts_reneed ON facts(scope, first_reneed_at);
@@ -1962,9 +2014,197 @@ export class Store {
     return true;
   }
 
+  /**
+   * W-1e（v0.7.7 阶段 6）：后台长任务表 `bg_jobs`。
+   *
+   * **不提升 schema_version**：与 `#ensureEpisodeDomainColumn` /
+   * `#ensureThreadChildSessionColumn` 同范式，挂在 migrate() 的「每次 open 都跑」
+   * 通用幂等段。`state` 刻意用自由 TEXT（不写 CHECK 枚举）：阶段 1 曾因
+   * consolidations.status 的 CHECK 枚举被迫整表重建并把 schema 升到 16，
+   * 这里按计划要求避开枚举（新增状态值不再需要迁移）。
+   * @returns {boolean} 是否真的建了表
+   */
+  #ensureBgJobsTable() {
+    const before = this.#db
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'bg_jobs'")
+      .get();
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS bg_jobs (
+        id TEXT PRIMARY KEY,
+        label TEXT,
+        argv_json TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        script_sha256 TEXT,
+        child_agent_name TEXT,
+        child_session_id TEXT NOT NULL,
+        root_session_id TEXT,
+        pid_or_unit TEXT,
+        started_at INTEGER NOT NULL,
+        deadline INTEGER NOT NULL,
+        state TEXT NOT NULL,
+        log_path TEXT NOT NULL,
+        exit_code INTEGER,
+        finished_at INTEGER,
+        wake_count INTEGER NOT NULL DEFAULT 0,
+        notice_sent INTEGER NOT NULL DEFAULT 0,
+        launched_by TEXT
+      )
+    `);
+    this.#db.exec('CREATE INDEX IF NOT EXISTS ix_bg_jobs_state ON bg_jobs(state, started_at)');
+    this.#db.exec('CREATE INDEX IF NOT EXISTS ix_bg_jobs_child ON bg_jobs(child_session_id)');
+    return before === undefined;
+  }
+
+  /**
+   * W-1f：登记一条后台任务，返回行 id。state 初始为 `running`（由调用方决定是否
+   * 先用 `queued`，W-5 满额时根本不会落库）。
+   * @param {object} input
+   * @returns {object}
+   */
+  insertBgJob(input = {}) {
+    const id = requireString(input.id, 'bg_jobs.id');
+    const state = requireString(input.state ?? 'running', 'bg_jobs.state');
+    this.#db
+      .prepare(
+        `INSERT INTO bg_jobs (id, label, argv_json, cwd, script_sha256, child_agent_name,
+           child_session_id, root_session_id, pid_or_unit, started_at, deadline, state,
+           log_path, exit_code, finished_at, wake_count, notice_sent, launched_by)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        id,
+        optionalText(input.label),
+        JSON.stringify(Array.isArray(input.argv) ? input.argv : []),
+        requireString(input.cwd, 'bg_jobs.cwd'),
+        optionalText(input.script_sha256),
+        optionalText(input.child_agent_name),
+        requireString(input.child_session_id, 'bg_jobs.child_session_id'),
+        optionalText(input.root_session_id),
+        optionalText(input.pid_or_unit),
+        epochOr(input.started_at, nowSeconds()),
+        epochOr(input.deadline, nowSeconds()),
+        state,
+        requireString(input.log_path, 'bg_jobs.log_path'),
+        Number.isInteger(input.exit_code) ? input.exit_code : null,
+        Number.isInteger(input.finished_at) ? input.finished_at : null,
+        Number.isInteger(input.wake_count) ? input.wake_count : 0,
+        input.notice_sent === true ? 1 : 0,
+        optionalText(input.launched_by),
+      );
+    return this.getBgJob(id);
+  }
+
+  /** @param {string} id @returns {object|null} */
+  getBgJob(id) {
+    const key = requireString(id, 'bg_jobs.id');
+    const row = this.#db.prepare('SELECT * FROM bg_jobs WHERE id = ?').get(key);
+    return row === undefined ? null : hydrateBgJob(row);
+  }
+
+  /**
+   * W-2/W-4：按状态列任务。`state` 可传单值或数组。
+   * @param {{state?: string|string[], limit?: number}} [options]
+   * @returns {object[]}
+   */
+  listBgJobs(options = {}) {
+    const where = [];
+    const args = [];
+    if (options.state !== undefined) {
+      const states = Array.isArray(options.state) ? options.state : [options.state];
+      if (states.length === 0) return [];
+      where.push(`state IN (${states.map(() => '?').join(',')})`);
+      for (const state of states) args.push(state);
+    }
+    const limit = Number.isInteger(options.limit) && options.limit > 0
+      ? Math.min(options.limit, 500)
+      : 100;
+    const clause = where.length === 0 ? '' : ` WHERE ${where.join(' AND ')}`;
+    const rows = this.#db
+      .prepare(`SELECT * FROM bg_jobs${clause} ORDER BY started_at ASC, id ASC LIMIT ?`)
+      .all(...args, limit);
+    return rows.map(hydrateBgJob);
+  }
+
+  /**
+   * W-2：更新状态与结果字段（只更新显式给出的列）。
+   * @param {string} id
+   * @param {{state?: string, exit_code?: number|null, finished_at?: number|null,
+   *   pid_or_unit?: string|null, wake_count?: number, notice_sent?: boolean}} patch
+   * @returns {object|null}
+   */
+  updateBgJob(id, patch = {}) {
+    const key = requireString(id, 'bg_jobs.id');
+    if (patch === null || typeof patch !== 'object' || Array.isArray(patch)) {
+      throw new TypeError('[store] updateBgJob(id, patch) requires a plain object');
+    }
+    const sets = [];
+    const args = [];
+    if (patch.state !== undefined) {
+      sets.push('state = ?');
+      args.push(requireString(patch.state, 'bg_jobs.state'));
+    }
+    if (patch.exit_code !== undefined) {
+      sets.push('exit_code = ?');
+      args.push(Number.isInteger(patch.exit_code) ? patch.exit_code : null);
+    }
+    if (patch.finished_at !== undefined) {
+      sets.push('finished_at = ?');
+      args.push(Number.isInteger(patch.finished_at) ? patch.finished_at : null);
+    }
+    if (patch.pid_or_unit !== undefined) {
+      sets.push('pid_or_unit = ?');
+      args.push(optionalText(patch.pid_or_unit));
+    }
+    if (patch.wake_count !== undefined) {
+      sets.push('wake_count = ?');
+      args.push(Number.isInteger(patch.wake_count) ? patch.wake_count : 0);
+    }
+    if (patch.notice_sent !== undefined) {
+      sets.push('notice_sent = ?');
+      args.push(patch.notice_sent === true ? 1 : 0);
+    }
+    if (sets.length === 0) return this.getBgJob(key);
+    args.push(key);
+    this.#db.prepare(`UPDATE bg_jobs SET ${sets.join(', ')} WHERE id = ?`).run(...args);
+    return this.getBgJob(key);
+  }
+
+  /**
+   * W-3：**原子迁移只唤醒一次**。`UPDATE … WHERE id = ? AND state = 'running'`，
+   * 只有影响行数为 1 时调用方才能继续唤醒（并发/重启双跑的兜底）。
+   * @param {string} id
+   * @param {string} next 目标状态（如 `woken` / `timeout`）
+   * @param {{exit_code?: number|null, finished_at?: number|null}} [extra]
+   * @returns {boolean} 是否由本次调用抢到迁移
+   */
+  claimBgJobState(id, next, extra = {}) {
+    const key = requireString(id, 'bg_jobs.id');
+    const target = requireString(next, 'bg_jobs.state');
+    const finishedAt = Number.isInteger(extra.finished_at) ? extra.finished_at : nowSeconds();
+    const info = this.#db
+      .prepare(
+        `UPDATE bg_jobs SET state = ?, exit_code = ?, finished_at = ?
+         WHERE id = ? AND state = 'running'`,
+      )
+      .run(
+        target,
+        Number.isInteger(extra.exit_code) ? extra.exit_code : null,
+        finishedAt,
+        key,
+      );
+    return Number(info.changes) === 1;
+  }
+
+  /** W-5：当前 running 的任务数（并发闸门）。@returns {number} */
+  countRunningBgJobs() {
+    const row = this.#db.prepare("SELECT COUNT(*) AS n FROM bg_jobs WHERE state = 'running'").get();
+    return Number(row?.n ?? 0);
+  }
+
   close() {
     this.#db.close();
   }
+
 
   /**
    * 同步事务：BEGIN IMMEDIATE → fn() → COMMIT；fn 抛错（或返回 Promise）时

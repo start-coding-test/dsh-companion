@@ -18,6 +18,7 @@ const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks)
 
 const EXPECTED_COMMANDS = ['chat-off', 'chat-on', 'cost', 'memory', 'status', 'threads'];
 const EXPECTED_TOOLS = [
+  'bg_run',
   'cost_report',
   'memory_forget',
   'memory_search',

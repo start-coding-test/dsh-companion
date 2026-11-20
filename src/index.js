@@ -45,6 +45,8 @@ import {
   planAutoDedupe,
 } from './memory/govern-auto.js';
 import { buildWeeklyMemoryReport } from './memory/weekly-report.js';
+// W-2/W-4（v0.7.7 阶段 6）：后台长任务的监视、重启恢复与唤醒文案。
+import { BG_JOB_STATES, monitorBgJobs } from './task/bg-jobs.js';
 import { backoffAfter429 } from './runtime/quota.js';
 import { deferBackground, isQuotaError, readQuotaFile } from './runtime/quota-gate.js';
 import {
@@ -595,6 +597,10 @@ export function apply(ctx, rawConfig, hooks = {}) {
       (info) => deliverTaskReceipt(state, info),
       // SA-B1/D3（v0.7.7 阶段 4）：子代理模型（默认空 = 沿用主会话路由）。
       config.subagent?.model ?? '',
+      // W-1..W-5（v0.7.7 阶段 6）：后台长任务配置（浅拷贝，`bg.workRoot` 决定工具是否可用）。
+      config,
+      // A2：唤醒失败时的兜底投递目标。
+      () => currentMainSessionId(state),
     );
     track(startScheduler(state));
   } catch (error) {
@@ -1182,7 +1188,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
  * @param {(info: object) => object} [taskReceipt] SA-B3：回执投递入口
  * @param {string} [subagentModel] SA-B1/D3：子代理模型（空 = 沿用主会话路由）
  */
-function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg, recordTokenUsage, taskReceipt, subagentModel) {
+function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg, recordTokenUsage, taskReceipt, subagentModel, bgConfig, mainSessionId) {
   // V7-H1 审计：tools 是声明的 inject，apply 前就绪；工具注册只能在 apply
   // 阶段完成，故保留 apply 时判断。线程能力见下方 execute 内的调用时判断。
   if (!platform.capabilities.tools) return;
@@ -1207,6 +1213,9 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     ...(typeof taskReceipt === 'function' ? { taskReceipt } : {}),
     // SA-B1/D3（阶段 4）：子代理模型；空串由 tools 层归一成「不传 agentOptions」。
     ...(typeof subagentModel === 'string' ? { subagentModel } : {}),
+    // W-1/W-5（阶段 6）：后台长任务配置与主会话兜底目标。
+    ...(bgConfig !== null && typeof bgConfig === 'object' ? { bgConfig } : {}),
+    ...(typeof mainSessionId === 'function' ? { mainSessionId } : {}),
     vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
@@ -1218,13 +1227,16 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
         schema: { type: 'object', additionalProperties: true },
         render: (_args, value) => [{ type: 'text', text: renderToolValue(value) }],
       },
-      execute: (args) => {
+      execute: (args, exec) => {
         // V7-H1：线程/任务工具一律注册，执行时再判能力（宿主可能晚于 apply
         // 挂载 sessionController）；缺失时返回稳定错误对象，不抛未捕获异常。
         if (THREAD_TOOL_NAMES.has(tool.name) && platform.capabilities.threadTools !== true) {
           return threadCapabilityMissing();
         }
-        return tool.execute(args ?? {});
+        // SA-B1/W-1（阶段 4/6）：宿主以 `execute(args, exec)` 调用，`exec.agent`
+        // 是存活父代理（宿主 UNAUTHORIZED 守卫要求精确对象，见
+        // dsh-subagent/src/index.ts:275-277）与 bg_run 的唤醒目标来源，必须透传。
+        return tool.execute(args ?? {}, exec ?? {});
       },
     }));
   }
@@ -4932,6 +4944,11 @@ function startScheduler(state) {
     'deep-sleep': async () => {
       await runDeepSleep(state);
     },
+    // W-2（v0.7.7 阶段 6）：后台长任务监视。降级/熔断期间照常跑——它只是收尸与唤醒，
+    // 不做对外推送；真正的投递走下面自己的 flush。
+    'bg-jobs': async () => {
+      await runBgJobMonitor(state);
+    },
     's2-purge': () => {
       const result = store.purge({ now: platform.now(), cutoffDays: config.purgeAfterDays });
       platform.log('info', '[dsh-companion] s2-purge done', result);
@@ -4956,6 +4973,9 @@ function startScheduler(state) {
   });
   state.scheduler = scheduler;
   scheduler.start(platform.now());
+  // W-4（阶段 6）：启动即补投一轮——上次进程退出时可能已有任务跑完但没来得及唤醒。
+  // 不 await：恢复不应阻塞插件装载；失败只 warn（见 recoverBgJobsOnStart）。
+  void recoverBgJobsOnStart(state);
   platform.log('info', '[dsh-companion] scheduler started', { jobs: JOB_IDS.length, metrics: metrics.snapshot() });
   return () => scheduler.stop();
 }
@@ -5177,6 +5197,112 @@ function deliverTaskReceipt(state, info) {
     // flush 失败保留 backlog，等待下一次 tick 重试（proactive 自带退避）。
   }
   return { queued };
+}
+
+/**
+ * W-3（v0.7.7 阶段 6）：后台任务结束时把结果交回。
+ *
+ * 优先**冷恢复原子代理**：目标 = `bg_jobs.child_session_id`（发起 bg_run 的子代理
+ * 会话 id，即宿主 `childId` / `senderSessionId` 同空间的那个 id，见
+ * `dsh-subagent/src/index.ts:368-375` 的 sendMessage 与 `store.getThreadBySessionId`
+ * 的双列反查注释）。sender 必须是存活的根 Agent（宿主 UNAUTHORIZED 守卫要求精确
+ * 对象，见 `dsh-subagent/src/index.ts:275-277`），定时器里没有 `exec.agent`，所以
+ * 经 `agents` 服务按主会话 id 取。
+ *
+ * A2 兜底：sender 取不到 / sendMessage 抛错 / 唤醒预算耗尽 → `woken-fallback`，
+ * 直接按 SA-B3 通道投主会话卡片，不再唤醒。
+ *
+ * @param {object} state
+ * @param {object} info monitorBgJobs 给的唤醒信息
+ * @returns {Promise<{delivered: boolean, channel: string}>}
+ */
+async function wakeBgJob(state, info) {
+  const job = info?.job ?? {};
+  const { platform } = state;
+  if (info?.allowWake === true && typeof platform?.sendToSubagent === 'function') {
+    const mainSession = currentMainSessionId(state);
+    const sender = typeof platform.agentBySessionId === 'function' && typeof mainSession === 'string'
+      ? platform.agentBySessionId(mainSession)
+      : null;
+    const target = typeof job.child_session_id === 'string' ? job.child_session_id : '';
+    if (sender !== null && sender !== undefined && target !== '') {
+      try {
+        await platform.sendToSubagent(sender, target, [{ type: 'text', text: info.message }], {});
+        return { delivered: true, channel: 'subagent' };
+      } catch (error) {
+        platform.log('warn', '[dsh-companion] bg job wake failed; falling back to main session', {
+          jobId: job.id,
+          target,
+          message: errorMessage(error),
+        });
+      }
+    }
+  }
+  return deliverBgFallback(state, job, info?.message, info?.allowWake === true ? 'wake-failed' : 'wake-budget-exhausted');
+}
+
+/**
+ * A2（阶段 6）：唤醒失败/预算耗尽的兜底——沿 SA-B3 通道直接投主会话卡片。
+ * 状态落 `woken-fallback`，便于 /状态 区分「唤醒过」与「直接通知」。
+ * @param {object} state
+ * @param {object} job
+ * @param {string} message
+ * @param {string} reason
+ * @returns {{delivered: boolean, channel: string}}
+ */
+function deliverBgFallback(state, job, message, reason) {
+  const text = typeof message === 'string' ? message : '';
+  if (text !== '') {
+    deliverTaskReceipt(state, {
+      taskId: typeof job?.id === 'string' ? job.id : '',
+      status: 'ok',
+      receipt: text,
+      title: typeof job?.label === 'string' ? job.label : null,
+      sessionId: typeof job?.child_session_id === 'string' ? job.child_session_id : null,
+      reason,
+    });
+  }
+  try {
+    state.store.updateBgJob(job?.id, { state: BG_JOB_STATES.wokenFallback });
+  } catch {
+    // 状态改装失败不影响已投递的卡片。
+  }
+  return { delivered: text !== '', channel: 'main' };
+}
+
+/**
+ * W-2（阶段 6）：扫描一轮后台任务（每 30s 由调度器调用）。
+ * @param {object} state
+ * @param {{recovering?: boolean}} [options]
+ * @returns {Promise<object>} 汇总
+ */
+async function runBgJobMonitor(state, options = {}) {
+  const summary = await monitorBgJobs({
+    store: state.store,
+    config: state.config,
+    wake: (info) => wakeBgJob(state, info),
+    recovering: options.recovering === true,
+    nowMs: state.platform.now(),
+  });
+  if (summary.woken + summary.timedOut + summary.lost > 0) {
+    state.platform.log('info', '[dsh-companion] bg jobs settled', summary);
+  }
+  return summary;
+}
+
+/**
+ * W-4（阶段 6）：插件启动时补投——扫 `running` 三分支（存活继续 / 已退补投 /
+ * 无退出文件记 lost 并唤醒）由 monitorBgJobs 一次性判定。
+ * @param {object} state
+ * @returns {Promise<object|null>}
+ */
+async function recoverBgJobsOnStart(state) {
+  try {
+    return await runBgJobMonitor(state, { recovering: true });
+  } catch (error) {
+    state.platform.log('warn', '[dsh-companion] bg job recovery failed', { message: errorMessage(error) });
+    return null;
+  }
 }
 
 /**

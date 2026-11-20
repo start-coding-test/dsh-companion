@@ -162,6 +162,52 @@
 - **非真机证据**：事实 / 情景 / 线程行全部构造，未回放 50041 云端快照；宿主子代理与模型
   调用均为 mock。
 
+### Added（阶段 6）
+
+- **W-1 `bg_run` 后台长任务**：新工具 `bg_run(argv, cwd, deadline_min, label)` 把预计超过
+  10 分钟的脚本（训练等）交给宿主外部的 cgroup 单元跑，立即返回 id，发起它的子代理可以
+  正常结束本轮。校验：`cwd` / 脚本 realpath 都必须落在 `bg.workRoot` 内（`..` 与指向外面的
+  符号链接被拒）、`argv[0]` 只允许 `bg.interpreters` 内的解释器、`argv` 按数组直传 spawn
+  （`shell: false`，不经 shell 拼接）。`bg.workRoot` 未配置时工具直接返回不可用。
+  新增 `src/task/bg-jobs.js`（校验 / 启动 / 唤醒文案 / 监视）与 `src/task/bg-launcher.js`
+  （launcher 抽象：Linux 生产 `systemd-run --unit … --collect -p RuntimeMaxSec/MemoryMax/
+  CPUQuota`，`bg.runAs` 非空才加 `--uid`；Windows detached 替身仅作本机单测）。
+- **W-1e `bg_jobs` 表 + 审计**：`Store` 幂等建表（`CREATE TABLE IF NOT EXISTS`，`state`
+  用自由 TEXT 不加 CHECK 枚举，避免整表重建升 schema），字段覆盖 id / label / argv / cwd /
+  脚本 sha256 / 发起子代理名与 `child_session_id` / 根主会话 / pid 或 unit / 起止时间 /
+  deadline / 状态 / 日志路径 / 退出码；启动与结束都写 `memory_events`（`bg_job_started` /
+  `bg_job_finished` / `bg_recover`）。
+- **W-2 监视 + 兜底终止**：scheduler 新增 `bg-jobs` 任务（30s），按退出码文件与单元/进程
+  状态判定；超 deadline 由 `RuntimeMaxSec` 主杀，插件兜底 **TERM → 10s → KILL** 并记
+  `timeout`。
+- **W-3 唤醒一次**：`UPDATE bg_jobs SET state='woken' WHERE id=? AND state='running'`
+  （`changes === 1` 才继续），经 `ctx.subagents.sendMessage` 冷恢复发起它的子代理，消息带
+  退出码、末尾 ≤2KB 输出与日志路径；子代理随后按 SA-B3 回执主会话。无存活根 Agent 或
+  唤醒预算（`bg.wakeBudgetPerAgent`）耗尽 → 状态 `woken-fallback`，直接投主会话卡片。
+- **W-4 重启恢复**：插件启动扫 `state='running'` 三分支——进程仍活继续监视 / 已退出且有
+  退出码文件补投 / 没有退出码文件记 `lost` 并唤醒。
+- **W-5 防护**：`bgConcurrency`（默认 1）满额拒绝并返回正在运行的任务；deadline 必填且
+  ≤ `bg.maxDeadlineMin`（360）；workRoot 剩余空间 < `bg.minFreeDiskMB` 拒绝启动；启动即
+  告知一句（label、预计时长、deadline）；夜间安静时段只投递不推送。
+- **说明（安全边界）**：50041 以 root 运行（珞然作为管家需要 root），`bg_run` 不改变
+  这一点；安全边界靠工作目录、解释器白名单、时长与资源上限和审计记录。
+- **顺带修 bug**：`registerTools` 的工具包装原本写成 `execute: (args) => tool.execute(args)`，
+  丢弃了宿主传入的第二个参数 `exec`，导致阶段 4 起 `exec.agent` / `exec.signal` 在生产
+  从未生效；现已透传 `exec`。
+
+### Tests（阶段 6）
+
+- `test/v077-stage6.test.js`（22 例）：workRoot 未配置 / `..` 逃逸 / 符号链接越界 /
+  解释器越权 / 脚本越界 / deadline 三态 / 磁盘余量 / 并发满额返回运行中任务 / 执行计划
+  形状；systemd-run 参数与 `--uid`；包装器 argv 单引号包裹与 Windows 元字符拒绝；退出码
+  与日志尾部 ≤2KB；`startBgJob` 落库 + 审计行；监视器四态（woken / timeout 先 TERM 后
+  KILL / lost / 预算耗尽 fallback）；原子迁移只唤醒一次；`bg` 配置默认值与校验（16 键
+  安装面不动）；`bg_run` 工具两态（不可用 / 启动 + 告知 + busy）。
+- `test/scheduler.test.js` 与 `test/tools.test.js` 相应更新（7 个内置 job、10 个工具）。
+- **非真机证据**：systemd-run / `RuntimeMaxSec` / 真实 20 分钟脚本与重启补投本机无法验证，
+  测试用注入 launcher 与假 pid/unit 覆盖状态机，systemd 参数只做纯函数断言；Windows 路径
+  是 detached 替身，不是生产路径。
+
 ### Fixed（阶段 2）
 
 - **L120-H2 提醒有截止时间却不触发**：巩固抽出的提醒只有 `due_at`、没有 `next_fire_at`

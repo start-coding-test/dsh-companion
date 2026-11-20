@@ -18,6 +18,8 @@ const NOW_SEC = Math.floor(NOW_MS / 1000);
 const TOOL_NAMES = [
   'memory_search', 'memory_write', 'memory_forget', 'reminder_add',
   'reminder_done', 'thread_list', 'thread_run', 'cost_report', 'task_run',
+  // W-1（v0.7.7 阶段 6）：后台长任务。
+  'bg_run',
 ];
 
 function makeHarness() {
@@ -76,12 +78,12 @@ function addFact(store, overrides = {}) {
   });
 }
 
-test('9 个工具描述符：name 唯一，parameters 为合法 JSON Schema', () => {
+test('10 个工具描述符：name 唯一，parameters 为合法 JSON Schema', () => {
   const harness = makeHarness();
   try {
-    assert.equal(harness.tools.length, 9);
+    assert.equal(harness.tools.length, 10);
     const names = harness.tools.map((tool) => tool.name);
-    assert.equal(new Set(names).size, 9);
+    assert.equal(new Set(names).size, 10);
     assert.deepEqual([...names].sort(), [...TOOL_NAMES].sort());
 
     for (const tool of harness.tools) {

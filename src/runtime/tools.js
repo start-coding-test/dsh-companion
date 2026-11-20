@@ -34,6 +34,9 @@ import {
   threadSubagentName,
 } from '../task/subagent-runner.js';
 import { progressFromReceipt } from '../task/receipt.js';
+// W-1..W-5（v0.7.7 阶段 6）：后台长任务。
+import { buildStartNotice, startBgJob } from '../task/bg-jobs.js';
+import { sessionIdOfAgent } from '../session/identity.js';
 
 const FACT_KINDS = new Set(STORE_FACT_KINDS);
 const SALIENCE = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
@@ -213,6 +216,10 @@ export function createTools({
   recordTokenUsage,
   // SA-B3（v0.7.7 阶段 4）：task_run 收尾后的回执投递回调（接线层注入；缺省不投递）。
   taskReceipt,
+  // W-1/W-5（阶段 6）：后台长任务配置（含 bg 节与 bgConcurrency）与主会话 id 解析。
+  // bgConfig 可以是配置对象或返回配置的函数；缺省视为「未配置 bg.workRoot」。
+  bgConfig,
+  mainSessionId,
   currentScope,
   budgetGate,
   metrics,
@@ -261,6 +268,18 @@ export function createTools({
    * @returns {string|null|undefined}
    */
   const scopeNow = () => (typeof currentScope === 'function' ? currentScope() : undefined);
+
+  /**
+   * W-1（阶段 6）：后台长任务配置。返回 null 表示「bg.workRoot 未配置」——
+   * 工具直接报不可用，不去猜路径。
+   * @returns {object|null}
+   */
+  const bgConfigNow = () => {
+    const source = typeof bgConfig === 'function' ? bgConfig() : bgConfig;
+    if (source === null || source === undefined || typeof source !== 'object') return null;
+    const workRoot = typeof source?.bg?.workRoot === 'string' ? source.bg.workRoot.trim() : '';
+    return workRoot === '' ? null : source;
+  };
 
   /**
    * M4 闸门快照；闸门本身异常时放行（不能因为保护层故障阻断工具）。
@@ -963,6 +982,112 @@ export function createTools({
           () => {},
         );
         return pending;
+      },
+    },
+
+    {
+      name: 'bg_run',
+      description:
+        '把长耗时脚本（训练/构建/批处理）丢到后台跑，立即返回 id，本轮可以正常结束。'
+        + '只做边界限制、不审脚本内容：cwd 与脚本必须在 bg.workRoot 内（符号链接与 .. 跳出会被拒），'
+        + 'argv[0] 只允许 bg.interpreters（python3/bash/node），argv 数组直传不经 shell。'
+        + '只该用于预计超过 10 分钟的任务；10 分钟以内的活直接用 task_run/thread_run，'
+        + '否则光调度与轮询的开销就不划算。deadline_min 必填且不超过 bg.maxDeadlineMin。'
+        + '同一时刻只跑 bgConcurrency（默认 1）个，满额会返回正在运行的任务。'
+        + '结束后会唤醒发起它的子代理并回执主会话（退出码 + 日志尾部 ≤2KB + 日志路径）。'
+        + 'bg.workRoot 未配置时本工具不可用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          argv: {
+            type: 'array',
+            items: { type: 'string' },
+            minItems: 2,
+            description: 'argv 数组：argv[0] 是解释器（python3/bash/node），argv[1] 是 workRoot 内的脚本，后续为传给脚本的参数',
+          },
+          cwd: {
+            type: 'string',
+            description: '工作目录（相对 bg.workRoot 或绝对路径，必须落在 workRoot 内）',
+          },
+          deadline_min: {
+            type: 'integer',
+            description: '预计最长运行分钟数（必填；超时会被 RuntimeMaxSec 终止，插件侧兜底 TERM→KILL）',
+          },
+          label: {
+            type: 'string',
+            description: '任务标签（可选，用于回执与审计）',
+          },
+        },
+        required: ['argv', 'cwd', 'deadline_min'],
+        additionalProperties: false,
+      },
+      async execute(args = {}, exec = {}) {
+        assertArgs(args, 'bg_run');
+        const argv = args.argv;
+        if (!Array.isArray(argv) || argv.some((item) => typeof item !== 'string')) {
+          return { ok: false, reason: 'bad-argv', message: 'argv 必须是字符串数组' };
+        }
+        const bgConfig = typeof bgConfigNow === 'function' ? bgConfigNow() : null;
+        if (bgConfig === null) {
+          return { ok: false, reason: 'not-configured', message: '不可用：未配置 bg.workRoot（后台长任务的工作目录根）' };
+        }
+        const cwdText = requireString(args.cwd, 'bg_run', 'cwd');
+        const deadlineMin = args.deadline_min;
+        const label = optionalString(args.label, 'bg_run', 'label');
+
+        // W-3：唤醒目标是「发起它的子代理会话」——即 exec.agent 的会话 id。
+        const senderSessionId = sessionIdOfAgent(exec?.agent);
+        if (senderSessionId === null) {
+          return { ok: false, reason: 'no-sender', message: 'bg_run 需要调用方 agent 的会话 id（exec.agent）' };
+        }
+        // A2：主会话 id 用来在唤醒失败时兜底投递。
+        const rootSessionId = typeof mainSessionId === 'function' ? mainSessionId() : null;
+
+        const started = await startBgJob({
+          store,
+          config: bgConfig,
+          params: { argv, cwd: cwdText, deadlineMin, label },
+          origin: {
+            childAgentName: typeof exec?.agent?.name === 'string' ? exec.agent.name : null,
+            childSessionId: senderSessionId,
+            rootSessionId,
+            launchedBy: 'bg_run',
+          },
+        });
+        if (started.ok !== true) {
+          return {
+            ok: false,
+            reason: started.reason,
+            message: started.message,
+            ...(Array.isArray(started.running) ? { running: started.running } : {}),
+          };
+        }
+        // W-5：启动即沿 SA-B3 路径告知一句（label、预计时长、deadline）。
+        const notice = buildStartNotice({
+          ...started.job,
+          deadlineMin,
+        });
+        if (typeof taskReceipt === 'function') {
+          try {
+            await taskReceipt({
+              title: started.job.label,
+              status: 'ok',
+              receipt: notice,
+              taskId: started.job.id,
+              sessionId: senderSessionId,
+            });
+          } catch {
+            // 告知只是辅助信息，失败不影响任务已经拉起。
+          }
+        }
+        return {
+          ok: true,
+          id: started.job.id,
+          state: started.job.state,
+          deadline: started.job.deadline,
+          log_path: started.job.log_path,
+          pid_or_unit: started.job.pid_or_unit,
+        };
       },
     },
 
