@@ -25,6 +25,11 @@ v0.7.10 评审（插件侧 + 第三方全项目评审）的修复版：子代理
   systemd-run 可能已经把 unit 提交出去。现在超时后 best-effort `systemctl [--user] stop
   dsh-bg-<id>`，结果写进 `failure.stopAttempted/stopOutcome` 与审计（`bg_job_failed` 的
   `stop_attempted` / `stop_outcome`）；终态仍是 `launch-timeout`（超时即 failed）。
+- **复核增量 M2：排队中被取消的任务会错账槽位**：排队任务在 `admit()` 时没有占用槽位，
+  被 `/停止任务` 取消后 `finally` 仍无条件 `release()`——等待队列为空时会多减一个 `active`，
+  有人排队时会把从未持有的槽「转交」给下一位，两种都让执行槽失守。现在只在真正持有槽位时
+  释放。**M3**：`/停止任务` 的无参行为与三处文案统一为「查看用法与在跑清单」，
+  带 taskId 才中止，并清理了不可达的「已请求中止 N 个」与「已在取消中」分支。
 - **V710-L2 `bg.runAs` 非空不再拖垮插件**：uid≠0 且 `bg.runAs` 非空时，v0.7.10 会抛
   `ConfigError`，而 apply 顶层 `normalizeConfig` 无 try/catch，整个插件加载失败。现在
   降级为配置 warning：`bg.unavailableReason="runas-unsupported"`，`bg_run` 返回
@@ -32,8 +37,8 @@ v0.7.10 评审（插件侧 + 第三方全项目评审）的修复版：子代理
 
 ### Added
 
-- **V710-L1 `/停止任务 [taskId]`**（命令名 `stop-task`）：无参数中止全部在跑 task_run，
-  带参数只中止该任务；走 3P-H1 的 dispose 路径，回执 `reason=cancelled`。
+- **V710-L1 `/停止任务 [taskId]`**（命令名 `stop-task`）：无参数查看用法与在跑清单，
+  带 taskId 只中止该任务；走 3P-H1 的 dispose 路径，回执 `reason=cancelled`。
   `listActiveTasks()` / `stopTaskById()` / `stopActiveTask()` 同时导出给单测与后续 UI 使用。
 - **契约门禁（item 七）**：`startSubagent` 断言 `signal instanceof AbortSignal`；
   `sendToSubagent` 在调用方没给 signal 时自动补 `deliverySignal()`；`registerTools` 的
@@ -45,19 +50,21 @@ v0.7.10 评审（插件侧 + 第三方全项目评审）的修复版：子代理
   「默认空 = 与 50041 相同（当前 ubuntu uid 1000）；非 root 时走用户级 systemd，runAs 必须为空」；
   `bg-launcher` 的 systemd 退出时机注释按用户给定口径重写（不带 `--no-block` 等 start job；
   `Type=simple` 的 start job 在进程拉起后即完成，通常很快以 0 退出；不等 unit 结束是没加 `--wait`）。
-  历史 CHANGELOG 条目不改，只有 0.7.10 段里指向不存在命令的 `/停止` 精确改为 `/stop-task`。
+  历史 CHANGELOG 条目不改，只有 0.7.10 段里指向不存在命令的 `/停止` 精确改为
+  `/停止任务`（0.7.11 起提供）。
 - **CI（item 八）**：`.github/workflows/test.yml` 的 tz 矩阵补 `Asia/Shanghai`（UTC / Asia/Shanghai / America/New_York）。
 
 ### Tests
 
-- 新增 `test/v0711.test.js` 13 例：/stop-task 分发与文案、`stopTaskById`/`listActiveTasks` 出
-  cancelled 回执、硬超时按宿主契约走 dispose 并出 timeout、外部取消、`signal` 契约门禁（含
+- 新增 `test/v0711.test.js` 15 例：/停止任务 分发与文案、`stopTaskById`/`listActiveTasks` 出
+  cancelled 回执、硬超时按宿主契约走 dispose 并出 timeout、`activation.result` reject →
+  `teardown_error`、外部取消、排队中被取消不错账槽位（M2 回归）、`signal` 契约门禁（含
   `sendToSubagent(..., {})`）、`exec.signal` 门禁、launch-timeout 停孤儿 unit（system 与 user
   两种模式）、同日 3 条回执全送达且不占额度、重启补投。
 - 旧测试按新语义调整：`v0710.test.js`（硬超时替身改为「dispose 才结算」、runAs 改为 warning）、
   `scheduler.test.js`（task_report 豁免额度、合并窗口）、`p1b` / `v044-regression` / `e2e`
   （命令数 6 → 7，新增 stop-task）、`acceptance.test.js`（提醒线场景回执不占额度）。
-- 全量 1600 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
+- 全量 1602 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
 - **非真机证据**：用户级 systemd / polkit / DBus / cgroup / 真实子代理取消在 Windows 开发机
   不可复现，Linux 路径用 `run` / `spawnImpl` 替身、子代理用「只有 dispose 才结算」的替身验证；
   真实行为属 50041（ubuntu uid 1000）云端验收。
@@ -73,7 +80,7 @@ v0.7.10 评审（插件侧 + 第三方全项目评审）的修复版：子代理
   主会话要等子代理结束才回复。现在登记任务后**立即返回** `{ok:true, status:'started',
   taskId, title}`，执行 Promise 脱离工具调用继续跑，异常只记日志与审计；结果只经
   SA-B3 `onReceipt` 以回执（task_report）投回主会话，不再作为工具结果返回。执行信号
-  改为插件自持 `AbortController`（硬超时 900s、`/stop-task`、插件卸载时的
+  改为插件自持 `AbortController`（硬超时 900s、`/停止任务`（0.7.11 起提供）、插件卸载时的
   `abortActiveTasks()`），主轮次信号不再传给子代理——主会话结束或被取消不会中止
   子代理。busy / 额度闸门 / session-unavailable 等前置拒绝仍同步返回。
 - **D21-H3 `bg_run` 被拒的启动被当成成功**：之前 `watchLaunch` 在 150ms 内没看到
@@ -130,8 +137,6 @@ v0.7.10 评审（插件侧 + 第三方全项目评审）的修复版：子代理
 - 全量 1587 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
 - **v0.7.10 未单独部署**，修复随 v0.7.11 一起上线。
 
-- 全量 1571 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
-
 ## [0.7.9] - 2026-11-21
 
 阶段 6（后台长任务）的复核修复，只动 `bg_run` 的启动判定与日志截断。
@@ -156,6 +161,7 @@ v0.7.10 评审（插件侧 + 第三方全项目评审）的修复版：子代理
   `logMaxMB=1025` 被拒、3MB 日志分块截到 1.5MB（校验尾部内容与 inode 不变）。
 - **非真机证据**：真实 `systemd-run` 的退出时机仍在云端验证；本机用 spawn 替身覆盖
   三种退出形态。
+- 全量 1571 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
 
 ## [0.7.8] - 2026-11-20
 

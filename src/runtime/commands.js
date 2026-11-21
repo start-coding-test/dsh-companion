@@ -45,7 +45,7 @@ const COMPACTION_DISABLED_TEXT = '压缩：宿主未开启（compaction-basic �
 const COMPACTION_ENABLED_TEXT = '压缩：宿主已开启（compaction-basic 已启用）';
 
 /** V3-L3：宿主只注册 ASCII 命令名，给误输入中文命令的用户一句固定提示。 */
-export const CHINESE_COMMAND_HINT = '请用 /memory、/status、/cost、/threads（停止任务用 /stop-task）';
+export const CHINESE_COMMAND_HINT = '请用 /memory、/status、/cost、/threads（停止任务用 /停止任务）';
 
 /** V3-L3：会被 pre-step 识别为「中文命令误输入」的前缀。 */
 const CHINESE_COMMAND_PREFIXES = Object.freeze(['/记忆', '/状态', '/成本', '/线程']);
@@ -245,7 +245,7 @@ export function summarizeCost(store, now, timeZone = DEFAULT_TIMEZONE) {
 }
 
 /**
- * `/stop-task` 的回复文案（v0.7.11 V710-L1）。
+ * `/停止任务` 的回复文案（v0.7.11 V710-L1）。
  *
  * 三种调用形态：无参给用法 + 在跑清单；带 taskId 给「已请求停止」；取消失败给原因。
  * @param {{usage?: boolean, active?: string[], taskId?: string|null,
@@ -256,8 +256,8 @@ export function formatStopTaskReply(input = {}) {
   const active = Array.isArray(input.active) ? input.active.filter((id) => typeof id === 'string' && id !== '') : [];
   if (input.usage === true) {
     const lines = [
-      '用法：/stop-task [taskId]',
-      '不带参数：中止全部在跑的任务；带 taskId：只中止该任务。',
+      '用法：/停止任务 [taskId]（内部命令名 /stop-task）',
+      '不带参数：查看用法与在跑清单；带 taskId：只中止该任务。',
     ];
     lines.push(active.length === 0
       ? '当前没有在跑的 task_run。'
@@ -270,19 +270,12 @@ export function formatStopTaskReply(input = {}) {
   const target = typeof input.taskId === 'string' && input.taskId !== '' ? input.taskId : null;
   if (info.ok === true) {
     if (info.cancelled === 0) {
-      return target === null
-        ? '停止任务：当前没有在跑的任务'
-        : `停止任务：${target} 不在运行（可能已结束）`;
+      return `停止任务：${target ?? '该任务'} 不在运行（可能已结束）`;
     }
-    return target === null
-      ? `停止任务：已请求中止 ${info.cancelled} 个在跑任务，回执将送达（状态：已取消）`
-      : `停止任务：已请求中止 ${target}，回执将送达（状态：已取消）`;
+    return `停止任务：已请求中止 ${target ?? '该任务'}，回执将送达（状态：已取消）`;
   }
   if (info.reason === 'not-found') {
     return `停止任务：没有在跑的任务：${target ?? ''}（可能已结束，可用 /status 查看）`;
-  }
-  if (info.reason === 'already-cancelled') {
-    return `停止任务：${target ?? '该任务'} 已经在取消中`;
   }
   return `停止任务：取消失败（${info.reason ?? 'unknown'}）`;
 }

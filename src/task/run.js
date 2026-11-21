@@ -101,9 +101,9 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
    * 工具调用的 signal）会连带中止子代理，且工具调用要 `await` 整个执行 Promise，
    * 主会话因此被阻塞。现在执行信号与主轮次解耦，只有三种来源能中止子代理：
    * 硬超时（subagent-runner 的 900s）、`abortAll()`（插件卸载/进程退出）、
-   * 显式取消（`/stop-tasks`，V710-L1）。
+   * 显式取消（`/停止任务`，V710-L1）。
    *
-   * 用 Map 而不是 Set 只为定向取消：`/stop-tasks <taskId>` 要能找到那一个任务。
+   * 用 Map 而不是 Set 只为定向取消：`/停止任务 <taskId>` 要能找到那一个任务。
    */
   const activeControllers = new Map();
 
@@ -257,7 +257,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
               sessionId: null,
               durationMs: Math.max(0, clock() - startedAt),
               reason: 'cancelled',
-              error: '任务在排队时被取消（/stop-task）',
+              error: '任务在排队时被取消（/停止任务）',
             };
           } else if (useSubagent) {
             workerResult = await runSubagentTask({
@@ -305,9 +305,9 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
               tokenWarn,
               tokenStop,
               sampleMs,
-          // v0.7.11（V710-L1）：worker 路径同样受执行器自持 controller 控制，
-          // 这样 /stop-tasks 对没有子代理能力的宿主（worker 会话）也有效。
-          signal: controller.signal,
+              // v0.7.11（V710-L1）：worker 路径同样受执行器自持 controller 控制，
+              // 这样 /停止任务 对没有子代理能力的宿主（worker 会话）也有效。
+              signal: controller.signal,
             });
           }
         } catch (error) {
@@ -399,7 +399,9 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
         return result;
       } finally {
         activeControllers.delete(taskId);
-        release();
+        // M2（v0.7.11 复核）：排队中的任务 admit 时没有计数，被取消的任务从未持有槽位，
+        // 不能再 release()——否则会把别人的槽减掉，或把不存在的槽「转交」给下一位排队者。
+        if (!queuedCancelled) release();
       }
     })();
 
@@ -449,14 +451,6 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
   }
 
   /**
-   * 取消在跑任务（v0.7.11 V710-L1：`/stop-tasks [taskId]`）。
-   *
-   * 只 abort 执行器自持的 controller——子代理侧会据此走 dispose + 取消回执（见
-   * src/task/subagent-runner.js），worker 侧由 worker 的 abort 监听取消会话。
-   * @param {string|null} [taskId=null] null/空表示「全部在跑任务」
-   * @returns {{ok: boolean, cancelled: number, taskId: string|null, reason?: string}}
-   */
-  /**
    * v0.7.11（V710-L1）：按 taskId 中止单个在跑任务。
    * @param {string} taskId
    * @returns {boolean} 是否命中并把取消请求发了出去
@@ -481,6 +475,14 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
     return [...activeControllers.keys()];
   }
 
+  /**
+   * v0.7.11（V710-L1）：内部批量/单值取消入口（`/停止任务 <taskId>` 只走 taskId 路径）。
+   *
+   * 只 abort 执行器自持的 controller——子代理侧会据此走 dispose + 取消回执（见
+   * src/task/subagent-runner.js），worker 侧由 worker 的 abort 监听取消会话。
+   * @param {string|null} [taskId=null] null/空表示「全部在跑任务」
+   * @returns {{ok: boolean, cancelled: number, taskId: string|null, reason?: string}}
+   */
   function cancelTask(taskId = null) {
     const key = taskId === null || taskId === undefined ? '' : String(taskId).trim();
     if (key === '') {
@@ -560,14 +562,6 @@ export function startTask(options) {
  */
 export function abortActiveTasks(reason) {
   return defaultRunner.abortAll(reason);
-}
-
-/**
- * 取消在跑任务（v0.7.11 V710-L1，`/stop-tasks` 的实现入口）。
- * @param {string|null} [taskId] null/空 = 全部
- */
-export function cancelActiveTask(taskId = null) {
-  return defaultRunner.cancelTask(taskId);
 }
 
 /**

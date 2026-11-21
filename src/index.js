@@ -370,7 +370,7 @@ const COMMAND_ALIASES = Object.freeze([
     name: 'stop-task',
     definitionId: 'dsh-companion/command-stop-task',
     // V710-L1（v0.7.11）：task_run 结果只经回执送达后，用户需要一个「别跑了」的入口。
-    description: '中止在跑的任务（对应 /停止任务；可带 taskId，缺省中止全部）',
+    description: '查看用法与在跑清单；带 taskId 时中止该任务（/停止任务 [taskId]）',
     prefix: '/停止任务',
   }),
   Object.freeze({
