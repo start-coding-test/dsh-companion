@@ -2,6 +2,66 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.11] - 2026-11-21
+
+v0.7.10 评审（插件侧 + 第三方全项目评审）的修复版：子代理取消、回执额度、孤儿 unit、
+停止任务入口、配置降级、文档口径与契约门禁。**v0.7.10 未单独部署，随本版一次上线。**
+
+### Fixed
+
+- **3P-H1 子代理硬超时与取消在发布后无效**：宿主契约是「signal 只在创建期生效，发布后
+  只能通过 dispose 取消」（`dsh-subagent/src/types.ts:42`；`manager.ts:810-821` 的 abort
+  监听在启动完成后移除，`:1039-1116` 的 `finishDisposal` 才让 `activation.result` 结算）。
+  之前硬超时只 `controller.abort()`，发布后的子代理停不掉，执行槽永不释放、也不出 timeout
+  回执。现在硬超时与外部取消（`abortActiveTasks` / `/stop-task`）都走 `activation.dispose()`，
+  与结果做 `Promise.race`，失败方不再写回执（once 守卫）；dispose 本身挂起时 10s 上限后照常
+  出回执并释放槽位。归类：超时 → `timeout/hard_timeout`；取消且 `stopReason==="aborted"` →
+  `cancelled`；dispose 抛错（`manager.ts:1114` 的异常分支）→ `teardown_error`；其余五态不变。
+- **3P-M1 task_run 回执被每日上限吞掉**：`KIND_CAPS.task_report=1` 且超额直接丢弃，v0.7.10
+  起结果只经回执送达，第二个回执当天必丢。现在 `task_report` 是「对用户请求的答复」，
+  不计入主动消息每日/单类额度（`EXEMPT_KINDS`），仍受去重与合并窗口约束；未送达的回执
+  落库为 `proactive_pending`，重启后由 `replayPending()` 按「pending 无后续 sent」补投。
+- **V710-M1 launch-timeout 留下孤儿 unit**：`waitForLaunchClient` 超时杀掉客户端后，
+  systemd-run 可能已经把 unit 提交出去。现在超时后 best-effort `systemctl [--user] stop
+  dsh-bg-<id>`，结果写进 `failure.stopAttempted/stopOutcome` 与审计（`bg_job_failed` 的
+  `stop_attempted` / `stop_outcome`）；终态仍是 `launch-timeout`（超时即 failed）。
+- **V710-L2 `bg.runAs` 非空不再拖垮插件**：uid≠0 且 `bg.runAs` 非空时，v0.7.10 会抛
+  `ConfigError`，而 apply 顶层 `normalizeConfig` 无 try/catch，整个插件加载失败。现在
+  降级为配置 warning：`bg.unavailableReason="runas-unsupported"`，`bg_run` 返回
+  `{ok:false, reason:"bg-unavailable"}`，`/状态` 显示原因，其余功能照常加载。
+
+### Added
+
+- **V710-L1 `/停止任务 [taskId]`**（命令名 `stop-task`）：无参数中止全部在跑 task_run，
+  带参数只中止该任务；走 3P-H1 的 dispose 路径，回执 `reason=cancelled`。
+  `listActiveTasks()` / `stopTaskById()` / `stopActiveTask()` 同时导出给单测与后续 UI 使用。
+- **契约门禁（item 七）**：`startSubagent` 断言 `signal instanceof AbortSignal`；
+  `sendToSubagent` 在调用方没给 signal 时自动补 `deliverySignal()`；`registerTools` 的
+  execute 包装断言宿主第二参 `exec.signal` 形状，防止再出现「丢 exec / 传 {} 当 signal」的同款缺陷。
+
+### Changed
+
+- **文档口径（item 六）**：`README.md` 与 `config.example.yml` 的「即 root」改为
+  「默认空 = 与 50041 相同（当前 ubuntu uid 1000）；非 root 时走用户级 systemd，runAs 必须为空」；
+  `bg-launcher` 的 systemd 退出时机注释按用户给定口径重写（不带 `--no-block` 等 start job；
+  `Type=simple` 的 start job 在进程拉起后即完成，通常很快以 0 退出；不等 unit 结束是没加 `--wait`）。
+  历史 CHANGELOG 条目不改，只有 0.7.10 段里指向不存在命令的 `/停止` 精确改为 `/stop-task`。
+- **CI（item 八）**：`.github/workflows/test.yml` 的 tz 矩阵补 `Asia/Shanghai`（UTC / Asia/Shanghai / America/New_York）。
+
+### Tests
+
+- 新增 `test/v0711.test.js` 13 例：/stop-task 分发与文案、`stopTaskById`/`listActiveTasks` 出
+  cancelled 回执、硬超时按宿主契约走 dispose 并出 timeout、外部取消、`signal` 契约门禁（含
+  `sendToSubagent(..., {})`）、`exec.signal` 门禁、launch-timeout 停孤儿 unit（system 与 user
+  两种模式）、同日 3 条回执全送达且不占额度、重启补投。
+- 旧测试按新语义调整：`v0710.test.js`（硬超时替身改为「dispose 才结算」、runAs 改为 warning）、
+  `scheduler.test.js`（task_report 豁免额度、合并窗口）、`p1b` / `v044-regression` / `e2e`
+  （命令数 6 → 7，新增 stop-task）、`acceptance.test.js`（提醒线场景回执不占额度）。
+- 全量 1600 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
+- **非真机证据**：用户级 systemd / polkit / DBus / cgroup / 真实子代理取消在 Windows 开发机
+  不可复现，Linux 路径用 `run` / `spawnImpl` 替身、子代理用「只有 dispose 才结算」的替身验证；
+  真实行为属 50041（ubuntu uid 1000）云端验收。
+
 ## [0.7.10] - 2026-11-21
 
 真机反馈修复版（D21-H2 / H3 / H4 / M1 / M2）。50041 以 ubuntu（uid 1000）运行，
@@ -13,7 +73,7 @@
   主会话要等子代理结束才回复。现在登记任务后**立即返回** `{ok:true, status:'started',
   taskId, title}`，执行 Promise 脱离工具调用继续跑，异常只记日志与审计；结果只经
   SA-B3 `onReceipt` 以回执（task_report）投回主会话，不再作为工具结果返回。执行信号
-  改为插件自持 `AbortController`（硬超时 900s、`/停止`、插件卸载时的
+  改为插件自持 `AbortController`（硬超时 900s、`/stop-task`、插件卸载时的
   `abortActiveTasks()`），主轮次信号不再传给子代理——主会话结束或被取消不会中止
   子代理。busy / 额度闸门 / session-unavailable 等前置拒绝仍同步返回。
 - **D21-H3 `bg_run` 被拒的启动被当成成功**：之前 `watchLaunch` 在 150ms 内没看到
@@ -67,6 +127,10 @@
   另：systemd 手册称不带 `--no-block` 时 `systemd-run` 会等 start job 完成，与 v0.7.9 用户
   原文「启动 unit 后立即以 0 退出」矛盾；本版不翻案、不改历史记录，只把判定改成「等客户端
   退出再看退出码」，两者都能覆盖。
+- 全量 1587 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
+- **v0.7.10 未单独部署**，修复随 v0.7.11 一起上线。
+
+- 全量 1571 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
 
 ## [0.7.9] - 2026-11-21
 

@@ -71,6 +71,8 @@ export async function runTask(options = {}) {
     tokenWarn = WORKER_WARN_TOKENS,
     tokenStop = WORKER_STOP_TOKENS,
     sampleMs = DEFAULT_SAMPLE_MS,
+    // v0.7.11（V710-L1）：执行器自持的执行信号；abort 后取消该会话并出 cancelled 结果。
+    signal,
     cwd,
   } = options;
 
@@ -116,7 +118,7 @@ export async function runTask(options = {}) {
     }
     await platform.prompt(promptRequest);
 
-    outcome = await waitForIdle({
+    const idle = waitForIdle({
       platform,
       agent: created?.agent ?? created,
       sessionId,
@@ -127,6 +129,23 @@ export async function runTask(options = {}) {
       sampleMs,
       ...resolveTokenSampling(platform, created),
     });
+    if (signal !== undefined && typeof signal.addEventListener === 'function') {
+      // v0.7.11（V710-L1）：用户取消与 waitForIdle 竞速；取消后主动 cancel 会话，
+      // 否则 worker 的采样/硬超时定时器还会继续跑。
+      const cancelledOutcome = { status: 'error', reason: 'cancelled', error: '任务已取消（/stop-tasks）' };
+      if (signal.aborted) {
+        outcome = cancelledOutcome;
+        await cancelTask(platform, sessionId);
+      } else {
+        const aborted = new Promise((resolve) => {
+          signal.addEventListener('abort', () => resolve(cancelledOutcome), { once: true });
+        });
+        outcome = await Promise.race([idle, aborted]);
+        if (outcome === cancelledOutcome) await cancelTask(platform, sessionId);
+      }
+    } else {
+      outcome = await idle;
+    }
   } catch (error) {
     outcome = { status: 'error', error: messageOf(error) };
   }
@@ -135,7 +154,7 @@ export async function runTask(options = {}) {
   // 硬超时与 token 截断在这里共用一个两段式回收，但 reason 不同。
   if (outcome.status === 'timeout' || outcome.status === 'partial') {
     await cancelTask(platform, sessionId);
-  } else if (outcome.status === 'error' && sessionId !== null) {
+  } else if (outcome.status === 'error' && sessionId !== null && outcome.reason !== 'cancelled') {
     await cancelTask(platform, sessionId);
   }
 

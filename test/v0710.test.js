@@ -212,7 +212,11 @@ test('D21-H2：task_run 返回 started，onReceipt 恰好一次，主轮次 sign
   assert.equal(receipts[0].status, 'done');
 });
 
-test('D21-H2：硬超时仍产生 timeout 回执（子代理被 abort 后结算）', async () => {
+test('D21-H2：硬超时仍产生 timeout 回执（按宿主契约：只有 dispose 才让 result 结算）', async () => {
+  // **非真机证据**：替身按宿主真实契约实现——信号只在创建期生效
+  // （dsh-subagent/src/types.ts:42「Cancellation before publication; callers own
+  // later cancellation through dispose」），发布后 abort 不结算 result，只有
+  // dispose() 才让 activation.result 结算（manager.ts:1039-1116）。
   const store = makeStore();
   const fake = makeSubagentPlatform();
   const receipts = [];
@@ -227,14 +231,20 @@ test('D21-H2：硬超时仍产生 timeout 回执（子代理被 abort 后结算�
   }));
   const tool = tools.find((item) => item.name === 'task_run');
 
-  // 子代理在 abort（硬超时）后才结算——模拟宿主按 signal 收尾。
+  const observed = { abortedSettledResult: false, disposed: 0 };
   fake.platform.startSubagent = async (spec) => {
     fake.calls.push(spec);
     const resolvers = Promise.withResolvers();
-    spec.signal.addEventListener('abort', () => {
-      resolvers.resolve({ stopReason: 'aborted', output: [] });
-    }, { once: true });
-    return { childId: 'child-timeout', result: resolvers.promise, dispose: async () => {} };
+    // 发布后 abort：宿主不会因此结算 result——这里显式记录，防止换成假绿。
+    spec.signal.addEventListener('abort', () => { observed.abortedSettledResult = false; }, { once: true });
+    return {
+      childId: 'child-timeout',
+      result: resolvers.promise,
+      dispose: async () => {
+        observed.disposed += 1;
+        resolvers.resolve({ stopReason: 'aborted', output: [] });
+      },
+    };
   };
 
   const result = await tool.execute({ goal: '慢任务' }, { agent: { id: 'agent-1' } });
@@ -243,6 +253,9 @@ test('D21-H2：硬超时仍产生 timeout 回执（子代理被 abort 后结算�
   assert.equal(receipts.length, 1);
   assert.equal(receipts[0].status, 'timeout');
   assert.equal(receipts[0].taskId, result.taskId);
+  // 证明超时回执只能由 dispose 路径产生（删掉 disposeActivation 调用该用例必须红）。
+  assert.equal(observed.disposed, 1);
+  assert.equal(observed.abortedSettledResult, false);
 });
 
 test('D21-H2：abortAll() 能中止在跑的子代理（插件卸载路径）', async () => {
@@ -544,10 +557,18 @@ test('D21-H4：bgSelfCheck 按模式跑 systemd-run（portable 直接可用）',
   assert.match(failed.message, /No such file or directory/u);
 });
 
-test('D21-H4：bg.runAs 在 user 模式下配置报错，root 下保留', () => {
-  assert.throws(() => normalizeBg({ runAs: 'trainer' }, [], { uid: 1000 }), /bg\.runAs/u);
+test('v0.7.11 V710-L2：bg.runAs 在 user 模式下只 warn（bg 不可用，插件照常加载），root 下保留', () => {
+  const warnings = [];
+  const asUser = normalizeBg({ runAs: 'trainer' }, warnings, { uid: 1000 });
+  assert.equal(asUser.runAs, 'trainer');
+  assert.equal(asUser.unavailableReason, 'runas-unsupported');
+  assert.match(asUser.unavailableMessage ?? '', /bg\.runAs/u);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /bg\.runAs/u);
   const asRoot = normalizeBg({ runAs: 'trainer' }, [], { uid: 0 });
   assert.equal(asRoot.runAs, 'trainer');
+  assert.equal(asRoot.unavailableReason, null);
+  assert.equal(asRoot.unavailableMessage, null);
 });
 
 test('D21-H4：自检失败 → bg_run 返回 bg-unavailable（不再假装派出）', async () => {

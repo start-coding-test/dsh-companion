@@ -9,7 +9,7 @@
  *   `{childId, name, messageId?, result, dispose}`；
  * - `sendMessage(sender, targetId, content, {signal})` :368-375：续派；
  * - `SubagentResult`（`types.ts:260-286`）：`{output, structured?, diagnostic?,
- *   stopReason}`，`stopReason ∈ completed|aborted|error|max-tokens|refusal`
+ *   stopKind}`，`stopKind ∈ completed|aborted|error|max-tokens|refusal`
  *   （`types.ts:241-252`），**`structured` 不保证存在**。
  *
  * 本模块只做三件事：组装 spec（A12 命名 / D3 模型裁决）、等结果并把五态映射成
@@ -43,6 +43,15 @@ export const SUBAGENT_MAX_DEPTH = 1;
 
 /** 硬超时（毫秒）：沿用 worker 的两段式口径（软 10min / 硬 15min，这里只做硬线）。 */
 export const SUBAGENT_HARD_MS = 900_000;
+
+/**
+ * v0.7.11（3P-H1）：dispose() 的等待上限。
+ *
+ * 宿主 `dispose()` 会等子代理 `whenIdle()` 再收尾（manager.ts:1060-1066），理论上
+ * 很快；但 teardown 也可能被宿主内部锁挂住。超时回执不能因此永不出现，所以给
+ * dispose 一个上限，到点就照常出回执并释放执行槽。
+ */
+export const SUBAGENT_DISPOSE_MS = 10_000;
 
 /**
  * D3 裁决（阶段 4）：`subagent.model` **默认空 = 沿用主会话路由**，只有显式
@@ -154,7 +163,7 @@ export function resolveSubagentModel(model, hooks = {}) {
 /**
  * A3：五态映射（`types.ts:241-252`）+ 结构化结果缺失/损坏降级。
  *
- * | stopReason | 插件 status | 说明 |
+ * | stopKind | 插件 status | 说明 |
  * | --- | --- | --- |
  * | completed | ok | 正常结束 |
  * | aborted | error | 被取消，带 diagnostic 摘要 |
@@ -162,11 +171,11 @@ export function resolveSubagentModel(model, hooks = {}) {
  * | max-tokens | partial | 部分完成（上下文/输出上限） |
  * | refusal | error | 模型拒绝执行 |
  *
- * @param {string} stopReason
+ * @param {string} stopKind
  * @returns {{status: 'ok'|'partial'|'error', reason?: string}}
  */
-export function mapStopReason(stopReason) {
-  switch (stopReason) {
+export function mapStopReason(stopKind) {
+  switch (stopKind) {
     case 'completed':
       return { status: 'ok' };
     case 'max-tokens':
@@ -178,8 +187,8 @@ export function mapStopReason(stopReason) {
     case 'error':
       return { status: 'error', reason: 'subagent_error' };
     default:
-      // 未知 stopReason（host 的映射可扩展）：按失败处理，但保留原始值便于诊断。
-      return { status: 'error', reason: `unknown_stop_reason:${String(stopReason)}` };
+      // 未知 stopKind（host 的映射可扩展）：按失败处理，但保留原始值便于诊断。
+      return { status: 'error', reason: `unknown_stop_reason:${String(stopKind)}` };
   }
 }
 
@@ -312,32 +321,89 @@ export async function runSubagentTask(options = {}) {
     ? task.agentPreset.trim()
     : SUBAGENT_PRESET;
 
-  // 硬超时与外部 signal 合成一个控制器：任一触发都 abort 宿主侧运行。
+  // v0.7.11（3P-H1）：宿主把 `signal` 定为**仅创建期**取消，发布后取消必须走 dispose。
   //
-  // v0.7.10（D21-H2）：外部 signal 现在是 task/run.js 自持的 AbortController
-  // （插件卸载 / 进程退出 / 显式取消），不再是宿主的 `exec.signal`——主会话本轮
-  // 结束不会传到这里。显式取消单独标记，回执 reason 写 'cancelled'。
+  // 宿主源码（本机 asar 扁平安装路径，不是仓库式 packages/... 路径）：
+  //   D:\dsh\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-subagent\src\types.ts:41-42
+  //     「/** Cancellation before publication; callers own later cancellation through
+  //      dispose. */ readonly signal: AbortSignal」
+  //   ...\dsh-subagent\src\manager.ts:747-749 `dispose()` → `finishDisposal(activation, true)`
+  //   ...\dsh-subagent\src\manager.ts:1039-1116 `finishDisposal(activation, stop)`：
+  //     stop=true 时 :1060-1066 cancel → whenIdle → captureLocalResult；正常路径
+  //     :1113 `activation.result.resolve(result)`，只有 teardown 抛错才 :1114 reject。
+  //
+  // 所以「dispose 让 result 结算」是常态、reject 只是异常分支：两条都接住，但回执
+  // 归类由超时/取消意图主导，不被 result 的最终值覆盖（once 守卫）。
   const controller = new AbortController();
   let cancelled = false;
-  const onExternalAbort = () => {
-    cancelled = true;
-    controller.abort();
-  };
-  if (signal !== undefined && typeof signal.addEventListener === 'function') {
-    if (signal.aborted) {
-      cancelled = true;
-      controller.abort();
-    } else signal.addEventListener('abort', onExternalAbort, { once: true });
-  }
   let timedOut = false;
-  const hardTimer = setTimeout(() => {
-    timedOut = true;
-    controller.abort();
-  }, Math.max(1, Number(hardMs)));
-  // 定时器不应拖住进程退出。
-  if (typeof hardTimer?.unref === 'function') hardTimer.unref();
-
+  /** @type {'hard_timeout'|'cancelled'|null} */
+  let stopKind = null;
+  let stopSettled = false;
+  const stopWaiters = [];
+  /** @type {object|null} 宿主 activation 句柄（startSubagent 返回） */
   let activation = null;
+  /** @type {Promise<string>|null} dispose 的共享 promise（幂等） */
+  let disposePromise = null;
+
+  /** 唤醒 race 的「stop 分支」；只唤醒一次就够了。 */
+  const markStopSettled = () => {
+    stopSettled = true;
+    for (const resolve of stopWaiters.splice(0)) resolve();
+  };
+
+  /**
+   * 释放宿主侧 activation；有 10s 上限（SUBAGENT_DISPOSE_MS）。
+   * 发布前的 stop 不在这里——那时宿主还靠 signal 取消 startup。
+   * @returns {Promise<string>}
+   */
+  const disposeActivation = () => {
+    if (disposePromise !== null) return disposePromise;
+    const target = activation;
+    if (target === null || typeof target.dispose !== 'function') {
+      disposePromise = Promise.resolve('no-activation');
+      return disposePromise;
+    }
+    const limit = new Promise((resolve) => {
+      const timer = setTimeout(() => resolve('dispose-timeout'), SUBAGENT_DISPOSE_MS);
+      timer.unref?.();
+    });
+    disposePromise = Promise.race([
+      Promise.resolve().then(() => target.dispose()).then(() => 'disposed', (error) => {
+        if (warn !== null) {
+          warn('warn', '[dsh-companion] subagent dispose failed', { error: messageOf(error) });
+        }
+        return 'dispose-failed';
+      }),
+      limit,
+    ]);
+    return disposePromise;
+  };
+
+  /** 记为超时/取消并立刻 abort；发布后同时 dispose（dispose 完成才唤醒 race）。 */
+  const stopWith = (reason) => {
+    if (stopKind === null) stopKind = reason;
+    if (reason === 'hard_timeout') timedOut = true;
+    else cancelled = true;
+    controller.abort(reason);
+    if (activation !== null) void disposeActivation().then(markStopSettled);
+  };
+
+  // 外部 cancel（/停止任务、abortAll）与硬超时都在这里汇合。
+  const onExternalAbort = () => stopWith('cancelled');
+  if (signal !== undefined && typeof signal.addEventListener === 'function') {
+    if (signal.aborted) stopWith('cancelled');
+    else signal.addEventListener('abort', onExternalAbort, { once: true });
+  }
+  const hardTimer = setTimeout(() => stopWith('hard_timeout'), Math.max(1, Number(hardMs)));
+  // 定时器不应拖住进程退出。
+  hardTimer.unref?.();
+  const detachSignal = () => {
+    if (signal !== undefined && typeof signal.removeEventListener === 'function') {
+      signal.removeEventListener('abort', onExternalAbort);
+    }
+  };
+
   try {
     activation = await platform.startSubagent({
       provider: SUBAGENT_PROVIDER,
@@ -356,13 +422,24 @@ export async function runSubagentTask(options = {}) {
     });
   } catch (error) {
     clearTimeout(hardTimer);
-    if (signal !== undefined && typeof signal.removeEventListener === 'function') {
-      signal.removeEventListener('abort', onExternalAbort);
+    detachSignal();
+    const durationMs = Math.max(0, clock() - startedAt);
+    if (stopKind !== null) {
+      // 发布前被取消/超时：宿主取消 startup 后 startSubagent 抛 AbortError。
+      return {
+        status: timedOut ? 'timeout' : 'error',
+        sessionId: null,
+        durationMs,
+        ...(timedOut ? { reason: 'hard_timeout' } : { reason: 'cancelled' }),
+        error: timedOut
+          ? `subagent did not start within ${hardMs}ms`
+          : '任务在派出前已取消（/停止任务）',
+      };
     }
     return {
       status: 'error',
       sessionId: null,
-      durationMs: Math.max(0, clock() - startedAt),
+      durationMs,
       error: messageOf(error),
     };
   }
@@ -376,41 +453,42 @@ export async function runSubagentTask(options = {}) {
     }
   }
 
-  let result = null;
-  let failure = null;
-  try {
-    result = await activation.result;
-  } catch (error) {
-    failure = error;
-  } finally {
-    clearTimeout(hardTimer);
-    if (signal !== undefined && typeof signal.removeEventListener === 'function') {
-      signal.removeEventListener('abort', onExternalAbort);
-    }
-  }
-
+  // 发布后才可能兑现的 stop（定时器/外部 cancel 可能早于 startSubagent 返回）。
+  if (stopKind !== null) void disposeActivation().then(markStopSettled);
+  const stopRace = new Promise((resolve) => {
+    if (stopSettled) resolve(null);
+    else stopWaiters.push(() => resolve(null));
+  });
+  // 两条结算路径都接住：宿主正常 dispose 是 resolve，teardown 失败才是 reject。
+  const resultOutcome = Promise.resolve(activation.result).then(
+    (value) => ({ kind: 'result', value }),
+    (error) => ({ kind: 'error', error }),
+  );
+  const first = await Promise.race([resultOutcome, stopRace]);
+  // 无论谁先结算都释放宿主资源：正常结算时宿主已 close（close() 幂等立即返回），
+  // stop 路径下这次 await 就是被上限兜住的 dispose。
+  await disposeActivation();
+  clearTimeout(hardTimer);
+  detachSignal();
   const durationMs = Math.max(0, clock() - startedAt);
-  const dispose = async () => {
-    if (typeof activation?.dispose !== 'function') return;
-    try {
-      await activation.dispose();
-    } catch {
-      // dispose 失败只影响宿主侧清理，不影响回执。
-    }
-  };
-  await dispose();
 
-  if (failure !== null) {
-    // result 本身 reject：可能是取消/宿主内部错误；timedOut 优先报超时。
+  // ---- 归类（once：以下分支只产生一份回执）----
+  //
+  // reject 臂 = 宿主 teardown 事务抛错（manager.ts:1068-1075 → :1114
+  // `activation.result.reject(resultFailure.error)`），一律按 error 回执，
+  // 不拿 reject 的形状去判 timeout/cancelled：正常 dispose 走的是 :1113 resolve。
+  if (first !== null && first.kind === 'error') {
     return {
-      status: timedOut ? 'timeout' : 'error',
+      status: 'error',
       sessionId: childId,
       durationMs,
-      ...(timedOut ? { reason: 'hard_timeout' } : {}),
-      ...(!timedOut && cancelled ? { reason: 'cancelled' } : {}),
-      error: messageOf(failure),
+      reason: 'teardown_error',
+      error: messageOf(first.error),
     };
   }
+  const result = first !== null && first.kind === 'result' ? first.value : undefined;
+  // 超时意图优先：dispose 后 result 通常以 stopReason 'aborted' 结算（
+  // activation.ts:148-160 + lifecycle.ts:81-107），回执仍应是 timeout。
   if (timedOut) {
     return {
       status: 'timeout',
@@ -418,6 +496,19 @@ export async function runSubagentTask(options = {}) {
       durationMs,
       reason: 'hard_timeout',
       error: `subagent did not finish within ${hardMs}ms`,
+    };
+  }
+  // 取消意图：只有宿主给出的 stopReason 是 'aborted' 才算被取消；第一臂是
+  // stopRace（dispose 挂到 10s 上限、result 未结算）时同样按取消处理。
+  // 其余情况（例如取消动作未赶上、子代理已正常完成）落回既定五态映射。
+  if (cancelled && (first === null || result?.stopReason === 'aborted')) {
+    return {
+      status: 'error',
+      sessionId: childId,
+      durationMs,
+      ...(typeof result?.stopReason === 'string' ? { stopReason: result.stopReason } : {}),
+      reason: 'cancelled',
+      error: '任务已取消（/停止任务）',
     };
   }
 

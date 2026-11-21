@@ -369,7 +369,7 @@ test('安静时段 23:00–08:00 不发送，08:00 后各自补发（提醒不�
   assert.match(platform.calls[1].text, /早点休息/);
 });
 
-test('每日硬上限 3 条：超出部分保留 backlog，次日再发', async (t) => {
+test('每日硬上限 3 条：task_report 豁免不占额度，超出部分保留 backlog，次日再发', async (t) => {
   const { gate, platform } = setupProactive(t, { cap: 3 });
   gate.enqueue({ kind: 'task_report', text: '汇报', at: local(15, 10, 0) });
   gate.enqueue({ kind: 'reminder', text: '提醒一', at: local(15, 10, 0) });
@@ -377,27 +377,40 @@ test('每日硬上限 3 条：超出部分保留 backlog，次日再发', async 
   gate.enqueue({ kind: 'chat', text: '闲聊', at: local(15, 10, 25) });
 
   const report = await gate.flush(local(15, 10, 30));
-  assert.equal(report.sent, 3);
-  assert.equal(platform.calls.length, 3);
-  assert.equal(gate.stats(local(15, 10, 30)).backlog, 1);
+  // 3P-M1（v0.7.11）：task_report 是对用户请求的答复，不计入主动消息每日上限，
+  // 所以 4 条全部投递，sentToday 只记提醒一/二 + 闲聊 = 3。
+  assert.equal(report.sent, 4);
+  assert.equal(platform.calls.length, 4);
+  assert.equal(gate.stats(local(15, 10, 30)).backlog, 0);
   assert.equal(gate.stats(local(15, 10, 30)).sentToday, 3);
+
+  gate.enqueue({ kind: 'chat', text: '第二条闲聊', at: local(15, 10, 40) });
+  const capped = await gate.flush(local(15, 10, 50));
+  // 额度已满：普通主动消息留 backlog，不丢弃。
+  assert.equal(capped.sent, 0);
+  assert.equal(gate.stats(local(15, 10, 50)).backlog, 1);
 
   const nextDay = await gate.flush(local(16, 10, 0));
   assert.equal(nextDay.sent, 1);
-  assert.equal(platform.calls.length, 4);
-  assert.match(platform.calls[3].text, /闲聊/);
+  assert.equal(platform.calls.length, 5);
+  assert.match(platform.calls[4].text, /第二条闲聊/);
 });
 
-test('单类上限 task_report 1 / reminder 2 / chat 1', async (t) => {
+test('单类上限：task_report 豁免（不再 1 条封顶）/ reminder 2 / chat 1', async (t) => {
   const { gate, platform } = setupProactive(t, { cap: 10 });
-  let sent = 0;
 
   gate.enqueue({ kind: 'task_report', text: '汇报一', at: local(15, 10, 0) });
   gate.enqueue({ kind: 'task_report', text: '汇报二', at: local(15, 10, 15) });
+  gate.enqueue({ kind: 'task_report', text: '汇报三', at: local(15, 10, 20) });
   const reports = await gate.flush(local(15, 10, 30));
-  assert.equal(reports.sent, KIND_CAPS.task_report);
-  assert.equal(reports.suppressed, 1);
-  sent += reports.sent;
+  // 3P-M1（v0.7.11）：同一天 3 个 task_run 回执必须都送达——回执是答复，不是主动消息。
+  // 合并窗口可能把它们并成 1~2 条 prompt，所以按「文本都出现」而不是按条数断言。
+  const reportText = platform.calls.map((call) => call.text).join('\n');
+  assert.match(reportText, /汇报一/u);
+  assert.match(reportText, /汇报二/u);
+  assert.match(reportText, /汇报三/u);
+  assert.equal(reports.suppressed, 0);
+  const reportCalls = platform.calls.length;
 
   gate.enqueue({ kind: 'reminder', text: '提醒一', at: local(15, 10, 0) });
   gate.enqueue({ kind: 'reminder', text: '提醒二', at: local(15, 10, 15) });
@@ -405,19 +418,20 @@ test('单类上限 task_report 1 / reminder 2 / chat 1', async (t) => {
   const reminders = await gate.flush(local(15, 10, 31));
   assert.equal(reminders.sent, KIND_CAPS.reminder);
   assert.equal(reminders.suppressed, 1);
-  sent += reminders.sent;
 
   gate.enqueue({ kind: 'chat', text: '闲聊一', at: local(15, 10, 0) });
   gate.enqueue({ kind: 'chat', text: '闲聊二', at: local(15, 10, 15) });
   const chats = await gate.flush(local(15, 10, 32));
   assert.equal(chats.sent, KIND_CAPS.chat);
   assert.equal(chats.suppressed, 1);
-  sent += chats.sent;
 
-  assert.equal(sent, 4);
-  assert.equal(platform.calls.length, 4);
+  // 回执段 2 条 prompt（合并 + 单独）+ 提醒 2 + 闲聊 1。
+  assert.equal(platform.calls.length, reportCalls + KIND_CAPS.reminder + KIND_CAPS.chat);
   const stats = gate.stats(local(15, 10, 32));
-  assert.deepEqual(stats.byKind, { task_report: 1, reminder: 2, chat: 1 });
+  // byKind 逐次投递计数（合并条算 1 条），只用来观测，不参与豁免类闸门。
+  assert.equal(stats.byKind.task_report, 2);
+  assert.equal(stats.byKind.reminder, KIND_CAPS.reminder);
+  assert.equal(stats.byKind.chat, KIND_CAPS.chat);
 });
 
 test('dedupeKey 120 分钟内不重发，超过后放行', async (t) => {
@@ -443,14 +457,18 @@ test('10 分钟合并窗口：同类相邻消息合并，仍只占 1 条预算�
   gate.enqueue({ kind: 'task_report', text: 'C', at: local(15, 10, 20) });
 
   const report = await gate.flush(local(15, 10, 30));
-  assert.equal(report.sent, 1);
+  // 3P-M1（v0.7.11）：task_report 豁免单类闸门，窗口内的 A+B 合并成 1 条，
+  // C 不在同一合并窗口内 → 同一轮另发 1 条；两条都是回执，不占每日额度。
+  assert.equal(report.sent, 2);
   assert.equal(report.merged, 1);
-  assert.equal(platform.calls.length, 1);
+  assert.equal(platform.calls.length, 2);
   assert.match(platform.calls[0].text, /A/);
   assert.match(platform.calls[0].text, /B/);
   assert.doesNotMatch(platform.calls[0].text, /C/);
-  // task_report 单类上限 1：A+B 合并占唯一名额，窗口外的 C 本轮被压掉。
-  assert.equal(report.suppressed, 1);
+  assert.match(platform.calls[1].text, /C/);
+  assert.equal(report.suppressed, 0);
+  assert.equal(gate.stats(local(15, 10, 30)).backlog, 0);
+  assert.equal(gate.stats(local(15, 10, 30)).sentToday, 0);
 });
 
 test('enqueue 同一 dedupeKey 只保留一份（V4-H1）', async (t) => {

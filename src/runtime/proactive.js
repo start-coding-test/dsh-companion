@@ -32,6 +32,20 @@ import { DEFAULT_TIMEZONE, isValidTimeZone, zonedDayKey } from '../time.js';
 /** 单类每日上限（PR-03）。 */
 export const KIND_CAPS = Object.freeze({ task_report: 1, reminder: 2, chat: 1 });
 
+/**
+ * v0.7.11（3P-M1）：`task_report` 是对用户 task_run 请求的答复，不是主动消息。
+ *
+ * v0.7.10 起 task_run 的结果只经 SA-B3 回执送达，如果回执照 `KIND_CAPS.task_report=1`
+ * 计数，当天第二条回执会在 flush 的「单类超额」分支被 `continue` 直接丢掉
+ * （queue.shift() 之后不再回队），用户就永远看不到第二个任务的结果。
+ * 所以这一类消息：不计入每日总量、不做单类封顶；去重与合并窗口照旧。
+ */
+const EXEMPT_KINDS = new Set(['task_report']);
+//
+// 3P-M1 补强：豁免类被 MAX_BACKLOG 逐出时优先保留（回执丢失等于答复丢失）；
+// 入队时 best-effort 写一条 proactive_pending 事件，重启后 seedFromStore 用它补投
+// （同 dedupeKey 之后没有 proactive_sent 即为未送达）。不新增表、不动 schema。
+
 /** 同一 dedupeKey 的重发间隔（PR-04）。 */
 export const DEDUPE_WINDOW_MS = 120 * 60 * 1000;
 
@@ -145,6 +159,8 @@ export function createProactive({ store, platform, config, target, clock = Date.
   };
   let seq = 0;
   let dropped = 0;
+  /** 3P-M1：补投期间不重复写 pending 事件。 */
+  let replaying = false;
   /** settle 链：flush 串行执行，避免并发 flush 重复发同一条 */
   let chain = Promise.resolve();
 
@@ -165,7 +181,7 @@ export function createProactive({ store, platform, config, target, clock = Date.
       if (!Number.isFinite(seconds)) continue;
       const sentAt = seconds * 1000;
       if (KINDS.includes(detail.msgKind) && dayKey(sentAt, timeZone) === state.dayKey) {
-        state.sentToday += 1;
+        if (!EXEMPT_KINDS.has(detail.msgKind)) state.sentToday += 1;
         state.byKind[detail.msgKind] += 1;
       }
       const key = typeof detail.dedupeKey === 'string' ? detail.dedupeKey : '';
@@ -176,7 +192,58 @@ export function createProactive({ store, platform, config, target, clock = Date.
     }
   }
 
+  /**
+   * 3P-M1（v0.7.11）：重启补投——同 dedupeKey 之后没有再写 proactive_sent 的
+   * 回执事件视为未送达，重建队列。只补豁免类，避免把普通闲聊/提醒重放。
+   */
+  function replayPending() {
+    if (typeof store.listEvents !== 'function') return 0;
+    let rows;
+    try {
+      rows = store.listEvents({ table_name: PROACTIVE_EVENT_TABLE, limit: 500 });
+    } catch {
+      return 0;
+    }
+    if (!Array.isArray(rows)) return 0;
+    const sentAt = new Map();
+    const pendingAt = new Map();
+    for (const row of rows) {
+      const detail = parseDetail(row?.detail_json);
+      const seconds = Number(row?.at);
+      if (!Number.isFinite(seconds)) continue;
+      const at = seconds * 1000;
+      const key = typeof detail?.dedupeKey === 'string' ? detail.dedupeKey : '';
+      if (key === '') continue;
+      if (detail?.kind === 'proactive_sent') {
+        const previous = sentAt.get(key);
+        if (previous === undefined || at > previous) sentAt.set(key, at);
+      } else if (detail?.kind === 'proactive_pending') {
+        const previous = pendingAt.get(key);
+        if (previous === undefined || at > previous.at) {
+          pendingAt.set(key, {
+            at,
+            kind: typeof detail.msgKind === 'string' ? detail.msgKind : '',
+            text: typeof detail.text === 'string' ? detail.text : '',
+          });
+        }
+      }
+    }
+    let replayed = 0;
+    replaying = true;
+    for (const [key, entry] of pendingAt) {
+      const later = sentAt.get(key);
+      if (later !== undefined && later >= entry.at) continue;
+      if (entry.text === '' || !EXEMPT_KINDS.has(entry.kind)) continue;
+      enqueue({ kind: entry.kind, text: entry.text, dedupeKey: key, at: entry.at });
+      replayed += 1;
+    }
+    replaying = false;
+    return replayed;
+  }
+
   seedFromStore();
+  replayPending();
+
 
   /** 跨天后重置当日预算。 */
   function ensureDay(at) {
@@ -206,6 +273,32 @@ export function createProactive({ store, platform, config, target, clock = Date.
   }
 
   /** 投递失败落库（C5-H1a）：写 error.name / error.message，供 /status「最近失败」。 */
+  /**
+   * 3P-M1（v0.7.11）：把豁免类待投消息落库（best-effort，失败不影响投递）。
+   * 重启后由 replayPending 用「pending 无后续 sent」判定补投。
+   * @param {{kind: string, text: string, dedupeKey: string|null, at: number}} entry
+   */
+  function recordPending(entry) {
+    try {
+      store.appendEvent({
+        at: Math.floor(entry.at / 1000),
+        action: 'USED',
+        table_name: PROACTIVE_EVENT_TABLE,
+        row_id: null,
+        actor: 'scheduler',
+        reason: 'proactive:pending',
+        detail_json: {
+          kind: 'proactive_pending',
+          msgKind: entry.kind,
+          dedupeKey: entry.dedupeKey,
+          text: entry.text,
+        },
+      });
+    } catch {
+      // 落库失败只是少了补投能力，不能阻断本次投递。
+    }
+  }
+
   function recordDeliveryError(item, error, at) {
     try {
       store.appendEvent({
@@ -287,6 +380,9 @@ export function createProactive({ store, platform, config, target, clock = Date.
       hooks.push({ onAttempt: msg.onAttempt, onSent: msg.onSent, onFailed: msg.onFailed });
     }
 
+    // 3P-M1（v0.7.11）：豁免类（回执）入队即落库，重启后靠它补投。
+    if (EXEMPT_KINDS.has(kind) && replaying === false) recordPending({ kind, text, dedupeKey, at });
+
     if (dedupeKey !== null && queue.some((item) => item.dedupeKey === dedupeKey)) {
       return { queued: queue.length, dropped, duplicate: true };
     }
@@ -297,7 +393,9 @@ export function createProactive({ store, platform, config, target, clock = Date.
     const part = { text, dedupeKey, requestId, hooks };
     queue.push({ kind, text, at, seq: seq++, dedupeKey, requestId, hooks, parts: [part] });
     while (queue.length > MAX_BACKLOG) {
-      const droppedItem = queue.shift();
+      // 3P-M1：先逐出普通主动消息，回执（豁免类）尽量保留到最后。
+      const victim = queue.findIndex((item) => !EXEMPT_KINDS.has(item.kind));
+      const [droppedItem] = queue.splice(victim >= 0 ? victim : 0, 1);
       dropped += 1;
       for (const droppedPart of droppedItem.parts) runHooks(droppedPart, 'onFailed');
     }
@@ -366,7 +464,13 @@ export function createProactive({ store, platform, config, target, clock = Date.
     while (queue.length > 0) {
       const head = queue[0];
       if (head.at > at) break; // 尚未到点的消息不提前发
-      if (state.sentToday + candidates.length >= dailyCap) break; // 到日上限：保留 backlog
+      // v0.7.11（3P-M1）：task_report 不占每日总额；到上限时也只拦非 task_report
+      // 的消息，避免回执被「日上限」连带饿死。
+      const countedCandidates = candidates.reduce(
+        (total, item) => (EXEMPT_KINDS.has(item.kind) ? total : total + 1),
+        0,
+      );
+      if (!EXEMPT_KINDS.has(head.kind) && state.sentToday + countedCandidates >= dailyCap) break;
 
       queue.shift();
 
@@ -388,7 +492,8 @@ export function createProactive({ store, platform, config, target, clock = Date.
         continue;
       }
 
-      if (plannedKind >= KIND_CAPS[head.kind]) {
+      // v0.7.11（3P-M1）：task_report 不受单类上限约束（见 EXEMPT_KINDS）。
+      if (!EXEMPT_KINDS.has(head.kind) && plannedKind >= KIND_CAPS[head.kind]) {
         report.suppressed += 1;
         continue;
       }
@@ -471,7 +576,8 @@ export function createProactive({ store, platform, config, target, clock = Date.
         break;
       }
 
-      state.sentToday += 1;
+      // v0.7.11（3P-M1）：task_report 计入 byKind（统计用）但不占每日总额。
+      if (!EXEMPT_KINDS.has(item.kind)) state.sentToday += 1;
       state.byKind[item.kind] += 1;
       if (item.dedupeKey !== null) dedupe.set(item.dedupeKey, at);
       report.sent += 1;

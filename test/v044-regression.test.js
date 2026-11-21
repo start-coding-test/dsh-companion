@@ -625,7 +625,7 @@ test('V3-M1：dispose 后重新 apply 不产生重复注册', async () => {
   try {
     const first = apply(ctx, { dbPath: temp.dbPath });
     assert.equal(ctx.tools.registrations.length, 11);
-    assert.equal(ctx.commands.registrations.length, 6);
+    assert.equal(ctx.commands.registrations.length, 7);
     assert.equal(ctx.sections.filter((item) => !item.disposed).length, 4);
     assert.equal((ctx.listeners.get('agent/pre-step') ?? []).filter((entry) => !entry.disposed).length, 1);
 
@@ -633,7 +633,7 @@ test('V3-M1：dispose 后重新 apply 不产生重复注册', async () => {
     const second = apply(ctx, { dbPath: temp.dbPath });
     try {
       assert.equal(ctx.tools.registrations.length, 11, '重新 apply 不得累加工具');
-      assert.equal(ctx.commands.registrations.length, 6, '重新 apply 不得累加命令');
+      assert.equal(ctx.commands.registrations.length, 7, '重新 apply 不得累加命令');
       // FakeCtx 的 section 注册不实现物理移除，按 disposed 数生效条目。
       assert.equal(ctx.sections.filter((item) => !item.disposed).length, 4, '重新 apply 不得累加人格段');
       assert.equal(

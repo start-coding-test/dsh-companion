@@ -3,7 +3,7 @@
  *
  * 分三层：
  * - commitments.js / chat.js 纯函数（时间、排序、敏感词、句数、资格）；
- * - 真实 apply() 注册的 6 个 ASCII 命令与 schema_meta 持久化；
+ * - 真实 apply() 注册的 7 个 ASCII 命令与 schema_meta 持久化；
  * - FakeCtx 手动时钟 + 调度器 tick 的生产接线（reminders / idle-probe job）。
  */
 import test from 'node:test';
@@ -290,13 +290,14 @@ async function interact(ctx, session, text = '今天有点累') {
   }, { kind: 'enter', messages: [] });
 }
 
-test('命令：6 个 ASCII 名；/别闲聊 与 /恢复闲聊 经 schema_meta 跨重启持久化', () => {
+test('命令：7 个 ASCII 名；/别闲聊 与 /恢复闲聊 经 schema_meta 跨重启持久化', () => {
   const temp = makeTempStore();
   const firstCtx = makeCtx();
   const firstHandle = apply(firstCtx, { dbPath: temp.dbPath });
   try {
     const names = firstCtx.commands.registrations.map((definition) => definition.name).sort();
-    assert.deepEqual(names, ['chat-off', 'chat-on', 'cost', 'memory', 'status', 'threads']);
+    // v0.7.11 V710-L1：新增 stop-task（对应 /停止任务）。
+    assert.deepEqual(names, ['chat-off', 'chat-on', 'cost', 'memory', 'status', 'stop-task', 'threads']);
     for (const definition of firstCtx.commands.registrations) {
       assert.match(definition.name, /^[a-z][a-z0-9_-]*$/);
     }

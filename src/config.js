@@ -1221,17 +1221,23 @@ export function normalizeBg(raw, warnings = [], options = {}) {
   if (typeof runAs !== 'string') {
     throw new ConfigError('bg.runAs', `must be a string, got ${typeof runAs}`);
   }
-  // D21-H4（v0.7.10）：非 root（50041 的 ubuntu uid 1000）只能提交用户级 systemd
-  // unit，用户级管理器**不能切换身份**——`bg.runAs` 非空是无效配置，直接报错，
-  // 免得拉起时才死在 `systemd-run --user --uid`。
+  // V710-L2（v0.7.11）：非 root（50041 的 ubuntu uid 1000）只能提交用户级 systemd
+  // unit，用户级管理器**不能切换身份**——`bg.runAs` 非空是无效配置。
+  //
+  // v0.7.10 在这里抛 ConfigError fail-fast；但 normalizeConfig 在 apply 顶层没有
+  // try/catch（src/index.js 的 apply），一个后台任务配置错误会把整个插件拖垮
+  // （聊天/记忆/压缩全部不加载）。v0.7.11 起改为 warn + 只把 bg_run 标成不可用
+  // （reason `runas-unsupported`），其余功能照常；`/status` 的「后台任务」行会显示原因。
   const uid = Number.isInteger(options?.uid)
     ? Number(options.uid)
     : (typeof process.getuid === 'function' ? Number(process.getuid()) : 0);
-  if (uid !== 0 && runAs.trim() !== '') {
-    throw new ConfigError(
-      'bg.runAs',
-      `must be empty when running as uid ${uid} (用户级 systemd 不能切换运行身份；只有 root 的系统实例支持 --uid)`,
-    );
+  const runAsUnsupported = uid !== 0 && runAs.trim() !== '';
+  const unavailableReason = runAsUnsupported ? 'runas-unsupported' : null;
+  const unavailableMessage = runAsUnsupported
+    ? `bg.runAs 只能配合 root 的系统级 systemd（当前 uid ${uid} 走用户级实例）；已忽略该配置，bg_run 不可用`
+    : null;
+  if (unavailableReason !== null) {
+    warnings.push(`config bg.runAs: ${unavailableMessage}`);
   }
 
   // W77-M2：额外透传的环境变量名（PATH/HOME 由 launcher 恒透传，这里只列附加项）。
@@ -1292,6 +1298,10 @@ export function normalizeBg(raw, warnings = [], options = {}) {
     cpuQuota: cpuQuota.trim(),
     minFreeDiskMB,
     wakeBudgetPerAgent,
+    // V710-L2（v0.7.11）：非空表示 runAs 与运行身份冲突，bg_run 应直接不可用
+    // （reason 与 bg-launcher 的 failure.reason 同串复用）。
+    unavailableReason,
+    unavailableMessage,
   });
 }
 

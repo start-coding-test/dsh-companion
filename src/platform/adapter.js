@@ -1004,8 +1004,9 @@ export function createAdapter(ctx, opts = {}) {
    *   provider 声明对应能力（spawn provider 四项全开，
    *   `dsh-subagent-spawn-in-process/src/index.ts:39-44`）。
    * - 返回 `SubagentActivation`（`types.ts:49-66`）：`{childId, name, messageId?,
-   *   result: Promise<SubagentResult>, dispose()}`；`result` **不 reject** 而是
-   *   以 `stopReason` 收尾，调用方按五态映射。
+   *   result: Promise<SubagentResult>, dispose()}`；`result` 正常路径 **resolve**
+   *   （`manager.ts:1113`），只有 close 事务抛错才 reject（`manager.ts:1114`），
+   *   调用方要同时接住两臂（见 src/task/subagent-runner.js 的 race）。
    *
    * @param {object} spec 宿主 SubagentActivationSpec（插件侧组装，见 src/task/subagent-runner.js）
    * @returns {Promise<object>} SubagentActivation
@@ -1026,6 +1027,13 @@ export function createAdapter(ctx, opts = {}) {
     }
     if (!Array.isArray(spec.prompt) || spec.prompt.length === 0) {
       throw new TypeError('startSubagent(spec): prompt must be a non-empty content block array');
+    }
+    // 契约门禁（v0.7.11 item 七）：`signal` 必须是真 AbortSignal。宿主会直接调
+    // `signal.throwIfAborted()`（`dsh-subagent/src/manager.ts:810-821` 的
+    // trackStartup 里也监听它），传 `{}` 会在创建期就抛错，且错误点离调用方很远。
+    if (!(spec.signal instanceof AbortSignal)) {
+      throw new TypeError('startSubagent(spec): signal must be an AbortSignal'
+        + ` (call site: ${typeof spec.callSite === 'string' ? spec.callSite : 'unknown'})`);
     }
     const activation = await impl.startActivation(spec);
     if (activation === null || typeof activation !== 'object'
@@ -1066,9 +1074,14 @@ export function createAdapter(ctx, opts = {}) {
     // D21-M2（v0.7.10）：宿主第 4 参必填 AbortSignal——调用方没给就用带超时的
     // 真 signal 兜底，绝不传 `{}`（`{}` 会在 `signal.throwIfAborted()` 处抛错，
     // 真机表现为后台任务唤醒全部落兜底）。
-    return impl.sendMessage(sender, targetId, content, {
-      signal: options?.signal ?? deliverySignal({ requestId: options?.requestId }),
-    });
+    // v0.7.11 item 七（契约门禁）：给了但不是 AbortSignal（典型是历史遗留的 `{}`）
+    // 直接在这里报错，别让第一处宿主调用才炸。
+    const signal = options?.signal ?? deliverySignal({ requestId: options?.requestId });
+    if (!(signal instanceof AbortSignal)) {
+      throw new TypeError('sendToSubagent(options): signal must be an AbortSignal'
+        + ` (call site: ${typeof options?.callSite === 'string' ? options.callSite : 'unknown'})`);
+    }
+    return impl.sendMessage(sender, targetId, content, { signal });
   }
 
   /**

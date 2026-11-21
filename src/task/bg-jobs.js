@@ -375,6 +375,9 @@ export async function startBgJob({
           // D21-H3：systemd-run 客户端的 stderr（polkit/DBus 原文）进审计，
           // 排障不必再去翻 launch.log。
           launch_log_tail: Array.isArray(failure.launchLogTail) ? failure.launchLogTail : [],
+          // V710-M1（v0.7.11）：launch-timeout 后 best-effort 停孤儿 unit 的结果。
+          stop_attempted: failure.stopAttempted === true,
+          stop_outcome: failure.stopOutcome ?? null,
           child_session_id: origin?.childSessionId ?? null,
           log_path: failedJob.log_path,
         },

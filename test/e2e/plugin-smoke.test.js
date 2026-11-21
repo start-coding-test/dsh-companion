@@ -16,7 +16,8 @@ import { strictCtx } from '../helpers/strict-ctx.js';
 // C-H1：apply 一律经严格 ctx 代理，未声明 inject 的属性读会像真实 cordis 一样抛错。
 const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
-const EXPECTED_COMMANDS = ['chat-off', 'chat-on', 'cost', 'memory', 'status', 'threads'];
+// v0.7.11 V710-L1：新增 stop-task（对应 /停止任务）。
+const EXPECTED_COMMANDS = ['chat-off', 'chat-on', 'cost', 'memory', 'status', 'stop-task', 'threads'];
 const EXPECTED_TOOLS = [
   'bg_run',
   'cost_report',

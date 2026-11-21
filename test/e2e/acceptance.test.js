@@ -230,23 +230,23 @@ test('T11c 验收：V2/V10/V15/V16 + 提醒线', async (t) => {
     assert.equal(morning.sent, 1);
     assert.equal(prompts.length, 1);
 
-    // 当日剩余额度 2：2 条提醒 + 1 条任务汇报，只发 2 条。
+    // 当日剩余额度 2：2 条提醒占满额度；任务汇报是回执，3P-M1 起不占主动消息额度。
     proactive.enqueue({ kind: 'reminder', text: '提醒：交周报。', dedupeKey: 'r-1', at: now });
     proactive.enqueue({ kind: 'reminder', text: '提醒：开会。', dedupeKey: 'r-2', at: now });
     proactive.enqueue({ kind: 'task_report', text: '任务完成：整理文档。', dedupeKey: 't-1', at: now });
     const capped = await proactive.flush(now);
-    assert.equal(capped.sent, 2);
+    assert.equal(capped.sent, 3);
     assert.equal(capped.merged, 0, 'V4-H1：提醒不参与合并，两条各自投递');
-    assert.equal(prompts.length, 3);
-    assert.equal(capped.deferred, 1, '任务汇报留到下一轮（日上限已满）');
+    assert.equal(prompts.length, 4);
+    assert.equal(capped.deferred, 0, '回执不计入日上限，三条都送出');
     assert.equal(proactive.stats(now).remainingToday, 0);
 
-    // 日上限后再来的消息不得突破 3 条。
+    // 日上限后再来的主动消息不得突破 3 条（回执仍可送达）。
     proactive.enqueue({ kind: 'chat', text: '再加一句。', dedupeKey: 'c-2', at: now });
     const extra = await proactive.flush(now);
     assert.equal(extra.sent, 0);
-    assert.equal(extra.deferred, 2, '超额消息留在 backlog，不丢也不发');
-    assert.equal(prompts.length, 3);
+    assert.equal(extra.deferred, 1, '超额主动消息留在 backlog，不丢也不发');
+    assert.equal(prompts.length, 4);
 
     // 调度器补扫：04:30 启动，6h 内的 4 个每日任务各补一次；重启不重复。
     const { store: schedulerStore } = makeTempStore({ t });

@@ -101,7 +101,7 @@ import {
   followUpText,
   scanCommitmentFollowups,
 } from './scheduler/commitments.js';
-import { bgSelfCheck } from './task/bg-launcher.js';
+import { bgSelfCheck, resolveSystemdMode } from './task/bg-launcher.js';
 import { createAdapter, deliverySignal } from './platform/adapter.js';
 import { MAIN_SCOPE, MAIN_BINDING_LATEST, MAIN_SESSION_META_KEY, classifySession, threadScope } from './session/identity.js';
 import {
@@ -122,14 +122,14 @@ import {
   isCredentialError,
   retryDelayMs,
 } from './runtime/retry.js';
-import { COMMAND_HINT_SOURCE_KIND, commandHintMessage, handleCommand } from './runtime/commands.js';
+import { COMMAND_HINT_SOURCE_KIND, commandHintMessage, formatStopTaskReply, handleCommand } from './runtime/commands.js';
 import { elapsedMs, nowMs, recordTimingSample } from './runtime/timing.js';
 import { createMetrics } from './runtime/metrics.js';
 import { createProactive } from './runtime/proactive.js';
 import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
 import { createTools } from './runtime/tools.js';
 // SA-B1/D6（v0.7.7 阶段 4）：task_run 执行槽上限由 config.subagent.concurrency 驱动。
-import { abortActiveTasks, configureTaskConcurrency } from './task/run.js';
+import { abortActiveTasks, configureTaskConcurrency, listActiveTasks, stopActiveTask } from './task/run.js';
 import {
   clearCompactionAttempts,
   clearCompactionFailures,
@@ -367,6 +367,13 @@ const COMMAND_ALIASES = Object.freeze([
     prefix: '/状态',
   }),
   Object.freeze({
+    name: 'stop-task',
+    definitionId: 'dsh-companion/command-stop-task',
+    // V710-L1（v0.7.11）：task_run 结果只经回执送达后，用户需要一个「别跑了」的入口。
+    description: '中止在跑的任务（对应 /停止任务；可带 taskId，缺省中止全部）',
+    prefix: '/停止任务',
+  }),
+  Object.freeze({
     name: 'chat-off',
     definitionId: 'dsh-companion/command-chat-off',
     description: '关闭主动闲聊（对应 /别闲聊）',
@@ -499,7 +506,16 @@ export function apply(ctx, rawConfig, hooks = {}) {
   // D21-H4（v0.7.10）：后台任务启动自检。只有配了 bg.workRoot 才有意义（空 =
   // bg_run 不可用，不猜路径）。失败 → bg_run 直接返回 bg-unavailable，/状态 显示
   // 原因；成功 → /状态 显示 user/system 模式。异步跑，不阻塞 apply。
-  if (typeof config.bg?.workRoot === 'string' && config.bg.workRoot.trim() !== '') {
+  // V710-L2（v0.7.11）：配置冲突只让 bg_run 不可用，不再拖垮整个插件。
+  if (typeof config.bg?.unavailableReason === 'string' && config.bg.unavailableReason !== '') {
+    state.bgSelfCheck = {
+      ok: false,
+      mode: resolveSystemdMode(),
+      reason: config.bg.unavailableReason,
+      message: config.bg.unavailableMessage ?? config.bg.unavailableReason,
+      missingControllers: [],
+    };
+  } else if (typeof config.bg?.workRoot === 'string' && config.bg.workRoot.trim() !== '') {
     state.bgSelfCheck = { pending: true };
     void bgSelfCheck({
       memoryMax: config.bg.memoryMax,
@@ -1114,6 +1130,28 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             });
             if (custom !== null) return { kind: 'success', text: custom };
           }
+          if (alias.name === 'stop-task') {
+            // V710-L1（v0.7.11）：/停止任务 [taskId]，直接走执行器的取消入口。
+            // 不进 handleCommand：MEMORY_COMMANDS 是中文四命令专用门（见 glm 终稿）。
+            const parts = rawInput.trim().split(/\s+/u).filter((part) => part !== '');
+            const target = parts.length > 0 ? parts[0] : null;
+            if (target === null) {
+              return {
+                kind: 'success',
+                text: formatStopTaskReply({ usage: true, active: listActiveTasks() }),
+              };
+            }
+            const stopped = stopActiveTask(target);
+            return {
+              kind: 'success',
+              text: formatStopTaskReply({
+                taskId: target,
+                result: stopped
+                  ? { ok: true, cancelled: 1, taskId: target }
+                  : { ok: false, cancelled: 0, taskId: target, reason: 'not-found' },
+              }),
+            };
+          }
           if (alias.name === 'chat-off' || alias.name === 'chat-on') {
             return {
               kind: 'success',
@@ -1283,6 +1321,14 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
         // SA-B1/W-1（阶段 4/6）：宿主以 `execute(args, exec)` 调用，`exec.agent`
         // 是存活父代理（宿主 UNAUTHORIZED 守卫要求精确对象，见
         // dsh-subagent/src/index.ts:275-277）与 bg_run 的唤醒目标来源，必须透传。
+        //
+        // 契约门禁（v0.7.11 item 七）：第二参是宿主注入的 exec，`exec.signal` 必须
+        // 是真 AbortSignal。v0.7.7 阶段 6 曾因包装成 `execute(args)` 丢掉整个 exec
+        // （`exec.agent`/`exec.signal` 全程为 undefined），这类回归一律在这里炸出来。
+        if (exec !== null && exec !== undefined && typeof exec === 'object'
+          && exec.signal !== undefined && !(exec.signal instanceof AbortSignal)) {
+          throw new TypeError(`registerTools(${tool.name}): exec.signal must be an AbortSignal`);
+        }
         return tool.execute(args ?? {}, exec ?? {});
       },
     }));

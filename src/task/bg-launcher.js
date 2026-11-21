@@ -449,6 +449,26 @@ export async function startBgProcess({
     const launch = await waitForLaunchClient(child, launchWaitMs);
     writeLaunchLog(launchLogPath, stderrText);
     if (!launch.ok) {
+      // V710-M1（v0.7.11）：客户端超时被 kill 时，systemd-run 可能已经把 unit
+      // 提交出去了（polkit 交互/start job 卡住）。best-effort 停一次孤儿 unit，
+      // 避免「判为失败但后台还在跑」。终态仍是 launch-timeout（用户要求超时即 failed），
+      // stop 结果只作为说明与审计字段。
+      let stopAttempted = false;
+      let stopOutcome = null;
+      let failureMessage = launch.failure.message;
+      if (launch.failure.reason === 'launch-timeout') {
+        stopAttempted = true;
+        stopOutcome = await signalBgProcess({
+          unit,
+          pid: null,
+          kind,
+          signal: 'TERM',
+          user,
+          uid: effectiveUid,
+          run,
+        });
+        failureMessage = `${failureMessage}；已尝试 systemctl ${user ? '--user ' : ''}stop ${unit}（${stopOutcome ? '成功' : '失败'}）`;
+      }
       return {
         unit,
         pid: null,
@@ -460,7 +480,9 @@ export async function startBgProcess({
         failure: {
           ...launch.failure,
           launchLogTail: formatLaunchLogTail(launchLogPath).split('\n').filter((line) => line !== ''),
-          message: withLaunchLogTail(launch.failure.message, launchLogPath),
+          message: withLaunchLogTail(failureMessage, launchLogPath),
+          stopAttempted,
+          stopOutcome,
         },
       };
     }
@@ -552,6 +574,10 @@ function watchLaunch(child, graceMs, { exitIsFailure }) {
  * 用户级 systemd（`systemd-run --user`）的客户端退出时机取决于 start job 与
  * polkit/DBus 授权流程，可能远晚于启动瞬间；因此判定只看客户端退出结果，
  * 不看启动后经过了多久（授权失败时客户端以非 0 退出并带 stderr 原文）。
+ *
+ * 退出时机本身：不带 `--no-block` 时 `systemd-run` 等 start job 完成才退出；
+ * `Type=simple` 的 start job 在进程拉起后即完成，所以通常很快以 0 退出；
+ * 它不等 unit 运行结束（那是 `--wait`）。
  *
  * 结论口径：
  * - `code === 0` 且 `signal === null` → ok（unit 已提交）；

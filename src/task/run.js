@@ -95,15 +95,17 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
   let sequence = 0;
   let finished = 0;
   /**
-   * v0.7.10（D21-H2）：本执行器自持的中止信号（每个在跑任务一个）。
+   * v0.7.10（D21-H2）：本执行器自持的中止信号（v0.7.11 起 taskId → controller）。
    *
    * 之前 task_run 把宿主的 `exec.signal` 传给子代理：主会话本轮结束（宿主 abort
    * 工具调用的 signal）会连带中止子代理，且工具调用要 `await` 整个执行 Promise，
    * 主会话因此被阻塞。现在执行信号与主轮次解耦，只有三种来源能中止子代理：
    * 硬超时（subagent-runner 的 900s）、`abortAll()`（插件卸载/进程退出）、
-   * 显式取消。
+   * 显式取消（`/stop-tasks`，V710-L1）。
+   *
+   * 用 Map 而不是 Set 只为定向取消：`/stop-tasks <taskId>` 要能找到那一个任务。
    */
-  const activeControllers = new Set();
+  const activeControllers = new Map();
 
   /**
    * 同步准入（v0.7.10 D21-H2）：空闲直接占槽；忙时占一个排队位；队列满返回 null
@@ -137,6 +139,34 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
   }
 
   /**
+   * v0.7.11（V710-L1）：排队等槽，取消时把自己从等待队列摘掉并返回 false。
+   *
+   * 只 resolve 而不摘除会让 `release()` 把槽位转交给已取消的任务（或对同一条
+   * 等待者重复计数）；取消后的任务不该执行，也不该占槽。
+   * @param {AbortSignal} signal
+   * @returns {Promise<boolean>} true=拿到槽位；false=排队期间被取消
+   */
+  function waitForSlot(signal) {
+    return new Promise((resolve) => {
+      const waiter = () => {
+        signal?.removeEventListener?.('abort', onAbort);
+        resolve(true);
+      };
+      const onAbort = () => {
+        const at = waiting.indexOf(waiter);
+        if (at >= 0) waiting.splice(at, 1);
+        resolve(false);
+      };
+      waiting.push(waiter);
+      if (signal?.aborted === true) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener?.('abort', onAbort, { once: true });
+    });
+  }
+
+  /**
    * 开始一次任务，**不等待**执行结束（v0.7.10 D21-H2）。
    *
    * 调用方拿到的 `done` 覆盖排队与子代理的 `activation.result` 全部执行过程，
@@ -165,6 +195,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
    * @returns {{ok: true, taskId: string, queued: boolean, done: Promise<object>}
    *   | {ok: false, reason: 'busy', queue: number}}
    */
+
   function startTask(options = {}) {
     const {
       platform,
@@ -202,13 +233,13 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
     // D21-H2：执行信号只受本执行器控制——硬超时（subagent-runner）、abortAll()
     // （插件卸载/进程退出）与显式取消能中止子代理；主会话本轮结束不会。
     const controller = new AbortController();
-    activeControllers.add(controller);
+    activeControllers.set(taskId, controller);
 
     const done = (async () => {
+      let queuedCancelled = false;
       if (admission.queued) {
-        await new Promise((resolve) => {
-          waiting.push(resolve);
-        });
+        const granted = await waitForSlot(controller.signal);
+        if (!granted) queuedCancelled = true;
       }
       try {
         let workerResult;
@@ -219,7 +250,16 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
           && platform?.capabilities?.subagents === true
           && agent !== null && typeof agent === 'object';
         try {
-          if (useSubagent) {
+          if (queuedCancelled) {
+            // v0.7.11（V710-L1）：排队期间被 /停止任务 取消——不启动执行，直接出回执。
+            workerResult = {
+              status: 'error',
+              sessionId: null,
+              durationMs: Math.max(0, clock() - startedAt),
+              reason: 'cancelled',
+              error: '任务在排队时被取消（/stop-task）',
+            };
+          } else if (useSubagent) {
             workerResult = await runSubagentTask({
               platform,
               task: {
@@ -265,6 +305,9 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
               tokenWarn,
               tokenStop,
               sampleMs,
+          // v0.7.11（V710-L1）：worker 路径同样受执行器自持 controller 控制，
+          // 这样 /stop-tasks 对没有子代理能力的宿主（worker 会话）也有效。
+          signal: controller.signal,
             });
           }
         } catch (error) {
@@ -281,14 +324,19 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
         const durationMs = Number.isFinite(workerResult.durationMs)
           ? Number(workerResult.durationMs)
           : Math.max(0, clock() - startedAt);
-        const baseSummary = titleText === undefined
-          ? defaultSummary(status, workerResult.error)
-          : titleText;
+        // v0.7.11（V710-L1）：reason 不只 partial 有——cancelled 也要透传到回执/审计。
+        const reason = typeof workerResult.reason === 'string' && workerResult.reason !== ''
+          ? workerResult.reason
+          : (status === 'partial' ? 'token_limit' : undefined);
+        // v0.7.11（V710-L1）：用户主动取消不是失败，摘要单独给「已取消」。
+        const cancelled = reason === 'cancelled';
+        const baseSummary = cancelled
+          ? (titleText === undefined ? '已取消' : titleText)
+          : (titleText === undefined ? defaultSummary(status, workerResult.error) : titleText);
         // token 硬线：标题保留已完成内容，另起一行说明提前结束的原因。
         const summary = status === 'partial' && titleText !== undefined
           ? `${titleText}\n${TOKEN_LIMIT_NOTE}`
           : baseSummary;
-        const reason = status === 'partial' ? workerResult.reason ?? 'token_limit' : undefined;
         // SA-B1：子代理路径已经用结构化结果收过 ≤300 字回执（A1），没有显式
         // title 时直接用它（保持「回执只说结论」的口径），否则沿用 title 口径。
         const receipt = titleText === undefined
@@ -346,13 +394,11 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
         if (status === 'failed' && workerResult.error !== undefined) {
           result.error = String(workerResult.error);
         }
-        if (status === 'partial') {
-          result.partial = true;
-          result.reason = reason;
-        }
+        if (reason !== undefined) result.reason = reason;
+        if (status === 'partial') result.partial = true;
         return result;
       } finally {
-        activeControllers.delete(controller);
+        activeControllers.delete(taskId);
         release();
       }
     })();
@@ -388,7 +434,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
    * @returns {number} 被中止的任务数
    */
   function abortAll(reason = 'shutdown') {
-    const controllers = [...activeControllers];
+    const controllers = [...activeControllers.values()];
     activeControllers.clear();
     let aborted = 0;
     for (const controller of controllers) {
@@ -400,6 +446,52 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
       }
     }
     return aborted;
+  }
+
+  /**
+   * 取消在跑任务（v0.7.11 V710-L1：`/stop-tasks [taskId]`）。
+   *
+   * 只 abort 执行器自持的 controller——子代理侧会据此走 dispose + 取消回执（见
+   * src/task/subagent-runner.js），worker 侧由 worker 的 abort 监听取消会话。
+   * @param {string|null} [taskId=null] null/空表示「全部在跑任务」
+   * @returns {{ok: boolean, cancelled: number, taskId: string|null, reason?: string}}
+   */
+  /**
+   * v0.7.11（V710-L1）：按 taskId 中止单个在跑任务。
+   * @param {string} taskId
+   * @returns {boolean} 是否命中并把取消请求发了出去
+   */
+  function stopTaskById(taskId) {
+    if (typeof taskId !== 'string' || taskId.trim() === '') return false;
+    const controller = activeControllers.get(taskId.trim());
+    if (controller === undefined || controller.signal.aborted) return false;
+    try {
+      controller.abort('cancelled');
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * v0.7.11（V710-L1）：/停止任务 不带参数时列在跑任务（用法提示用）。
+   * @returns {string[]}
+   */
+  function listActiveTasks() {
+    return [...activeControllers.keys()];
+  }
+
+  function cancelTask(taskId = null) {
+    const key = taskId === null || taskId === undefined ? '' : String(taskId).trim();
+    if (key === '') {
+      let cancelled = 0;
+      for (const id of [...activeControllers.keys()]) {
+        if (stopTaskById(id)) cancelled += 1;
+      }
+      return { ok: true, cancelled, taskId: null };
+    }
+    if (stopTaskById(key)) return { ok: true, cancelled: 1, taskId: key };
+    return { ok: false, cancelled: 0, taskId: key, reason: 'not-found' };
   }
 
   /**
@@ -437,7 +529,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
     return true;
   }
 
-  return { startTask, runTask, stats, tryAcquire, release, setMaxExec, abortAll };
+  return { startTask, runTask, stats, tryAcquire, release, setMaxExec, abortAll, cancelTask, stopTaskById, listActiveTasks };
 }
 
 const defaultRunner = createTaskRunner();
@@ -468,6 +560,31 @@ export function startTask(options) {
  */
 export function abortActiveTasks(reason) {
   return defaultRunner.abortAll(reason);
+}
+
+/**
+ * 取消在跑任务（v0.7.11 V710-L1，`/stop-tasks` 的实现入口）。
+ * @param {string|null} [taskId] null/空 = 全部
+ */
+export function cancelActiveTask(taskId = null) {
+  return defaultRunner.cancelTask(taskId);
+}
+
+/**
+ * v0.7.11（V710-L1）：按 taskId 取消单个在跑任务（/停止任务 <taskId>）。
+ * @param {string} taskId
+ * @returns {boolean}
+ */
+export function stopActiveTask(taskId) {
+  return defaultRunner.stopTaskById(taskId);
+}
+
+/**
+ * v0.7.11（V710-L1）：列在跑任务 id（/停止任务 无参时给用法与清单）。
+ * @returns {string[]}
+ */
+export function listActiveTasks() {
+  return defaultRunner.listActiveTasks();
 }
 
 /** 单例槽位统计。 */

@@ -172,7 +172,8 @@ reminderTodoStaleDays: 7
 #
 # workRoot：留空（默认）时 bg_run 返回「不可用：未配置 bg.workRoot」。
 # interpreters：只比 argv[0]；脚本按 argv 数组直传，不经 shell 拼接。
-# runAs：空 = 与 50041 相同（即 root）；可配为专用用户。
+# runAs：默认空 = 与 50041 相同（当前 ubuntu uid 1000）；非 root 时走用户级 systemd，runAs 必须为空
+#        （非空则 bg_run 直接不可用，插件其余功能照常加载）。
 # maxDeadlineMin：deadline_min 必填且不超过它，超时 RuntimeMaxSec 终止（状态 timeout）。
 # memoryMax / cpuQuota：cgroup 资源上限（默认 4G / 2 核）。
 # minFreeDiskMB：workRoot 剩余空间不足就拒绝启动。
