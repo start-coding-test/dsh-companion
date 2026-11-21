@@ -16,9 +16,12 @@
 import { forgetMemory } from '../memory/forget.js';
 import {
   releaseExecSlot,
-  runTask as runBackgroundTask,
+  startTask as startBackgroundTask,
   tryAcquireExecSlot,
 } from '../task/run.js';
+// D21-M2（v0.7.10）：宿主 sendToSubagent/prompt 的第 4 参必须是真的 AbortSignal，
+// 传 `{}` 时宿主会调 `signal.throwIfAborted()` 直接抛错。
+import { deliverySignal } from '../platform/adapter.js';
 import { summarizeCost } from './commands.js';
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
 import { nextOccurrence, parseRRule } from '../scheduler/recurrence.js';
@@ -224,6 +227,10 @@ export function createTools({
   // systemd-run；单测注入临时目录 + startBgProcess 替身，不碰真实 /opt 与真实 systemd。
   bgLogRoot,
   bgLauncher,
+  // D21-H4（v0.7.10）：后台任务可用性（启动自检结果）。返回
+  // `{ok:true, mode:'user'|'system', missingControllers}` 或
+  // `{ok:false, reason, message}`；缺省视为「未做自检 = 可用」。
+  bgAvailability,
   currentScope,
   budgetGate,
   metrics,
@@ -628,11 +635,14 @@ export function createTools({
               let continued = false;
               if (goal !== undefined) {
                 try {
+                  // D21-M2（v0.7.10）：第 4 参必须是真 AbortSignal（宿主会调
+                  // `signal.throwIfAborted()`）；旧代码在没有 exec.signal 时传
+                  // `{}`，续派必然抛错并退化成重建会话。
                   await platform.sendToSubagent(
                     sender,
                     anchor,
                     [{ type: 'text', text: goal }],
-                    exec?.signal === undefined ? {} : { signal: exec.signal },
+                    { signal: exec?.signal ?? deliverySignal({ requestId }) },
                   );
                   continued = true;
                 } catch (error) {
@@ -910,8 +920,10 @@ export function createTools({
       description:
         '一次性的活用这个：把一件独立任务交给子代理执行，跑完就结束。'
         + '需要多天反复推进、同类事沿用的用 thread_run。'
-        + '并发上限 2（subagentConcurrency），忙时排队最多 2 个，超出直接返回 busy；'
-        + '软超时 600s 只告警，硬超时 900s 中止。返回 ≤300 字回执。',
+        + '**立即返回** {ok, status:"started", taskId, title}，子代理在后台继续跑；'
+        + '结果稍后以回执（task_report）送达会话，本轮先告诉用户「已派出」。'
+        + '并发上限 2（subagentConcurrency），忙时排队最多 2 个，超出立即返回 busy；'
+        + '软超时 600s 只告警，硬超时 900s 中止。',
       parameters: {
         type: 'object',
         properties: {
@@ -953,13 +965,17 @@ export function createTools({
         // requestId = companion-task:<taskId>:<claimKey>，重试不换 id。
         const claimKey = makeExecutionId('claim', nowMs());
         const runScope = typeof scope === 'string' && scope !== '' ? scope : 'main';
-        const pending = runBackgroundTask({
+        // D21-H2（v0.7.10）：这里**不 await** 执行 Promise——宿主的工具调用会等
+        // execute 返回。执行信号由 task/run.js 自持（硬超时 / abortAll），与主轮次
+        // 的 `exec.signal` 解耦，结果只走 SA-B3 的 onReceipt 回执。
+        // SA-B3 的 onReceipt 回执。
+        const started = startBackgroundTask({
           platform,
           store,
           goal,
           title,
           at: nowMs(),
-          scope: typeof scope === 'string' && scope !== '' ? scope : 'main',
+          scope: runScope,
           cwd: defaultCwd,
           claimKey,
           // SA-B1：派活所需的存活 parent（宿主 UNAUTHORIZED 守卫要求精确对象，
@@ -970,7 +986,6 @@ export function createTools({
               enabled: true,
               model: subagentModel,
               label: title ?? goal.slice(0, 32),
-              ...(exec?.signal === undefined ? {} : { signal: exec.signal }),
               logger: typeof platform?.log === 'function'
                 ? (message, meta) => platform.log('warn', message, meta)
                 : undefined,
@@ -980,12 +995,21 @@ export function createTools({
           // SA-B3（阶段 4）：回执投回主会话由接线层决定（tools 不认识 proactive）。
           ...(typeof taskReceipt === 'function' ? { onReceipt: taskReceipt } : {}),
         });
+        // busy / 额度闸门 / session-unavailable 等前置拒绝仍是**同步**返回值。
+        if (started.ok !== true) return started;
         // A1（v0.4.13）：worker 会话的 token 估算按 task 来源入账；记账是旁路。
-        Promise.resolve(pending).then(
+        Promise.resolve(started.done).then(
           (result) => reportTaskUsage(result, { scope: runScope, recordTokenUsage }),
           () => {},
         );
-        return pending;
+        return {
+          ok: true,
+          status: 'started',
+          taskId: started.taskId,
+          title: title ?? null,
+          queued: started.queued === true,
+          note: '已派出，结果稍后以回执送达；本轮不必等待。',
+        };
       },
     },
 
@@ -1034,6 +1058,18 @@ export function createTools({
         const bgConfig = typeof bgConfigNow === 'function' ? bgConfigNow() : null;
         if (bgConfig === null) {
           return { ok: false, reason: 'not-configured', message: '不可用：未配置 bg.workRoot（后台长任务的工作目录根）' };
+        }
+        // D21-H4（v0.7.10）：启动自检失败时后台任务整体不可用——别让用户以为派出去了
+        // （D21-H3 的「被拒当成功」就是同类误导）。
+        const availability = typeof bgAvailability === 'function' ? bgAvailability() : null;
+        if (availability !== null && availability !== undefined && availability.ok === false) {
+          return {
+            ok: false,
+            reason: 'bg-unavailable',
+            message: typeof availability.message === 'string' && availability.message !== ''
+              ? availability.message
+              : '后台任务不可用：systemd 自检失败',
+          };
         }
         const cwdText = requireString(args.cwd, 'bg_run', 'cwd');
         const deadlineMin = args.deadline_min;

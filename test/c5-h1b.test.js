@@ -25,6 +25,15 @@ import { TEST_NOW } from './e2e/helpers.js';
 
 const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
+/** 轮询等待异步链路推进（D21-H2 起 task_run 立即返回，投放是异步的）。**非真机证据**。 */
+async function waitFor(predicate, timeoutMs = 3000) {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error('waitFor timeout');
+    await new Promise((resolve) => { setTimeout(resolve, 10); });
+  }
+}
+
 /** strict FakeCtx：只有真实宿主公开的线程服务方法。 */
 function makeStrictCtx({ now = TEST_NOW } = {}) {
   const ctx = new FakeCtx({ now, strict: true });
@@ -129,7 +138,9 @@ test('C5-H1b：task_run 投递携带 companion-task requestId；worker 重投不
     const tool = ctx.tools.registrations.find((definition) => definition.name === 'task_run');
     const result = await tool.execute({ goal: '写一条任务回执', title: 'C5-H1b' });
     assert.equal(result.ok, true, JSON.stringify(result));
+    assert.equal(result.status, 'started', 'v0.7.10 D21-H2：工具立即返回');
 
+    await waitFor(() => ctx.callsOf('sessionController.prompt').length > 0);
     const delivered = ctx.callsOf('sessionController.prompt')[0].args[0];
     assert.match(delivered.requestId, /^companion-task:task-[a-z0-9-]+:claim-/);
   } finally {

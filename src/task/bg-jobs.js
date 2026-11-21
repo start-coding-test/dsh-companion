@@ -18,9 +18,11 @@ import { isAbsolute, basename, relative, resolve } from 'node:path';
 import {
   DEFAULT_BG_LOG_ROOT,
   capLogFile,
+  currentUid,
   jobDir,
   probeBgProcess,
   readExitCode,
+  resolveSystemdMode,
   signalBgProcess,
   startBgProcess,
   tailLog,
@@ -300,6 +302,7 @@ export async function startBgJob({
   logRoot = DEFAULT_BG_LOG_ROOT,
   launcher = {},
   nowMs = Date.now(),
+  uid,
 }) {
   const verdict = validateBgRun({
     argv: params?.argv,
@@ -326,6 +329,8 @@ export async function startBgJob({
     memoryMax: config?.bg?.memoryMax ?? '4G',
     cpuQuota: config?.bg?.cpuQuota ?? '200%',
     runAs: config?.bg?.runAs ?? '',
+    // D21-H4：uid 决定 systemd 模式（0=系统实例，非 0=该用户的用户级实例）。
+    uid: Number.isInteger(uid) ? Number(uid) : currentUid(),
     logRoot,
   });
   const logPath = started.logPath ?? bgLogPath(id, logRoot);
@@ -367,6 +372,9 @@ export async function startBgJob({
           cwd: plan.cwd,
           failure: failure.reason,
           message: failure.message,
+          // D21-H3：systemd-run 客户端的 stderr（polkit/DBus 原文）进审计，
+          // 排障不必再去翻 launch.log。
+          launch_log_tail: Array.isArray(failure.launchLogTail) ? failure.launchLogTail : [],
           child_session_id: origin?.childSessionId ?? null,
           log_path: failedJob.log_path,
         },
@@ -374,10 +382,19 @@ export async function startBgJob({
     } catch {
       // 同 W-1e：审计失败不影响失败回执本身。
     }
+    const launchLogTail = Array.isArray(failure.launchLogTail) && failure.launchLogTail.length > 0
+      ? failure.launchLogTail
+      : [];
+    const tailText = launchLogTail.length > 0 ? launchLogTail.join('\n') : '';
+    // D21-H3：launcher 可能已经把同一段 stderr 拼进 failure.message（真实拉起失败
+    // 就是这条路径）；回执里只允许出现一次，message 缺了才补。
+    const failureMessage = typeof failure.message === 'string' ? failure.message : String(failure.message ?? '');
+    const needsTail = tailText !== '' && !failureMessage.includes(tailText);
     return {
       ok: false,
       reason: 'launch-failed',
-      message: `后台任务拉起失败（${failure.reason}）：${failure.message}`,
+      message: `后台任务拉起失败（${failure.reason}）：${failureMessage}${needsTail ? `\n启动日志末尾：\n${tailText}` : ''}`,
+      launchLogTail,
       job: failedJob,
     };
   }
@@ -499,6 +516,7 @@ export function writeWakeCount(store, childSessionId, count) {
  * @param {(info: object) => Promise<object>|object} input.wake 唤醒/投递回调
  * @param {object} [input.launcher] {probeBgProcess, signalBgProcess, tailLog, readExitCode}
  * @param {number} [input.nowMs]
+ * @param {number} [input.uid] 进程 uid（D21-H4：非 0 → 用户级 systemd）
  * @param {boolean} [input.recovering] 启动恢复（W-4）时为 true，语义相同但日志区分
  * @returns {Promise<{checked: number, woken: number, timedOut: number, lost: number, running: number}>}
  */
@@ -508,6 +526,7 @@ export async function monitorBgJobs({
   wake,
   launcher = {},
   nowMs = Date.now(),
+  uid,
   recovering = false,
   graceMs = BG_TERM_GRACE_MS,
 }) {
@@ -515,6 +534,9 @@ export async function monitorBgJobs({
   const signal = launcher.signalBgProcess ?? signalBgProcess;
   const readTail = launcher.tailLog ?? tailLog;
   const capLog = launcher.capLogFile ?? capLogFile;
+  // D21-H4：探针与信号查询要和拉起时同一模式（--user + DBus 环境）。
+  const effectiveUid = Number.isInteger(uid) ? Number(uid) : currentUid();
+  const userMode = resolveSystemdMode(effectiveUid) === 'user';
   const jobs = store.listBgJobs({ state: BG_JOB_STATES.running, limit: 100 });
   const summary = { checked: jobs.length, woken: 0, timedOut: 0, lost: 0, running: 0 };
   const nowSec = Math.floor(nowMs / 1000);
@@ -531,7 +553,7 @@ export async function monitorBgJobs({
     const exitPath = `${String(job.log_path).replace(/\/output\.log$/u, '')}/exit`;
     let probed;
     try {
-      probed = await probe({ unit: job.pid_or_unit, pid, exitPath, kind });
+      probed = await probe({ unit: job.pid_or_unit, pid, exitPath, kind, ...(kind === 'linux' ? { user: userMode, uid: effectiveUid } : {}) });
     } catch {
       summary.running += 1;
       continue;
@@ -556,20 +578,20 @@ export async function monitorBgJobs({
 
     if (probed.running === true && nowSec >= job.deadline) {
       // W-2：主杀由 systemd 的 RuntimeMaxSec 完成，这里是兜底（TERM → 10s → KILL）。
-      await signal({ unit: job.pid_or_unit, pid, kind, signal: 'TERM' });
+      await signal({ unit: job.pid_or_unit, pid, kind, signal: 'TERM', ...(kind === 'linux' ? { user: userMode, uid: effectiveUid } : {}) });
       const termDeadline = nowMs + graceMs;
       let stillAlive = true;
       while (nowMs < termDeadline) {
         await sleep(Math.min(250, Math.max(0, termDeadline - nowMs)));
         nowMs = Date.now() > nowMs ? Date.now() : nowMs;
-        const again = await probe({ unit: job.pid_or_unit, pid, exitPath, kind }).catch(() => ({ running: false }));
+        const again = await probe({ unit: job.pid_or_unit, pid, exitPath, kind, ...(kind === 'linux' ? { user: userMode, uid: effectiveUid } : {}) }).catch(() => ({ running: false }));
         if (again.exited === true || again.running !== true) {
           stillAlive = false;
           break;
         }
         break; // 单轮不阻塞调度器：下一轮 tick 继续判断，KILL 由下一轮补。
       }
-      if (stillAlive) await signal({ unit: job.pid_or_unit, pid, kind, signal: 'KILL' });
+      if (stillAlive) await signal({ unit: job.pid_or_unit, pid, kind, signal: 'KILL', ...(kind === 'linux' ? { user: userMode, uid: effectiveUid } : {}) });
       const code = readExitCode(exitPath);
       const claimed = store.claimBgJobState(job.id, BG_JOB_STATES.timeout, {
         exit_code: code ?? null,

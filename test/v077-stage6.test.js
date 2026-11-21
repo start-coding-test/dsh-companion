@@ -256,6 +256,8 @@ test('W-1c：systemd-run 参数（RuntimeMaxSec / MemoryMax / CPUQuota / --colle
   };
   const asRoot = buildSystemdRunArgs({ ...base, runAs: '' });
   assert.deepEqual(asRoot, [
+    // v0.7.10 D21-H3：客户端不再允许交互式授权（否则 polkit 会把启动挂住）。
+    '--no-ask-password',
     '--unit', 'dsh-bg-abc',
     '--collect',
     '-p', 'RuntimeMaxSec=1200',
@@ -792,7 +794,10 @@ test('W78-H1：早退带 signal（或非 0）仍是拉起失败', async (t) => {
   assert.ok(work.length > 0);
 });
 
-test('W78-H1：150ms 内没退出也没有 error → 视为已拉起，交给探针', async () => {
+test('v0.7.10 D21-H3：systemd-run 客户端不退出 → launch-timeout（不再 150ms 判成功）', async () => {
+  // **非真机证据**：本机是 Windows，用替身客户端模拟「systemd-run 卡在 polkit 授权」。
+  // 旧行为（150ms grace 内没退出就判已拉起）会把这种启动当成功，真机 bg-mwq5ghga
+  // 就是这样 lost 的；新行为必须等到客户端退出，超时则 kill 并记 launch-timeout。
   const logRoot = mkdtempSync(join(tmpdir(), 'dsh-bglog-'));
   try {
     const started = await startBgProcess({
@@ -805,10 +810,11 @@ test('W78-H1：150ms 内没退出也没有 error → 视为已拉起，交给探
       cpuQuota: '100%',
       logRoot,
       platform: 'linux',
-      launchGraceMs: 20,
+      launchWaitMs: 30,
       spawnImpl: fakeSpawner([]),
     });
-    assert.equal(started.failure, undefined);
+    assert.equal(started.failure?.reason, 'launch-timeout');
+    assert.match(started.failure.message, /polkit/u);
     assert.equal(started.unit, 'dsh-bg-bg-noxit');
   } finally {
     rmSync(logRoot, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });

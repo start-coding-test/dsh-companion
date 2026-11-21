@@ -94,22 +94,30 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
   const waiting = [];
   let sequence = 0;
   let finished = 0;
+  /**
+   * v0.7.10（D21-H2）：本执行器自持的中止信号（每个在跑任务一个）。
+   *
+   * 之前 task_run 把宿主的 `exec.signal` 传给子代理：主会话本轮结束（宿主 abort
+   * 工具调用的 signal）会连带中止子代理，且工具调用要 `await` 整个执行 Promise，
+   * 主会话因此被阻塞。现在执行信号与主轮次解耦，只有三种来源能中止子代理：
+   * 硬超时（subagent-runner 的 900s）、`abortAll()`（插件卸载/进程退出）、
+   * 显式取消。
+   */
+  const activeControllers = new Set();
 
   /**
-   * 取执行槽：空闲直接拿；忙则排队；队列满返回 false。
-   * 被唤醒时槽位直接转交（active 不变），因此不能在这里重复 +1。
-   * @returns {Promise<boolean>}
+   * 同步准入（v0.7.10 D21-H2）：空闲直接占槽；忙时占一个排队位；队列满返回 null
+   * ——工具层据此**同步**返回 busy，不再 await 队列。
+   * 被唤醒时槽位直接转交（active 不变），因此排队分支不能在这里 +1。
+   * @returns {{queued: boolean}|null}
    */
-  async function acquire() {
+  function admit() {
     if (active < slots) {
       active += 1;
-      return true;
+      return { queued: false };
     }
-    if (waiting.length >= maxQueue) return false;
-    await new Promise((resolve) => {
-      waiting.push(resolve);
-    });
-    return true;
+    if (waiting.length >= maxQueue) return null;
+    return { queued: true };
   }
 
   /** 释放执行槽：有等待者则转交，否则回收。 */
@@ -129,7 +137,13 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
   }
 
   /**
-   * 跑一次任务（串行、可排队）。
+   * 开始一次任务，**不等待**执行结束（v0.7.10 D21-H2）。
+   *
+   * 调用方拿到的 `done` 覆盖排队与子代理的 `activation.result` 全部执行过程，
+   * 工具层不 await 它，因此工具调用与主会话都不被阻塞：
+   *   - 参数校验、busy 判定、占槽全部同步完成，工具层可立即返回 started/busy；
+   *   - 执行 Promise 以 `done` 返回，调用方**不需要** await（rejection 已内部消费）；
+   *   - 子代理执行信号是本执行器自持的 AbortController，与主轮次解耦。
    *
    * @param {object} options
    * @param {object} options.platform T2 适配器（createSession/prompt/whenIdle/cancel）
@@ -145,12 +159,13 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
    * @param {string} [options.claimKey] 本次执行的稳定标识；给了就生成
    *   `companion-task:<taskId>:<claimKey>` 作为 prompt requestId（C5-H1b）
    * @param {string} [options.scope='main'] 回执/审计 scope
-   * @returns {Promise<{ok: true, taskId: string, status: 'done'|'timeout'|'partial'|'failed',
-   *   receipt: string, sessionId: string|null, durationMs: number,
-   *   partial?: true, reason?: string, error?: string}
-   *   | {ok: false, reason: 'busy', queue: number}>}
+   * @param {string} [options.taskId] 预先生成的 taskId（工具层先回 started 用）
+   * @param {object} [options.subagent] 派活参数 {enabled, name, label, model, hardMs, onChildId, logger}
+   * @param {Function} [options.onReceipt] SA-B3 回执投递（唯一的结果回传通道）
+   * @returns {{ok: true, taskId: string, queued: boolean, done: Promise<object>}
+   *   | {ok: false, reason: 'busy', queue: number}}
    */
-  async function runTask(options = {}) {
+  function startTask(options = {}) {
     const {
       platform,
       store = null,
@@ -166,6 +181,7 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
       agent = null,
       subagent = null,
       onReceipt = null,
+      taskId: presetTaskId,
     } = options;
 
     const goalText = normalizeGoal(goal);
@@ -173,154 +189,217 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
     const { softMs, hardMs, tokenWarn, tokenStop, sampleMs } = normalizeLimits(limits);
     const clock = typeof now === 'function' ? () => Number(now()) : () => Number(now);
     const startedAt = Number.isFinite(at) ? Number(at) : clock();
-    const taskId = nextTaskId(startedAt);
+    const taskId = typeof presetTaskId === 'string' && presetTaskId !== ''
+      ? presetTaskId
+      : nextTaskId(startedAt);
     const receiptScope = typeof scope === 'string' && scope !== '' ? scope : 'main';
 
-    const granted = await acquire();
-    if (!granted) {
+    const admission = admit();
+    if (admission === null) {
       return { ok: false, reason: 'busy', queue: maxQueue };
     }
 
-    try {
-      let workerResult;
-      // SA-B1（阶段 4）：有子代理能力且有存活 parent 时走派活路径；否则回退
-      // worker 的 createSession + prompt（保留原行为，兼容不支持子代理的宿主）。
-      const useSubagent = subagent !== null && typeof subagent === 'object'
-        && subagent.enabled === true
-        && platform?.capabilities?.subagents === true
-        && agent !== null && typeof agent === 'object';
-      try {
-        if (useSubagent) {
-          workerResult = await runSubagentTask({
-            platform,
-            task: {
-              id: taskId,
-              scope: receiptScope,
-              prompt: goalText,
-              ...(agentPreset === undefined ? {} : { agentPreset }),
-              ...(cwd === undefined ? {} : { cwd }),
-            },
-            parent: agent,
-            name: subagent.name,
-            label: subagent.label ?? (titleText ?? taskId),
-            model: subagent.model ?? null,
-            now: clock,
-            ...(subagent.hardMs === undefined ? {} : { hardMs: subagent.hardMs }),
-            ...(subagent.signal === undefined ? {} : { signal: subagent.signal }),
-            ...(typeof subagent.onChildId === 'function' ? { onChildId: subagent.onChildId } : {}),
-            logger: subagent.logger,
-          });
-        } else {
-          workerResult = await runWorkerTask({
-            platform,
-            task: {
-              id: taskId,
-              scope: receiptScope,
-              prompt: goalText,
-              summary: titleText,
-              ...(typeof claimKey === 'string' && claimKey !== ''
-                ? { requestId: `companion-task:${taskId}:${claimKey}` }
-                : {}),
-              ...(agentPreset === undefined ? {} : { agentPreset }),
-              ...(cwd === undefined ? {} : { cwd }),
-            },
-            // 回执由本模块写（需要 title/status 映射），worker 不再写第二条。
-            store: null,
-            now: clock,
-            softMs,
-            hardMs,
-            tokenWarn,
-            tokenStop,
-            sampleMs,
-          });
-        }
-      } catch (error) {
-        // 参数/适配器异常：worker 尚未接管，直接收敛成 failed 回执。
-        workerResult = {
-          status: 'error',
-          sessionId: null,
-          durationMs: Math.max(0, clock() - startedAt),
-          error: messageOf(error),
-        };
-      }
+    // D21-H2：执行信号只受本执行器控制——硬超时（subagent-runner）、abortAll()
+    // （插件卸载/进程退出）与显式取消能中止子代理；主会话本轮结束不会。
+    const controller = new AbortController();
+    activeControllers.add(controller);
 
-      const status = toStatus(workerResult.status);
-      const durationMs = Number.isFinite(workerResult.durationMs)
-        ? Number(workerResult.durationMs)
-        : Math.max(0, clock() - startedAt);
-      const baseSummary = titleText === undefined
-        ? defaultSummary(status, workerResult.error)
-        : titleText;
-      // token 硬线：标题保留已完成内容，另起一行说明提前结束的原因。
-      const summary = status === 'partial' && titleText !== undefined
-        ? `${titleText}\n${TOKEN_LIMIT_NOTE}`
-        : baseSummary;
-      const reason = status === 'partial' ? workerResult.reason ?? 'token_limit' : undefined;
-      // SA-B1：子代理路径已经用结构化结果收过 ≤300 字回执（A1），没有显式
-      // title 时直接用它（保持「回执只说结论」的口径），否则沿用 title 口径。
-      const receipt = titleText === undefined
-        && typeof workerResult.receipt === 'string' && workerResult.receipt !== ''
-        ? workerResult.receipt
-        : formatReceipt({
-          status: RECEIPT_STATUS[status],
-          summary: status === 'failed' ? defaultSummary(status, workerResult.error) : summary,
-          artifacts: [],
+    const done = (async () => {
+      if (admission.queued) {
+        await new Promise((resolve) => {
+          waiting.push(resolve);
+        });
+      }
+      try {
+        let workerResult;
+        // SA-B1（阶段 4）：有子代理能力且有存活 parent 时走派活路径；否则回退
+        // worker 的 createSession + prompt（保留原行为，兼容不支持子代理的宿主）。
+        const useSubagent = subagent !== null && typeof subagent === 'object'
+          && subagent.enabled === true
+          && platform?.capabilities?.subagents === true
+          && agent !== null && typeof agent === 'object';
+        try {
+          if (useSubagent) {
+            workerResult = await runSubagentTask({
+              platform,
+              task: {
+                id: taskId,
+                scope: receiptScope,
+                prompt: goalText,
+                ...(agentPreset === undefined ? {} : { agentPreset }),
+                ...(cwd === undefined ? {} : { cwd }),
+              },
+              parent: agent,
+              name: subagent.name,
+              label: subagent.label ?? (titleText ?? taskId),
+              model: subagent.model ?? null,
+              now: clock,
+              // 硬超时来自任务限额（默认 900s，与 SUBAGENT_HARD_MS 一致），不是主轮次预算。
+              hardMs,
+              // D21-H2（v0.7.10）：用执行器自持的 controller，不用 exec.signal——
+              // 主轮次结束/被取消不得中止子代理（宿主验证见 dsh-subagent/src/manager.ts:857-865
+              // 与 dsh-agent/src/index.ts:99-100 的 creation-only signal）。
+              signal: controller.signal,
+              ...(typeof subagent.onChildId === 'function' ? { onChildId: subagent.onChildId } : {}),
+              logger: subagent.logger,
+            });
+          } else {
+            workerResult = await runWorkerTask({
+              platform,
+              task: {
+                id: taskId,
+                scope: receiptScope,
+                prompt: goalText,
+                summary: titleText,
+                ...(typeof claimKey === 'string' && claimKey !== ''
+                  ? { requestId: `companion-task:${taskId}:${claimKey}` }
+                  : {}),
+                ...(agentPreset === undefined ? {} : { agentPreset }),
+                ...(cwd === undefined ? {} : { cwd }),
+              },
+              // 回执由本模块写（需要 title/status 映射），worker 不再写第二条。
+              store: null,
+              now: clock,
+              softMs,
+              hardMs,
+              tokenWarn,
+              tokenStop,
+              sampleMs,
+            });
+          }
+        } catch (error) {
+          // 参数/适配器异常：worker 尚未接管，直接收敛成 failed 回执。
+          workerResult = {
+            status: 'error',
+            sessionId: null,
+            durationMs: Math.max(0, clock() - startedAt),
+            error: messageOf(error),
+          };
+        }
+
+        const status = toStatus(workerResult.status);
+        const durationMs = Number.isFinite(workerResult.durationMs)
+          ? Number(workerResult.durationMs)
+          : Math.max(0, clock() - startedAt);
+        const baseSummary = titleText === undefined
+          ? defaultSummary(status, workerResult.error)
+          : titleText;
+        // token 硬线：标题保留已完成内容，另起一行说明提前结束的原因。
+        const summary = status === 'partial' && titleText !== undefined
+          ? `${titleText}\n${TOKEN_LIMIT_NOTE}`
+          : baseSummary;
+        const reason = status === 'partial' ? workerResult.reason ?? 'token_limit' : undefined;
+        // SA-B1：子代理路径已经用结构化结果收过 ≤300 字回执（A1），没有显式
+        // title 时直接用它（保持「回执只说结论」的口径），否则沿用 title 口径。
+        const receipt = titleText === undefined
+          && typeof workerResult.receipt === 'string' && workerResult.receipt !== ''
+          ? workerResult.receipt
+          : formatReceipt({
+            status: RECEIPT_STATUS[status],
+            summary: status === 'failed' ? defaultSummary(status, workerResult.error) : summary,
+            artifacts: [],
+            durationMs,
+          });
+
+        writeAudit({
+          platform,
+          store,
+          scope: receiptScope,
+          taskId,
+          title: titleText,
+          status,
+          receipt,
           durationMs,
+          sessionId: workerResult.sessionId ?? null,
+          atSeconds: Math.floor(startedAt / 1000),
+          reason,
         });
 
-      writeAudit({
-        platform,
-        store,
-        scope: receiptScope,
-        taskId,
-        title: titleText,
-        status,
-        receipt,
-        durationMs,
-        sessionId: workerResult.sessionId ?? null,
-        atSeconds: Math.floor(startedAt / 1000),
-        reason,
-      });
-
-      // SA-B3（阶段 4）：回执投递是旁路——失败只 warn，不影响任务终态。
-      if (typeof onReceipt === 'function') {
-        try {
-          await onReceipt({
-            taskId,
-            status,
-            receipt,
-            title: titleText ?? null,
-            sessionId: workerResult.sessionId ?? null,
-            ...(reason === undefined ? {} : { reason }),
-          });
-        } catch (error) {
-          safeLog(platform, 'warn', '[dsh-companion] task receipt delivery failed', {
-            taskId,
-            error: messageOf(error),
-          });
+        // SA-B3（阶段 4）：回执投递是旁路——失败只 warn，不影响任务终态。
+        if (typeof onReceipt === 'function') {
+          try {
+            await onReceipt({
+              taskId,
+              status,
+              receipt,
+              title: titleText ?? null,
+              sessionId: workerResult.sessionId ?? null,
+              ...(reason === undefined ? {} : { reason }),
+            });
+          } catch (error) {
+            safeLog(platform, 'warn', '[dsh-companion] task receipt delivery failed', {
+              taskId,
+              error: messageOf(error),
+            });
+          }
         }
-      }
 
-      finished += 1;
-      const result = {
-        ok: true,
+        finished += 1;
+        const result = {
+          ok: true,
+          taskId,
+          status,
+          receipt,
+          sessionId: workerResult.sessionId ?? null,
+          durationMs,
+        };
+        if (status === 'failed' && workerResult.error !== undefined) {
+          result.error = String(workerResult.error);
+        }
+        if (status === 'partial') {
+          result.partial = true;
+          result.reason = reason;
+        }
+        return result;
+      } finally {
+        activeControllers.delete(controller);
+        release();
+      }
+    })();
+
+    // 工具层不 await done：这里消费 rejection，任何执行异常只记日志，绝不冒到
+    // 工具调用层（D21-H2）。
+    done.catch((error) => {
+      safeLog(platform, 'error', '[dsh-companion] task execution crashed', {
         taskId,
-        status,
-        receipt,
-        sessionId: workerResult.sessionId ?? null,
-        durationMs,
-      };
-      if (status === 'failed' && workerResult.error !== undefined) {
-        result.error = String(workerResult.error);
+        error: messageOf(error),
+      });
+    });
+
+    return { ok: true, taskId, queued: admission.queued, done };
+  }
+
+  /**
+   * 等任务真正结束（内部与测试用的兼容包装）。
+   * 工具层不要用它——那会把主会话重新卡住（D21-H2）。
+   * @param {object} options 同 startTask
+   * @returns {Promise<object>}
+   */
+  async function runTask(options = {}) {
+    const started = startTask(options);
+    if (started.ok !== true) return started;
+    return await started.done;
+  }
+
+  /**
+   * 中止所有在跑任务的执行信号（插件卸载 / 进程退出）。
+   * 这是「主轮次结束」之外唯一能中止子代理的路径之一（另一个是硬超时）。
+   * @param {string} [reason='shutdown']
+   * @returns {number} 被中止的任务数
+   */
+  function abortAll(reason = 'shutdown') {
+    const controllers = [...activeControllers];
+    activeControllers.clear();
+    let aborted = 0;
+    for (const controller of controllers) {
+      try {
+        controller.abort(reason);
+        aborted += 1;
+      } catch {
+        // 已 abort 或不属于本执行器：忽略。
       }
-      if (status === 'partial') {
-        result.partial = true;
-        result.reason = reason;
-      }
-      return result;
-    } finally {
-      release();
     }
+    return aborted;
   }
 
   /**
@@ -358,17 +437,37 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
     return true;
   }
 
-  return { runTask, stats, tryAcquire, release, setMaxExec };
+  return { startTask, runTask, stats, tryAcquire, release, setMaxExec, abortAll };
 }
 
 const defaultRunner = createTaskRunner();
 
 /**
  * 模块级单例：`task_run` 工具用它，保证全进程只有一个执行槽。
+ *
+ * v0.7.10（D21-H2）：工具层改用 `startTask`（立即返回），`runTask` 只留给
+ * 需要等待结果的内部调用与测试。
  * @param {object} options 同 createTaskRunner().runTask
  */
 export function runTask(options) {
   return defaultRunner.runTask(options);
+}
+
+/**
+ * 立即开始任务并返回 `{ok, taskId, queued, done}`；`done` 不 await 也能跑完。
+ * @param {object} options 同 createTaskRunner().startTask
+ */
+export function startTask(options) {
+  return defaultRunner.startTask(options);
+}
+
+/**
+ * 中止所有在跑任务的执行信号（插件卸载 / 进程退出时调用）。
+ * @param {string} [reason]
+ * @returns {number}
+ */
+export function abortActiveTasks(reason) {
+  return defaultRunner.abortAll(reason);
 }
 
 /** 单例槽位统计。 */

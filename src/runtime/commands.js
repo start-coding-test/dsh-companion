@@ -152,6 +152,8 @@ export function handleCommand({
   appraiser,
   // A1（v0.4.13）：今日按来源的 token 账本（没有样本时整行省略）。
   tokenUsage,
+  // D21-H4（v0.7.10）：后台任务 systemd 模式与自检结果（只由接线层传入）。
+  bg,
 } = {}) {
   if (typeof text !== 'string') return { handled: false, reply: '' };
   const raw = text.trim();
@@ -202,6 +204,8 @@ export function handleCommand({
       appraiser,
       // A1：今日用量与来源占比。
       tokenUsage,
+      // D21-H4：后台任务可用性 / systemd 模式 / cgroup 控制器缺失。
+      bg,
       now: toMillis(now),
     }),
   };
@@ -613,6 +617,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
     const suffix = Number.isFinite(pending) && pending > 0 ? `，待压缩 ${pending} 个区间` : '';
     lines.push(`${COMPACTION_ENABLED_TEXT}${suffix}`);
   }
+  // D21-H4：后台任务 systemd 模式与可用性；只在接线层传入 bg 时输出（旧调用方格式不变）。
+  const bgLine = formatBgLine(options.bg);
+  if (bgLine !== null) lines.push(bgLine);
   // G0-9：最近一次压缩/巩固实际耗时（只观测，不设超时）；无样本显示 —。
   // timing 只在接线层传入时输出，保持旧调用方（单测）的 /状态 格式不变。
   if (options.timing !== null && options.timing !== undefined && typeof options.timing === 'object') {
@@ -677,6 +684,40 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   if (appraiserLine !== null) lines.push(appraiserLine);
   lines.push(`水位 ${scope}：${watermark}`, `最近 job：${jobText}`, failureText);
   return lines.join('\n');
+}
+
+/**
+ * D21-H4（v0.7.10）：后台任务行。
+ *
+ * 输出：`后台任务：user 模式` / `后台任务：system 模式` /
+ * `后台任务：不可用（<原因>）`；cgroup 控制器缺失时追加
+ * `；MemoryMax/CPUQuota 不生效（缺 <控制器>）`——只告警，不阻止使用。
+ *
+ * @param {{available?: unknown, mode?: unknown, reason?: unknown, message?: unknown,
+ *          missingControllers?: unknown}} [bg]
+ * @returns {string|null} 未传 bg 时返回 null（不输出该行）
+ */
+function formatBgLine(bg) {
+  if (bg === null || bg === undefined || typeof bg !== 'object') return null;
+  // 自检还在跑：给一行状态，不至于让用户以为行丢了。
+  if (bg.pending === true) return '后台任务：检测中…';
+  const mode = bg.mode === 'user' ? 'user' : (bg.mode === 'system' ? 'system' : null);
+  if (bg.available === false) {
+    const reasonText = typeof bg.message === 'string' && bg.message.trim() !== ''
+      ? bg.message.trim()
+      : (typeof bg.reason === 'string' && bg.reason.trim() !== '' ? bg.reason.trim() : '未知原因');
+    const modeText = mode === null ? '' : `（${mode} 模式）`;
+    return `后台任务：不可用（${reasonText}）${modeText}`;
+  }
+  if (mode === null) return null;
+  let line = `后台任务：${mode} 模式`;
+  const missing = Array.isArray(bg.missingControllers)
+    ? bg.missingControllers.filter((entry) => typeof entry === 'string' && entry !== '')
+    : [];
+  if (missing.length > 0) {
+    line += `；MemoryMax/CPUQuota 不生效（缺 ${missing.join('/')}）`;
+  }
+  return line;
 }
 
 /**

@@ -313,11 +313,21 @@ export async function runSubagentTask(options = {}) {
     : SUBAGENT_PRESET;
 
   // 硬超时与外部 signal 合成一个控制器：任一触发都 abort 宿主侧运行。
+  //
+  // v0.7.10（D21-H2）：外部 signal 现在是 task/run.js 自持的 AbortController
+  // （插件卸载 / 进程退出 / 显式取消），不再是宿主的 `exec.signal`——主会话本轮
+  // 结束不会传到这里。显式取消单独标记，回执 reason 写 'cancelled'。
   const controller = new AbortController();
-  const onExternalAbort = () => controller.abort();
+  let cancelled = false;
+  const onExternalAbort = () => {
+    cancelled = true;
+    controller.abort();
+  };
   if (signal !== undefined && typeof signal.addEventListener === 'function') {
-    if (signal.aborted) controller.abort();
-    else signal.addEventListener('abort', onExternalAbort, { once: true });
+    if (signal.aborted) {
+      cancelled = true;
+      controller.abort();
+    } else signal.addEventListener('abort', onExternalAbort, { once: true });
   }
   let timedOut = false;
   const hardTimer = setTimeout(() => {
@@ -397,6 +407,7 @@ export async function runSubagentTask(options = {}) {
       sessionId: childId,
       durationMs,
       ...(timedOut ? { reason: 'hard_timeout' } : {}),
+      ...(!timedOut && cancelled ? { reason: 'cancelled' } : {}),
       error: messageOf(failure),
     };
   }

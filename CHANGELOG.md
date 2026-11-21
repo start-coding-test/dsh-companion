@@ -2,6 +2,72 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.10] - 2026-11-21
+
+真机反馈修复版（D21-H2 / H3 / H4 / M1 / M2）。50041 以 ubuntu（uid 1000）运行，
+本版按用户级 systemd 调整后台任务，并把子代理派活从工具调用里彻底解耦。
+
+### Fixed
+
+- **D21-H2 `task_run` 阻塞主会话**：之前 `execute` 直接把执行 Promise 返回给工具层，
+  主会话要等子代理结束才回复。现在登记任务后**立即返回** `{ok:true, status:'started',
+  taskId, title}`，执行 Promise 脱离工具调用继续跑，异常只记日志与审计；结果只经
+  SA-B3 `onReceipt` 以回执（task_report）投回主会话，不再作为工具结果返回。执行信号
+  改为插件自持 `AbortController`（硬超时 900s、`/停止`、插件卸载时的
+  `abortActiveTasks()`），主轮次信号不再传给子代理——主会话结束或被取消不会中止
+  子代理。busy / 额度闸门 / session-unavailable 等前置拒绝仍同步返回。
+- **D21-H3 `bg_run` 被拒的启动被当成成功**：之前 `watchLaunch` 在 150ms 内没看到
+  退出就判「已拉起」，而 `systemd-run` 等 polkit 授权可能超过 150ms，随后以 1 退出
+  （Interactive authentication required）却被忽略。现在必须**等 systemd-run 客户端
+  退出**再判定：`code === 0` 且无 signal 才算成功；上限 10s，超时杀掉客户端并记
+  `launch-timeout`。参数加 `--no-ask-password`，stdio 不再 ignore——stderr 写入
+  job 目录的 `launch.log`，失败回执与审计（`bg_job_failed.detail_json.launch_log_tail`）
+  附其末尾 20 行（并入 D21-L1）。
+- **D21-H4 `bg_run` 改走用户级 systemd**：ubuntu 无权向系统实例提交 unit。`process.getuid()`
+  非 0 时用 `systemd-run --user`，并为子进程补 `XDG_RUNTIME_DIR=/run/user/<uid>`、
+  `DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus`（已有则沿用）；uid 0 仍走系统
+  实例。user 模式 `bg.runAs` 必须为空（配置层直接报错，launcher 再留一道失败防御）。
+  探针与超时查询同样按模式加 `--user` 与同一环境。启动自检用同一模式跑
+  `systemd-run --no-ask-password --wait --collect` + 同组 `-p RuntimeMaxSec/MemoryMax/CPUQuota`
+  `/bin/true`：失败则 bg_run 直接返回 `{ok:false, reason:'bg-unavailable', message}`，
+  `/状态` 显示「后台任务：不可用（原因）」；成功显示「后台任务：user 模式 / system 模式」。
+  自检同时读 `user@<uid>.service` 的 `cgroup.controllers`，缺 memory/cpu 时日志 warn 并在
+  `/状态` 标注「MemoryMax/CPUQuota 不生效」。
+- **D21-M2 `bg_run` 唤醒子代理必然失败**：`sendToSubagent(sender, target, content, {})`
+  第 4 参传 `{}`，宿主当 AbortSignal 调 `throwIfAborted()` 抛错，唤醒全部落兜底。现在唤醒
+  与 thread_run 续派都传真正的 `AbortSignal`（`deliverySignal` 带 30s 超时），
+  `sendToSubagent` 内部也会在调用方没给 signal 时补一个。
+- **D21-M1 小区间跳过压缩后水位照推**：区间小于 `compactMinRegionTokens` 时不登记 pending，
+  但水位照推，该段永远不会被插件压缩（真机 7044–7060 仅 1,042 tokens 被跳过）。现在小区间
+  也登记为「累积中」pending（`accumulating:true`），不触发压缩；下一次巩固区间与之相接
+  （新区间起点在旧区间之后）时合并——startSeq 取旧起点、tokens 累加，累计 ≥ 门槛才解除
+  累积标记并可执行压缩。pending 含 tokens/累积标记并落库到 `schema_meta`
+  （`pending_compact:<scope>`），重启后由 `recoverPendingCompacts` 恢复；起点不在当前
+  surface 时照旧丢弃并清掉落库状态。**schema 不变，仍为 16，未新增表。**
+
+### 已知非阻断残留
+
+- 宿主 ACP prompt driver 把本轮 prompt slot 保持到子树排空：模型本轮能立即回复「已派出」，
+  但 GUI 该轮会显示进行中直到子代理结束——这是宿主原生 UX，不是插件可改的阻塞。
+- 用户按停主轮次不再中止子代理（正是 D21-H2 的解耦意图），SA-B3 回执照常送达。
+
+### Tests
+
+- 新增 `test/v0710.test.js` 16 例：task_run 立即返回 / 主轮 signal 不影响子代理 / 硬超时
+  仍出 timeout 回执 / onReceipt 恰好一次 / busy 同步 / abortAll 生效；systemd-run 替身
+  exit 1 → `launcher-exited`、不退出 → `launch-timeout`、失败回执带 launch.log 末尾；
+  uid 0 与非 0 两套参数、user 模式环境补齐、runAs 冲突、自检失败 → `bg-unavailable`；
+  三个 1.5K 区间合并 4.5K、未达门槛保持累积、落库后重启恢复；sendToSubagent 第 4 参
+  `throwIfAborted()` 可调用。
+- 旧测试按新语义调整：`task-run.test.js`（工具返回 started + 回执捕获）、
+  `c5-h1b.test.js` / `v046-regression.test.js`（等回执投递而非工具结果）、
+  `v077-stage6.test.js`（`--no-ask-password`、150ms 判成功改为 launch-timeout）。
+- **非真机证据**：用户级 systemd / polkit / DBus / cgroup 在 Windows 开发机不可复现，
+  Linux 路径全部用 `run` / `spawnImpl` 替身验证参数与状态机，真实行为属 50041 云端验收。
+  另：systemd 手册称不带 `--no-block` 时 `systemd-run` 会等 start job 完成，与 v0.7.9 用户
+  原文「启动 unit 后立即以 0 退出」矛盾；本版不翻案、不改历史记录，只把判定改成「等客户端
+  退出再看退出码」，两者都能覆盖。
+
 ## [0.7.9] - 2026-11-21
 
 阶段 6（后台长任务）的复核修复，只动 `bg_run` 的启动判定与日志截断。

@@ -339,10 +339,30 @@ test('task_run 工具：schema 合法、10 个工具、execute 走执行器并�
   assert.equal(tool.parameters.properties.title.maxLength, TITLE_MAX_CHARS);
   assert.equal(tool.parameters.additionalProperties, false);
 
-  const result = await tool.execute({ goal: '整理会议纪要', title: '纪要' });
+  // v0.7.10 D21-H2：工具立即返回 started，结果稍后经 onReceipt 投回。
+  let receiptInfo = null;
+  let resolveReceipt = () => {};
+  const receiptDone = new Promise((resolve) => { resolveReceipt = resolve; });
+  const toolsWithReceipt = createTools({
+    store,
+    platform,
+    retrieve: async () => ({ items: [], tokens: 0, usedIds: [], truncated: false }),
+    clock: () => Date.UTC(2026, 10, 4, 9, 0, 0),
+    taskReceipt: async (info) => {
+      receiptInfo = info;
+      resolveReceipt();
+    },
+  });
+  const receiptTool = toolsWithReceipt.find((item) => item.name === 'task_run');
+  const result = await receiptTool.execute({ goal: '整理会议纪要', title: '纪要' });
   assert.equal(result.ok, true);
-  assert.equal(result.status, 'done');
-  assert.match(result.receipt, /^状态：成功/);
+  assert.equal(result.status, 'started');
+  assert.equal(typeof result.taskId, 'string');
+  assert.equal(result.title, '纪要');
+  assert.equal(result.receipt, undefined, '工具结果不再携带回执正文');
+  await receiptDone;
+  assert.equal(receiptInfo.status, 'done');
+  assert.match(receiptInfo.receipt, /^状态：成功/);
   assert.equal(store.events.length, 2);
 
   await assert.rejects(() => tool.execute({}), TypeError);

@@ -369,6 +369,11 @@ test('v0.4.6 C5-H1b：strict 宿主无 createSession，线程走 create/resolveA
 
   const taskResult = await task.execute({ goal: '写一条任务回执', title: 'v046' });
   assert.equal(taskResult.ok, true, JSON.stringify(taskResult));
+  assert.equal(taskResult.status, 'started', 'v0.7.10 D21-H2：工具立即返回');
+  // 投放是异步的（工具已返回）：轮询等第二个 prompt 落地。**非真机证据**。
+  for (let i = 0; i < 300 && ctx.callsOf('sessionController.prompt').length < 2; i += 1) {
+    await new Promise((resolve) => { setTimeout(resolve, 10); });
+  }
   const taskRequest = ctx.callsOf('sessionController.prompt')[1].args[0];
   assert.match(taskRequest.requestId, /^companion-task:task-[a-z0-9-]+:claim-/);
 });

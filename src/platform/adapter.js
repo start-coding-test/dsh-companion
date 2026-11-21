@@ -131,10 +131,14 @@ const PROMPT_TIMEOUT_MS = 30_000;
  * AbortSignal，并尽量在它上面附加 `kind` / `rpcId`（附加失败就忽略，
  * 不影响新宿主）。
  *
- * @param {{ requestId?: string }} request
+ * v0.7.10（D21-M2）：导出给 tools.js / index.js 复用——宿主的
+ * `sendToSubagent(sender, target, content, signal)` 第 4 参同样是 AbortSignal，
+ * 传 `{}` 会在 `signal.throwIfAborted()` 处抛错（真机唤醒子代理全落兜底）。
+ *
+ * @param {{ requestId?: string }} [request]
  * @returns {AbortSignal}
  */
-function deliverySignal(request) {
+export function deliverySignal(request) {
   const signal = AbortSignal.timeout(PROMPT_TIMEOUT_MS);
   try {
     Object.defineProperty(signal, 'kind', { value: 'user', configurable: true });
@@ -1042,7 +1046,7 @@ export function createAdapter(ctx, opts = {}) {
    * @param {object} sender 存活 agent 句柄
    * @param {string} targetId 目标会话 id（即 activation.childId）
    * @param {object[]} content ContentBlock 数组
-   * @param {{signal?: AbortSignal}} [options]
+   * @param {{signal?: AbortSignal, requestId?: string}} [options]
    * @returns {Promise<string>} messageId
    */
   async function sendToSubagent(sender, targetId, content, options = {}) {
@@ -1059,8 +1063,11 @@ export function createAdapter(ctx, opts = {}) {
     if (!Array.isArray(content) || content.length === 0) {
       throw new TypeError('sendToSubagent(content): content must be a non-empty content block array');
     }
+    // D21-M2（v0.7.10）：宿主第 4 参必填 AbortSignal——调用方没给就用带超时的
+    // 真 signal 兜底，绝不传 `{}`（`{}` 会在 `signal.throwIfAborted()` 处抛错，
+    // 真机表现为后台任务唤醒全部落兜底）。
     return impl.sendMessage(sender, targetId, content, {
-      ...(options?.signal === undefined ? {} : { signal: options.signal }),
+      signal: options?.signal ?? deliverySignal({ requestId: options?.requestId }),
     });
   }
 

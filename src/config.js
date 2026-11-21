@@ -325,8 +325,10 @@ Object.defineProperty(DEFAULT_VALUES, 'subagent', {
 // 口径来自用户《修订一》/《修订二》原文：
 // - workRoot：脚本与工作目录根；空 = bg_run 工具不可用（不猜路径）；
 // - interpreters：argv[0] 白名单（python3/bash/node），不做 shell 拼接；
-// - runAs：进程运行身份，**默认空 = 与 50041 相同（root）**；非空时 Linux 侧
-//   systemd-run 加 --uid=<runAs>（《修订二》W-1c 原文保留该控制项）；
+// - runAs：进程运行身份，**默认空 = 与 50041 相同（ubuntu uid 1000，用户已定保持）**；
+//   非空时 Linux 侧 systemd-run 加 --uid=<runAs>（《修订二》W-1c 原文保留该控制项）；
+//   D21-H4（v0.7.10）：非 root 走用户级 systemd，用户级管理器不能切身份，因此
+//   uid≠0 时 runAs 必须为空（normalizeBg 直接报错），只有 root 的系统实例支持 --uid。
 // - maxDeadlineMin：deadline 上限（分钟，默认 360）；
 // - memoryMax / cpuQuota：systemd-run 的 MemoryMax / CPUQuota 取值（用户裁决 4G / 200%）；
 // - minFreeDiskMB：workRoot 剩余空间下限（默认 1024）；
@@ -1178,7 +1180,7 @@ export function normalizeSubagent(raw, warnings = []) {
  *   maxDeadlineMin: number, memoryMax: string, cpuQuota: string,
  *   minFreeDiskMB: number, wakeBudgetPerAgent: number}>}
  */
-export function normalizeBg(raw, warnings = []) {
+export function normalizeBg(raw, warnings = [], options = {}) {
   const defaults = DEFAULTS.bg;
   if (raw === undefined) return defaults;
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -1218,6 +1220,18 @@ export function normalizeBg(raw, warnings = []) {
   const runAs = raw.runAs === undefined ? defaults.runAs : raw.runAs;
   if (typeof runAs !== 'string') {
     throw new ConfigError('bg.runAs', `must be a string, got ${typeof runAs}`);
+  }
+  // D21-H4（v0.7.10）：非 root（50041 的 ubuntu uid 1000）只能提交用户级 systemd
+  // unit，用户级管理器**不能切换身份**——`bg.runAs` 非空是无效配置，直接报错，
+  // 免得拉起时才死在 `systemd-run --user --uid`。
+  const uid = Number.isInteger(options?.uid)
+    ? Number(options.uid)
+    : (typeof process.getuid === 'function' ? Number(process.getuid()) : 0);
+  if (uid !== 0 && runAs.trim() !== '') {
+    throw new ConfigError(
+      'bg.runAs',
+      `must be empty when running as uid ${uid} (用户级 systemd 不能切换运行身份；只有 root 的系统实例支持 --uid)`,
+    );
   }
 
   // W77-M2：额外透传的环境变量名（PATH/HOME 由 launcher 恒透传，这里只列附加项）。

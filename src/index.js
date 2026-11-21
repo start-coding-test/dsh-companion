@@ -101,7 +101,8 @@ import {
   followUpText,
   scanCommitmentFollowups,
 } from './scheduler/commitments.js';
-import { createAdapter } from './platform/adapter.js';
+import { bgSelfCheck } from './task/bg-launcher.js';
+import { createAdapter, deliverySignal } from './platform/adapter.js';
 import { MAIN_SCOPE, MAIN_BINDING_LATEST, MAIN_SESSION_META_KEY, classifySession, threadScope } from './session/identity.js';
 import {
   BUDGET_REASONS,
@@ -128,7 +129,7 @@ import { createProactive } from './runtime/proactive.js';
 import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
 import { createTools } from './runtime/tools.js';
 // SA-B1/D6（v0.7.7 阶段 4）：task_run 执行槽上限由 config.subagent.concurrency 驱动。
-import { configureTaskConcurrency } from './task/run.js';
+import { abortActiveTasks, configureTaskConcurrency } from './task/run.js';
 import {
   clearCompactionAttempts,
   clearCompactionFailures,
@@ -139,7 +140,9 @@ import {
 } from './state/compaction-failures.js';
 import {
   createPendingCompacts,
+  clearPersistedPendingCompact,
   peekPendingCompact,
+  persistPendingCompact,
   recoverPendingCompacts,
   setPendingCompact,
   takePendingCompact,
@@ -493,6 +496,34 @@ export function apply(ctx, rawConfig, hooks = {}) {
       message: errorMessage(error),
     });
   }
+  // D21-H4（v0.7.10）：后台任务启动自检。只有配了 bg.workRoot 才有意义（空 =
+  // bg_run 不可用，不猜路径）。失败 → bg_run 直接返回 bg-unavailable，/状态 显示
+  // 原因；成功 → /状态 显示 user/system 模式。异步跑，不阻塞 apply。
+  if (typeof config.bg?.workRoot === 'string' && config.bg.workRoot.trim() !== '') {
+    state.bgSelfCheck = { pending: true };
+    void bgSelfCheck({
+      memoryMax: config.bg.memoryMax,
+      cpuQuota: config.bg.cpuQuota,
+    })
+      .then((result) => {
+        state.bgSelfCheck = result;
+        platform.log(result.ok ? 'info' : 'warn', '[dsh-companion] bg systemd self-check', {
+          ok: result.ok,
+          mode: result.mode,
+          reason: result.reason,
+          missingControllers: result.missingControllers,
+        });
+      })
+      .catch((error) => {
+        state.bgSelfCheck = {
+          ok: false,
+          mode: 'unknown',
+          reason: 'self-check-error',
+          message: errorMessage(error),
+          missingControllers: [],
+        };
+      });
+  }
   // v0.4.12：人格卡只在 apply 时加载一次（不做热加载）；失败回落内置卡并 warn。
   applyPersonaCard(state, hooks);
   // V3-H2：先把上次进程崩溃时残留的 delivering 提醒收回 pending，避免永久卡住。
@@ -648,6 +679,13 @@ export function apply(ctx, rawConfig, hooks = {}) {
       } catch {
         // 队列收尾失败不影响资源释放。
       }
+      // D21-H2（v0.7.10）：插件卸载时中止仍在跑的 task_run 子代理，否则它们会
+      // 一直跑到硬超时（900s）且回执没人接。传 plugin-disposed 只为日志可读。
+      try {
+        abortActiveTasks('plugin-disposed');
+      } catch {
+        // 中止失败不影响资源释放。
+      }
       try {
         store.close();
       } catch {
@@ -698,6 +736,11 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     embedderWarmupState: 'idle',
     scheduler: null,
     proactive: null,
+    /**
+     * D21-H4（v0.7.10）：后台任务自检结果。null = 未配置 bg.workRoot（不可用）；
+     * {pending:true} = 自检进行中；否则为 bgSelfCheck() 的返回（ok/mode/…）。
+     */
+    bgSelfCheck: null,
     /** M4：每日 token 累计（按配置时区的日键复位）。 */
     budget: createBudgetState(),
     /** M4：每个会话上次测得的 totalTokens；差值即一轮新增用量。 */
@@ -1091,6 +1134,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             budget: typeof budgetInfo === 'function' ? budgetInfo() : undefined,
     // A1：今日按来源的 token 账本（读库，重启后仍在）。
     tokenUsage: tokenUsageSnapshot(state),
+            // D21-H4：后台任务 systemd 模式 / 可用性（命令层只在传入时输出该行）。
+            bg: state.bgSelfCheck,
             // V7-H1：每次命令调用时读能力位，不用 apply 时快照（宿主可能晚挂载）。
             threadsSupported: platform.capabilities.threadTools === true,
             // V3-M2：/状态 展示当前主会话与绑定模式。
@@ -1216,6 +1261,8 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     // W-1/W-5（阶段 6）：后台长任务配置与主会话兜底目标。
     ...(bgConfig !== null && typeof bgConfig === 'object' ? { bgConfig } : {}),
     ...(typeof mainSessionId === 'function' ? { mainSessionId } : {}),
+    // D21-H4：自检失败时 bg_run 直接返回 {ok:false, reason:'bg-unavailable'}。
+    bgAvailability: () => state.bgSelfCheck,
     vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
@@ -1461,6 +1508,78 @@ function writeWatermarkAnchor(store, scope, seq) {
 /** 清掉锚点，回到「最新一条巩固行的 upto_seq」口径。 */
 function clearWatermarkAnchor(store, scope) {
   writeWatermarkAnchor(store, scope, null);
+}
+
+/**
+ * D21-M1（v0.7.10）：登记 pending 压缩区间并落库。
+ *
+ * 与 v0.7.9 的差别：太小的区间不再直接丢弃，而是以 `accumulating: true` 留在
+ * pending 里（水位照推），等相邻巩固区间把它凑到 compactMinRegionTokens 再压。
+ * 累积状态写进 schema_meta（key 见 state/pending-compact.js 的
+ * PENDING_COMPACT_META_PREFIX），重启后由 recoverPendingCompacts 读回——
+ * 不新增表，SCHEMA_VERSION 不变。
+ *
+ * @param {object} state
+ * @param {{id: number|null, startSeq: number, endSeq: number, scope?: string,
+ *          tokens?: number, accumulating?: boolean}} pending
+ */
+function rememberPendingCompact(state, pending) {
+  const entry = { ...pending, scope: pending.scope ?? SCOPE };
+  setPendingCompact(state.pendingCompact, entry);
+  persistPendingCompact(state.store, entry);
+}
+
+/** 丢弃 pending 并清掉落库的累积状态（区间过期 / 压缩完成 / 确定性失败）。 */
+function forgetPendingCompact(state, scope) {
+  takePendingCompact(state.pendingCompact, scope);
+  clearPersistedPendingCompact(state.store, scope);
+}
+
+/**
+ * D21-M1（v0.7.10）：巩固写完后的 pending 决策。
+ *
+ * - 上一段 pending 与本段首尾相接 → 合并：startSeq 取旧起点、tokens 累加、
+ *   endSeq 取本段终点（id 用最新那条，压缩成功后标它）；
+ * - 累计仍不足 compactMinRegionTokens → 继续标记 accumulating（不触发压缩）；
+ * - 累计达标 → 去标记，交给 maybeCompact 压整段合并区间。
+ *
+ * @param {object} state
+ * @param {{scope: string, id: number|null, startSeq: number, endSeq: number, tokens: number}} region
+ */
+function rememberConsolidatedRegion(state, { scope, id, startSeq, endSeq, tokens }) {
+  const min = Number(state.config?.compactMinRegionTokens) || 0;
+  const previous = peekPendingCompact(state.pendingCompact, scope);
+  const tokensNow = Number.isFinite(tokens) && tokens > 0 ? Math.trunc(tokens) : 0;
+  // 相邻：本段起点在旧区间终点之后（巩固窗口只向前推进）。中间若发生过宿主
+  // 自动压缩导致旧 seq 失效，由 maybeCompact 的既有「区间过期」路径丢弃，不必在
+  // 这里查 gap——查 gap 反而会把正常衔接判成不相邻、让累积彻底失效。
+  const adjacent = previous !== null
+    && Number.isFinite(previous.startSeq)
+    && Number.isFinite(previous.endSeq)
+    && startSeq >= previous.startSeq
+    && startSeq > previous.endSeq;
+  const mergedStart = adjacent ? previous.startSeq : startSeq;
+  const mergedTokens = (adjacent ? (Number(previous.tokens) || 0) : 0) + tokensNow;
+  const mergedId = id ?? (adjacent ? (previous.id ?? null) : null);
+  // 门槛为 0 视为关闭闸门（与 belowCompactMinRegion 同口径）。
+  const accumulating = min > 0 && mergedTokens < min;
+  rememberPendingCompact(state, {
+    id: mergedId ?? null,
+    startSeq: mergedStart,
+    endSeq,
+    scope,
+    tokens: mergedTokens,
+    ...(accumulating ? { accumulating: true } : {}),
+  });
+  if (accumulating) {
+    state.platform.log('debug', '[dsh-companion] pending compaction accumulating: region merged, waiting for more tokens', {
+      scope,
+      startSeq: mergedStart,
+      endSeq,
+      tokens: mergedTokens,
+      min,
+    });
+  }
 }
 
 /**
@@ -2805,24 +2924,16 @@ async function executeConsolidationJob(state, job) {
     }
 
     const consolidation = findConsolidation(store, job.scope, Number(result.upto_seq));
-    // C120-M1：太小的区间不登记 pending——压缩收益抵不过一次 surface replace 的成本，
-    // 也更容易撞上宿主「压后不更小」的确定性拒绝。0 表示关闭闸门。
-    if (belowCompactMinRegion(regionTokens, config.compactMinRegionTokens)) {
-      platform.log('debug', '[dsh-companion] pending compaction skipped: region below compactMinRegionTokens', {
-        scope: job.scope,
-        startSeq,
-        endSeq,
-        tokens: regionTokens,
-        min: config.compactMinRegionTokens,
-      });
-    } else {
-      setPendingCompact(state.pendingCompact, {
-        id: consolidation?.id ?? null,
-        startSeq,
-        endSeq,
-        scope: job.scope,
-      });
-    }
+    // D21-M1（v0.7.10）：小区间不再直接丢弃——登记为「累积中」并落库，
+    // 等相邻巩固区间把它凑到 compactMinRegionTokens 再压。v0.7.9 之前这里
+    // 跳过登记但水位照推，该段永远不会被插件压缩。
+    rememberConsolidatedRegion(state, {
+      scope: job.scope,
+      id: consolidation?.id ?? null,
+      startSeq,
+      endSeq,
+      tokens: regionTokens,
+    });
     // r2 M-1：pendingCompact 不保存 trigger，所以冷却归零必须在这里按 job.trigger 做，
     // 否则 recordCompactionFloor 里的 threshold 分支永远不可达，计数只增不减。
     if (job.trigger === 'threshold') resetThresholdCooldown(state, job.scope);
@@ -3219,6 +3330,20 @@ async function maybeCompact(state, payload, scope = SCOPE) {
   const { platform, store, config } = state;
   const pending = peekPendingCompact(state.pendingCompact, scope);
   if (pending === null) return;
+  // D21-M1（v0.7.10）：多个小区间合并而成的 pending 还在累积——先不压，
+  // 等累计到 compactMinRegionTokens（合并发生在 rememberConsolidatedRegion）。
+  // 必须同时看 tokens：只判 accumulating 会被旧库里没有 tokens 字段的 pending 绕过。
+  const minRegionTokens = Number(config.compactMinRegionTokens) || 0;
+  if (pending.accumulating === true && (Number(pending.tokens) || 0) < minRegionTokens) {
+    platform.log('debug', '[dsh-companion] pending compaction accumulating; waiting for adjacent region', {
+      scope,
+      startSeq: pending.startSeq,
+      endSeq: pending.endSeq,
+      tokens: pending.tokens,
+      min: config.compactMinRegionTokens,
+    });
+    return;
+  }
   if (!platform.capabilities.compaction) {
     platform.log('debug', '[dsh-companion] compaction unavailable; keeping pending_compact');
     return;
@@ -3236,7 +3361,7 @@ async function maybeCompact(state, payload, scope = SCOPE) {
       endSeq: pending.endSeq,
       nodes: seqs.length,
     });
-    takePendingCompact(state.pendingCompact, scope);
+    forgetPendingCompact(state, scope);
     state.metrics.inc('compactionDrops');
     return;
   }
@@ -3251,7 +3376,7 @@ async function maybeCompact(state, payload, scope = SCOPE) {
       endSeq: pending.endSeq,
       nodes: seqs.length,
     });
-    takePendingCompact(state.pendingCompact, scope);
+    forgetPendingCompact(state, scope);
     state.metrics.inc('compactionDrops');
     return;
   }
@@ -3282,7 +3407,7 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     });
     setWatermark(state, scope, watermark);
     if (pending.id) store.retargetConsolidation(pending.id, { uptoSeq: watermark });
-    takePendingCompact(state.pendingCompact, scope);
+    forgetPendingCompact(state, scope);
     clearWatermarkAnchor(state.store, scope);
     // A6：记录压后实测水位（持久化），并标注「压了还超目标」；threshold 触发后重置冷却。
     recordCompactionFloor(state, payload, scope);
@@ -3342,7 +3467,7 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     if (deterministic || attempts >= MAX_COMPACTION_RETRIES) {
       // C120-H2：确定性失败（边界不合法 / 压后不更小）与超过上限的非确定性失败，
       // 继续留 pending 只会在每个 turn 重复失败：丢弃并计数，交给下一轮巩固重新规划。
-      takePendingCompact(state.pendingCompact, scope);
+      forgetPendingCompact(state, scope);
       state.metrics.inc('compactionDrops');
       platform.log('warn', '[dsh-companion] compaction dropped after failure', {
         start,
@@ -4631,15 +4756,14 @@ async function deepConsolidate(state) {
     });
     if (result?.skipped) return { written: false, reason: 'skipped' };
     const row = findConsolidation(store, SCOPE, Number(result.upto_seq));
-    // C120-M1：与 nap 路径同一道闸门。
-    if (!belowCompactMinRegion(region.tokens, state.config.compactMinRegionTokens)) {
-      setPendingCompact(state.pendingCompact, {
-        id: row?.id ?? null,
-        startSeq: region.startSeq,
-        endSeq: region.endSeq,
-        scope: SCOPE,
-      });
-    }
+    // D21-M1（v0.7.10）：与 nap 路径同一套累积逻辑（小区间也登记，凑够再压）。
+    rememberConsolidatedRegion(state, {
+      scope: SCOPE,
+      id: row?.id ?? null,
+      startSeq: region.startSeq,
+      endSeq: region.endSeq,
+      tokens: region.tokens,
+    });
     setWatermark(state, SCOPE, region.endSeq);
     clearWatermarkAnchor(state.store, SCOPE);
     state.metrics.inc('consolidations');
@@ -5227,7 +5351,13 @@ async function wakeBgJob(state, info) {
     const target = typeof job.child_session_id === 'string' ? job.child_session_id : '';
     if (sender !== null && sender !== undefined && target !== '') {
       try {
-        await platform.sendToSubagent(sender, target, [{ type: 'text', text: info.message }], {});
+        // D21-M2（v0.7.10）：第 4 参必须是真 AbortSignal——宿主会直接调
+        // signal.throwIfAborted()，传 {} 会抛错使唤醒全部落兜底（真机已复现）。
+        // deliverySignal 带 30s 超时（platform/adapter.js），超时只让本次唤醒
+        // 失败并走 deliverBgFallback，不牵连其它唤醒。
+        await platform.sendToSubagent(sender, target, [{ type: 'text', text: info.message }], {
+          signal: deliverySignal({ requestId: `companion-bg-wake:${job.id}` }),
+        });
         return { delivered: true, channel: 'subagent' };
       } catch (error) {
         platform.log('warn', '[dsh-companion] bg job wake failed; falling back to main session', {
@@ -6583,6 +6713,8 @@ function renderToolValue(value) {
 export {
   captureTranscript,
   expireStaleReminders,
+  // D21-M1（v0.7.10）：小区间累积 pending 的两个纯函数，仅为单测可达（非公开 API）。
+  forgetPendingCompact,
   formatChatStatus,
   governDedupeAuto,
   handleChatCommand,
@@ -6591,6 +6723,8 @@ export {
   isInjectedMessage,
   isPluginNotice,
   lastUserText,
+  // D21-M1（v0.7.10）：巩固区间合并入 pending，仅为单测可达（非公开 API）。
+  rememberConsolidatedRegion,
   runCommitmentFollowups,
   runLightChat,
   stripImEnvelopes,
