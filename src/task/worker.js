@@ -132,7 +132,7 @@ export async function runTask(options = {}) {
     if (signal !== undefined && typeof signal.addEventListener === 'function') {
       // v0.7.11（V710-L1）：用户取消与 waitForIdle 竞速；取消后主动 cancel 会话，
       // 否则 worker 的采样/硬超时定时器还会继续跑。
-      const cancelledOutcome = { status: 'error', reason: 'cancelled', error: '任务已取消（/stop-tasks）' };
+      const cancelledOutcome = { status: 'error', reason: 'cancelled', error: '任务已取消（/停止任务）' };
       if (signal.aborted) {
         outcome = cancelledOutcome;
         await cancelTask(platform, sessionId);

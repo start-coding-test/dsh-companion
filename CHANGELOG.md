@@ -2,6 +2,36 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.12] - 2026-11-21
+
+v0.7.11 复核增量的小修版。**v0.7.10、v0.7.11 均未单独部署，随本版一次上线。**
+
+### Fixed
+
+- **V711-M1 合并回执只记首条 dedupeKey，重启后重复补投**：同类回执在 10 分钟合并窗口里拼成
+  一条时，`proactive_sent` 事件只记了首条的 `dedupeKey`，而 `replayPending()` 以「pending 之后
+  没有同 key 的 sent」判定未送达——合并进来的第 2、3 条回执每次重启都会被当成未送达再发一遍；
+  补投时若再次合并，仍只记首条，直到滑出最近 500 条事件。现在 `proactive_sent` 额外写
+  `detail.dedupeKeys`（合并条每一份的 key），`recordSent()` 与发送后的 dedupe 窗口都按每一份 key
+  记账，`seedFromStore()` / `replayPending()` 同时识别新数组与旧单键事件。
+- **V711-L1 注释把宿主字段写成 `stopKind`**：`SubagentResult` 的字段名是 `stopReason`
+  （`dsh-subagent/src/types.ts:285`），代码读的也是 `result.stopReason`；只有文档与 `mapStopReason`
+  的形参名写错，已改回。插件内部记录「停止意图」的局部变量仍叫 `stopKind`，与宿主字段无关。
+- **V711-L3 文案**：`worker.js` 的取消文案改为 `/停止任务`；`proactive.js` 里 `recordPending` 与
+  `recordDeliveryError` 的 JSDoc 错位已理顺（只调注释，不改逻辑）。
+
+### Changed
+
+- **V711-L2 `/停止任务` 无参行为写明**：无参数只给用法与在跑清单，不中止任何任务；带 `taskId`
+  才只中止该任务。README 命令表与本节同步说明（行为与 v0.7.11 的实现一致，本版只补文档）。
+
+### Tests
+
+- 新增 `test/v0712.test.js` 3 例：3 条回执合并成 1 条后同 store 重建不再补投（且 dedupe 窗口按
+  每份 key 生效）、只有第 2 条未送达时只补那一条、`proactive_pending` 带原 `requestId` 补投沿用。
+- 全量 1605 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
+- **非真机证据**：`platform.prompt` 为替身、事件库用内存 SQLite；真实投递与宿主 rpcId 去重属云端验收。
+
 ## [0.7.11] - 2026-11-21
 
 v0.7.10 评审（插件侧 + 第三方全项目评审）的修复版：子代理取消、回执额度、孤儿 unit、

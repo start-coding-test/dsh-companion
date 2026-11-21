@@ -22,7 +22,8 @@
  * 没有 prompt」的行一定被释放回 pending。onSent 成功、onFailed 失败/放弃/队列溢出丢弃
  * 时调用，均 best-effort，不影响闸门自身的计数。
  * 每次发送成功写一条 memory_events 事件（table_name='proactive',
- * detail.kind='proactive_sent'），重启后可恢复当日计数与 dedupe 窗口。
+ * detail.kind='proactive_sent'；detail.dedupeKeys 记录合并条每一份的 dedupeKey），
+ * 重启后可恢复当日计数与 dedupe 窗口。
  * 仅使用 Node 内置能力。
  */
 
@@ -86,6 +87,41 @@ function normalizeNow(value) {
 /** @param {number} ms @param {string} timeZone @returns {string} 分区日期键 */
 function dayKey(ms, timeZone) {
   return zonedDayKey(ms, timeZone);
+}
+
+/**
+ * 取一条消息所有份的 dedupeKey（去重、去空、保序）。
+ *
+ * v0.7.12（V711-M1）：合并条只保留首条 dedupeKey 时，合并进来的第 2、3 条回执
+ * 在重启后会被 replayPending 当成未送达重复补投，所以发送记账与去重窗口都按
+ * 「每一份」的 key 记。
+ * @param {{dedupeKey?: string|null, parts?: object[]}} item
+ * @returns {string[]}
+ */
+function collectDedupeKeys(item) {
+  const keys = [];
+  const seen = new Set();
+  const push = (key) => {
+    if (typeof key !== 'string' || key === '' || seen.has(key)) return;
+    seen.add(key);
+    keys.push(key);
+  };
+  for (const part of item.parts ?? []) push(part?.dedupeKey);
+  push(item.dedupeKey);
+  return keys;
+}
+
+/**
+ * 读取一条 proactive_sent 事件里的 dedupeKey 列表（兼容只有单键的旧事件）。
+ * @param {object} detail
+ * @returns {string[]}
+ */
+function sentKeysOf(detail) {
+  if (Array.isArray(detail.dedupeKeys)) {
+    return detail.dedupeKeys.filter((key) => typeof key === 'string' && key !== '');
+  }
+  const key = typeof detail.dedupeKey === 'string' ? detail.dedupeKey : '';
+  return key === '' ? [] : [key];
 }
 
 /** @param {unknown} detail @returns {object|null} */
@@ -184,8 +220,7 @@ export function createProactive({ store, platform, config, target, clock = Date.
         if (!EXEMPT_KINDS.has(detail.msgKind)) state.sentToday += 1;
         state.byKind[detail.msgKind] += 1;
       }
-      const key = typeof detail.dedupeKey === 'string' ? detail.dedupeKey : '';
-      if (key !== '') {
+      for (const key of sentKeysOf(detail)) {
         const previous = dedupe.get(key);
         if (previous === undefined || sentAt > previous) dedupe.set(key, sentAt);
       }
@@ -212,18 +247,21 @@ export function createProactive({ store, platform, config, target, clock = Date.
       const seconds = Number(row?.at);
       if (!Number.isFinite(seconds)) continue;
       const at = seconds * 1000;
-      const key = typeof detail?.dedupeKey === 'string' ? detail.dedupeKey : '';
-      if (key === '') continue;
       if (detail?.kind === 'proactive_sent') {
-        const previous = sentAt.get(key);
-        if (previous === undefined || at > previous) sentAt.set(key, at);
+        for (const key of sentKeysOf(detail)) {
+          const previous = sentAt.get(key);
+          if (previous === undefined || at > previous) sentAt.set(key, at);
+        }
       } else if (detail?.kind === 'proactive_pending') {
+        const key = typeof detail.dedupeKey === 'string' ? detail.dedupeKey : '';
+        if (key === '') continue;
         const previous = pendingAt.get(key);
         if (previous === undefined || at > previous.at) {
           pendingAt.set(key, {
             at,
             kind: typeof detail.msgKind === 'string' ? detail.msgKind : '',
             text: typeof detail.text === 'string' ? detail.text : '',
+            requestId: typeof detail.requestId === 'string' ? detail.requestId : null,
           });
         }
       }
@@ -234,7 +272,7 @@ export function createProactive({ store, platform, config, target, clock = Date.
       const later = sentAt.get(key);
       if (later !== undefined && later >= entry.at) continue;
       if (entry.text === '' || !EXEMPT_KINDS.has(entry.kind)) continue;
-      enqueue({ kind: entry.kind, text: entry.text, dedupeKey: key, at: entry.at });
+      enqueue({ kind: entry.kind, text: entry.text, dedupeKey: key, requestId: entry.requestId, at: entry.at });
       replayed += 1;
     }
     replaying = false;
@@ -272,11 +310,10 @@ export function createProactive({ store, platform, config, target, clock = Date.
     return `companion-${item.kind}:merged:${item.seq}`;
   }
 
-  /** 投递失败落库（C5-H1a）：写 error.name / error.message，供 /status「最近失败」。 */
   /**
    * 3P-M1（v0.7.11）：把豁免类待投消息落库（best-effort，失败不影响投递）。
    * 重启后由 replayPending 用「pending 无后续 sent」判定补投。
-   * @param {{kind: string, text: string, dedupeKey: string|null, at: number}} entry
+   * @param {{kind: string, text: string, dedupeKey: string|null, requestId?: string|null, at: number}} entry
    */
   function recordPending(entry) {
     try {
@@ -291,6 +328,7 @@ export function createProactive({ store, platform, config, target, clock = Date.
           kind: 'proactive_pending',
           msgKind: entry.kind,
           dedupeKey: entry.dedupeKey,
+          requestId: entry.requestId ?? null,
           text: entry.text,
         },
       });
@@ -299,6 +337,7 @@ export function createProactive({ store, platform, config, target, clock = Date.
     }
   }
 
+  /** 投递失败落库（C5-H1a）：写 error.name / error.message，供 /status「最近失败」。 */
   function recordDeliveryError(item, error, at) {
     try {
       store.appendEvent({
@@ -327,6 +366,7 @@ export function createProactive({ store, platform, config, target, clock = Date.
   /** 写发送记账事件；写库失败不影响投递结果（只记入报告）。 */
   function recordSent(item, at) {
     const seconds = Math.floor(at / 1000);
+    const keys = collectDedupeKeys(item);
     store.appendEvent({
       at: seconds,
       action: 'USED',
@@ -338,7 +378,8 @@ export function createProactive({ store, platform, config, target, clock = Date.
         kind: 'proactive_sent',
         msgKind: item.kind,
         text: item.text,
-        dedupeKey: item.dedupeKey,
+        dedupeKey: keys[0] ?? null,
+        dedupeKeys: keys,
         at: seconds,
       },
     });
@@ -381,7 +422,7 @@ export function createProactive({ store, platform, config, target, clock = Date.
     }
 
     // 3P-M1（v0.7.11）：豁免类（回执）入队即落库，重启后靠它补投。
-    if (EXEMPT_KINDS.has(kind) && replaying === false) recordPending({ kind, text, dedupeKey, at });
+    if (EXEMPT_KINDS.has(kind) && replaying === false) recordPending({ kind, text, dedupeKey, requestId, at });
 
     if (dedupeKey !== null && queue.some((item) => item.dedupeKey === dedupeKey)) {
       return { queued: queue.length, dropped, duplicate: true };
@@ -579,7 +620,7 @@ export function createProactive({ store, platform, config, target, clock = Date.
       // v0.7.11（3P-M1）：task_report 计入 byKind（统计用）但不占每日总额。
       if (!EXEMPT_KINDS.has(item.kind)) state.sentToday += 1;
       state.byKind[item.kind] += 1;
-      if (item.dedupeKey !== null) dedupe.set(item.dedupeKey, at);
+      for (const key of collectDedupeKeys(item)) dedupe.set(key, at);
       report.sent += 1;
       report.items.push({ kind: item.kind, text: delivered.text });
       for (const part of delivered.parts) runHooks(part, 'onSent', report);

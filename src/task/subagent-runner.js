@@ -9,8 +9,8 @@
  *   `{childId, name, messageId?, result, dispose}`；
  * - `sendMessage(sender, targetId, content, {signal})` :368-375：续派；
  * - `SubagentResult`（`types.ts:260-286`）：`{output, structured?, diagnostic?,
- *   stopKind}`，`stopKind ∈ completed|aborted|error|max-tokens|refusal`
- *   （`types.ts:241-252`），**`structured` 不保证存在**。
+ *   stopReason}`，`stopReason ∈ completed|aborted|error|max-tokens|refusal`
+ *   （`types.ts:241-252`；字段定义见 `types.ts:285`），**`structured` 不保证存在**。
  *
  * 本模块只做三件事：组装 spec（A12 命名 / D3 模型裁决）、等结果并把五态映射成
  * 插件自己的 `{status, receipt}`（A1 ≤300 字）、异常兜底。深耕投递与审计留在
@@ -163,7 +163,7 @@ export function resolveSubagentModel(model, hooks = {}) {
 /**
  * A3：五态映射（`types.ts:241-252`）+ 结构化结果缺失/损坏降级。
  *
- * | stopKind | 插件 status | 说明 |
+ * | stopReason | 插件 status | 说明 |
  * | --- | --- | --- |
  * | completed | ok | 正常结束 |
  * | aborted | error | 被取消，带 diagnostic 摘要 |
@@ -171,11 +171,11 @@ export function resolveSubagentModel(model, hooks = {}) {
  * | max-tokens | partial | 部分完成（上下文/输出上限） |
  * | refusal | error | 模型拒绝执行 |
  *
- * @param {string} stopKind
+ * @param {string} stopReason
  * @returns {{status: 'ok'|'partial'|'error', reason?: string}}
  */
-export function mapStopReason(stopKind) {
-  switch (stopKind) {
+export function mapStopReason(stopReason) {
+  switch (stopReason) {
     case 'completed':
       return { status: 'ok' };
     case 'max-tokens':
@@ -187,8 +187,8 @@ export function mapStopReason(stopKind) {
     case 'error':
       return { status: 'error', reason: 'subagent_error' };
     default:
-      // 未知 stopKind（host 的映射可扩展）：按失败处理，但保留原始值便于诊断。
-      return { status: 'error', reason: `unknown_stop_reason:${String(stopKind)}` };
+      // 未知 stopReason（host 的映射可扩展）：按失败处理，但保留原始值便于诊断。
+      return { status: 'error', reason: `unknown_stop_reason:${String(stopReason)}` };
   }
 }
 
