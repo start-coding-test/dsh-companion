@@ -2,6 +2,50 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.13] - 2026-11-22
+
+回执通道修正版：任务回执不再冒充用户发言进主会话，改经 dsh-im 出站到 IM；同时修「成功任务被标失败」
+与投递记录状态混淆。**v0.7.10、v0.7.11、v0.7.12 均未单独部署，随本版一次上线。**
+
+### Fixed
+
+- **R22-H1 任务回执改走 dsh-im 出站**：`task_report` 回执（含后台任务兜底）过去走 `platform.prompt`
+  进主会话，等于冒充用户发言。现在改走 dsh-im 的进程内服务 `ctx.dshIm.send(botId, targetId, text,
+  { signal, format: 'plain' })`（`@xmanrui/dsh-im`，contractVersion = 1，作为可选依赖：未安装时
+  插件照常加载并记一条 info 日志）。outbox 持久化、`dedupeKey` 去重、补投、3P-M1 豁免与 10 分钟合并
+  全部保留；`proactive_sent` 只在 `send` 返回 `{sent:true}` 后写。通道不可用或发送失败时记
+  `delivery_error` 并按现有退避重试，**绝不退回 `platform.prompt`**。新增配置 `receipt.im.botId` /
+  `receipt.im.targetId`（显式填写，留空 = 不可用）；`/状态` 新增「回执通道」行（可用性、bot → target、
+  最近一次投递结果）。
+- **R22-H2 成功任务被标成「失败」**：宿主 `dsh-subagent/src/activation.ts:150-158` 在父方声明
+  `outputSchema`、子代理没提交结构化结果时，会把 `completed` 改写成 `error` 且不带 `structured`，
+  插件据此生成「任务失败：<正文>」。现在 `startSubagent` 不再声明 `outputSchema`，回执取 `output`
+  文本并按 300 字截断（`receipt.js`）；子代理提示词仍要求「最后一段用一句话给出结论」；宿主若仍回传
+  `structured`，照旧解析（读兼容）。
+- **R22-M1 投递记录把任务终态当投递状态**：`task_receipt_delivery` 的 `status` 现在是投递结果
+  （`delivered` / `failed`），任务终态另记 `task_status`；旧记录（`status` = 任务终态 + `delivered`
+  布尔）仍可读（`readReceiptDeliveryRecord`）。
+
+### Added
+
+- **R22-H1 主会话 notice（知情但不开 turn）**：回执经 dsh-im 出站成功后，给主会话放一条
+  `agent.send(message, 'next-turn', false)` 的 notice（`source = {kind: 'companion-task-receipt',
+  form: 'notice', summary}`，不唤醒、不单独开 turn），方便用户之后追问；开关 `receipt.sessionNotice`
+  （默认 `true`）。三处排除集（`hasRealUserInput` / `isInjectedMessage` / `lastUserText`）按 kind 认出
+  它不是用户发言。
+- **V712-S2 补记**：`proactive_pending` 事件持久化回执原始 `requestId`，重启补投沿用原 id（v0.7.12 只在
+  Tests 段带过，本节补入变更记录）。
+
+### Tests
+
+- 新增 `test/v0713.test.js` 13 例：receipt 配置默认值与 trim、dshIm 通道成功/不可用/拒绝/未确认、
+  按 kind 分流（task_report 不碰 `platform.prompt`）、notice 形状与唤醒位、notice 摘要截断、
+  `/状态` 回执行、投递记录新旧两种 schema、R22-H2 `completed` 无 `structured` → ok、`error` 带正文
+  无 `diagnostic` → error。
+- 全量 1618 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
+- **非真机证据**：dsh-im 服务、宿主 `agent.send`、子代理 activation 均为替身；真实 IM 送达语义、
+  notice 的宿主排队行为与云端 systemd 属 50041 验收。
+
 ## [0.7.12] - 2026-11-21
 
 v0.7.11 复核增量的小修版。**v0.7.10、v0.7.11 均未单独部署，随本版一次上线。**

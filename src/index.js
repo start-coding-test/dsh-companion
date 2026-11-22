@@ -285,17 +285,24 @@ const COMPANION_RPC_PREFIX = 'companion-';
 const REMINDER_TEXT_PREFIX = '[提醒] ';
 
 /**
- * SA-B3（v0.7.7 阶段 4）：子代理回执投回主会话时的正文前缀与 source.kind。
+ * SA-B3（v0.7.7 阶段 4）：子代理回执的正文前缀与 source.kind。
  *
- * 回执沿既有 proactive 投递路径（`runtime/proactive.js` 的 enqueue → flush →
- * `platform.prompt`）进主会话，由主会话那一轮转述给用户；宿主会把它记成
- * `source.kind='user'`，所以必须同时被三处排除集认出来（hasRealUserInput /
- * isInjectedMessage / lastUserText），否则回执会被当作用户发言参与巩固、
- * 主会话重绑与召回查询。前缀与 kind 两条冗余口径各管一处：surface 记录没有
- * source，只能按正文前缀兜底。
+ * v0.7.13（R22-H1）起回执正文改走 dsh-im 出站（`ctx.dshIm.send`），不再作为
+ * 用户消息进主会话；但 `TASK_RECEIPT_SOURCE_KIND` 仍被三处排除集用来认「这
+ * 不是用户发言」（hasRealUserInput / isInjectedMessage / lastUserText）：
+ *   - 本版新增的会话 notice（source.form='notice'）复用同一 kind；
+ *   - v0.7.7—v0.7.12 落库/进 surface 的旧回执仍是 `source.kind='user'`，
+ *     只能靠正文前缀兜底识别。两条冗余口径都保留，不要删。
  */
 const REMINDER_TASK_PREFIX = '[任务] ';
 const TASK_RECEIPT_SOURCE_KIND = 'companion-task-receipt';
+
+/** R22-H1（v0.7.13）：`ctx.dshIm.send` 单次等待上限（im send 自己有 signal 通道）。 */
+const RECEIPT_IM_TIMEOUT_MS = 30_000;
+/** R22-H1：回执 notice 的 source.form 值（与用户发言区分）。 */
+const RECEIPT_NOTICE_FORM = 'notice';
+/** R22-H1：notice 摘要上限（宿主 summary 只用于提示）。 */
+const RECEIPT_NOTICE_SUMMARY_MAX = 60;
 
 /**
  * A7（U13-H1）：IM 插件的来源/引用信封。
@@ -540,6 +547,9 @@ export function apply(ctx, rawConfig, hooks = {}) {
         };
       });
   }
+  // R22-H1（v0.7.13）：回执出站通道探测。dsh-im 是可选依赖，未安装时插件照常
+  // 加载（不能写进顶层 inject：cordis 的 inject 只有必选语义）。
+  initReceiptChannel(state, host);
   // v0.4.12：人格卡只在 apply 时加载一次（不做热加载）；失败回落内置卡并 warn。
   applyPersonaCard(state, hooks);
   // V3-H2：先把上次进程崩溃时残留的 delivering 提醒收回 pending，避免永久卡住。
@@ -757,6 +767,12 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
      * {pending:true} = 自检进行中；否则为 bgSelfCheck() 的返回（ok/mode/…）。
      */
     bgSelfCheck: null,
+    /**
+     * R22-H1（v0.7.13）：回执出站通道（dsh-im）状态。null = 尚未初始化；
+     * 初始化后为 {available, service, contractVersion, botId, targetId, reason,
+     * message, lastDelivery}，/状态 与 sendReceiptViaIm 都读它。
+     */
+    im: null,
     /** M4：每日 token 累计（按配置时区的日键复位）。 */
     budget: createBudgetState(),
     /** M4：每个会话上次测得的 totalTokens；差值即一轮新增用量。 */
@@ -1174,6 +1190,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
     tokenUsage: tokenUsageSnapshot(state),
             // D21-H4：后台任务 systemd 模式 / 可用性（命令层只在传入时输出该行）。
             bg: state.bgSelfCheck,
+            // R22-H1：回执出站通道（dsh-im）与最近一次投递结果。
+            receipt: state.im,
             // V7-H1：每次命令调用时读能力位，不用 apply 时快照（宿主可能晚挂载）。
             threadsSupported: platform.capabilities.threadTools === true,
             // V3-M2：/状态 展示当前主会话与绑定模式。
@@ -5078,6 +5096,9 @@ function startScheduler(state) {
     },
     // V3-H2：投递目标是 identity 解析出的当前主会话 id，不再是字面量 'main'。
     target: () => currentMainSessionId(state),
+    // R22-H1（v0.7.13）：task_report 走 dsh-im 出站，其它 kind 仍走 platform.prompt。
+    deliver: (item) => deliverProactiveItem(state, item),
+    deliverKind: (kind) => kind === 'task_report',
     config,
     clock: platform.now,
   });
@@ -5303,18 +5324,245 @@ function fireDueReminders(state) {
 }
 
 /**
+ * R22-H1（v0.7.13）：回执出站通道初始化。
+ *
+ * dsh-im 是可选依赖（第三方插件 `@xmanrui/dsh-im`，服务名 `dshIm`；契约见其
+ * PROACTIVE_DELIVERY.md）。cordis 的 inject 只有必选语义（cordis/src/registry.ts:19
+ * 的 `Inject` 是服务名数组或拦截配置映射，没有 optional），所以不能把 dshIm 写进
+ * 本插件顶层 `inject`——未安装时会一直等依赖、整个插件不 apply。这里改为：
+ *   1. `ctx.get('dshIm')` 读一次（cordis 4 唯一不抛的读法，未注册返回 undefined）；
+ *   2. 读不到就 `ctx.inject(['dshIm'], cb)` 挂一个子 fiber
+ *      （cordis/src/registry.ts:300-302 `inject(deps, cb) => this.plugin({inject, apply})`），
+ *      等 dsh-im 晚挂载时再接管；子 fiber 等待不影响父插件。
+ *
+ * 启动时校验 contractVersion === 1，并记一条 info 日志（版本号 + 是否可用）。
+ * @param {object} state
+ * @param {object} host cordis Context
+ * @returns {void}
+ */
+function initReceiptChannel(state, host) {
+  const { platform, config } = state;
+  const imConfig = config?.receipt?.im ?? {};
+  const botId = typeof imConfig.botId === 'string' ? imConfig.botId : '';
+  const targetId = typeof imConfig.targetId === 'string' ? imConfig.targetId : '';
+  const channel = {
+    available: false,
+    service: null,
+    contractVersion: null,
+    botId,
+    targetId,
+    sessionNotice: config?.receipt?.sessionNotice === true,
+    reason: 'im-missing',
+    message: 'dsh-im 未安装或未注册 dshIm 服务',
+    lastDelivery: null,
+  };
+  state.im = channel;
+
+  const adopt = (service) => {
+    const picked = service === undefined ? null : service;
+    channel.service = picked;
+    channel.contractVersion = Number.isInteger(picked?.contractVersion) ? picked.contractVersion : null;
+    if (picked === null || typeof picked.send !== 'function') {
+      channel.available = false;
+      channel.reason = 'im-missing';
+      channel.message = 'dsh-im 未安装或未注册 dshIm 服务';
+    } else if (channel.contractVersion !== 1) {
+      channel.available = false;
+      channel.reason = 'im-contract-version';
+      channel.message = `dsh-im contractVersion=${String(channel.contractVersion ?? 'missing')}，本插件只支持 1`;
+    } else if (botId === '' || targetId === '') {
+      channel.available = false;
+      channel.reason = 'im-not-configured';
+      channel.message = 'receipt.im.botId / receipt.im.targetId 未配置';
+    } else {
+      channel.available = true;
+      channel.reason = null;
+      channel.message = null;
+    }
+    platform.log('info', '[dsh-companion] receipt channel', {
+      available: channel.available,
+      contractVersion: channel.contractVersion,
+      botId: botId === '' ? null : botId,
+      targetId: targetId === '' ? null : targetId,
+      reason: channel.reason,
+    });
+  };
+
+  // cordis 4 的 ctx.get(name) 在未注册时返回 undefined，但其它实现可能抛 → 兜住，
+  // 绝不能让可选依赖把整个插件 apply 拖失败。
+  let early;
+  try {
+    early = typeof host?.get === 'function' ? host.get('dshIm') : undefined;
+  } catch (error) {
+    platform.log('debug', '[dsh-companion] dshIm probe threw', { message: errorMessage(error) });
+    early = undefined;
+  }
+  adopt(early);
+  if (channel.service !== null) return;
+  if (typeof host?.inject !== 'function') return;
+  try {
+    host.inject(['dshIm'], (imCtx) => {
+      const late = typeof imCtx?.get === 'function' ? imCtx.get('dshIm') : imCtx?.dshIm;
+      adopt(late);
+    });
+  } catch (error) {
+    platform.log('debug', '[dsh-companion] optional dshIm inject skipped', {
+      message: errorMessage(error),
+    });
+  }
+}
+
+/**
+ * R22-H1：把一条回执正文经 dsh-im 出站发给用户（IM 一侧）。
+ *
+ * 契约（`@xmanrui/dsh-im` v5.10.0 的 lib/index.js：`contractVersion: 1` 的
+ * `Object.freeze({... send(botId, targetId, text, { signal, format })}` +
+ * PROACTIVE_DELIVERY.md:180-200）：`format` 只接受 'plain' | 'markdown'；
+ * 成功返回 `{sent: true}`（只代表平台受理，:357 明确不保证送达/已读）；失败
+ * Promise reject，`error.code` 用公共错误码（delivery-failed / target-not-found /
+ * account-unverified / target-changed）。
+ *
+ * 已知限制（用户已确认接受）：`send` 没有幂等键，「已发出但 recordSent 前崩溃」
+ * 会重复投一条；回执正文带任务 id，重复时可辨认。
+ * @param {object} state
+ * @param {string} text
+ * @returns {Promise<void>}
+ */
+async function sendReceiptViaIm(state, text) {
+  const channel = state.im;
+  const at = Math.floor(state.platform.now() / 1000);
+  if (channel === null || channel === undefined || channel.available !== true) {
+    const error = new Error(channel?.message ?? '回执通道不可用');
+    error.code = channel?.reason ?? 'im-unavailable';
+    if (channel !== null && channel !== undefined) {
+      channel.lastDelivery = { ok: false, at, code: error.code, message: error.message };
+    }
+    throw error;
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RECEIPT_IM_TIMEOUT_MS);
+  try {
+    const result = await channel.service.send(channel.botId, channel.targetId, text, {
+      signal: controller.signal,
+      format: 'plain',
+    });
+    if (result === null || typeof result !== 'object' || result.sent !== true) {
+      const error = new Error('dshIm.send 未确认送达（返回值不是 {sent:true}）');
+      error.code = 'delivery-unconfirmed';
+      throw error;
+    }
+    channel.lastDelivery = { ok: true, at, code: null, message: null };
+  } catch (error) {
+    const code = typeof error?.code === 'string' && error.code !== '' ? error.code : 'delivery-failed';
+    channel.lastDelivery = { ok: false, at, code, message: errorMessage(error) };
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * R22-H1（v0.7.13）：proactive 的出站分流。
+ *
+ * 只有 task_report 走 dsh-im；提醒/闲聊保持原 platform.prompt 路径不变。
+ * task_report 失败时直接抛出，交给 proactive 的退避重试——绝不退回
+ * platform.prompt（那会把回执伪装成用户发言，用户已明令禁止）。
+ * @param {object} state
+ * @param {{kind: string, text: string, requestId?: string|null, sessionId?: string|null}} item
+ * @returns {Promise<void>}
+ */
+async function deliverProactiveItem(state, item) {
+  const { platform } = state;
+  const kind = typeof item?.kind === 'string' ? item.kind : '';
+  const text = typeof item?.text === 'string' ? item.text : '';
+  if (kind !== 'task_report') {
+    const sessionId = typeof item?.sessionId === 'string' && item.sessionId !== '' ? item.sessionId : null;
+    if (sessionId === null) throw new Error('[dsh-companion] proactive delivery has no main session');
+    await platform.prompt({
+      sessionId,
+      content: [{ type: 'text', text }],
+      ...(typeof item?.requestId === 'string' && item.requestId !== '' ? { requestId: item.requestId } : {}),
+    });
+    return;
+  }
+  await sendReceiptViaIm(state, text);
+  // 出站确认后再放会话 notice：用户之后追问时主会话有上下文，但不单独开 turn。
+  deliverSessionNotice(state, text);
+}
+
+/**
+ * R22-H1：notice 的 source.summary（≤60 字，取正文首个非空行）。
+ * @param {string} text
+ * @returns {string}
+ */
+function noticeSummaryOf(text) {
+  const body = String(text).replace(/^\[任务\]\s*/u, '').trim();
+  const firstLine = body.split(/\r?\n/u).map((line) => line.trim()).find((line) => line !== '') ?? '';
+  return firstLine.length > RECEIPT_NOTICE_SUMMARY_MAX
+    ? `${firstLine.slice(0, RECEIPT_NOTICE_SUMMARY_MAX - 1)}…`
+    : firstLine;
+}
+
+/**
+ * R22-H1（v0.7.13）：回执出站后给主会话留一条 notice（不开 turn、不唤醒）。
+ *
+ * 用 `agent.send(message, 'next-turn', false)`：宿主签名见
+ * `dsh-agent-loop/src/agent.ts:171-178`（`send(message, target, wakeup)`；
+ * wakeup=false 只排队，:180-190 是宿主自己的 inject/steer 用法）。message 形状
+ * 对齐 `createUserMessage`（`dsh-llm/src/message.ts:246-253`，运行时不校验
+ * source.kind），source 用 {kind, form:'notice', summary}；三处排除集按 kind
+ * 认出它不是用户发言。主会话 agent 取不到就跳过，只记 warn。
+ * @param {object} state
+ * @param {string} text
+ * @returns {void}
+ */
+function deliverSessionNotice(state, text) {
+  const { platform } = state;
+  if (state.config?.receipt?.sessionNotice !== true) return;
+  const sessionId = currentMainSessionId(state);
+  if (typeof sessionId !== 'string' || sessionId === '') return;
+  let agent = null;
+  try {
+    agent = typeof platform.agentBySessionId === 'function' ? platform.agentBySessionId(sessionId) : null;
+  } catch {
+    agent = null;
+  }
+  if (agent === null || agent === undefined || typeof agent.send !== 'function') {
+    platform.log('warn', '[dsh-companion] task receipt notice skipped: main session agent unavailable', {
+      sessionId,
+    });
+    return;
+  }
+  try {
+    agent.send({
+      id: randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text: String(text) }],
+      source: {
+        kind: TASK_RECEIPT_SOURCE_KIND,
+        form: RECEIPT_NOTICE_FORM,
+        summary: noticeSummaryOf(text),
+      },
+    }, 'next-turn', false);
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] task receipt notice failed', {
+      sessionId,
+      message: errorMessage(error),
+    });
+  }
+}
+
+/**
  * SA-B3（v0.7.7 阶段 4）：把子代理的 ≤300 字回执投回主会话。
  *
- * 为什么要绕这一圈：宿主没有 `dsh-im` 出站接口，插件唯一能「说话」的通道是
- * 既有 proactive 投递路径——`proactive.enqueue` → `flush` → 主会话一轮
- * （用户真机已确认这类非 IM 发起的主会话 turn 能回到 QQ）。回执不新建通道：
- * 复用 `task_report` 类别（proactive.js:33 `KIND_CAPS`），正文加
- * `[任务] ` 前缀供 surface/回放侧兜底识别。
+ * v0.7.13（R22-H1）：正文改走 dsh-im 出站（ctx.dshIm.send，见
+ * sendReceiptViaIm），仍是「入 outbox → 立刻 flush」两个动作；outbox 的
+ * 持久化、dedupeKey 去重、补投、3P-M1 豁免与 10 分钟合并全部照旧。
  *
  * 为什么不改提醒触发逻辑：SA-B3 原文只要求「沿现有提醒投递路径」投回执；
- * `fireDueReminders`（提醒到点）完全不动，只在它旁边复用同一个 outbox。
+ * ireDueReminders（提醒到点）完全不动，只在它旁边复用同一个 outbox。
  *
- * 投递日志（计划明确要求）：`dsh-im` 没有出站日志，插件自记一条才能核对
+ * 投递日志（计划明确要求）：dsh-im 没有出站日志，插件自记一条才能核对
  * 「回执 id / 时间 / 投递成功与否」，落 memory_events（kind=task_receipt_delivery）。
  *
  * @param {object} state
@@ -5369,6 +5617,24 @@ function deliverTaskReceipt(state, info) {
   return { queued };
 }
 
+/**
+ * SA-B3（v0.7.7 阶段 4）：把子代理的 ≤300 字回执投回主会话。
+ *
+ * v0.7.13（R22-H1）：正文改走 dsh-im 出站（`ctx.dshIm.send`，见
+ * `sendReceiptViaIm`），仍是「入 outbox → 立刻 flush」两个动作；outbox 的
+ * 持久化、dedupeKey 去重、补投、3P-M1 豁免与 10 分钟合并全部照旧。
+ *
+ * 为什么不改提醒触发逻辑：SA-B3 原文只要求「沿现有提醒投递路径」投回执；
+ * `fireDueReminders`（提醒到点）完全不动，只在它旁边复用同一个 outbox。
+ *
+ * 投递日志（计划明确要求）：dsh-im 没有出站日志，插件自记一条才能核对
+ * 「回执 id / 时间 / 投递成功与否」，落 memory_events（kind=task_receipt_delivery）。
+ *
+ * @param {object} state
+ * @param {{taskId: string, status?: string, receipt: string, title?: string|null,
+ *   sessionId?: string|null, reason?: string}} info
+ * @returns {{queued: boolean, duplicate?: boolean}}
+ */
 /**
  * W-3（v0.7.7 阶段 6）：后台任务结束时把结果交回。
  *
@@ -5501,7 +5767,9 @@ function recordTaskReceiptDelivery(state, info) {
         kind: 'task_receipt_delivery',
         receiptId: info.receiptId,
         taskId: info.taskId ?? null,
-        status: info.status ?? null,
+        // R22-M1（v0.7.13）：status = 投递结果；任务终态另记 task_status。
+        status: info.delivered === true ? 'delivered' : 'failed',
+        task_status: info.status ?? null,
         delivered: info.delivered === true,
         title: info.title ?? null,
         sessionId: info.sessionId ?? null,
@@ -5514,6 +5782,31 @@ function recordTaskReceiptDelivery(state, info) {
       message: errorMessage(error),
     });
   }
+}
+
+/**
+ * R22-M1（v0.7.13）：统一读 `task_receipt_delivery` 事件。
+ *
+ * 旧记录（≤v0.7.12）把任务终态写在 `status`、投递结果只有 `delivered` 布尔；
+ * 新记录 `status` = delivered|failed，任务终态在 `task_status`。两种都读成
+ * `{delivery, taskStatus, delivered}`。
+ * @param {object|null|undefined} detail memory_events.detail_json
+ * @returns {{delivery: 'delivered'|'failed', taskStatus: string|null, delivered: boolean}}
+ */
+export function readReceiptDeliveryRecord(detail) {
+  const record = detail ?? {};
+  const delivered = record.delivered === true || record.status === 'delivered';
+  let taskStatus = null;
+  if (typeof record.task_status === 'string' && record.task_status !== '') {
+    taskStatus = record.task_status;
+  } else if (record.task_status === undefined
+    && typeof record.status === 'string'
+    && record.status !== 'delivered'
+    && record.status !== 'failed') {
+    // 旧记录：status 就是任务终态。
+    taskStatus = record.status;
+  }
+  return { delivery: delivered ? 'delivered' : 'failed', taskStatus, delivered };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -6769,6 +7062,13 @@ export {
   isInjectedMessage,
   isPluginNotice,
   lastUserText,
+  // R22-H1/M1（v0.7.13）：回执通道、会话 notice 与投递记录，仅为单测可达（非公开 API）。
+  deliverProactiveItem,
+  deliverSessionNotice,
+  initReceiptChannel,
+  noticeSummaryOf,
+  recordTaskReceiptDelivery,
+  sendReceiptViaIm,
   // D21-M1（v0.7.10）：巩固区间合并入 pending，仅为单测可达（非公开 API）。
   rememberConsolidatedRegion,
   runCommitmentFollowups,

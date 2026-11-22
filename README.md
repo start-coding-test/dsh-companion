@@ -138,8 +138,16 @@ persona:
 | `bg.minFreeDiskMB` | `1024` | workRoot 剩余空间低于它就拒绝启动 |
 | `bg.wakeBudgetPerAgent` | `3` | 每个发起子代理最多被唤醒几次，超预算直接投主会话 |
 | `bgConcurrency` | `1` | 同时运行的后台任务上限；训练这类占资源的任务默认不并行 |
+| `receipt.im.botId` / `receipt.im.targetId` | `""` | 任务回执经 dsh-im 出站到 IM 的 bot 与目标；留空 = 回执不可用（需安装 `@xmanrui/dsh-im`，contractVersion = 1） |
+| `receipt.sessionNotice` | `true` | 回执出站后给主会话留一条 notice（`next-turn`、不唤醒、不开 turn） |
 
 token 四档须满足 `retainTokens < compactAtTokens < workingMemoryTokens < compactHardTokens`。未知配置键只记警告，不阻断启动。
+
+**任务回执的投递通道**：`task_run` 的子代理回执（含后台任务兜底）不再伪装成用户发言进主会话，
+而是经 dsh-im 的进程内服务 `ctx.dshIm.send` 出站到 IM（需要配置 `receipt.im.botId` /
+`receipt.im.targetId`，并安装 `@xmanrui/dsh-im`）。dsh-im 缺失、未配置、契约版本不符或发送失败时，
+回执记为 `delivery_error` 并按现有退避重试，**不会退回主会话 prompt**。回执发出后还会给主会话留
+一条 notice（随下一轮进入、不唤醒），方便用户之后追问；`/状态` 的「回执通道」行显示可用性与最近一次投递。
 
 **后台长任务的安全边界**：50041 以 ubuntu（uid 1000）运行，`bg_run` 不改变运行身份；`process.getuid() !== 0` 时任务提交到该用户的用户级 systemd（`systemd-run --user`，自动补 `XDG_RUNTIME_DIR` / `DBUS_SESSION_BUS_ADDRESS`），此时 `bg.runAs` 必须为空。安全边界靠工作目录（`bg.workRoot` 内、realpath 校验）、解释器白名单、时长与资源上限和审计记录（`bg_jobs` 表 + `memory_events`）。`bg_run` 不审脚本内容（脚本由珞然自建，如训练脚本），只限制工作目录、解释器、时长与资源；`bg.workRoot` 未配置、或用户级 systemd 自检失败时工具返回不可用。预计 10 分钟内结束的事不用 `bg_run`，用 `task_run` / `thread_run`。
 

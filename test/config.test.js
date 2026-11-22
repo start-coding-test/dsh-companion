@@ -324,7 +324,9 @@ describe('apply（插件入口）', () => {
     const calls = [];
     const ctx = { logger: { info: (...args) => calls.push(args) } };
     assert.doesNotThrow(() => apply(ctx, { threadIdleDays: 21, dbPath: ':memory:' }));
-    assert.equal(calls.length, 1);
+    const configLines = calls.filter((args) => args[0] === '[dsh-companion] config ok');
+    // v0.7.13：apply 还会记一条回执通道 info 日志（dshIm 探活），这里只数 config ok。
+    assert.equal(configLines.length, 1);
     assert.equal(calls[0][0], '[dsh-companion] config ok');
     assert.deepEqual(calls[0][1], { warnings: [] });
   });
@@ -333,7 +335,8 @@ describe('apply（插件入口）', () => {
     const calls = [];
     const ctx = { logger: { info: (...args) => calls.push(args) } };
     apply(ctx, { nope: 1, dbPath: ':memory:' });
-    assert.equal(calls.length, 1);
+    const configLines = calls.filter((args) => args[0] === '[dsh-companion] config ok');
+    assert.equal(configLines.length, 1);
     assert.equal(calls[0][1].warnings.length, 1);
     assert.match(calls[0][1].warnings[0], /nope/);
   });

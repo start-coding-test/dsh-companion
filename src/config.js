@@ -365,6 +365,24 @@ Object.defineProperty(DEFAULT_VALUES, 'bgConcurrency', {
   configurable: false,
 });
 
+// R22-H1（v0.7.13）：task_report 回执改走 dsh-im 出站通道（`ctx.dshIm.send`）。
+// botId / targetId 必须显式填写（不自动猜）；任一为空 → 回执通道不可用，
+// task_report 只留在 outbox 里重试，绝不退回 platform.prompt（不冒充用户发言）。
+// sessionNotice：回执投出后给主会话插一条 notice（source.form='notice'），
+// 随下一轮进入、不唤醒、不单独开 turn；开关默认开。
+// 与其它扩展节一致：非枚举，不参与 16 键安装自检。
+const RECEIPT_DEFAULTS = Object.freeze({
+  im: Object.freeze({ botId: '', targetId: '' }),
+  sessionNotice: true,
+});
+
+Object.defineProperty(DEFAULT_VALUES, 'receipt', {
+  value: RECEIPT_DEFAULTS,
+  enumerable: false,
+  writable: false,
+  configurable: false,
+});
+
 // v0.7.7 C120-M1：低于该 token 数的巩固区间不登记 pending_compact。
 // 小片段压缩收益低于一次surface replace 的成本，而且更容易踩到宿主「压后不更小」
 // 的确定性失败；保留默认 4096（与 retainTokens 的尾部预算同量级）。
@@ -1180,6 +1198,47 @@ export function normalizeSubagent(raw, warnings = []) {
  *   maxDeadlineMin: number, memoryMax: string, cpuQuota: string,
  *   minFreeDiskMB: number, wakeBudgetPerAgent: number}>}
  */
+/**
+ * R22-H1（v0.7.13）：回执出站通道配置。botId / targetId 为空即「未配置」，
+ * 不做任何自动推断（dsh-im 的 bot / target 归属只有用户知道）。
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {{im: {botId: string, targetId: string}, sessionNotice: boolean}}
+ */
+export function normalizeReceipt(raw, warnings = []) {
+  const defaults = DEFAULTS.receipt;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('receipt', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  for (const key of Object.keys(raw)) {
+    if (key !== 'im' && key !== 'sessionNotice') warnings.push(`unknown config field "receipt.${key}" ignored`);
+  }
+  const imRaw = raw.im === undefined ? defaults.im : raw.im;
+  if (imRaw === null || typeof imRaw !== 'object' || Array.isArray(imRaw)) {
+    throw new ConfigError('receipt.im', `must be a plain object, got ${imRaw === null ? 'null' : typeof imRaw}`);
+  }
+  for (const key of Object.keys(imRaw)) {
+    if (key !== 'botId' && key !== 'targetId') warnings.push(`unknown config field "receipt.im.${key}" ignored`);
+  }
+  const readId = (value, fallback, field) => {
+    const picked = value === undefined ? fallback : value;
+    if (typeof picked !== 'string') throw new ConfigError(field, `must be a string, got ${typeof picked}`);
+    return picked.trim();
+  };
+  const botId = readId(imRaw.botId, defaults.im.botId, 'receipt.im.botId');
+  const targetId = readId(imRaw.targetId, defaults.im.targetId, 'receipt.im.targetId');
+  const sessionNotice = raw.sessionNotice === undefined ? defaults.sessionNotice : raw.sessionNotice;
+  if (typeof sessionNotice !== 'boolean') {
+    throw new ConfigError('receipt.sessionNotice', `must be a boolean, got ${typeof sessionNotice}`);
+  }
+  return Object.freeze({
+    im: Object.freeze({ botId, targetId }),
+    sessionNotice,
+  });
+}
+
+
 export function normalizeBg(raw, warnings = [], options = {}) {
   const defaults = DEFAULTS.bg;
   if (raw === undefined) return defaults;
@@ -1457,6 +1516,7 @@ export function normalizeConfig(raw = {}) {
   cfg.decay = normalizeDecay(input.decay, warnings);
   cfg.subagent = normalizeSubagent(input.subagent, warnings);
   cfg.bg = normalizeBg(input.bg, warnings);
+  cfg.receipt = normalizeReceipt(input.receipt, warnings);
 
   // W-5：非枚举标量，与 bg 节同批；默认 1 = 训练脚本不并行。
   cfg.bgConcurrency = input.bgConcurrency === undefined

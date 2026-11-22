@@ -146,9 +146,19 @@ function parseDetail(detail) {
  * @param {() => (string|null)} options.target 解析当前主会话 id（无主会话返回 null）
  * @param {Record<string, unknown>} [options.config] 已校验配置（缺省用 DEFAULTS）
  * @param {() => number|Date} [options.clock]
+ * @param {(item: object) => Promise<void>} [options.deliver] 按 kind 分流的投递函数（R22-H1：task_report 走 dsh-im；缺省回落到 platform.prompt）
+ * @param {(kind: string) => boolean} [options.deliverKind] 该 kind 是否走 deliver（不走时仍要求主会话 id）
  * @returns {{enqueue: Function, flush: Function, stats: Function}}
  */
-export function createProactive({ store, platform, config, target, clock = Date.now } = {}) {
+export function createProactive({
+  store,
+  platform,
+  config,
+  target,
+  clock = Date.now,
+  deliver = null,
+  deliverKind = null,
+} = {}) {
   if (store === null || typeof store !== 'object') {
     throw new TypeError('createProactive(store): store must be an object');
   }
@@ -164,6 +174,13 @@ export function createProactive({ store, platform, config, target, clock = Date.
   if (typeof clock !== 'function') {
     throw new TypeError('createProactive(clock): clock must be a function');
   }
+  if (deliver !== null && typeof deliver !== 'function') {
+    throw new TypeError('createProactive(deliver): must be a function when provided');
+  }
+  if (deliverKind !== null && typeof deliverKind !== 'function') {
+    throw new TypeError('createProactive(deliverKind): must be a function when provided');
+  }
+  const usesChannel = (kind) => (typeof deliverKind === 'function' ? deliverKind(kind) === true : false);
 
   const settings = config ?? {};
   const dailyCap = settings.proactiveDailyCap ?? DEFAULTS.proactiveDailyCap;
@@ -562,7 +579,7 @@ export function createProactive({ store, platform, config, target, clock = Date.
       report.error = error;
       sessionId = null;
     }
-    if (sessionId === null) {
+    if (sessionId === null && candidates.some((candidate) => !usesChannel(candidate.kind))) {
       const remaining = candidates.map((candidate) => ({ ...candidate, parts: candidate.parts.slice() }));
       queue.unshift(...remaining);
       for (const candidate of remaining) {
@@ -597,7 +614,13 @@ export function createProactive({ store, platform, config, target, clock = Date.
       };
       delivered.requestId = deliveryRequestId(delivered);
       try {
-        await platform.prompt(sessionId, delivered.text, { requestId: delivered.requestId });
+        if (typeof deliver === 'function') {
+          // R22-H1：task_report 走 dsh-im 出站；失败直接抛出，交给下面的统一失败路径
+          // （不退回 platform.prompt，避免回执冒充用户发言）。
+          await deliver({ ...delivered, sessionId });
+        } else {
+          await platform.prompt(sessionId, delivered.text, { requestId: delivered.requestId });
+        }
       } catch (error) {
         report.failed += 1;
         recordDeliveryError(delivered, error, at);

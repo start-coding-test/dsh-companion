@@ -67,7 +67,13 @@ export const SUBAGENT_MODEL_ALLOWLIST = Object.freeze([
 ]);
 
 /**
- * A1：给子代理声明的结构化输出 schema。
+ * A1：子代理结构化输出 schema（**v0.7.13 / R22-H2 起不再声明给宿主**，只用于读兼容）。
+ *
+ * 为什么不再传：宿主 `dsh-subagent/src/activation.ts:148-160` 的 `captureLocalResult`
+ * 在父方声明了 `outputSchema`、子代理却没提交结构化结果时，会把 `completed` 改写成
+ * `error` 且不带 `structured`（:157）——任务本身成功，回执却被插件标成「任务失败」。
+ * 现在改为只取 `output` 文本、由 `receipt.js` 截到 300 字；若宿主仍回传 `structured`
+ * （旧版本/外部直接调用），`parseStructured` 照旧解析，属于读兼容。
  *
  * 宿主 schema 子集只允许 `type/oneOf/properties/required/additionalProperties/
  * items/enum/const` + 注解（`dsh-tools/src/json-schema.ts:267`），**没有
@@ -250,6 +256,22 @@ export function buildSubagentReceipt({ status, structured, text, durationMs = 0 
 }
 
 /**
+ * R22-H2（v0.7.13）：提示词尾部要求「最后一段用一句话给结论」。
+ *
+ * 不再声明 `outputSchema`（会触发宿主把 completed 改写成 error，见
+ * `dsh-subagent/src/activation.ts:150-158`），结论只能从正文文本取，所以必须
+ * 明确要求子代理把结论写清楚；已经要求过的不重复追加。
+ *
+ * @param {string} prompt
+ * @returns {string}
+ */
+function withConclusionHint(prompt) {
+  const text = typeof prompt === 'string' ? prompt : String(prompt ?? '');
+  if (text.includes('最后一段用一句话给出结论')) return text;
+  return `${text}\n\n最后一段用一句话给出结论（不超过 ${RECEIPT_MAX_CHARS} 字），把产物路径写在结论里。`;
+}
+
+/**
  * 派一个子代理并把结果收成插件自己的 {status, receipt} 形状。
  *
  * 与 `src/task/worker.js` 的 `runTask()` 返回同一形状，调用方（`src/task/run.js`）
@@ -412,10 +434,12 @@ export async function runSubagentTask(options = {}) {
       maxDepth: SUBAGENT_MAX_DEPTH,
       label: typeof label === 'string' && label !== '' ? label : (task.id ?? 'task'),
       ...(normalizedName === null ? {} : { name: normalizedName }),
-      prompt: [{ type: 'text', text: task.prompt }],
+      prompt: [{ type: 'text', text: withConclusionHint(task.prompt) }],
       parent,
       signal: controller.signal,
-      outputSchema: SUBAGENT_OUTPUT_SCHEMA,
+      // R22-H2（v0.7.13）：**故意不传 outputSchema**。宿主 `dsh-subagent/src/activation.ts:150-158`
+      // 在父方声明 schema 而子代理没交结构化结果时，会把 `completed` 改写成 `error` 且不带
+      // `structured` → 插件把成功任务标成失败。结论改从 `output` 文本取，长度由 receipt.js 截断。
       // D3：默认不传 agentOptions → 沿用主会话路由；只有显式 allowlist 模型才传。
       ...(resolvedModel === null ? {} : { agentOptions: { model: resolvedModel } }),
       ...(typeof task.cwd === 'string' && task.cwd !== '' ? { cwd: task.cwd } : {}),

@@ -153,6 +153,8 @@ export function handleCommand({
   // A1（v0.4.13）：今日按来源的 token 账本（没有样本时整行省略）。
   tokenUsage,
   // D21-H4（v0.7.10）：后台任务 systemd 模式与自检结果（只由接线层传入）。
+  // R22-H1（v0.7.13）：回执出站通道（dsh-im）状态（只由接线层传入）。
+  receipt,
   bg,
   // V710-L1（v0.7.11）：取消在跑 task_run；null = 全部。
 } = {}) {
@@ -206,6 +208,8 @@ export function handleCommand({
       // A1：今日用量与来源占比。
       tokenUsage,
       // D21-H4：后台任务可用性 / systemd 模式 / cgroup 控制器缺失。
+      // R22-H1：回执通道可用性与最近投递（只由接线层传入）。
+      receipt,
       bg,
       now: toMillis(now),
     }),
@@ -657,6 +661,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // D21-H4：后台任务 systemd 模式与可用性；只在接线层传入 bg 时输出（旧调用方格式不变）。
   const bgLine = formatBgLine(options.bg);
   if (bgLine !== null) lines.push(bgLine);
+  // R22-H1（v0.7.13）：回执出站通道（dsh-im）状态；只在接线层传入 receipt 时输出。
+  const receiptLine = formatReceiptLine(options.receipt);
+  if (receiptLine !== null) lines.push(receiptLine);
   // G0-9：最近一次压缩/巩固实际耗时（只观测，不设超时）；无样本显示 —。
   // timing 只在接线层传入时输出，保持旧调用方（单测）的 /状态 格式不变。
   if (options.timing !== null && options.timing !== undefined && typeof options.timing === 'object') {
@@ -753,6 +760,42 @@ function formatBgLine(bg) {
     : [];
   if (missing.length > 0) {
     line += `；MemoryMax/CPUQuota 不生效（缺 ${missing.join('/')}）`;
+  }
+  return line;
+}
+
+/**
+ * R22-H1（v0.7.13）：回执出站通道状态行。
+ *
+ * 格式：
+ * - `回执通道：dsh-im 可用（bot <id> → <target>）`；有投递记录时追加
+ *   `；最近投递：成功` 或 `；最近投递：失败（<code>）`。
+ * - `回执通道：不可用（<原因>）`：dsh-im 未安装、contractVersion ≠ 1、或
+ *   `receipt.im.botId/targetId` 未配置。
+ *
+ * @param {{available?: unknown, botId?: unknown, targetId?: unknown, reason?: unknown,
+ *          message?: unknown, lastDelivery?: unknown}} [receipt]
+ * @returns {string|null} 未传 receipt（旧调用方）时返回 null
+ */
+function formatReceiptLine(receipt) {
+  if (receipt === null || receipt === undefined || typeof receipt !== 'object') return null;
+  if (receipt.available !== true) {
+    const reasonText = typeof receipt.message === 'string' && receipt.message.trim() !== ''
+      ? receipt.message.trim()
+      : (typeof receipt.reason === 'string' && receipt.reason.trim() !== '' ? receipt.reason.trim() : '未知原因');
+    return `回执通道：不可用（${reasonText}）`;
+  }
+  const botId = typeof receipt.botId === 'string' && receipt.botId !== '' ? receipt.botId : '（未配置）';
+  const targetId = typeof receipt.targetId === 'string' && receipt.targetId !== '' ? receipt.targetId : '（未配置）';
+  let line = `回执通道：dsh-im 可用（bot ${botId} → ${targetId}）`;
+  const last = receipt.lastDelivery;
+  if (last !== null && last !== undefined && typeof last === 'object') {
+    if (last.ok === true) {
+      line += '；最近投递：成功';
+    } else {
+      const code = typeof last.code === 'string' && last.code !== '' ? `（${last.code}）` : '';
+      line += `；最近投递：失败${code}`;
+    }
   }
   return line;
 }

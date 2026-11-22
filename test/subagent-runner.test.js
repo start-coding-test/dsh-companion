@@ -94,7 +94,7 @@ function makeSubagentPlatform(options = {}) {
 
 /* ---------------------------------------------------------------- SA-B1 */
 
-test('SA-B1：startActivation 规格（provider/delivery/preset/maxDepth/prompt/parent/signal/outputSchema）', async () => {
+test('SA-B1：startActivation 规格（provider/delivery/preset/maxDepth/prompt/parent/signal，v0.7.13 起不传 outputSchema）', async () => {
   const platform = makeSubagentPlatform();
   const parent = makeAgent();
   const result = await runSubagentTask({
@@ -114,13 +114,15 @@ test('SA-B1：startActivation 规格（provider/delivery/preset/maxDepth/prompt/
   assert.equal(spec.maxDepth, SUBAGENT_MAX_DEPTH);
   assert.equal(spec.parent, parent, 'parent 必须是同一个 Agent 引用（宿主 UNAUTHORIZED 守卫）');
   assert.ok(spec.signal instanceof AbortSignal, 'signal 必须显式传入');
-  assert.deepEqual(spec.prompt, [{ type: 'text', text: '写周报' }]);
+  // R22-H2：提示词尾部必须追加「最后一段用一句话给出结论」，其余正文原样保留。
+  assert.equal(spec.prompt.length, 1);
+  assert.equal(spec.prompt[0].type, 'text');
+  assert.ok(spec.prompt[0].text.startsWith('写周报'), '原 prompt 必须原样保留在前面');
+  assert.ok(spec.prompt[0].text.includes('最后一段用一句话给出结论'), 'v0.7.13：必须追加结论要求');
   assert.equal(spec.label, '周报');
-  // outputSchema 只能落在宿主子集内：object + properties + required
-  assert.equal(spec.outputSchema.type, 'object');
-  assert.deepEqual(Object.keys(spec.outputSchema.properties).sort(), ['artifacts', 'receipt', 'status']);
-  assert.deepEqual(spec.outputSchema.required, ['receipt']);
-  assert.equal(spec.outputSchema.additionalProperties, false);
+  // R22-H2（v0.7.13）：不再声明 outputSchema —— 宿主 `dsh-subagent/src/activation.ts:150-158`
+  // 在父方声明 schema 而子代理没交结构化结果时，会把 completed 改写成 error。
+  assert.equal(Object.hasOwn(spec, 'outputSchema'), false, 'v0.7.13 起不得再传 outputSchema');
   // D3：默认不传 agentOptions（= 沿用主会话路由）
   assert.equal(Object.hasOwn(spec, 'agentOptions'), false, '默认不得传 agentOptions.model');
 });
