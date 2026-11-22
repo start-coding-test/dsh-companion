@@ -38,11 +38,12 @@
 
 ### Tests
 
-- 新增 `test/v0713.test.js` 13 例：receipt 配置默认值与 trim、dshIm 通道成功/不可用/拒绝/未确认、
+- 新增 `test/v0713.test.js` 14 例：receipt 配置默认值与 trim、dshIm 通道成功/不可用/拒绝/未确认、
   按 kind 分流（task_report 不碰 `platform.prompt`）、notice 形状与唤醒位、notice 摘要截断、
-  `/状态` 回执行、投递记录新旧两种 schema、R22-H2 `completed` 无 `structured` → ok、`error` 带正文
-  无 `diagnostic` → error。
-- 全量 1618 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
+  `/状态` 回执行、投递记录新旧两种 schema、R22-H2 的 `completed` 无 `structured` → ok 与
+  `error` 带正文无 `diagnostic` → error，以及**生产接线判别用例**（`startScheduler` 恒注入
+  `deliver`，删掉注入即变红）。
+- 全量 1619 个用例 / 67 个套件（`TZ=UTC`、`TZ=Asia/Shanghai`、`TZ=America/New_York` 三遍全绿）。
 - **非真机证据**：dsh-im 服务、宿主 `agent.send`、子代理 activation 均为替身；真实 IM 送达语义、
   notice 的宿主排队行为与云端 systemd 属 50041 验收。
 

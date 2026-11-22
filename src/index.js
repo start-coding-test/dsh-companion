@@ -5076,7 +5076,7 @@ function expireOne(store, platform, id) {
  * @param {object} state
  * @returns {Function} disposer：停止 scheduler
  */
-function startScheduler(state) {
+export function startScheduler(state) {
   const { platform, store, config, metrics } = state;
   // V7-H1 审计：timer 是声明的 inject（cordis 在 apply 前就绪）；调度器只能
   // 注册一次，故保留 apply 时判断，不存在晚挂载后补启动的路径。
@@ -5560,7 +5560,7 @@ function deliverSessionNotice(state, text) {
  * 持久化、dedupeKey 去重、补投、3P-M1 豁免与 10 分钟合并全部照旧。
  *
  * 为什么不改提醒触发逻辑：SA-B3 原文只要求「沿现有提醒投递路径」投回执；
- * ireDueReminders（提醒到点）完全不动，只在它旁边复用同一个 outbox。
+ * `fireDueReminders`（提醒到点）完全不动，只在它旁边复用同一个 outbox。
  *
  * 投递日志（计划明确要求）：dsh-im 没有出站日志，插件自记一条才能核对
  * 「回执 id / 时间 / 投递成功与否」，落 memory_events（kind=task_receipt_delivery）。
@@ -5617,24 +5617,6 @@ function deliverTaskReceipt(state, info) {
   return { queued };
 }
 
-/**
- * SA-B3（v0.7.7 阶段 4）：把子代理的 ≤300 字回执投回主会话。
- *
- * v0.7.13（R22-H1）：正文改走 dsh-im 出站（`ctx.dshIm.send`，见
- * `sendReceiptViaIm`），仍是「入 outbox → 立刻 flush」两个动作；outbox 的
- * 持久化、dedupeKey 去重、补投、3P-M1 豁免与 10 分钟合并全部照旧。
- *
- * 为什么不改提醒触发逻辑：SA-B3 原文只要求「沿现有提醒投递路径」投回执；
- * `fireDueReminders`（提醒到点）完全不动，只在它旁边复用同一个 outbox。
- *
- * 投递日志（计划明确要求）：dsh-im 没有出站日志，插件自记一条才能核对
- * 「回执 id / 时间 / 投递成功与否」，落 memory_events（kind=task_receipt_delivery）。
- *
- * @param {object} state
- * @param {{taskId: string, status?: string, receipt: string, title?: string|null,
- *   sessionId?: string|null, reason?: string}} info
- * @returns {{queued: boolean, duplicate?: boolean}}
- */
 /**
  * W-3（v0.7.7 阶段 6）：后台任务结束时把结果交回。
  *
@@ -7051,6 +7033,8 @@ function renderToolValue(value) {
 
 export {
   captureTranscript,
+  // R22-H1（v0.7.13）：生产接线层（scheduler 注入 + 回执入队），仅为单测可达（非公开 API）。
+  deliverTaskReceipt,
   expireStaleReminders,
   // D21-M1（v0.7.10）：小区间累积 pending 的两个纯函数，仅为单测可达（非公开 API）。
   forgetPendingCompact,

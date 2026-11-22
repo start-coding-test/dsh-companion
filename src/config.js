@@ -1187,18 +1187,6 @@ export function normalizeSubagent(raw, warnings = []) {
 }
 
 /**
- * 合并后台长任务节（bg）并校验；未知子字段 warn，越界抛 ConfigError。
- *
- * 语义见 DEFAULT_VALUES.bg 的注释：workRoot 空表示工具不可用；runAs 空表示
- * 与主进程同身份（root）；interpreters 是 argv[0] 白名单，必须非空且元素非空串。
- *
- * @param {unknown} raw
- * @param {string[]} [warnings]
- * @returns {Readonly<{workRoot: string, interpreters: ReadonlyArray<string>, runAs: string,
- *   maxDeadlineMin: number, memoryMax: string, cpuQuota: string,
- *   minFreeDiskMB: number, wakeBudgetPerAgent: number}>}
- */
-/**
  * R22-H1（v0.7.13）：回执出站通道配置。botId / targetId 为空即「未配置」，
  * 不做任何自动推断（dsh-im 的 bot / target 归属只有用户知道）。
  * @param {unknown} raw
@@ -1238,7 +1226,18 @@ export function normalizeReceipt(raw, warnings = []) {
   });
 }
 
-
+/**
+ * 合并后台长任务节（bg）并校验；未知子字段 warn，越界抛 ConfigError。
+ *
+ * 语义见 DEFAULT_VALUES.bg 的注释：workRoot 空表示工具不可用；runAs 空表示
+ * 与主进程同身份（当前 uid；用户级实例不能切换身份）；interpreters 是 argv[0] 白名单，必须非空且元素非空串。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{workRoot: string, interpreters: ReadonlyArray<string>, runAs: string,
+ *   maxDeadlineMin: number, memoryMax: string, cpuQuota: string,
+ *   minFreeDiskMB: number, wakeBudgetPerAgent: number}>}
+ */
 export function normalizeBg(raw, warnings = [], options = {}) {
   const defaults = DEFAULTS.bg;
   if (raw === undefined) return defaults;

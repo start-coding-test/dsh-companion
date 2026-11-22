@@ -15,12 +15,14 @@ import { handleCommand } from '../src/runtime/commands.js';
 import { runSubagentTask } from '../src/task/subagent-runner.js';
 import {
   deliverProactiveItem,
+  deliverTaskReceipt,
   deliverSessionNotice,
   initReceiptChannel,
   noticeSummaryOf,
   readReceiptDeliveryRecord,
   recordTaskReceiptDelivery,
   sendReceiptViaIm,
+  startScheduler,
 } from '../src/index.js';
 
 const NOW = Date.parse('2026-11-22T10:00:00+08:00');
@@ -77,7 +79,7 @@ test('R22-H1：receipt 配置默认值、trim 与 sessionNotice 开关（非真�
   const off = normalizeConfig({ receipt: { sessionNotice: false } });
   assert.equal(off.receipt.sessionNotice, false, '显式 false 必须保留');
 
-  // 57 键安装面不变：receipt 是节级扩展（非枚举），不参与 16 键自检。
+  // 16 核心键 + 非枚举节扩展：receipt 是节级扩展（非枚举），不参与 16 键自检。
   assert.equal(Object.keys(base).includes('receipt'), true);
 });
 
@@ -368,4 +370,74 @@ test('R22-H2：stopReason=error 带正文、无 diagnostic → error 且正文�
   assert.equal(result.status, 'error');
   assert.equal(result.error, '脚本第 3 行报错');
   assert.match(result.receipt, /状态：失败/u);
+});
+/* ------------------------------------------- R22-H1 生产接线（glm M1） */
+
+/**
+ * **非真机证据**：这是「生产接线层」判别用例 —— 钉住 startScheduler 恒把
+ * deliver/deliverKind 注入 createProactive。若删掉 src/index.js 里的
+ * deliver 注入，task_report 会悄悄退回 platform.prompt，本用例必须变红。
+ */
+test('R22-H1 接线：startScheduler 注入 deliver，task_report 走 dshIm 而不是 platform.prompt', async () => {
+  // 10:05 不在安静时段（否则 proactive.flush 会被 quiet 挡住），且已超出 daily job 的 catch-up 窗。
+  const at = Date.parse('2026-11-22T10:05:00+08:00');
+  const everyCalls = [];
+  const prompts = [];
+  const logs = [];
+  const service = makeService();
+  const platform = {
+    capabilities: { timer: true },
+    now: () => at,
+    every: (delay, callback) => {
+      everyCalls.push({ delay, callback });
+      return () => {};
+    },
+    log: (level, message, meta) => logs.push({ level, message, meta }),
+    async prompt(request) {
+      prompts.push(request);
+    },
+    agentBySessionId: () => null,
+  };
+  const store = Store.open(':memory:');
+  try {
+    const state = {
+      platform,
+      store,
+      config: normalizeConfig({ receipt: { im: { botId: 'bot-wire', targetId: 'tg-wire' } } }),
+      metrics: { snapshot: () => ({}) },
+      mainSessionId: 'session-main',
+      pendingCompact: new Map(),
+    };
+
+    const stop = startScheduler(state);
+    assert.equal(typeof stop, 'function', 'startScheduler 应返回 stop 句柄');
+    assert.ok(state.proactive !== null && state.proactive !== undefined, 'scheduler 必须创建 proactive');
+    assert.ok(everyCalls.length >= 1, 'scheduler 必须向 platform.every 注册定时器');
+
+    initReceiptChannel(state, { get: (name) => (name === 'dshIm' ? service : undefined) });
+    assert.equal(state.im.available, true);
+
+    const receipt = await deliverTaskReceipt(state, { taskId: 'task-wire-1', receipt: '结论：已跑完' });
+    assert.equal(receipt.queued, true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await state.proactive.flush();
+
+    assert.equal(service.calls.length, 1, 'task_report 必须经 dshIm 出站一次');
+    assert.equal(service.calls[0].botId, 'bot-wire');
+    assert.equal(service.calls[0].targetId, 'tg-wire');
+    assert.match(service.calls[0].text, /结论：已跑完/u);
+    assert.equal(service.calls[0].options.format, 'plain');
+    assert.ok(service.calls[0].options.signal instanceof AbortSignal);
+
+    const viaPrompt = prompts.filter((request) => JSON.stringify(request).includes('结论：已跑完'));
+    assert.deepEqual(viaPrompt, [], 'task_report 绝不能退回 platform.prompt');
+    assert.ok(
+      store.listEvents({ table_name: 'proactive', limit: 10 })
+        .some((row) => row.reason === 'proactive:task_report'),
+      'proactive_sent 只在 dshIm 成功后才写',
+    );
+    stop();
+  } finally {
+    store.close();
+  }
 });
