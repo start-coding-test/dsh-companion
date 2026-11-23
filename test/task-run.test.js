@@ -320,7 +320,7 @@ test('adapter：whenIdle(sessionId) 与 cleanInbox(sessionId) 走 agent.inbox', 
   assert.equal(platform.capabilities.sessionController, true);
 });
 
-test('task_run 工具：schema 合法、10 个工具、execute 走执行器并返回结构化结果', async () => {
+test('task_run 工具：schema 合法、11 个工具、execute 走执行器并返回结构化结果', async () => {
   const ctx = new FakeCtx();
   const platform = makePlatform(ctx);
   const store = makeStore();
@@ -333,7 +333,7 @@ test('task_run 工具：schema 合法、10 个工具、execute 走执行器并�
   const tool = tools.find((item) => item.name === 'task_run');
 
   assert.ok(tool, '缺少 task_run 工具');
-  assert.equal(tools.length, 10);
+  assert.equal(tools.length, 11);
   assert.deepEqual(tool.parameters.required, ['goal']);
   assert.equal(tool.parameters.properties.goal.maxLength, GOAL_MAX_CHARS);
   assert.equal(tool.parameters.properties.title.maxLength, TITLE_MAX_CHARS);

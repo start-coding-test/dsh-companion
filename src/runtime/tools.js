@@ -14,9 +14,11 @@
  */
 
 import { forgetMemory } from '../memory/forget.js';
+// M2（v0.7.15）：task_cancel 走执行器的取消入口；startTask 仍是 task_run 的派出入口。
 import {
   releaseExecSlot,
   startTask as startBackgroundTask,
+  stopTaskById,
   tryAcquireExecSlot,
 } from '../task/run.js';
 // D21-M2（v0.7.10）：宿主 sendToSubagent/prompt 的第 4 参必须是真的 AbortSignal，
@@ -38,7 +40,8 @@ import {
 } from '../task/subagent-runner.js';
 import { progressFromReceipt } from '../task/receipt.js';
 // W-1..W-5（v0.7.7 阶段 6）：后台长任务。
-import { buildStartNotice, startBgJob } from '../task/bg-jobs.js';
+// H2（v0.7.15）：bg_run 不再发「启动告知」，故 buildStartNotice 不再引入。
+import { startBgJob } from '../task/bg-jobs.js';
 import { sessionIdOfAgent } from '../session/identity.js';
 
 const FACT_KINDS = new Set(STORE_FACT_KINDS);
@@ -923,7 +926,7 @@ export function createTools({
         + '**立即返回** {ok, status:"started", taskId, title}，子代理在后台继续跑；'
         + '结果稍后以回执（task_report）送达会话，本轮先告诉用户「已派出」。'
         + '并发上限 2（subagentConcurrency），忙时排队最多 2 个，超出立即返回 busy；'
-        + '软超时 600s 只告警，硬超时 900s 中止。',
+        + '软超时 600s 只告警，硬超时 900s 中止。立即返回 started，结果稍后以回执送达。派出后直接回复用户，不要在本轮 sleep 或轮询等结果；要取消用 task_cancel。',
       parameters: {
         type: 'object',
         properties: {
@@ -1022,7 +1025,7 @@ export function createTools({
         + '只该用于预计超过 10 分钟的任务；10 分钟以内的活直接用 task_run/thread_run，'
         + '否则光调度与轮询的开销就不划算。deadline_min 必填且不超过 bg.maxDeadlineMin。'
         + '同一时刻只跑 bgConcurrency（默认 1）个，满额会返回正在运行的任务。'
-        + '结束后会唤醒发起它的子代理并回执主会话（退出码 + 日志尾部 ≤2KB + 日志路径）。'
+        + '结束后会唤醒发起它的子代理并回执主会话（退出码 + 日志尾部 ≤2KB + 日志路径）。派出后直接回复用户，不要在本轮 sleep 或轮询等结果；要提前停下用 task_cancel。'
         + 'bg.workRoot 未配置时本工具不可用。',
       parameters: {
         type: 'object',
@@ -1128,24 +1131,10 @@ export function createTools({
             ...(Array.isArray(started.running) ? { running: started.running } : {}),
           };
         }
-        // W-5：启动即沿 SA-B3 路径告知一句（label、预计时长、deadline）。
-        const notice = buildStartNotice({
-          ...started.job,
-          deadlineMin,
-        });
-        if (typeof taskReceipt === 'function') {
-          try {
-            await taskReceipt({
-              title: started.job.label,
-              status: 'ok',
-              receipt: notice,
-              taskId: started.job.id,
-              sessionId: senderSessionId,
-            });
-          } catch {
-            // 告知只是辅助信息，失败不影响任务已经拉起。
-          }
-        }
+        // H2（v0.7.15）：启动告知不再走 taskReceipt。它与结束回执共用
+        // taskId=job.id，dedupeKey `task-receipt:<id>` 在 120 分钟窗口内会把结束回执
+        // 当成重复静默丢掉（且当时不写事件）。启动信息只由工具返回值告诉调用方，
+        // 结束回执才是真正需要投给主会话的那一条。
         return {
           ok: true,
           id: started.job.id,
@@ -1154,6 +1143,39 @@ export function createTools({
           log_path: started.job.log_path,
           pid_or_unit: started.job.pid_or_unit,
         };
+      },
+    },
+
+    {
+      name: 'task_cancel',
+      description:
+        '取消一个 task_run 派出的在跑任务（taskId 来自 task_run 的返回）。'
+        + '取消后该任务以 cancelled 终态结束，回执按正常回执通道交给主会话；'
+        + '已结束或未知的 taskId 返回 not-found。bg_run 的后台任务不走这里（它在 systemd 里跑）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          taskId: {
+            type: 'string',
+            description: 'task_run 返回的 taskId',
+          },
+        },
+        required: ['taskId'],
+        additionalProperties: false,
+      },
+      execute(args = {}) {
+        assertArgs(args, 'task_cancel');
+        const taskId = requireString(args.taskId, 'task_cancel', 'taskId');
+        const cancelled = stopTaskById(taskId);
+        if (cancelled !== true) {
+          return {
+            ok: false,
+            reason: 'not-found',
+            taskId,
+            message: '没有在跑的任务使用这个 taskId（可能已结束或 id 写错）',
+          };
+        }
+        return { ok: true, taskId, cancelled: true, note: '已请求中止，回执稍后送达。' };
       },
     },
 

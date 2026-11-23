@@ -1,6 +1,6 @@
 /**
  * 模型工具面与运行指标测试（t11）：
- * - 9 个工具描述符的 schema/唯一性；
+ * - 工具描述符的 schema/唯一性；
  * - execute 只走注入依赖（retrieve/store/registry/platform）；
  * - 线程工具与真实 registry、fake platform 的配合；
  * - metrics.snapshot() 的固定字段。
@@ -20,6 +20,8 @@ const TOOL_NAMES = [
   'reminder_done', 'thread_list', 'thread_run', 'cost_report', 'task_run',
   // W-1（v0.7.7 阶段 6）：后台长任务。
   'bg_run',
+  // M2（v0.7.15）：按 taskId 取消 task_run 派出的任务。
+  'task_cancel',
 ];
 
 function makeHarness() {
@@ -78,12 +80,12 @@ function addFact(store, overrides = {}) {
   });
 }
 
-test('10 个工具描述符：name 唯一，parameters 为合法 JSON Schema', () => {
+test('11 个工具描述符：name 唯一，parameters 为合法 JSON Schema', () => {
   const harness = makeHarness();
   try {
-    assert.equal(harness.tools.length, 10);
+    assert.equal(harness.tools.length, 11);
     const names = harness.tools.map((tool) => tool.name);
-    assert.equal(new Set(names).size, 10);
+    assert.equal(new Set(names).size, 11);
     assert.deepEqual([...names].sort(), [...TOOL_NAMES].sort());
 
     for (const tool of harness.tools) {

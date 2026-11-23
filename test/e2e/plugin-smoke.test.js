@@ -27,6 +27,7 @@ const EXPECTED_TOOLS = [
   'memory_write',
   'reminder_add',
   'reminder_done',
+  'task_cancel',
   'task_run',
   'thread_list',
   'thread_run',

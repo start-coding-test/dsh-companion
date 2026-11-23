@@ -2,6 +2,61 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.15] - 2026-11-23
+
+回执只交主会话版：子代理回执不再冒充用户发言、也不再直发 IM，改由主会话模型决定怎么告诉用户；
+同时修掉 v0.7.10 起 `bg_run` 一调就崩、后台任务结束回执被去重吞掉、后台任务超时被误记 lost、
+`/停止任务 <id>` 不可达、带标题任务丢结论等真机缺陷。
+
+> v0.7.10、v0.7.11、v0.7.12、v0.7.13、v0.7.14 均未单独部署，随本版一次上线。
+
+### Fixed
+
+- **P1 子代理回执不再直发用户，只交主会话**：删除 `ctx.dshIm.send` 直发路径，`task_report` 回执
+  改由 `deliverSessionNotice`（`src/index.js`）交给主会话 agent——主会话空闲时 `next-turn`（followup）、
+  忙时 `next-step`（steer），两者都唤醒，对齐宿主 subagent 结算的 `notifySettlement` 语义
+  （`dsh-agent-loop/src/agent.ts:157-159`、`:171-190`）。消息仍是 `role: "user"` + `source.kind =
+  companion-task-receipt` + `form: notice`，正文前加一行「这是后台任务回执，不是用户发言」，
+  `summary` 取回执正文首句（≤60 字）；三处排除集继续按 kind 认出它不是用户发言。
+  取不到主会话 / agent 时抛错交给 outbox 退避，**绝不退回 `platform.prompt`**。`receipt.im.*` 与
+  `receipt.sessionNotice` 保留读入但运行时不再读取，`/状态` 的回执通道行改为「主会话（session-notice）」。
+- **H1 `bg_run` 一调就崩（v0.7.10 起）**：`registerTools` 形参里没有 `state`，闭包却引用
+  `state.bgSelfCheck`，真机上一调用就 `ReferenceError`。改为新增 `bgAvailabilityFn` 末参，调用点传入
+  `() => state.bgSelfCheck`；工具不可用时按设计返回 `bg-unavailable`。
+- **H2 后台任务结束回执被去重吞掉**：`bg_run` 的启动告知与结束回执共用 `taskId = job.id`，
+  `dedupeKey: task-receipt:<id>` 在 120 分钟窗口内把结束回执当重复静默丢掉。已删除启动告知，
+  结束回执独占该 key；万一仍命中去重，落一条 `status = duplicate` 的投递记录（同一状态只写一次）。
+- **M1 后台任务超时被记成 lost**：`RuntimeMaxSec` 到期由 systemd 发 SIGTERM，sh 默认不执行 EXIT trap，
+  退出码文件因此丢失。包装器新增 `trap 'exit 143' TERM`；监视器在「不在跑、也没有退出码」分支先查
+  `systemctl show -p Result`（同模式同环境），`Result=timeout` 或墙钟越过 deadline 都按 timeout 处理，
+  两者都不成立才是 lost。⚠ 真机风险：从 v0.7.7 起 unit 恒带 `--collect`，failed 的 unit 可能被立刻回收，
+  「查不到 Result → lost」仍是主路径，墙钟兜底是超时的主判据（云端验收重点）。
+- **M2 `/停止任务 <id>` 不可达**：宿主 UI 只在命令声明 `input` 时才展示输入框并透传参数。`stop-task`
+  命令现在声明 `input: { hint: "taskId" }`（宿主 `dsh-commands/src/index.ts:68-69`、`:192-214`），
+  `registerCommands` 把 `input` 原样透传；并新增 `task_cancel(taskId)` 工具走 `stopTaskById`，
+  `task_run` / `bg_run` 的说明写明取消只能用 `task_cancel`。
+- **M3 有标题的任务丢掉结论正文**：成功任务带 `title` 时回执只剩标题，`workerResult.receipt` 的结论被
+  整个丢掉。现在 summary 为「标题 + 结论」（结论取格式化回执的结论段并按 300 字截断），
+  失败 / 取消 / partial 的文案不变。
+- **L1 后台任务兜底回执固定记成功**：`deliverBgFallback` 过去写死 `status: "ok"`，超时 / 丢失 / 失败
+  都报成成功。改为按终态映射（timeout / lost / failed / ok），`task_status` 如实记录。
+- **L2 派出后不要轮询**：`task_run` / `bg_run` 的工具说明补充「派出后直接回复用户，不要在本轮 sleep 或
+  轮询等结果；结果会以回执送达」（人格卡不变）。
+
+### Changed
+
+- `receipt.im.*` 与 `receipt.sessionNotice` 两个配置键保留但运行时不再读取：回执只投主会话，
+  `/状态` 的回执通道行显示「主会话（session-notice）」，配置了 `receipt.im` 时追加「receipt.im 已停用」。
+- 工具数量：`createTools` 11 个（新增 `task_cancel`），`apply` 注册 12 个。
+
+### Tests
+
+- 新增 `test/v0715.test.js`（11 例）与 `test/e2e/apply-turn.test.js` 两条真实 apply 路径用例；
+  `test/v0713.test.js`（15 例）、`test/v0714.test.js`（6 例）随回执通道下线改写为 session-notice 语义
+  （v0.7.14 的 dshIm 换实例用例退场）；工具 / 命令计数断言全部同步。
+- 单测全为「非真机证据」：宿主 `agent.send` / `agent.status`、`systemctl`、文件系统均为替身；
+  Linux 用户级 systemd、polkit、cgroup 与 QQ 出站属云端验收。
+- 全量（Node 24，三时区各一遍）：`ℹ tests 1639` / `ℹ suites 67` / `ℹ pass 1639` / `ℹ fail 0`，三次 exit=0（TZ=UTC / Asia/Shanghai / America/New_York）。
 ## [0.7.14] - 2026-11-23
 
 回执通道稳定性修正：dsh-im 重载后回执仍能投出；没有主会话时回执不再被同批提醒拖住；投递失败日志不再按退避节奏重复刷写。

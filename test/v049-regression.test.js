@@ -4,7 +4,7 @@
  * 与各修复自己的单测不同，这里统一用 strictCtx + FakeCtx + 临时库跑插件
  * 接线（commands/tools 注册、pre-step waterfall、scheduler、store），只断言
  * 用户可见的结果：
- *   1. V7-H1：apply 时没有 sessionController 也注册 10 个工具；线程工具返回
+ *   1. V7-H1：apply 时没有 sessionController 也注册 12 个工具；线程工具返回
  *      capability_missing；宿主晚挂载后同一注册项直接可用，/status 与 /threads
  *      文案随能力实时变化；
  *   2. V7-M1：恢复的 pending 起点落在 surface 的系统节点上时，压缩起点被
@@ -52,6 +52,7 @@ const ALL_TOOL_NAMES = [
   'memory_write',
   'reminder_add',
   'reminder_done',
+  'task_cancel',
   'task_run',
   'thread_list',
   'thread_run',
@@ -169,8 +170,8 @@ test('v0.4.9 集成：宿主晚挂载 sessionController 前后，线程工具与
     temp.cleanup();
   });
 
-  // apply 时没有 sessionController：仍然注册全部 11 个工具。
-  assert.equal(ctx.tools.registrations.length, 11);
+  // apply 时没有 sessionController：仍然注册全部 12 个工具。
+  assert.equal(ctx.tools.registrations.length, 12);
   assert.deepEqual(ctx.tools.registrations.map((entry) => entry.name).sort(), ALL_TOOL_NAMES);
 
   // 调用时判能力：三个线程/任务工具返回稳定错误对象。

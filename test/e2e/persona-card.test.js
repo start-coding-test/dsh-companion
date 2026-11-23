@@ -401,7 +401,7 @@ test('集成（v0.4.12 等价）：未配置卡时人格三段 SHA-256 一致，
     // v0.7.13：回执通道行（R22-H1）插在人格卡之前，索引整体 +1。
     const receiptIndex = lines.findIndex((line) => line.startsWith('回执通道：'));
     assert.equal(receiptIndex, 3, '回执通道行紧随 token 用量行（R22-H1）');
-    assert.match(lines[receiptIndex], /^回执通道：不可用（/u);
+    assert.match(lines[receiptIndex], /^回执通道：主会话（session-notice）/u, 'v0.7.15 P1：回执只投主会话');
     assert.equal(personaIndex, 8, '人格卡行应插在线程 preset 与水位数之间');
     assert.equal(lines[personaIndex], '人格卡：珞然 v1（内置默认）');
     // P3-c：情绪行紧随人格卡行；未启用卡只显示「未启用」，不读写情绪表。

@@ -1,12 +1,16 @@
 /**
- * v0.7.14（V713-M1 / V713-L1 / V713-L2）：
- *   M1 dsh-im 重载换实例后回执仍走新实例；
- *   L1 无主会话时只有「需要会话」的候选回队，回执照常走 dsh-im；
- *   L2 同一回执的投递日志只在状态变化时写一条。
+ * v0.7.14（V713-M1 / V713-L1 / V713-L2）——**V713-M1 已被 v0.7.15（P1）取代**：
+ * 回执不再经 dsh-im 直发用户，而是只投主会话 notice。本文件按新语义改写
+ * （旧「换实例 / 服务消失」断言改写而非删除）。
  *
- * **非真机证据**：本机（Windows）没有 dsh-im 插件、没有真实宿主，`ctx.dshIm` 的
- * 重载/热更新语义、宿主 `agent.send`、`platform.prompt` 全部用替身模拟；真实行为
- * 属 50041 云端验收。
+ * 覆盖：
+ *   - dsh-im 即使存在、即使换实例，也不被调用（回执只走主会话）；
+ *   - 主会话通道失败 → proactive 退避，连续失败只记 1 条（L2）；
+ *   - L1 无主会话时只有「需要会话」的候选回队（语义不变，仍保留）；
+ *   - L2 同一回执的投递日志只在状态变化时写一条。
+ *
+ * **非真机证据**：本机（Windows）没有 dsh-im 插件、没有真实宿主；dsh-im 服务、
+ * 宿主 `agent.send`、`platform.prompt` 全部用替身模拟，真实行为属 50041 云端验收。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -19,7 +23,6 @@ import {
   deliverTaskReceipt,
   initReceiptChannel,
   recordTaskReceiptDelivery,
-  sendReceiptViaIm,
   startScheduler,
 } from '../src/index.js';
 
@@ -37,25 +40,40 @@ function makeService() {
   };
 }
 
+function makeAgent({ status = 'idle' } = {}) {
+  const calls = [];
+  return {
+    status,
+    calls,
+    send(message, target, wakeup) {
+      calls.push({ message, target, wakeup });
+    },
+  };
+}
+
 function makePlatform(extra = {}) {
   const prompts = [];
+  const logs = [];
   return {
     prompts,
+    logs,
     now: () => NOW,
-    log: () => {},
+    log: (level, message, meta) => logs.push({ level, message, meta }),
     async prompt(request) {
       prompts.push(request);
     },
+    agentBySessionId: () => null,
     ...extra,
   };
 }
 
-function makeState(platform, config) {
+function makeState(platform, config, extra = {}) {
   return {
     platform,
     config,
     store: { getMeta: () => null },
     mainSessionId: 'session-main',
+    ...extra,
   };
 }
 
@@ -69,54 +87,41 @@ function deliveryEvents(store) {
   });
 }
 
-/* --------------------------------------------------------- V713-M1 重载 */
+/* ------------------- P1 取代 V713-M1：dsh-im 服务存在/换实例都不再被用 */
 
-test('V713-M1：dsh-im 换实例后投递现取新实例，旧实例不再被调用（非真机证据）', async () => {
-  const platform = makePlatform();
-  const config = normalizeConfig({ receipt: { im: { botId: 'bot-1', targetId: 'tg-1' } } });
-  const state = makeState(platform, config);
+test('P1 取代 V713-M1：dsh-im 存在且换实例也不被调用，回执仍走主会话（非真机证据）', async () => {
+  const agent = makeAgent();
+  const platform = makePlatform({ agentBySessionId: () => agent });
+  const state = makeState(platform, normalizeConfig({ receipt: { im: { botId: 'bot-1', targetId: 'tg-1' } } }));
   const first = makeService();
-  const second = makeService(); // 必须是不同对象、独立 calls 数组，同引用即假绿
+  const second = makeService();
   let current = first;
-  const host = { get: (name) => (name === 'dshIm' ? current : undefined) };
+  // 旧实现会在每次投递前现取 dshIm；新实现完全不读 host。
+  state.host = { get: (name) => (name === 'dshIm' ? current : undefined) };
 
-  initReceiptChannel(state, host);
-  assert.equal(state.im.available, true);
-  assert.equal(state.im.service, first, '启动时先接管 A');
-  await sendReceiptViaIm(state, 'first');
-  assert.equal(first.calls.length, 1);
+  initReceiptChannel(state);
+  assert.equal(state.im.channel, 'session');
+  await deliverProactiveItem(state, { kind: 'task_report', text: '[任务] 状态：成功', sessionId: 'session-main' });
+  assert.equal(agent.calls.length, 1);
 
-  // 模拟 dsh-im 重载：服务换成一个新实例。
+  // 模拟 dsh-im 重载：换实例、随后消失，都不应影响主会话投递。
   current = second;
-  await sendReceiptViaIm(state, 'second');
-  assert.equal(second.calls.length, 1, '必须用现取到的新实例投递');
-  assert.equal(first.calls.length, 1, '旧实例必须冻结在 1 次');
-  assert.equal(state.im.service, second);
-  assert.equal(state.im.lastDelivery.ok, true);
-  assert.equal(platform.prompts.length, 0, '不得退回 platform.prompt');
-
-  // 再模拟重载间隙：新实例也不在注册表里。
+  await deliverProactiveItem(state, { kind: 'task_report', text: '[任务] 状态：成功（二）', sessionId: 'session-main' });
   current = undefined;
-  await assert.rejects(
-    () => sendReceiptViaIm(state, 'third'),
-    (error) => error.code === 'im-missing',
-  );
-  assert.equal(first.calls.length, 1);
-  assert.equal(second.calls.length, 1);
-  assert.equal(state.im.available, false);
-  assert.equal(state.im.reason, 'im-missing');
-  assert.equal(platform.prompts.length, 0, '不可用时绝不退回 platform.prompt');
+  await deliverProactiveItem(state, { kind: 'task_report', text: '[任务] 状态：成功（三）', sessionId: 'session-main' });
+
+  assert.equal(first.calls.length, 0, '旧实例不得被调用');
+  assert.equal(second.calls.length, 0, '新实例也不得被调用');
+  assert.equal(agent.calls.length, 3, '三次回执都应投到主会话');
+  assert.equal(platform.prompts.length, 0, '不得退回 platform.prompt');
 });
 
-/**
- * **非真机证据**：生产接线层孪生用例——startScheduler 注入 deliver 后，dsh-im 重载
- * 换实例，第二次回执必须走新实例。缓存旧实例的实现会让第二次仍打 A，本用例必红。
- */
-test('V713-M1 接线：startScheduler 之后 dsh-im 换实例，第二条回执走新实例（非真机证据）', async () => {
+test('P1 取代 V713-M1 接线：startScheduler 之后 dsh-im 换实例仍被忽略（非真机证据）', async () => {
   // 10:05 不在安静时段（否则 proactive.flush 会被 quiet 挡住），且已超出 catch-up 窗。
   const at = Date.parse('2026-11-23T10:05:00+08:00');
   const everyCalls = [];
   const prompts = [];
+  const agent = makeAgent();
   const serviceA = makeService();
   const serviceB = makeService();
   let current = serviceA;
@@ -131,7 +136,7 @@ test('V713-M1 接线：startScheduler 之后 dsh-im 换实例，第二条回执�
     async prompt(request) {
       prompts.push(request);
     },
-    agentBySessionId: () => null,
+    agentBySessionId: () => agent,
   };
   const store = Store.open(':memory:');
   try {
@@ -142,55 +147,43 @@ test('V713-M1 接线：startScheduler 之后 dsh-im 换实例，第二条回执�
       metrics: { snapshot: () => ({}) },
       mainSessionId: 'session-main',
       pendingCompact: new Map(),
+      host: { get: (name) => (name === 'dshIm' ? current : undefined) },
     };
     const stop = startScheduler(state);
+    initReceiptChannel(state); // 生产里由 apply 调用；此处直接测接线。
     assert.equal(typeof stop, 'function');
     assert.ok(everyCalls.length >= 1);
-
-    initReceiptChannel(state, { get: (name) => (name === 'dshIm' ? current : undefined) });
-    assert.equal(state.im.available, true);
+    assert.equal(state.im.channel, 'session');
 
     deliverTaskReceipt(state, { taskId: 'task-wire-1', receipt: '结论：第一件已跑完' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     await state.proactive.flush();
-    assert.equal(serviceA.calls.length, 1, '第一条走 A');
 
     current = serviceB; // dsh-im 重载
     deliverTaskReceipt(state, { taskId: 'task-wire-2', receipt: '结论：第二件已跑完' });
     await new Promise((resolve) => setTimeout(resolve, 20));
     await state.proactive.flush();
 
-    assert.equal(serviceB.calls.length, 1, '第二条必须走现取到的 B');
-    assert.equal(serviceA.calls.length, 1, 'A 不得再被调用');
+    assert.equal(agent.calls.length, 2, '两条回执都应投主会话');
+    assert.equal(serviceA.calls.length, 0, 'A 不得被调用');
+    assert.equal(serviceB.calls.length, 0, 'B 不得被调用');
     assert.equal(prompts.length, 0, '回执不得退回 platform.prompt');
   } finally {
     store.close();
   }
 });
 
-test('V713-M1：服务消失后回执不可用，proactive 只退避、绝不退回 prompt（非真机证据）', async (t) => {
-  const platform = makePlatform();
-  const config = normalizeConfig({ receipt: { im: { botId: 'bot-1', targetId: 'tg-1' } } });
-  const state = makeState(platform, config);
-  let current = makeService();
-  const host = { get: (name) => (name === 'dshIm' ? current : undefined) };
-
-  initReceiptChannel(state, host);
-  assert.equal(state.im.available, true);
-
-  // 服务被卸载/重载间隙取不到。
-  current = undefined;
-  await assert.rejects(
-    () => sendReceiptViaIm(state, '[任务] x'),
-    (error) => error.code === 'im-missing',
-  );
-  assert.equal(state.im.available, false, '/状态 应显示不可用');
-  assert.equal(state.im.reason, 'im-missing');
-  assert.equal(statusOf(platform), 0, '不得退回 platform.prompt');
-
-  // 走真实接线：proactive 失败后把回执留在队列，不调用 platform.prompt。
+test('P1：主会话不可用时回执留在队列退避，连续失败只记 1 条，恢复后补投（非真机证据）', async (t) => {
   const store = Store.open(':memory:');
   t.after(() => store.close());
+  const platform = makePlatform();
+  const config = normalizeConfig({});
+  const state = {
+    ...makeState(platform, config),
+    store,
+  };
+  initReceiptChannel(state);
+
   const proactive = createProactive({
     store,
     config,
@@ -200,12 +193,27 @@ test('V713-M1：服务消失后回执不可用，proactive 只退避、绝不退
     deliver: (item) => deliverProactiveItem(state, item),
     deliverKind: (kind) => kind === 'task_report',
   });
-  proactive.enqueue({ kind: 'task_report', text: '[任务] 状态：成功', dedupeKey: 'rpt-1', at: NOW });
-  const report = await proactive.flush(NOW + 1000);
-  assert.equal(report.failed, 1);
-  assert.equal(report.sent, 0);
-  assert.equal(report.deferred, 1, '回执必须留在 backlog 等退避重试');
+  state.proactive = proactive;
+
+  deliverTaskReceipt(state, { taskId: 'task-l2', receipt: '结论：已跑完', status: 'done' });
+  for (let round = 0; round < 3; round += 1) {
+    await proactive.flush(NOW + 1000 * (round + 1));
+  }
+  let events = deliveryEvents(store);
+  assert.equal(events.length, 1, '同一回执连续失败必须只写 1 条');
+  assert.equal(JSON.parse(events[0].detail_json).status, 'failed');
+  assert.equal(JSON.parse(events[0].detail_json).task_status, 'done');
   assert.equal(platform.prompts.length, 0, '失败路径绝不退回 platform.prompt');
+
+  // 主会话恢复后在退避窗口外补投 → 只新增 1 条 delivered。
+  const agent = makeAgent();
+  platform.agentBySessionId = () => agent;
+  await proactive.flush(NOW + 10_000);
+  events = deliveryEvents(store);
+  assert.equal(events.length, 2, '失败→成功必须新增 1 条');
+  const statuses = events.map((row) => JSON.parse(row.detail_json).status).sort();
+  assert.deepEqual(statuses, ['delivered', 'failed']);
+  assert.equal(agent.calls.length, 1, '恢复后应补投主会话一次');
 });
 
 /* ------------------------------------------------------- V713-L1 会话分区 */
@@ -254,7 +262,7 @@ test('V713-L1：无主会话时 task_report 照常出站，只有需会话的提
 
   const report = await proactive.flush(NOW + 1000);
 
-  assert.deepEqual(delivered, ['task_report'], '回执必须走 dsh-im 通道投出去');
+  assert.deepEqual(delivered, ['task_report'], '回执必须走主会话通道投出去');
   assert.equal(report.sent, 1);
   assert.equal(report.deferred, 1, '提醒回队等主会话');
   assert.deepEqual(failed, ['reminder'], 'onFailed 只对需要会话的份调用');
@@ -317,54 +325,3 @@ test('V713-L2：同一回执连续失败只记一条，状态变化才新增（�
   // 任务终态字段仍按 R22-M1 写入。
   assert.equal(JSON.parse(events[0].detail_json).task_status, 'done');
 });
-
-/**
- * **非真机证据**：走真实接线（deliverTaskReceipt 的 onFailed 钩子 + proactive 退避）
- * 验证「不可用通道下 flush ×3 只写 1 条失败日志」，以及转可用后新增 1 条 delivered。
- */
-test('V713-L2 接线：不可用通道 flush ×3 只写 1 条 failed，转可用后 +1 条 delivered（非真机证据）', async (t) => {
-  const store = Store.open(':memory:');
-  t.after(() => store.close());
-  const platform = makePlatform();
-  const config = normalizeConfig({ receipt: { im: { botId: 'bot-l2', targetId: 'tg-l2' }, sessionNotice: false } });
-  const state = {
-    ...makeState(platform, config),
-    store,
-  };
-  let current;
-  const host = { get: (name) => (name === 'dshIm' ? current : undefined) };
-  initReceiptChannel(state, host); // 通道不可用（im-missing）
-
-  const proactive = createProactive({
-    store,
-    config,
-    platform,
-    target: () => 'session-main',
-    clock: () => NOW,
-    deliver: (item) => deliverProactiveItem(state, item),
-    deliverKind: (kind) => kind === 'task_report',
-  });
-  state.proactive = proactive;
-
-  deliverTaskReceipt(state, { taskId: 'task-l2', receipt: '结论：已跑完', status: 'done' });
-  for (let round = 0; round < 3; round += 1) {
-    await proactive.flush(NOW + 1000 * (round + 1));
-  }
-  let events = deliveryEvents(store);
-  assert.equal(events.length, 1, '同一回执连续失败必须只写 1 条');
-  assert.equal(JSON.parse(events[0].detail_json).status, 'failed');
-  assert.equal(JSON.parse(events[0].detail_json).task_status, 'done');
-
-  // dsh-im 重载/恢复后投成 → 只新增 1 条 delivered。
-  current = makeService();
-  await proactive.flush(NOW + 10_000);
-  events = deliveryEvents(store);
-  assert.equal(events.length, 2, '失败→成功必须新增 1 条');
-  const statuses = events.map((row) => JSON.parse(row.detail_json).status).sort();
-  assert.deepEqual(statuses, ['delivered', 'failed']);
-  assert.equal(platform.prompts.length, 0, '任何阶段都不得退回 platform.prompt');
-});
-
-function statusOf(platform) {
-  return platform.prompts.length;
-}

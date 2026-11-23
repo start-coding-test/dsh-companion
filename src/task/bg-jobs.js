@@ -26,6 +26,7 @@ import {
   signalBgProcess,
   startBgProcess,
   tailLog,
+  systemdUnitResult,
 } from './bg-launcher.js';
 
 /** W-3：唤醒预算按发起子代理聚合，存这份 meta 的前缀（值为次数）。 */
@@ -537,6 +538,8 @@ export async function monitorBgJobs({
   const signal = launcher.signalBgProcess ?? signalBgProcess;
   const readTail = launcher.tailLog ?? tailLog;
   const capLog = launcher.capLogFile ?? capLogFile;
+  // M1（v0.7.15）：systemctl show 的 Result 查询也可注入（单测替身，非真机证据）。
+  const unitResultOf = launcher.unitResult ?? systemdUnitResult;
   // D21-H4：探针与信号查询要和拉起时同一模式（--user + DBus 环境）。
   const effectiveUid = Number.isInteger(uid) ? Number(uid) : currentUid();
   const userMode = resolveSystemdMode(effectiveUid) === 'user';
@@ -615,6 +618,40 @@ export async function monitorBgJobs({
     }
 
     // W-4 第三分支：既没在跑，也没有退出码文件 → lost，仍然唤醒（附已取到的日志尾巴）。
+    // M1（v0.7.15）：RuntimeMaxSec 到期杀掉的 unit 可能既没有 exit 文件、也探不到 running，
+    // 直接记 lost 会把「超时被终止」误报成「任务丢了」。先问 systemd 的 Result：
+    //   - Result=timeout → 就是超时；按 timeout 处理（文案「已超时被终止」+ 退出码）；
+    //   - 查不到时看墙钟：nowSec >= deadline 也按 timeout；
+    //   - 两者都不成立才是真 lost。
+    //
+    // ⚠ 真机风险（云端首发验收重点）：v0.7.7 起 unit 恒带 `--collect`
+    // （CollectMode=inactive-or-failed），failed 的 unit 可能被立刻回收，
+    // 此时 `systemctl show -p Result` 查不到 → 本函数走「查不到 → lost」分支，
+    // 这是真机主路径；`Result=timeout` 只在回收前的竞态窗口内命中。
+    // 因此这里绝不把「查不到」当 timeout（不误报），墙钟兜底才是超时主判据。
+    const unitResult = kind === 'linux'
+      ? await unitResultOf({ unit: job.pid_or_unit, user: userMode, uid: effectiveUid }).catch(() => null)
+      : null;
+    const deadlinePassed = Number.isFinite(Number(job.deadline)) && nowSec >= Number(job.deadline);
+    if (unitResult === 'timeout' || deadlinePassed) {
+      const code = readExitCode(exitPath);
+      const claimedTimeout = store.claimBgJobState(job.id, BG_JOB_STATES.timeout, {
+        exit_code: code ?? null,
+        finished_at: nowSec,
+      });
+      if (!claimedTimeout) continue;
+      summary.timedOut += 1;
+      await deliverWake({
+        store,
+        config,
+        wake,
+        job,
+        exitCode: code ?? null,
+        tail: readTail(job.log_path, BG_TAIL_BYTES),
+        timedOut: true,
+      });
+      continue;
+    }
     const claimed = store.claimBgJobState(job.id, BG_JOB_STATES.lost, { finished_at: nowSec });
     if (!claimed) continue;
     summary.lost += 1;

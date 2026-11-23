@@ -28,7 +28,7 @@
  * 「因 token 上限提前结束」一行；硬超时仍是 `timeout`，两者不混淆。
  */
 
-import { formatReceipt, writeReceipt } from './receipt.js';
+import { formatReceipt, RECEIPT_MAX_CHARS, writeReceipt } from './receipt.js';
 import { runSubagentTask } from './subagent-runner.js';
 import {
   DEFAULT_HARD_MS,
@@ -334,9 +334,21 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
           ? (titleText === undefined ? '已取消' : titleText)
           : (titleText === undefined ? defaultSummary(status, workerResult.error) : titleText);
         // token 硬线：标题保留已完成内容，另起一行说明提前结束的原因。
-        const summary = status === 'partial' && titleText !== undefined
-          ? `${titleText}\n${TOKEN_LIMIT_NOTE}`
-          : baseSummary;
+        // M3（v0.7.15）：成功任务带 title 时以前只留标题，把子代理/worker 的结论
+        // （workerResult.receipt）整个丢掉。改为「标题 + 换行 + 结论」，结论按 300
+        // 字截断（与回执口径一致）；失败/取消/partial 的文案不变。
+        // workerResult.receipt 本身已是 formatReceipt 产物（`状态：成功｜结论：…｜产物：…`），
+        // 直接整串塞进 summary 会和外层 formatReceipt 叠一层。这里只取「结论」那一段，
+        // 取不到才退回整串（裁剪逻辑见 conclusionOfReceipt）。
+        const conclusion = status === 'done' && typeof workerResult.receipt === 'string'
+          && workerResult.receipt.trim() !== ''
+          ? conclusionOfReceipt(workerResult.receipt)
+          : '';
+        const summary = conclusion !== '' && titleText !== undefined
+          ? `${titleText}\n${truncateReceiptText(conclusion, RECEIPT_MAX_CHARS)}`
+          : (status === 'partial' && titleText !== undefined
+            ? `${titleText}\n${TOKEN_LIMIT_NOTE}`
+            : baseSummary);
         // SA-B1：子代理路径已经用结构化结果收过 ≤300 字回执（A1），没有显式
         // title 时直接用它（保持「回执只说结论」的口径），否则沿用 title 口径。
         const receipt = titleText === undefined
@@ -574,6 +586,16 @@ export function stopActiveTask(taskId) {
 }
 
 /**
+ * M2（v0.7.15）：task_cancel 工具用的按 id 取消入口（等价 stopActiveTask，
+ * 保留导出名与工具语义一致）。
+ * @param {string} taskId
+ * @returns {boolean} 命中并已请求中止时 true
+ */
+export function stopTaskById(taskId) {
+  return defaultRunner.stopTaskById(taskId);
+}
+
+/**
  * v0.7.11（V710-L1）：列在跑任务 id（/停止任务 无参时给用法与清单）。
  * @returns {string[]}
  */
@@ -665,6 +687,34 @@ function toStatus(status) {
   if (status === 'timeout') return 'timeout';
   if (status === 'partial') return 'partial';
   return 'failed';
+}
+
+/**
+ * M3（v0.7.15）：把结论截到 max 字（含省略号），用于「标题 + 结论」摘要。
+ * @param {string} text
+ * @param {number} max
+ * @returns {string}
+ */
+/**
+ * M3（v0.7.15）：从 worker/子代理的格式化回执里取出「结论」正文。
+ *
+ * `buildSubagentReceipt` 产出的是 `状态：成功｜结论：…｜产物：…｜耗时：…`；
+ * 任务带 title 时要把结论拼在标题下一行，只能取中间的结论段，否则外层
+ * `formatReceipt` 会再包一层、回执里出现两遍「状态：成功」。
+ * @param {string} receipt
+ * @returns {string}
+ */
+function conclusionOfReceipt(receipt) {
+  const text = typeof receipt === "string" ? receipt.trim() : "";
+  if (text === "") return "";
+  const match = /结论：([^｜\r\n]*)/u.exec(text);
+  const picked = match === null ? text : match[1].trim();
+  return picked === "" ? text : picked;
+}
+function truncateReceiptText(text, max) {
+  const limit = Number.isInteger(max) && max > 1 ? max : RECEIPT_MAX_CHARS;
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit - 1)}…`;
 }
 
 /** @param {unknown} goal @returns {string} */

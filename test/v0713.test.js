@@ -1,9 +1,13 @@
 /**
- * v0.7.13（R22-H1 / R22-H2 / R22-M1）：回执出站通道、会话 notice、投递记录与成功态归类。
+ * v0.7.13（R22-H1 / R22-H2 / R22-M1）——**v0.7.15（P1）已把 R22-H1 的回执通道改成
+ * 「只交主会话」**，本文件按新语义改写（旧 dsh-im 出站断言改写而非删除）。
+ *
+ * 覆盖：receipt 配置、主会话 notice 通道（空闲唤醒 / 忙 steer / 失败退避 / 形状）、
+ * /状态「回执通道」行、R22-M1 投递记录、R22-H2 成功态归类、startScheduler 生产接线。
  *
  * **非真机证据**：dsh-im 服务、宿主 `agent.send` 与子代理 activation 全部是替身。
  * 本机（Windows）没有 dsh-im 插件、没有 user systemd、也没有真实宿主子代理；
- * `ctx.dshIm.send` 的真实送达语义、宿主 notice 的实际排队行为属 50041 云端验收。
+ * 宿主「下一轮 / 下一步」的真实排队行为与唤醒时机属 50041 云端验收。
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -21,24 +25,22 @@ import {
   noticeSummaryOf,
   readReceiptDeliveryRecord,
   recordTaskReceiptDelivery,
-  sendReceiptViaIm,
   startScheduler,
 } from '../src/index.js';
 
 const NOW = Date.parse('2026-11-22T10:00:00+08:00');
+const PREAMBLE = '这是后台任务回执，不是用户发言；由你判断是否、何时、怎样告诉用户，不必逐条转述。';
 
-function makeService(overrides = {}) {
+function makeAgent({ status = 'idle', send } = {}) {
   const calls = [];
-  const service = {
-    contractVersion: 1,
+  return {
+    status,
     calls,
-    async send(botId, targetId, text, options) {
-      calls.push({ botId, targetId, text, options });
-      return { sent: true };
+    send(message, target, wakeup) {
+      calls.push({ message, target, wakeup });
+      if (typeof send === 'function') send(message, target, wakeup);
     },
-    ...overrides,
   };
-  return service;
 }
 
 function makePlatform(extra = {}) {
@@ -52,6 +54,7 @@ function makePlatform(extra = {}) {
     async prompt(request) {
       prompts.push(request);
     },
+    agentBySessionId: () => null,
     ...extra,
   };
 }
@@ -66,12 +69,12 @@ function makeState(platform, config, extra = {}) {
   };
 }
 
-/* ------------------------------------------------------------ R22-H1 配置 */
+/* ------------------------------------------------------------ P1 配置 */
 
 test('R22-H1：receipt 配置默认值、trim 与 sessionNotice 开关（非真机证据）', () => {
   const base = normalizeConfig({});
   assert.deepEqual(base.receipt.im, { botId: '', targetId: '' }, '默认不猜 bot/target');
-  assert.equal(base.receipt.sessionNotice, true, 'notice 默认开启');
+  assert.equal(base.receipt.sessionNotice, true, 'sessionNotice 键保留（v0.7.15 起代码不再读）');
 
   const trimmed = normalizeConfig({ receipt: { im: { botId: ' bot-1 ', targetId: ' tg-1 ' } } });
   assert.deepEqual(trimmed.receipt.im, { botId: 'bot-1', targetId: 'tg-1' });
@@ -83,136 +86,155 @@ test('R22-H1：receipt 配置默认值、trim 与 sessionNotice 开关（非真�
   assert.equal(Object.keys(base).includes('receipt'), true);
 });
 
-/* ------------------------------------------------------- R22-H1 出站通道 */
+/* ------------------------------------------- P1 主会话 notice 通道 */
 
-test('R22-H1：dshIm 可用时 sendReceiptViaIm 走 ctx.dshIm.send（format=plain + AbortSignal）', () => {
-  const service = makeService();
-  const platform = makePlatform();
-  const config = normalizeConfig({ receipt: { im: { botId: 'bot-1', targetId: 'tg-1' } } });
-  const state = makeState(platform, config);
-
-  initReceiptChannel(state, { get: (name) => (name === 'dshIm' ? service : undefined) });
+test('P1：主会话空闲时投递 notice（next-turn + wakeup=true，正文带前置说明）（非真机证据）', async () => {
+  const agent = makeAgent({ status: 'idle' });
+  const platform = makePlatform({ agentBySessionId: () => agent });
+  const state = makeState(platform, normalizeConfig({}));
+  initReceiptChannel(state);
   assert.equal(state.im.available, true);
-  assert.equal(state.im.contractVersion, 1);
-  assert.equal(state.im.botId, 'bot-1');
-  assert.equal(state.im.targetId, 'tg-1');
+  assert.equal(state.im.mode, 'session');
+  assert.equal(state.im.channel, 'session');
   assert.ok(platform.logs.some((entry) => entry.message === '[dsh-companion] receipt channel'));
 
-  return sendReceiptViaIm(state, '[任务] 状态：成功').then(() => {
-    assert.equal(service.calls.length, 1);
-    const call = service.calls[0];
-    assert.equal(call.botId, 'bot-1');
-    assert.equal(call.targetId, 'tg-1');
-    assert.equal(call.text, '[任务] 状态：成功');
-    assert.equal(call.options.format, 'plain');
-    assert.ok(call.options.signal instanceof AbortSignal, '必须带真 AbortSignal');
-    assert.equal(state.im.lastDelivery.ok, true);
-    assert.equal(platform.prompts.length, 0, '不得退回 platform.prompt');
-  });
+  await deliverSessionNotice(state, '[任务] 状态：成功\n产物：/tmp/a.md');
+
+  assert.equal(agent.calls.length, 1, '必须恰好投一次 notice');
+  const call = agent.calls[0];
+  assert.equal(call.target, 'next-turn', '空闲主会话走下一轮');
+  assert.equal(call.wakeup, true, '必须唤醒主会话');
+  assert.equal(call.message.role, 'user');
+  assert.equal(call.message.source.kind, 'companion-task-receipt');
+  assert.equal(call.message.source.form, 'notice');
+  assert.equal(call.message.source.summary, '状态：成功', 'summary 去 [任务] 前缀、取首行');
+  const body = call.message.content[0].text;
+  assert.ok(body.startsWith(PREAMBLE), '正文前必须带一行「不是用户发言」说明');
+  assert.match(body, /产物：\/tmp\/a\.md/u);
+  assert.equal(state.im.lastDelivery.ok, true);
+  assert.equal(state.im.lastDelivery.channel, 'session');
+  assert.equal(platform.prompts.length, 0, '不得退回 platform.prompt');
 });
 
-test('R22-H1：dsh-im 缺失 / contractVersion 不符 / 未配置 → 不可用且不退回 prompt', async () => {
-  const cases = [
-    { name: 'missing', service: undefined, config: { im: { botId: 'b', targetId: 't' } }, reason: 'im-missing' },
-    { name: 'contract', service: makeService({ contractVersion: 2 }), config: { im: { botId: 'b', targetId: 't' } }, reason: 'im-contract-version' },
-    { name: 'not-configured', service: makeService(), config: { im: { botId: '', targetId: '' } }, reason: 'im-not-configured' },
-  ];
-  for (const item of cases) {
-    const platform = makePlatform();
-    const config = normalizeConfig({ receipt: item.config });
-    const state = makeState(platform, config);
-    initReceiptChannel(state, { get: (name) => (name === 'dshIm' ? item.service : undefined) });
-    assert.equal(state.im.available, false, `${item.name} 应不可用`);
-    assert.equal(state.im.reason, item.reason);
-    await assert.rejects(() => sendReceiptViaIm(state, '[任务] x'), (error) => error.code === item.reason);
-    assert.equal(platform.prompts.length, 0, `${item.name} 不得退回 platform.prompt`);
-    assert.equal(state.im.lastDelivery.ok, false, '失败必须记录 lastDelivery');
-  }
+test('P1：主会话忙时走 next-step + wakeup=true（steer 语义）（非真机证据）', async () => {
+  const agent = makeAgent({ status: 'running' });
+  const platform = makePlatform({ agentBySessionId: () => agent });
+  const state = makeState(platform, normalizeConfig({}));
+  initReceiptChannel(state);
+
+  await deliverSessionNotice(state, '[任务] 状态：完成');
+  assert.equal(agent.calls[0].target, 'next-step', '忙时应插入下一步');
+  assert.equal(agent.calls[0].wakeup, true);
 });
 
-test('R22-H1：send 拒绝 / 未确认 {sent:true} → 抛错并记 lastDelivery（不吞）', async () => {
-  const platform = makePlatform();
-  const config = normalizeConfig({ receipt: { im: { botId: 'b', targetId: 't' } } });
-  const rejecting = makeService({
-    async send() {
-      const error = new Error('target not found');
-      error.code = 'target-not-found';
-      throw error;
-    },
-  });
-  const state = makeState(platform, config);
-  initReceiptChannel(state, { get: () => rejecting });
-  await assert.rejects(() => sendReceiptViaIm(state, '[任务] x'), (error) => error.code === 'target-not-found');
-  assert.deepEqual(
-    { ok: state.im.lastDelivery.ok, code: state.im.lastDelivery.code },
-    { ok: false, code: 'target-not-found' },
+test('P1：取不到主会话 agent → 抛 agent-unavailable 并记 lastDelivery（不退回 prompt）（非真机证据）', () => {
+  const platform = makePlatform({ agentBySessionId: () => null });
+  const state = makeState(platform, normalizeConfig({}));
+  initReceiptChannel(state);
+
+  assert.throws(
+    () => deliverSessionNotice(state, '[任务] x'),
+    (error) => error.code === 'agent-unavailable',
   );
-
-  const unconfirmed = makeService({ async send() { return { sent: false }; } });
-  const state2 = makeState(platform, config);
-  initReceiptChannel(state2, { get: () => unconfirmed });
-  await assert.rejects(() => sendReceiptViaIm(state2, '[任务] x'), (error) => error.code === 'delivery-unconfirmed');
-  assert.equal(state2.im.lastDelivery.code, 'delivery-unconfirmed');
+  assert.equal(state.im.lastDelivery.ok, false);
+  assert.equal(state.im.lastDelivery.code, 'agent-unavailable');
+  assert.equal(platform.prompts.length, 0, '绝不退回 platform.prompt');
 });
 
-/* ---------------------------------------------- R22-H1 分流与 notice */
+test('P1：agent.send 抛错 → session-delivery-failed（交给 proactive 退避）（非真机证据）', () => {
+  const agent = makeAgent({ send: () => { throw new Error('inbox closed'); } });
+  const platform = makePlatform({ agentBySessionId: () => agent });
+  const state = makeState(platform, normalizeConfig({}));
+  initReceiptChannel(state);
 
-test('R22-H1：task_report 走 dsh-im 且只发 notice；其它 kind 仍走 platform.prompt', async () => {
-  const service = makeService();
-  const sent = [];
-  const platform = makePlatform({
-    agentBySessionId: () => ({ send: (message, target, wakeup) => sent.push({ message, target, wakeup }) }),
-  });
-  const config = normalizeConfig({ receipt: { im: { botId: 'b', targetId: 't' }, sessionNotice: true } });
-  const state = makeState(platform, config);
-  initReceiptChannel(state, { get: () => service });
+  assert.throws(
+    () => deliverSessionNotice(state, '[任务] x'),
+    (error) => error.code === 'session-delivery-failed' && /inbox closed/u.test(error.message),
+  );
+  assert.equal(state.im.lastDelivery.code, 'session-delivery-failed');
+  assert.equal(platform.prompts.length, 0);
+});
+
+test('P1：没有主会话（sessionId 为空）→ session-unavailable（非真机证据）', () => {
+  const platform = makePlatform({ agentBySessionId: () => null });
+  const state = makeState(platform, normalizeConfig({}), { mainSessionId: null });
+  initReceiptChannel(state);
+
+  assert.throws(
+    () => deliverSessionNotice(state, '[任务] x'),
+    (error) => error.code === 'session-unavailable',
+  );
+});
+
+test('P1：dsh-im 即使存在也不被调用；配置了 receipt.im 只打「已停用」info（非真机证据）', async () => {
+  const imCalls = [];
+  const service = {
+    contractVersion: 1,
+    async send(...args) {
+      imCalls.push(args);
+      return { sent: true };
+    },
+  };
+  const agent = makeAgent();
+  const platform = makePlatform({ agentBySessionId: () => agent });
+  const state = makeState(platform, normalizeConfig({ receipt: { im: { botId: 'b', targetId: 't' } } }));
+  // 旧代码会去 ctx.get('dshIm')；现在即便宿主能给出服务，也不应再取或调用。
+  state.host = { get: () => service };
+  initReceiptChannel(state);
+
+  await deliverSessionNotice(state, '[任务] 状态：成功');
+  assert.equal(agent.calls.length, 1);
+  assert.equal(imCalls.length, 0, 'dshIm.send 必须 0 次');
+  assert.equal(state.im.imConfigured, true);
+  assert.ok(platform.logs.some((entry) => entry.message === '[dsh-companion] receipt channel disabled'
+    || String(entry.meta?.message).includes('receipt.im 已停用')
+    || String(entry.message).includes('receipt.im 已停用')), '必须记录 receipt.im 已停用');
+});
+
+/* ------------------------------------------ P1 分流（task_report 唯一） */
+
+test('P1：task_report 只交主会话；reminder 等其它 kind 仍走 platform.prompt（非真机证据）', async () => {
+  const agent = makeAgent();
+  const platform = makePlatform({ agentBySessionId: () => agent });
+  const state = makeState(platform, normalizeConfig({}));
+  initReceiptChannel(state);
 
   await deliverProactiveItem(state, { kind: 'task_report', text: '[任务] 状态：成功\n产物：/tmp/a.md', sessionId: 'session-main' });
-  assert.equal(service.calls.length, 1);
+  assert.equal(agent.calls.length, 1);
   assert.equal(platform.prompts.length, 0, 'task_report 不得进 platform.prompt');
-  assert.equal(sent.length, 1, '出站成功后必须放一条 notice');
-  assert.equal(sent[0].target, 'next-turn');
-  assert.equal(sent[0].wakeup, false, 'notice 不得唤醒');
-  assert.equal(sent[0].message.role, 'user');
-  assert.equal(sent[0].message.source.kind, 'companion-task-receipt');
-  assert.equal(sent[0].message.source.form, 'notice');
-  assert.ok(sent[0].message.source.summary.length <= 60);
-  assert.equal(sent[0].message.source.summary, '状态：成功', 'summary 去掉 [任务] 前缀并取首行');
 
   await deliverProactiveItem(state, { kind: 'reminder', text: '[提醒] 喝水', requestId: 'companion-reminder:1', sessionId: 'session-main' });
   assert.equal(platform.prompts.length, 1, '其它 kind 保持原通道');
   assert.equal(platform.prompts[0].requestId, 'companion-reminder:1');
-  assert.equal(service.calls.length, 1, '提醒不得走 dsh-im');
+  assert.equal(agent.calls.length, 1, '提醒不得走主会话 notice');
 });
 
-test('R22-H1：dsh-im 失败时抛给 proactive 退避重试；notice 开关关闭则不发 notice', async () => {
-  const platform = makePlatform({
-    agentBySessionId: () => ({ send: () => { throw new Error('should not send'); } }),
-  });
-  const config = normalizeConfig({ receipt: { im: { botId: 'b', targetId: 't' }, sessionNotice: false } });
-  const failing = makeService({ async send() { const e = new Error('busy'); e.code = 'delivery-failed'; throw e; } });
-  const state = makeState(platform, config);
-  initReceiptChannel(state, { get: () => failing });
-  await assert.rejects(() => deliverProactiveItem(state, { kind: 'task_report', text: '[任务] x', sessionId: 'session-main' }));
-  assert.equal(platform.prompts.length, 0);
-
-  // sessionNotice=false：即使出站成功也不放 notice。
-  const okService = makeService();
-  const state2 = makeState(platform, config);
-  initReceiptChannel(state2, { get: () => okService });
-  await deliverProactiveItem(state2, { kind: 'task_report', text: '[任务] 状态：成功', sessionId: 'session-main' });
-  assert.equal(okService.calls.length, 1);
-});
-
-test('R22-H1：notice 取不到主会话 agent 时只 warn，不抛', () => {
+test('P1：主会话投递失败把错误抛给 proactive 退避重试（非真机证据）', async (t) => {
+  const store = Store.open(':memory:');
+  t.after(() => store.close());
   const platform = makePlatform({ agentBySessionId: () => null });
-  const config = normalizeConfig({ receipt: { sessionNotice: true } });
-  const state = makeState(platform, config);
-  deliverSessionNotice(state, '[任务] 状态：成功');
-  assert.ok(platform.logs.some((entry) => entry.level === 'warn' && entry.message.includes('notice skipped')));
+  const config = normalizeConfig({});
+  const state = { ...makeState(platform, config), store };
+  initReceiptChannel(state);
+
+  const proactive = createProactive({
+    store,
+    config,
+    platform,
+    target: () => 'session-main',
+    clock: () => NOW,
+    deliver: (item) => deliverProactiveItem(state, item),
+    deliverKind: (kind) => kind === 'task_report',
+  });
+  proactive.enqueue({ kind: 'task_report', text: '[任务] 状态：成功', dedupeKey: 'rpt-1', at: NOW });
+  const report = await proactive.flush(NOW + 1000);
+  assert.equal(report.failed, 1);
+  assert.equal(report.sent, 0);
+  assert.equal(report.deferred, 1, '回执必须留在 backlog 等退避重试');
+  assert.equal(platform.prompts.length, 0, '失败路径绝不退回 platform.prompt');
 });
 
-test('R22-H1：noticeSummaryOf 去前缀 / 首行 / 60 字截断', () => {
+test('P1：noticeSummaryOf 去前缀 / 首行 / 60 字截断', () => {
   assert.equal(noticeSummaryOf('[任务] 状态：成功'), '状态：成功');
   assert.equal(noticeSummaryOf('[任务] 第一行\n第二行'), '第一行');
   const long = `[任务] ${'很长的结论'.repeat(30)}`;
@@ -221,37 +243,9 @@ test('R22-H1：noticeSummaryOf 去前缀 / 首行 / 60 字截断', () => {
   assert.ok(summary.endsWith('…'));
 });
 
-/* ---------------------------------- R22-H1：outbox 接线（按 kind 分通道） */
+/* ------------------------------------------------------ P1 /状态 */
 
-test('R22-H1：createProactive 的 deliver 分流让 task_report 不进 platform.prompt', async (t) => {
-  const store = Store.open(':memory:');
-  t.after(() => store.close());
-  const delivered = [];
-  const config = normalizeConfig({ proactiveDailyCap: 5 });
-  const proactive = createProactive({
-    store,
-    config,
-    target: () => 'main',
-    clock: () => NOW,
-    platform: {
-      async prompt() {
-        throw new Error('task_report 不应走 platform.prompt');
-      },
-    },
-    deliver: async (item) => { delivered.push(item); },
-    deliverKind: (kind) => kind === 'task_report',
-  });
-
-  proactive.enqueue({ kind: 'task_report', text: '任务完成', dedupeKey: 'k-1', at: NOW });
-  const flushed = await proactive.flush(NOW + 1000);
-  assert.equal(flushed.sent, 1);
-  assert.equal(delivered.length, 1, '必须交给 deliver 通道');
-  assert.equal(delivered[0].kind, 'task_report');
-});
-
-/* ------------------------------------------------------ R22-H1 /状态 */
-
-test('R22-H1：/状态 的「回执通道」行（可用 / 不可用 / 最近投递）', (t) => {
+test('P1：/状态 的「回执通道」行（主会话 notice / 最近投递 / 不可用）', (t) => {
   const store = Store.open(':memory:');
   t.after(() => store.close());
   const status = (receipt, extra = {}) => handleCommand({
@@ -263,21 +257,24 @@ test('R22-H1：/状态 的「回执通道」行（可用 / 不可用 / 最近投
     ...extra,
   }).reply;
 
-  const withAvailable = status(
-    { available: true, botId: 'bot-1', targetId: 'tg-1', lastDelivery: null },
+  const withChannel = status(
+    { available: true, channel: 'session', mode: 'session', lastDelivery: null },
     { bg: { available: false, reason: 'x', message: 'no systemd' } },
   );
-  assert.match(withAvailable, /回执通道：dsh-im 可用（bot bot-1 → tg-1）/u);
-  assert.match(withAvailable, /后台任务：不可用/u);
+  assert.match(withChannel, /回执通道：主会话（session-notice）/u);
+  assert.match(withChannel, /后台任务：不可用/u);
 
-  const failed = status({ available: true, botId: 'b', targetId: 't', lastDelivery: { ok: false, code: 'target-not-found' } });
-  assert.match(failed, /最近投递：失败（target-not-found）/u);
+  const imConfigured = status({ available: true, channel: 'session', imConfigured: true, lastDelivery: null });
+  assert.match(imConfigured, /receipt\.im 已停用/u);
 
-  const delivered = status({ available: true, botId: 'b', targetId: 't', lastDelivery: { ok: true } });
+  const failed = status({ available: true, channel: 'session', lastDelivery: { ok: false, code: 'agent-unavailable' } });
+  assert.match(failed, /最近投递：失败（agent-unavailable）/u);
+
+  const delivered = status({ available: true, channel: 'session', lastDelivery: { ok: true } });
   assert.match(delivered, /最近投递：成功/u);
 
-  const unavailable = status({ available: false, reason: 'im-missing', message: 'dsh-im 未安装或未注册 dshIm 服务' });
-  assert.match(unavailable, /回执通道：不可用（dsh-im 未安装或未注册 dshIm 服务）/u);
+  const unavailable = status({ available: false, reason: 'agent-unavailable', message: '主会话 agent 不可用' });
+  assert.match(unavailable, /回执通道：不可用（主会话 agent 不可用）/u);
 
   // 旧调用方不传 receipt：不出现该行。
   assert.equal(status(undefined).includes('回执通道'), false);
@@ -302,6 +299,7 @@ test('R22-M1：新记录 status=投递结果 + task_status=任务终态；旧记
   const first = JSON.parse(events.find((row) => row.row_id === 'task-1').detail_json);
   assert.equal(first.status, 'delivered', 'status 必须是投递结果');
   assert.equal(first.task_status, 'done', '任务终态必须另记');
+  assert.equal(first.channel, 'session', 'v0.7.15 起记录通道为 session');
   const second = JSON.parse(events.find((row) => row.row_id === 'task-2').detail_json);
   assert.equal(second.status, 'failed');
   assert.equal(second.task_status, 'failed');
@@ -371,20 +369,22 @@ test('R22-H2：stopReason=error 带正文、无 diagnostic → error 且正文�
   assert.equal(result.error, '脚本第 3 行报错');
   assert.match(result.receipt, /状态：失败/u);
 });
-/* ------------------------------------------- R22-H1 生产接线（glm M1） */
+
+/* ------------------------------------- P1 生产接线（原 glm M1 判别用例） */
 
 /**
  * **非真机证据**：这是「生产接线层」判别用例 —— 钉住 startScheduler 恒把
- * deliver/deliverKind 注入 createProactive。若删掉 src/index.js 里的
- * deliver 注入，task_report 会悄悄退回 platform.prompt，本用例必须变红。
+ * deliver/deliverKind 注入 createProactive，且 task_report 只投主会话。
+ * 若删掉 src/index.js 里的 deliver 注入，task_report 会悄悄退回 platform.prompt，
+ * 本用例必须变红。
  */
-test('R22-H1 接线：startScheduler 注入 deliver，task_report 走 dshIm 而不是 platform.prompt', async () => {
-  // 10:05 不在安静时段（否则 proactive.flush 会被 quiet 挡住），且已超出 daily job 的 catch-up 窗。
+test('P1 接线：startScheduler 注入 deliver，task_report 只投主会话、不进 platform.prompt', async () => {
+  // 10:05 不在安静时段（否则 proactive.flush 会被 quiet 挡住），且已超出 catch-up 窗。
   const at = Date.parse('2026-11-22T10:05:00+08:00');
   const everyCalls = [];
   const prompts = [];
-  const logs = [];
-  const service = makeService();
+  const agent = makeAgent();
+  const imCalls = [];
   const platform = {
     capabilities: { timer: true },
     now: () => at,
@@ -392,11 +392,11 @@ test('R22-H1 接线：startScheduler 注入 deliver，task_report 走 dshIm 而�
       everyCalls.push({ delay, callback });
       return () => {};
     },
-    log: (level, message, meta) => logs.push({ level, message, meta }),
+    log: () => {},
     async prompt(request) {
       prompts.push(request);
     },
-    agentBySessionId: () => null,
+    agentBySessionId: () => agent,
   };
   const store = Store.open(':memory:');
   try {
@@ -407,34 +407,35 @@ test('R22-H1 接线：startScheduler 注入 deliver，task_report 走 dshIm 而�
       metrics: { snapshot: () => ({}) },
       mainSessionId: 'session-main',
       pendingCompact: new Map(),
+      // 旧通道的替身：必须确认它一次都没被调用（v0.7.15 起回执不直发用户）。
+      host: { get: () => ({ contractVersion: 1, async send(...args) { imCalls.push(args); return { sent: true }; } }) },
     };
 
     const stop = startScheduler(state);
+    initReceiptChannel(state); // 生产里由 apply 调用；此处直接测接线。
     assert.equal(typeof stop, 'function', 'startScheduler 应返回 stop 句柄');
     assert.ok(state.proactive !== null && state.proactive !== undefined, 'scheduler 必须创建 proactive');
     assert.ok(everyCalls.length >= 1, 'scheduler 必须向 platform.every 注册定时器');
 
-    initReceiptChannel(state, { get: (name) => (name === 'dshIm' ? service : undefined) });
-    assert.equal(state.im.available, true);
+    assert.equal(state.im.channel, 'session');
 
     const receipt = await deliverTaskReceipt(state, { taskId: 'task-wire-1', receipt: '结论：已跑完' });
     assert.equal(receipt.queued, true);
     await new Promise((resolve) => setTimeout(resolve, 20));
     await state.proactive.flush();
 
-    assert.equal(service.calls.length, 1, 'task_report 必须经 dshIm 出站一次');
-    assert.equal(service.calls[0].botId, 'bot-wire');
-    assert.equal(service.calls[0].targetId, 'tg-wire');
-    assert.match(service.calls[0].text, /结论：已跑完/u);
-    assert.equal(service.calls[0].options.format, 'plain');
-    assert.ok(service.calls[0].options.signal instanceof AbortSignal);
+    assert.equal(agent.calls.length, 1, 'task_report 必须恰好投一次主会话 notice');
+    assert.equal(agent.calls[0].target, 'next-turn');
+    assert.equal(agent.calls[0].wakeup, true);
+    assert.match(agent.calls[0].message.content[0].text, /结论：已跑完/u);
+    assert.equal(imCalls.length, 0, 'dsh-im 通道必须 0 次');
 
     const viaPrompt = prompts.filter((request) => JSON.stringify(request).includes('结论：已跑完'));
     assert.deepEqual(viaPrompt, [], 'task_report 绝不能退回 platform.prompt');
     assert.ok(
       store.listEvents({ table_name: 'proactive', limit: 10 })
         .some((row) => row.reason === 'proactive:task_report'),
-      'proactive_sent 只在 dshIm 成功后才写',
+      'proactive_sent 只在投递成功后才写',
     );
     stop();
   } finally {

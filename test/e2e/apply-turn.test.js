@@ -216,7 +216,7 @@ test('同一 ctx 二次 apply 幂等，dispose 关闭 Store 并清掉 interval',
 
   assert.equal(first, second, '二次 apply 应返回同一个句柄');
   assert.equal(ctx.commands.registrations.length, 7);
-  assert.equal(ctx.tools.registrations.length, 11);
+  assert.equal(ctx.tools.registrations.length, 12);
   assert.equal((ctx.listeners.get('agent/pre-step') ?? []).length, 1);
   assert.equal(ctx.callsOf('interval').length, 1);
   assert.equal(ctx.callsOf('interval')[0].args[1], 30_000);
@@ -402,5 +402,38 @@ test('N1：巩固提示词来自 surface 选区（旧事实不在转录窗口，
   } finally {
     handle.dispose();
     temp.cleanup();
+  }
+});
+
+test('H1（v0.7.15 非真机证据）：真实 apply 注册的 bg_run 不再引用未声明的 state（ReferenceError）', async () => {
+  const temp = makeTempStore();
+  const { ctx } = makeApplyCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath, bg: { workRoot: temp.dir } });
+  try {
+    const bgRun = ctx.tools.registrations.find((tool) => tool.name === 'bg_run');
+    assert.ok(bgRun, 'bg_run 已注册');
+    // 旧代码在闭包里读 `state.bgSelfCheck`，形参里却没有 state → 一调用就
+    // ReferenceError: state is not defined（v0.7.10 起真机 bg_run 全崩）。
+    // 这里只要求「能走到配置/参数校验并给出结构化拒绝」，不要求真的拉起进程。
+    const result = await bgRun.execute({ argv: ['python3', 'no-such-script.py'], cwd: temp.dir, deadline_min: 1 }, {});
+    assert.equal(result.ok, false);
+    assert.equal(typeof result.reason, 'string');
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});
+
+test('M2（v0.7.15 非真机证据）：stop-task 声明 input.hint，宿主 UI 才会透传 taskId', () => {
+  const { ctx } = makeApplyCtx();
+  const handle = apply(ctx, { dbPath: ':memory:' });
+  try {
+    const stopTask = ctx.commands.registrations.find((command) => command.name === 'stop-task');
+    assert.ok(stopTask, 'stop-task 命令已注册');
+    // 宿主契约：dsh-commands/src/index.ts:68-69 的 `input?: CommandInputDescriptor`
+    // （`:192-214` 校验 hint 为非空字符串）；客户端只在有 input 时才显示输入框并透传。
+    assert.deepEqual(stopTask.input, { hint: 'taskId' });
+  } finally {
+    handle.dispose();
   }
 });

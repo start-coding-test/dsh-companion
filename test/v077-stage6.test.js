@@ -557,7 +557,7 @@ test('W-1：bg_run 工具在未配置 workRoot 时返回不可用', async (t) =>
   assert.equal(result.reason, 'not-configured');
 });
 
-test('W-1/W-5：bg_run 正常启动返回 id 并沿 SA-B3 告知一句；并发满额返回 busy', async (t) => {
+test('W-1/W-5：bg_run 正常启动返回 id；不再发启动告知（H2：结束回执共用 taskId）；并发满额返回 busy', async (t) => {
   const { work } = makeWorkRoot(t);
   const store = Store.open(':memory:');
   t.after(() => store.close());
@@ -588,8 +588,9 @@ test('W-1/W-5：bg_run 正常启动返回 id 并沿 SA-B3 告知一句；并发�
   assert.equal(started.ok, true, JSON.stringify(started));
   assert.match(started.id, /^bg-/u);
   assert.equal(store.getBgJob(started.id).child_session_id, 'child-session-1');
-  assert.equal(notices.length, 1);
-  assert.match(notices[0].receipt, /^\[任务\] /u);
+  // H2（v0.7.15）：启动告知已删 —— 它与结束回执共用 taskId，120 分钟的
+  // dedupeKey 会把结束回执当重复丢掉。这里必须一次都不投。
+  assert.equal(notices.length, 0, '启动不得再发任务回执');
   // W77-H1/M2：拉起时把 service 工作目录与 bg.env 透传给 launcher。
   assert.equal(launcher.calls.length, 1);
   assert.equal(launcher.calls[0].workingDirectory, join(work, 'proj'));

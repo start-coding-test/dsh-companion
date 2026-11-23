@@ -3,11 +3,11 @@
  *
  * 背景：sessionController 由宿主在 apply 之后才挂载（adapter.capabilities 是
  * getter），旧实现在 apply 时按 threadTools 快照过滤，真宿主上 thread_list /
- * thread_run / task_run 永远不会注册。现在一律注册 10 个工具，execute 内读
+ * thread_run / task_run 永远不会注册。现在一律注册 12 个工具，execute 内读
  * 能力位：缺失返回 {ok:false, reason:'capability_missing'}，不抛异常。
  *
  * 覆盖：
- *   1. apply 时无 sessionController（strict 宿主）仍注册全部 10 个工具；
+ *   1. apply 时无 sessionController（strict 宿主）仍注册全部 12 个工具；
  *   2. 能力缺失时三个线程/任务工具都返回稳定错误对象，/status 与 /threads
  *      共用同一句「线程：宿主不支持」；
  *   3. 宿主晚挂载（attachSessionController）后同一次注册的工具调用成功，
@@ -44,6 +44,7 @@ const ALL_TOOL_NAMES = [
   'memory_write',
   'reminder_add',
   'reminder_done',
+  'task_cancel',
   'task_run',
   'thread_list',
   'thread_run',
@@ -89,12 +90,12 @@ function commandText(ctx, name) {
   return definition.handler({ rawInput: '' }).text;
 }
 
-test('V7-H1：apply 时无 sessionController 也注册全部 11 个工具', (t) => {
+test('V7-H1：apply 时无 sessionController 也注册全部 12 个工具', (t) => {
   const ctx = makeCtx();
   const handle = apply(ctx, { dbPath: ':memory:' });
   t.after(() => handle.dispose());
 
-  assert.equal(ctx.tools.registrations.length, 11);
+  assert.equal(ctx.tools.registrations.length, 12);
   assert.deepEqual(
     ctx.tools.registrations.map((entry) => entry.name).sort(),
     ALL_TOOL_NAMES,

@@ -371,6 +371,9 @@ Object.defineProperty(DEFAULT_VALUES, 'bgConcurrency', {
 // sessionNotice：回执投出后给主会话插一条 notice（source.form='notice'），
 // 随下一轮进入、不唤醒、不单独开 turn；开关默认开。
 // 与其它扩展节一致：非枚举，不参与 16 键安装自检。
+// R22-H1（v0.7.13）引入；P1（v0.7.15）起 im 通道停用：回执只投主会话 notice。
+// im / sessionNotice 两个键仍读入并保留（旧配置不报错），但运行时不再使用它们；
+// `/状态` 的「回执通道」行会标注「receipt.im 已停用」。
 const RECEIPT_DEFAULTS = Object.freeze({
   im: Object.freeze({ botId: '', targetId: '' }),
   sessionNotice: true,

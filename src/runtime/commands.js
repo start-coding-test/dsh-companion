@@ -765,29 +765,29 @@ function formatBgLine(bg) {
 }
 
 /**
- * R22-H1（v0.7.13）：回执出站通道状态行。
+ * /状态 里的「回执通道」行。
  *
+ * v0.7.15（P1）：回执只投主会话（空闲唤醒、忙时 steer），dsh-im 直发已停用。
  * 格式：
- * - `回执通道：dsh-im 可用（bot <id> → <target>）`；有投递记录时追加
- *   `；最近投递：成功` 或 `；最近投递：失败（<code>）`。
- * - `回执通道：不可用（<原因>）`：dsh-im 未安装、contractVersion ≠ 1、或
- *   `receipt.im.botId/targetId` 未配置。
+ * - `回执通道：主会话（session-notice）`；配了旧 `receipt.im` 时追加
+ *   `；receipt.im 已停用`；有投递记录时追加 `；最近投递：成功` 或
+ *   `；最近投递：失败（<code>）`。
+ * - `回执通道：不可用（<原因>）`：主会话取不到等异常态（保留展示）。
  *
- * @param {{available?: unknown, botId?: unknown, targetId?: unknown, reason?: unknown,
- *          message?: unknown, lastDelivery?: unknown}} [receipt]
+ * @param {{available?: unknown, channel?: unknown, mode?: unknown, imConfigured?: unknown,
+ *          reason?: unknown, message?: unknown, lastDelivery?: unknown}} [receipt]
  * @returns {string|null} 未传 receipt（旧调用方）时返回 null
  */
 function formatReceiptLine(receipt) {
   if (receipt === null || receipt === undefined || typeof receipt !== 'object') return null;
-  if (receipt.available !== true) {
+  if (receipt.available === false) {
     const reasonText = typeof receipt.message === 'string' && receipt.message.trim() !== ''
       ? receipt.message.trim()
       : (typeof receipt.reason === 'string' && receipt.reason.trim() !== '' ? receipt.reason.trim() : '未知原因');
     return `回执通道：不可用（${reasonText}）`;
   }
-  const botId = typeof receipt.botId === 'string' && receipt.botId !== '' ? receipt.botId : '（未配置）';
-  const targetId = typeof receipt.targetId === 'string' && receipt.targetId !== '' ? receipt.targetId : '（未配置）';
-  let line = `回执通道：dsh-im 可用（bot ${botId} → ${targetId}）`;
+  let line = '回执通道：主会话（session-notice）';
+  if (receipt.imConfigured === true) line += '；receipt.im 已停用';
   const last = receipt.lastDelivery;
   if (last !== null && last !== undefined && typeof last === 'object') {
     if (last.ok === true) {

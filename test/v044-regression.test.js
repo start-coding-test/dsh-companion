@@ -572,7 +572,7 @@ test('V3-H3②/V7-H1：无 sessionController 仍注册全部工具，调用返�
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const names = ctx.tools.registrations.map((definition) => definition.name);
-    assert.equal(names.length, 11, `应注册 11 个工具，实际：${names.join(',')}`);
+    assert.equal(names.length, 12, `应注册 12 个工具，实际：${names.join(',')}`);
     for (const name of ['memory_search', 'memory_write', 'memory_forget', 'memory_update', 'reminder_add', 'reminder_done', 'cost_report']) {
       assert.ok(names.includes(name), `必须保留 ${name}`);
     }
@@ -598,13 +598,13 @@ test('V3-H3②/V7-H1：无 sessionController 仍注册全部工具，调用返�
   }
 });
 
-test('V3-H3②：sessionController 齐全时注册 11 个工具，/状态 无「不支持」提示', () => {
+test('V3-H3②：sessionController 齐全时注册 12 个工具，/状态 无「不支持」提示', () => {
   const temp = makeTempStore();
   const { ctx } = makeCtx();
   const handle = apply(ctx, { dbPath: temp.dbPath });
   try {
     const names = ctx.tools.registrations.map((definition) => definition.name);
-    assert.equal(names.length, 11);
+    assert.equal(names.length, 12);
     for (const name of ['thread_list', 'thread_run', 'task_run']) {
       assert.ok(names.includes(name));
     }
@@ -624,7 +624,7 @@ test('V3-M1：dispose 后重新 apply 不产生重复注册', async () => {
   const { ctx } = makeCtx();
   try {
     const first = apply(ctx, { dbPath: temp.dbPath });
-    assert.equal(ctx.tools.registrations.length, 11);
+    assert.equal(ctx.tools.registrations.length, 12);
     assert.equal(ctx.commands.registrations.length, 7);
     assert.equal(ctx.sections.filter((item) => !item.disposed).length, 4);
     assert.equal((ctx.listeners.get('agent/pre-step') ?? []).filter((entry) => !entry.disposed).length, 1);
@@ -632,7 +632,7 @@ test('V3-M1：dispose 后重新 apply 不产生重复注册', async () => {
     first.dispose();
     const second = apply(ctx, { dbPath: temp.dbPath });
     try {
-      assert.equal(ctx.tools.registrations.length, 11, '重新 apply 不得累加工具');
+      assert.equal(ctx.tools.registrations.length, 12, '重新 apply 不得累加工具');
       assert.equal(ctx.commands.registrations.length, 7, '重新 apply 不得累加命令');
       // FakeCtx 的 section 注册不实现物理移除，按 disposed 数生效条目。
       assert.equal(ctx.sections.filter((item) => !item.disposed).length, 4, '重新 apply 不得累加人格段');

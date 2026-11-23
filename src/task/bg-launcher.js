@@ -246,6 +246,10 @@ export function buildPosixWrapper({ logPath, exitPath, argv }) {
     '#!/bin/sh',
     '# dsh-companion bg wrapper（W-1d）：写截断日志 + 退出码文件，插件重启后仍可取证。',
     `exec >> '${logPath.replace(/'/g, `'\\''`)}' 2>&1`,
+    // M1（v0.7.15）：RuntimeMaxSec 到期由 systemd 发 SIGTERM；sh 默认不把信号转成
+    // 退出（EXIT trap 也不保证执行），退出码文件因此丢失，监视器只能记 lost。
+    // 先显式 trap TERM → exit 143，再由下面的 EXIT trap 落 143，时序才可靠。
+    `trap 'exit 143' TERM`,
     `trap 'printf "%s\\n" "$?" > "${exitPath.replace(/"/g, '\\"')}"' EXIT`,
     quoted,
     '',
@@ -838,6 +842,34 @@ export function capLogFile(logPath, maxBytes) {
   } catch {
     // 截断是防膨胀的尽力而为，失败不影响监视结论。
     return false;
+  }
+}
+
+/**
+ * M1（v0.7.15）：问 systemd 这个 unit 的 Result（`timeout` / `success` / `exit-code`…）。
+ *
+ * 包装器写退出码文件依赖 trap 执行；RuntimeMaxSec 杀掉的 unit 常常没有 exit 文件，
+ * 只剩 systemd 自己知道的 Result。查询模式必须与拉起时一致（`--user` + 同一套
+ * `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`），否则在用户级实例上查不到。
+ *
+ * 入参形状与 `probeBgProcess` / `signalBgProcess` 一致（对象 + 可注入 run），
+ * 调用方 `src/task/bg-jobs.js` 的 `unitResultOf({ unit, user, uid })` 直接复用。
+ * @param {{unit: string|null, user?: boolean, uid?: number}} input
+ * @param {Function} [run] execFile 兼容替身（单测注入，非真机证据）
+ * @returns {Promise<string|null>} Result 值；查不到返回 null
+ */
+export async function systemdUnitResult(input = {}, run = execFileAsync) {
+  const unit = typeof input?.unit === 'string' ? input.unit : '';
+  if (unit === '') return null;
+  const user = input?.user === true;
+  const args = [...(user ? ['--user'] : []), 'show', '-p', 'Result', '--value', unit];
+  const env = user ? userModeEnv(input?.uid ?? currentUid()) : undefined;
+  try {
+    const { stdout } = await run('systemctl', args, ...(env === undefined ? [] : [{ env }]));
+    const text = String(stdout ?? '').trim();
+    return text === '' ? null : text;
+  } catch {
+    return null;
   }
 }
 
