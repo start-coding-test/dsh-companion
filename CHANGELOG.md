@@ -2,6 +2,37 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.14] - 2026-11-23
+
+回执通道稳定性修正：dsh-im 重载后回执仍能投出；没有主会话时回执不再被同批提醒拖住；投递失败日志不再按退避节奏重复刷写。
+
+### Fixed
+
+- **V713-M1 dsh-im 重载后回执照旧失败**：`initReceiptChannel`（`src/index.js`）启动时 `host.get('dshIm')`
+  取到实例后就 return，不再挂晚接管；dsh-im 改配置 / 热更新会换成新实例，插件继续用旧实例 send，
+  回执一直落 `delivery_error` 直到宿主重启。现在每次投递前由 `resolveReceiptService` 现取
+  `host.get('dshIm')` 并重做可用性判断（contractVersion === 1、botId/targetId 已配置），
+  取不到 / 校验不过 → 记不可用并抛给 proactive 退避，**绝不退回 `platform.prompt`**。
+  启动时 info 日志与 `/状态` 的「回执通道」行保留（不可用时显示原因，最近投递结果仍可见）。
+- **V713-L1 无主会话时回执被同批提醒拖回队列**：`src/runtime/proactive.js` 的投递第二遍过去只要
+  本批有一条需要会话的候选，就把整批（含 `task_report`）放回队首并全部 `onFailed`。现在只回队
+  「需要会话」的候选，走 dsh-im 的 `task_report` 照常投递；`dedupeKey` / `requestId` / 10 分钟合并 /
+  `recordSent` 的 `dedupeKeys` / pending 重放 / `EXEMPT_KINDS` 豁免 / backlog 语义均不变。
+- **V713-L2 投递失败日志按退避节奏重复写**：`recordTaskReceiptDelivery`（`src/index.js`）过去每次
+  `onFailed` 都写一条 `task_receipt_failed`，`receipt.im` 未配置时日志会被同一份回执刷满。现在同一
+  `receiptId` 只在投递状态变化时写（失败→失败不重复、失败→成功写 `delivered`、成功→失败写 `failed`，
+  初次失败仍写 1 条）；状态放内存 Map，重启后第一次投递会重记一条当前状态，历史仍可从
+  `memory_events` 的 `task_receipt_delivery` 事件读到。`status` + `task_status` 字段与旧记录兼容读不变。
+
+### Tests
+
+- 新增 `test/v0714.test.js` 7 例：dsh-im 换实例后投递走新实例且旧实例不被调用；服务消失 → 通道不可用、
+  proactive 只退避不退回 prompt；无主会话时 task_report 出站而提醒回队（`onFailed` 只对需会话的份）；
+  同一回执连续失败只记 1 条、状态变化才新增。三例均做过「删掉对应修复必红」的判别力自验。
+- **非真机证据**：dsh-im 服务、宿主 `agent.send`、`platform.prompt`、`ctx.get` 重载语义全部用替身；
+  真实的 dsh-im 热更新/重载行为、IM 送达语义属 50041 云端验收。
+- 全量 1626 个用例 / 67 个套件，三时区（UTC / Asia/Shanghai / America/New_York）全绿。
+
 ## [0.7.13] - 2026-11-22
 
 回执通道修正版：任务回执不再冒充用户发言进主会话，改经 dsh-im 出站到 IM；同时修「成功任务被标失败」

@@ -5346,6 +5346,9 @@ function initReceiptChannel(state, host) {
   const botId = typeof imConfig.botId === 'string' ? imConfig.botId : '';
   const targetId = typeof imConfig.targetId === 'string' ? imConfig.targetId : '';
   const channel = {
+    // V713-M1（v0.7.14）：保留 host 引用，投递前用它现取 dshIm——dsh-im 重载
+    // （改配置 / 热更新）会换一个新实例，启动时缓存下来的旧实例不能再用于 send。
+    host: host ?? null,
     available: false,
     service: null,
     contractVersion: null,
@@ -5413,6 +5416,71 @@ function initReceiptChannel(state, host) {
 }
 
 /**
+ * V713-M1（v0.7.14）：每次投递前现取 dshIm，并重做一次可用性判断。
+ *
+ * 为什么不在启动时缓存：dsh-im 是独立第三方插件（`@xmanrui/dsh-im`，服务名
+ * `dshIm`），重载 / 改配置 / 热更新会让 `ctx.get('dshIm')` 返回新实例；缓存启动
+ * 时的旧实例会让之后每次 send 都落 delivery_error，直到宿主重启。`send` 本身是
+ * 外发动作，现取实例不引入新的持久状态。
+ *
+ * 取不到（未安装、cordis 4 的 ctx.get 未注册返回 undefined，或其它实现抛异常）
+ * 与校验不过（contractVersion ≠ 1、botId/targetId 未配置）都只让回执通道不可用，
+ * 绝不退回 platform.prompt。
+ *
+ * 宿主契约依据：`@deepseek-ai/cordis/src/reflect.ts:247-249` 的
+ * `get(name, strict = true) { return this._getImpl(name, strict)?.value }` 每次调用
+ * 都读注册表当前 impl；`provide()`（reflect.ts:34-46）在注销时会唤醒 dependents。
+ * 即 dsh-im 重载 = 旧 impl 注销 + 新 impl 注册，下一次 get 返回新实例、未注册返回
+ * undefined（本机 asar 路径：D:\dsh\resources\app.asar\dsh\node_modules\@deepseek-ai\cordis\src\reflect.ts）。
+ *
+ * 探活不打日志（只在 initReceiptChannel 记一条 info），避免每次投递刷屏；
+ * `available/reason/message` 随每次探测刷新——两次投递之间 /状态 显示的是上次
+ * 探测结果，不是缺陷。重载窗口内若恰有并发 send，可能有一次落在旧实例上
+ * （send 抛错 → delivery_error → 下次退避重试拿到新实例）；回执是低频消息，
+ * 这个竞态可接受。
+ * @param {object} channel state.im
+ * @returns {object} dshIm 服务实例
+ */
+function resolveReceiptService(channel) {
+  let service;
+  try {
+    service = typeof channel?.host?.get === 'function' ? channel.host.get('dshIm') : undefined;
+  } catch {
+    service = undefined;
+  }
+  const picked = service === undefined || service === null ? null : service;
+  const contractVersion = Number.isInteger(picked?.contractVersion) ? picked.contractVersion : null;
+  const unavailable = (reason, message) => {
+    channel.service = null;
+    channel.contractVersion = contractVersion;
+    channel.available = false;
+    channel.reason = reason;
+    channel.message = message;
+    const error = new Error(message);
+    error.code = reason;
+    return error;
+  };
+  if (picked === null || typeof picked.send !== 'function') {
+    throw unavailable('im-missing', 'dsh-im 未安装或未注册 dshIm 服务');
+  }
+  if (contractVersion !== 1) {
+    throw unavailable(
+      'im-contract-version',
+      `dsh-im contractVersion=${String(contractVersion ?? 'missing')}，本插件只支持 1`,
+    );
+  }
+  if (channel.botId === '' || channel.targetId === '') {
+    throw unavailable('im-not-configured', 'receipt.im.botId / receipt.im.targetId 未配置');
+  }
+  channel.service = picked;
+  channel.contractVersion = contractVersion;
+  channel.available = true;
+  channel.reason = null;
+  channel.message = null;
+  return picked;
+}
+
+/**
  * R22-H1：把一条回执正文经 dsh-im 出站发给用户（IM 一侧）。
  *
  * 契约（`@xmanrui/dsh-im` v5.10.0 的 lib/index.js：`contractVersion: 1` 的
@@ -5431,18 +5499,29 @@ function initReceiptChannel(state, host) {
 async function sendReceiptViaIm(state, text) {
   const channel = state.im;
   const at = Math.floor(state.platform.now() / 1000);
-  if (channel === null || channel === undefined || channel.available !== true) {
-    const error = new Error(channel?.message ?? '回执通道不可用');
-    error.code = channel?.reason ?? 'im-unavailable';
-    if (channel !== null && channel !== undefined) {
-      channel.lastDelivery = { ok: false, at, code: error.code, message: error.message };
-    }
+  if (channel === null || channel === undefined) {
+    const error = new Error('回执通道不可用');
+    error.code = 'im-unavailable';
+    throw error;
+  }
+  let service;
+  try {
+    // V713-M1（v0.7.14）：每次投递现取实例——dsh-im 重载后旧实例不再可用；
+    // 取不到 / 校验不过 → 记不可用并抛给 proactive 退避，绝不退回 platform.prompt。
+    service = resolveReceiptService(channel);
+  } catch (error) {
+    channel.lastDelivery = {
+      ok: false,
+      at,
+      code: typeof error?.code === 'string' && error.code !== '' ? error.code : 'im-unavailable',
+      message: errorMessage(error),
+    };
     throw error;
   }
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), RECEIPT_IM_TIMEOUT_MS);
   try {
-    const result = await channel.service.send(channel.botId, channel.targetId, text, {
+    const result = await service.send(channel.botId, channel.targetId, text, {
       signal: controller.signal,
       format: 'plain',
     });
@@ -5737,20 +5816,35 @@ async function recoverBgJobsOnStart(state) {
  */
 function recordTaskReceiptDelivery(state, info) {
   const { store, platform } = state;
+  const receiptKey = String(info.receiptId);
+  const nextStatus = info.delivered === true ? 'delivered' : 'failed';
+  // V713-L2（v0.7.14）：同一 receiptId 只在投递状态变化时落一条事件。
+  // proactive 退避重试会对同一份回执反复触发 onFailed；未配置 receipt.im 时按
+  // 退避节奏累积，日志会被「失败、失败、失败…」刷满。状态机只有 delivered /
+  // failed 两态：失败→失败不重复写，失败→成功写 delivered，成功→失败写 failed，
+  // 首次失败仍写 1 条。
+  //
+  // 状态放内存 Map（重启后为空）：重启后第一次投递会重新记一条当前状态，之后
+  // 继续按变化去重；历史状态仍可从 memory_events 的 task_receipt_delivery 事件
+  // （`readReceiptDeliveryRecord`）读到，所以不做持久化、不新增表。
+  const seen = state.receiptDeliveryLog instanceof Map
+    ? state.receiptDeliveryLog
+    : (state.receiptDeliveryLog = new Map());
+  if (seen.get(receiptKey) === nextStatus) return;
   try {
     store.appendEvent({
       at: Number.isFinite(info.atSeconds) ? info.atSeconds : Math.floor(platform.now() / 1000),
       action: 'USED',
       actor: 'scheduler',
       table_name: 'threads',
-      row_id: String(info.receiptId),
+      row_id: receiptKey,
       reason: info.delivered === true ? 'task_receipt_delivered' : 'task_receipt_failed',
       detail_json: {
         kind: 'task_receipt_delivery',
         receiptId: info.receiptId,
         taskId: info.taskId ?? null,
         // R22-M1（v0.7.13）：status = 投递结果；任务终态另记 task_status。
-        status: info.delivered === true ? 'delivered' : 'failed',
+        status: nextStatus,
         task_status: info.status ?? null,
         delivered: info.delivered === true,
         title: info.title ?? null,
@@ -5758,6 +5852,7 @@ function recordTaskReceiptDelivery(state, info) {
         reason: info.reason ?? null,
       },
     });
+    seen.set(receiptKey, nextStatus);
   } catch (error) {
     platform.log('warn', '[dsh-companion] failed to write task receipt delivery log', {
       receiptId: info.receiptId,

@@ -579,20 +579,30 @@ export function createProactive({
       report.error = error;
       sessionId = null;
     }
+    // V713-L1（v0.7.14）：没有主会话时只挡「需要会话」的候选。task_report 这类
+    // 走 dsh-im 出站的候选不需要 sessionId，必须照常投递——否则同批里只要有一条
+    // 提醒，整批（含回执）都会被放回队首，回执一直等到有主会话才发。
+    let deliverable = candidates;
     if (sessionId === null && candidates.some((candidate) => !usesChannel(candidate.kind))) {
-      const remaining = candidates.map((candidate) => ({ ...candidate, parts: candidate.parts.slice() }));
-      queue.unshift(...remaining);
-      for (const candidate of remaining) {
+      const needsSession = candidates.filter((candidate) => !usesChannel(candidate.kind));
+      const deferred = needsSession.map((candidate) => ({ ...candidate, parts: candidate.parts.slice() }));
+      queue.unshift(...deferred);
+      for (const candidate of deferred) {
         for (const part of candidate.parts) runHooks(part, 'onFailed', report);
       }
-      if (candidates.length > 0) report.failed += 1;
+      report.failed += 1;
       report.error = report.error ?? new Error('[proactive] no main session');
-      report.deferred += queue.length;
-      return report;
+      // 回执（不需要会话的候选）继续往下投；剩下没有可投的就维持原行为提前返回。
+      // deferred 只在提前返回时补记；继续投递的路径由函数末尾统一 `+= queue.length`。
+      deliverable = candidates.filter((candidate) => usesChannel(candidate.kind));
+      if (deliverable.length === 0) {
+        report.deferred += queue.length;
+        return report;
+      }
     }
 
-    for (let index = 0; index < candidates.length; index += 1) {
-      const item = candidates[index];
+    for (let index = 0; index < deliverable.length; index += 1) {
+      const item = deliverable[index];
       // 投递前钩子逐份判定：合并条里只剔除 onAttempt 返回 false 的那一份，其余照常
       // 投递（V4-H1：一个被取消的提醒不得拖累其它提醒）。被剔除的份一律回调
       // onFailed——它可能已经 claim 成功（必须先释放回 pending，才不会有残留）。
@@ -627,7 +637,7 @@ export function createProactive({
         // 本条已 claim 的份（allowed）必须释放；后面没轮到的候选一并回队等待重试。
         const remaining = [
           delivered,
-          ...candidates.slice(index + 1).map((candidate) => ({
+          ...deliverable.slice(index + 1).map((candidate) => ({
             ...candidate,
             parts: candidate.parts.slice(),
           })),
