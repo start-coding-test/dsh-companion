@@ -262,3 +262,206 @@ export function forgetMemory(input = {}) {
       });
     });
 }
+
+/** 单批最多处理的 id 数（与工具层 schema 的上限一致）。 */
+export const FORGET_BATCH_MAX = 50;
+
+const FACT_ID_PREFIX = 'fact_';
+const EPISODE_ID_PREFIX = 'ep_';
+
+/**
+ * 按 id 前缀判定记忆种类（M2）：`newId('fact')` / `newId('ep')` 的产物（形如 `fact_ab12…` / `ep_ab12…`）。
+ * 前缀优先于调用方给的 kind，防止 `ep-*` 被当成 fact 软删（两者都查不到时
+ * 会走 not_found，比误删安全）。
+ * @param {string} id
+ * @param {'fact'|'episode'} fallback
+ * @returns {'fact'|'episode'}
+ */
+function kindOfId(id, fallback) {
+  if (id.startsWith(FACT_ID_PREFIX)) return 'fact';
+  if (id.startsWith(EPISODE_ID_PREFIX)) return 'episode';
+  return fallback;
+}
+
+/** 批量去重 + 校验（保持输入顺序）。 */
+function normalizeBatchIds(raw) {
+  if (!Array.isArray(raw)) throw new TypeError('[forget] ids must be an array');
+  const seen = new Set();
+  const ids = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'string' || entry.trim() === '') {
+      throw new TypeError('[forget] ids must contain non-empty strings');
+    }
+    const id = entry.trim();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  if (ids.length === 0) throw new TypeError('[forget] ids must not be empty');
+  if (ids.length > FORGET_BATCH_MAX) {
+    throw new TypeError(`[forget] ids must contain at most ${FORGET_BATCH_MAX} entries`);
+  }
+  return ids;
+}
+
+/**
+ * 批量遗忘（M2，v0.7.17）。单条路径 {@link forgetMemory} 一字不动；本函数是
+ * 「逐条 S1 + 批量一次收尾」的组合：
+ *
+ * - 逐条独立：找不到 / 跨 scope / 已删 / 缺 confirm 只让该条失败，不炸整批，
+ *   **不回滚**已成功的条目（用户显式遗忘，失败条目单独可见即可）；
+ * - 状态板**一次收尾**：同 scope 的成功 id 合并成一次 scrub + 一次
+ *   render/stage/publish（逐条路径会 publish 3 次，这里是 1 次）；
+ * - immediate+confirm 时用**一次** `store.purgeIds` 物理删除，而不是逐条 purge；
+ * - 批量不做定向巩固（`llm` 缺省，与工具/命令两条现路径一致），
+ *   `consolidation` 固定为 `{skipped:true, reason:'no-llm'}`。
+ *
+ * @param {object} input
+ * @param {import('./store.js').Store} input.store
+ * @param {string[]} input.ids 记忆 id 列表（`fact-*` / `ep-*`，≤50）
+ * @param {'fact'|'episode'} [input.kind='fact'] 无前缀 id 的默认种类
+ * @param {string} [input.scope] 作用域守卫（跨 scope 的条目逐条拒绝）
+ * @param {Date|number} [input.at] 遗忘时刻（默认当前时间）
+ * @param {boolean} [input.immediate=false]
+ * @param {boolean} [input.confirm=false]
+ * @param {{warn?: Function}} [input.logger]
+ * @returns {object} 批量结果（同步，不含 Promise）
+ */
+export function forgetMany(input = {}) {
+  const { store, logger } = input;
+  if (!store || typeof store.forgetFact !== 'function' || typeof store.forgetEpisode !== 'function') {
+    throw new TypeError('[forget] store must be a Store instance');
+  }
+  const fallbackKind = input.kind ?? 'fact';
+  if (!MEMORY_KINDS.has(fallbackKind)) {
+    throw new TypeError(`[forget] unknown kind: ${String(fallbackKind)}`);
+  }
+  const ids = normalizeBatchIds(input.ids);
+  const at = toEpochSeconds(input.at ?? input.now ?? Date.now());
+  const immediate = input.immediate === true;
+  const confirm = input.confirm === true;
+  const guardScope = typeof input.scope === 'string' && input.scope !== '' ? input.scope : undefined;
+  const warn = resolveWarn(logger);
+
+  /** @type {Array<{id: string, ok: boolean, kind: string, reason?: string, deletedAt?: number, purgeAt?: number}>} */
+  const results = [];
+  /** @type {Map<string, {facts: string[], episodes: string[]}>} */
+  const okByScope = new Map();
+  const okFacts = [];
+  const okEpisodes = [];
+
+  for (const id of ids) {
+    const kind = kindOfId(id, fallbackKind);
+    const row = kind === 'fact' ? store.getFact(id) : store.getEpisode(id);
+    if (!row) {
+      results.push({ id, ok: false, kind, reason: 'not_found' });
+      continue;
+    }
+    const rowScope = typeof row.scope === 'string' && row.scope !== '' ? row.scope : guardScope ?? 'main';
+    if (guardScope !== undefined && typeof row.scope === 'string' && row.scope !== '' && row.scope !== guardScope) {
+      results.push({ id, ok: false, kind, reason: 'scope_denied' });
+      continue;
+    }
+    if (row.status === 'tombstoned' || (row.deleted_at !== null && row.deleted_at !== undefined)) {
+      results.push({
+        id,
+        ok: false,
+        kind,
+        reason: 'already_deleted',
+        deletedAt: row.deleted_at ?? null,
+      });
+      continue;
+    }
+    if (immediate && !confirm) {
+      results.push({ id, ok: false, kind, reason: 'needs_confirm' });
+      continue;
+    }
+    const payload =
+      kind === 'fact'
+        ? { statement: row.statement, kind: row.kind, scope: rowScope }
+        : { title: row.title, kind: 'episode', scope: rowScope };
+    let tombstoned = false;
+    try {
+      tombstoned = kind === 'fact' ? store.forgetFact(id, { at, payload }) : store.forgetEpisode(id, { at, payload });
+    } catch (error) {
+      warn(`[forget] batch tombstone failed for ${id}`, error);
+    }
+    if (!tombstoned) {
+      const current = kind === 'fact' ? store.getFact(id) : store.getEpisode(id);
+      if (!current || (current.status !== 'tombstoned' && !current.deleted_at)) {
+        results.push({ id, ok: false, kind, reason: 'not_active' });
+        continue;
+      }
+    }
+    let bucket = okByScope.get(rowScope);
+    if (bucket === undefined) {
+      bucket = { facts: [], episodes: [] };
+      okByScope.set(rowScope, bucket);
+    }
+    if (kind === 'fact') {
+      bucket.facts.push(id);
+      okFacts.push(id);
+    } else {
+      bucket.episodes.push(id);
+      okEpisodes.push(id);
+    }
+    results.push({ id, ok: true, kind, deletedAt: at, purgeAt: at + FORGET_PURGE_SECONDS });
+  }
+
+  let boardRevision = null;
+  let boardError;
+  let purged = 0;
+  for (const [boardScope, bucket] of okByScope) {
+    const idsInScope = [...bucket.facts, ...bucket.episodes];
+    if (idsInScope.length === 0) continue;
+    try {
+      store.scrubStateBoard({ scope: boardScope, ids: idsInScope, now: at });
+      const fragments = boardFragments(store, idsInScope);
+      const text = scrubBoardText(renderBoard(boardInput(store, boardScope)), fragments);
+      stageBoard(store, boardScope, text);
+      const revision = publishBoard(store, boardScope, 'forget');
+      if (revision !== null && revision !== undefined) boardRevision = revision;
+    } catch (error) {
+      boardError = error instanceof Error ? error.message : String(error);
+      warn('[forget] batch state board scrub failed', error);
+    }
+    try {
+      if (typeof store.resetEmotion === 'function') store.resetEmotion(boardScope);
+    } catch (error) {
+      warn('[forget] emotion reset failed', error);
+    }
+  }
+
+  if (immediate && confirm && (okFacts.length > 0 || okEpisodes.length > 0)) {
+    try {
+      const rows = store.purgeIds({ facts: okFacts, episodes: okEpisodes, at });
+      purged = (rows?.facts ?? 0) + (rows?.episodes ?? 0);
+    } catch (error) {
+      warn('[forget] batch purge failed', error);
+    }
+    for (const entry of results) {
+      if (entry.ok === true) {
+        entry.purged = true;
+        entry.purgeAt = at;
+      }
+    }
+  }
+
+  const marked = results.filter((entry) => entry.ok === true).length;
+  const result = {
+    ok: true,
+    kind: 'batch',
+    scope: guardScope ?? null,
+    summary: {
+      requested: ids.length,
+      marked,
+      failed: ids.length - marked,
+      purged: immediate && confirm ? purged : 0,
+    },
+    results,
+    boardRevision,
+    consolidation: { skipped: true, reason: 'no-llm' },
+  };
+  if (boardError !== undefined) result.boardError = boardError;
+  return result;
+}

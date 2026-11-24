@@ -13,7 +13,7 @@
  *   而不是把错误抛给模型。
  */
 
-import { forgetMemory } from '../memory/forget.js';
+import { forgetMany, forgetMemory } from '../memory/forget.js';
 // M2（v0.7.15）：task_cancel 走执行器的取消入口；startTask 仍是 task_run 的派出入口。
 import {
   releaseExecSlot,
@@ -479,26 +479,59 @@ export function createTools({
 
     {
       name: 'memory_forget',
-      description: '按 id 遗忘一条事实：默认 S1（7 天后物理删除）；immediate+confirm 时立即物删。',
+      description: '按 id 遗忘记忆：默认 S1（7 天后物理删除）；immediate+confirm 时立即物删。可传单个 id，也可传 ids 批量（≤50，逐条独立、批量一次收尾）。',
       parameters: {
         type: 'object',
         properties: {
-          id: { type: 'string', description: '事实 id' },
+          id: { type: 'string', description: '事实或情景 id（单条路径）' },
+          ids: {
+            type: 'array',
+            items: { type: 'string' },
+            maxItems: 50,
+            description: '批量 id 列表（≤50，自动去重；与 id 二选一）',
+          },
+          kind: {
+            type: 'string',
+            enum: ['fact', 'episode'],
+            description: '无 `fact_` / `ep_` 前缀的 id 按此种类处理，默认 fact',
+          },
           immediate: {
             type: 'boolean',
             description: '跳过 7 天冷静期立即物理删除（需 confirm=true）',
           },
           confirm: { type: 'boolean', description: '确认立即删除（immediate 的二次确认）' },
         },
-        required: ['id'],
+        required: [],
         additionalProperties: false,
       },
       execute(args = {}) {
         assertArgs(args, 'memory_forget');
-        const id = requireString(args.id, 'memory_forget', 'id');
         const immediate = optionalBoolean(args.immediate, 'memory_forget', 'immediate') ?? false;
         const confirm = optionalBoolean(args.confirm, 'memory_forget', 'confirm') ?? false;
         const current = scopeNow();
+        // M2（v0.7.17）：批量路径。逐条独立（跨 scope / 找不到只让该条失败），
+        // 状态板与（可选）物删在 forgetMany 里各收尾一次；单条路径一字不动。
+        if (Array.isArray(args.ids)) {
+          if (current === null) return { ok: false, reason: 'scope_denied', scope: null };
+          const kind = optionalEnum(args.kind, ['fact', 'episode'], 'memory_forget', 'kind') ?? 'fact';
+          if (args.ids.length === 0) {
+            throw new TypeError('[tools] memory_forget: ids must contain at least one id');
+          }
+          if (args.ids.length > 50) {
+            throw new TypeError('[tools] memory_forget: ids must contain at most 50 entries');
+          }
+          for (const entry of args.ids) requireString(entry, 'memory_forget', 'ids');
+          return forgetMany({
+            store,
+            ids: args.ids,
+            kind,
+            at: nowMs(),
+            immediate,
+            confirm,
+            ...(current === undefined ? {} : { scope: current }),
+          });
+        }
+        const id = requireString(args.id, 'memory_forget', 'id');
         if (current === null) return { ok: false, reason: 'scope_denied', scope: null };
         const fact = store.getFact(id);
         if (fact && current !== undefined && fact.scope !== current) {

@@ -1312,6 +1312,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             receipt: state.im,
             // v0.7.17 H1-A：回填只读状态（未配置该节时 undefined → 命令层省行）。
             backfill: backfillStatusOf(state, store, config, scope),
+            // v0.7.17 M2：FTS 投影自检（只读；全零时命令层省行）。
+            fts: typeof store.ftsHealth === 'function' ? store.ftsHealth() : undefined,
             // V7-H1：每次命令调用时读能力位，不用 apply 时快照（宿主可能晚挂载）。
             threadsSupported: platform.capabilities.threadTools === true,
             // V3-M2：/状态 展示当前主会话与绑定模式。

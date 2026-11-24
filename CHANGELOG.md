@@ -79,6 +79,25 @@
   共用），`memory_update`（`editMemoryFact`）对 pinned 返回 `reason: 'pinned'`，
   `memory_write` 的 `update` 目标若是 pinned 则退化为插新条并 warn，不阻断用户显式写入。
 
+### Fixed（v0.7.17 M2）
+
+- **M2 `memory_forget` 支持批量遗忘**：schema 新增 `ids`（字符串数组，去重后 ≤50）与可选
+  `kind`（`fact` / `episode`，默认 `fact`），单 `id` 路径一字不动、`execute({})` 仍抛
+  `id must be a non-empty string`。id 归类**前缀优先**（`fact_*` / `ep_*`，无前缀回落
+  `kind`），防止 `ep_*` 被按事实软删。每条独立处理：跨 scope 只让该条返回 `scope_denied`，
+  不炸整批、不回滚（混合批里好的条目照常 tombstoned）。批量跳过定向巩固沿用 `no-llm`
+  （工具与命令两条路径都不传 llm）。状态板**一次收尾**：整批只 `scrubStateBoard` +
+  `publishBoard('forget')` 一次、`resetEmotion` 一次；`immediate + confirm` 只调一次
+  `store.purgeIds`（一次两表 → 两条 `PURGED` 审计）。返回
+  `{ ok, kind: 'batch', scope, summary: { requested, marked, failed, purged }, results, boardRevision, consolidation: { skipped: true, reason: 'no-llm' } }`。
+- **M2 软删口径不变（方案 B）**：`forgetFact` / `forgetEpisode` 仍只写 `deleted_at` 与
+  tombstone，FTS 行继续留到 S2 purge 再物删——批量路径没有偷偷改成物理删除。
+- **M2 `/状态` 增加 FTS 投影自检**：新增只读 `store.ftsHealth()`，三类计数——FTS 孤儿
+  （索引有、主表没有，可清）、active 缺投影（主表有、索引没有，异常）、非 active 仍留索引
+  （S1 冷静期的正常状态，仅信息）。`/状态` 只在出现异常或非零时多一行，未传 `fts` 或全零
+  时整行省略（旧 golden 不变）；不新增 `/诊断` 命令。
+- **M2 搭车化妆**：`src/memory/consolidate.js` 中 M1 引入的 4 行行尾空白清理，纯空白改动。
+
 ## [0.7.16] - 2026-11-24
 
 后台任务终态与取消链修正版：超时不再被记成「已结束」、取消不再显示成失败、每个后台任务结束时

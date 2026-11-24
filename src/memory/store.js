@@ -4683,4 +4683,61 @@ export class Store {
     counts.fts_episodes = this.#db.prepare('SELECT COUNT(*) AS n FROM fts_episodes').get().n;
     return counts;
   }
+
+  /**
+   * FTS 投影健康检查（M2，v0.7.17 只读自检）。
+   *
+   * 口径（07 §7.8，方案 B 保留 S1 软删语义）：
+   * - `orphans`：FTS 行对应的主表行已物理删除（只可能来自历史 bug 或手工改库），
+   *   属**异常**，可安全清理；
+   * - `missing`：active 主表行没有 FTS 投影（写路径失败 / 迁移遗漏），属**异常**，
+   *   检索会漏召回；
+   * - `inactiveWithFts`：tombstoned / deleted / dormant 行仍带 FTS 投影——这是
+   *   **正常**的：S1 软删只写 `deleted_at` + tombstone，FTS 行要留到 7 天后 S2
+   *   purge 才物删（方案 B），所以非零是常态，仅作信息展示。
+   * @returns {{orphans: number, factOrphans: number, episodeOrphans: number,
+   *   missing: number, factMissing: number, episodeMissing: number,
+   *   inactiveWithFts: number}}
+   */
+  ftsHealth() {
+    const factOrphans = this.#db
+      .prepare('SELECT COUNT(*) AS n FROM fts_facts ft LEFT JOIN facts f ON f.rowid = ft.rowid WHERE f.rowid IS NULL')
+      .get().n;
+    const episodeOrphans = this.#db
+      .prepare('SELECT COUNT(*) AS n FROM fts_episodes ft LEFT JOIN episodes e ON e.rowid = ft.rowid WHERE e.rowid IS NULL')
+      .get().n;
+    const factMissing = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM facts f LEFT JOIN fts_facts ft ON ft.rowid = f.rowid
+          WHERE f.deleted_at IS NULL AND f.status = 'active' AND ft.rowid IS NULL`,
+      )
+      .get().n;
+    const episodeMissing = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM episodes e LEFT JOIN fts_episodes ft ON ft.rowid = e.rowid
+          WHERE e.deleted_at IS NULL AND e.status = 'active' AND ft.rowid IS NULL`,
+      )
+      .get().n;
+    const factInactive = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM facts f JOIN fts_facts ft ON ft.rowid = f.rowid
+          WHERE f.deleted_at IS NOT NULL OR f.status <> 'active'`,
+      )
+      .get().n;
+    const episodeInactive = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM episodes e JOIN fts_episodes ft ON ft.rowid = e.rowid
+          WHERE e.deleted_at IS NOT NULL OR e.status <> 'active'`,
+      )
+      .get().n;
+    return {
+      orphans: factOrphans + episodeOrphans,
+      factOrphans,
+      episodeOrphans,
+      missing: factMissing + episodeMissing,
+      factMissing,
+      episodeMissing,
+      inactiveWithFts: factInactive + episodeInactive,
+    };
+  }
 }

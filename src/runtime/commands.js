@@ -157,6 +157,8 @@ export function handleCommand({
   receipt,
   // v0.7.17 H1-A：回填只读状态（未配置该节时 undefined → 省行）。
   backfill,
+  // v0.7.17 M2：FTS 投影自检（只读；undefined/全零时省行）。
+  fts,
   bg,
   // V710-L1（v0.7.11）：取消在跑 task_run；null = 全部。
 } = {}) {
@@ -193,6 +195,7 @@ export function handleCommand({
     handled: true,
     reply: formatStatus(store, scope, metrics, timeZone, budget, {
       backfill,
+      fts,
       threadsSupported,
       mainSession,
       compactionSupported,
@@ -713,6 +716,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // v0.7.17 H1-A：历史回填只读状态（未传 options 时整行省略，保持旧 golden）。
   const backfillLine = formatBackfillLine(options.backfill);
   if (backfillLine !== null) lines.push(backfillLine);
+  // v0.7.17 M2：FTS 投影自检（异常或非零才输出；全零/未接线时整行省略）。
+  const ftsLine = formatFtsLine(options.fts);
+  if (ftsLine !== null) lines.push(ftsLine);
   // G0-9：最近一次压缩/巩固实际耗时（只观测，不设超时）；无样本显示 —。
   // timing 只在接线层传入时输出，保持旧调用方（单测）的 /状态 格式不变。
   if (options.timing !== null && options.timing !== undefined && typeof options.timing === 'object') {
@@ -837,6 +843,33 @@ function formatBackfillLine(backfill) {
     ? `最近压后底 ${Math.trunc(Number(backfill.lastFloor))} tokens`
     : '最近压后底 无记录');
   return bits.join(' · ');
+}
+
+/**
+ * `/状态` 的 FTS 自检行（v0.7.17 M2）。
+ *
+ * 口径（07 §7.8，方案 B：S1 软删保留 FTS 到 S2 purge）：
+ * - `orphans`（FTS 行主表已无）= 异常，可清理；
+ * - `missing`（active 主表行没有 FTS 投影）= 异常，检索会漏召回；
+ * - `inactiveWithFts`（tombstoned/deleted 行仍带 FTS）= **正常**，只作信息展示。
+ * 未接线（undefined）或全零时返回 null —— `/状态` 保持最短，旧 golden 不变。
+ *
+ * @param {{orphans?: number, missing?: number, inactiveWithFts?: number,
+ *          factOrphans?: number, episodeOrphans?: number}|null|undefined} fts
+ * @returns {string|null}
+ */
+function formatFtsLine(fts) {
+  if (fts === null || fts === undefined || typeof fts !== 'object') return null;
+  const count = (value) => (Number.isFinite(Number(value)) ? Math.trunc(Number(value)) : 0);
+  const orphans = count(fts.orphans);
+  const missing = count(fts.missing);
+  const inactive = count(fts.inactiveWithFts);
+  if (orphans === 0 && missing === 0 && inactive === 0) return null;
+  const bits = [];
+  if (orphans > 0) bits.push(`FTS 孤儿 ${orphans}`);
+  if (missing > 0) bits.push(`缺投影 ${missing}`);
+  if (inactive > 0) bits.push(`已遗忘仍留索引 ${inactive}（S2 清理）`);
+  return `FTS 自检：${bits.join(' · ')}`;
 }
 
 /**
