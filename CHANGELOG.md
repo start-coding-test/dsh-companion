@@ -8,7 +8,7 @@
 主会话都会收到一条回执，后台任务也终于有了取消入口；另修掉 `/停止任务` 无参文案、退回的
 `systemd-run` 退出码误判与三处注释缩进。
 
-> v0.7.15 尚未单独部署，其修复随本版一次上线。
+> v0.7.15 已于 2026-11-24 部署到云端（本版即其真机回报的后续修复）；v0.7.16 尚未部署。
 
 ### Fixed
 
@@ -40,13 +40,17 @@
 
 ### Tests
 
-新增 `test/v0716.test.js`（11 例，全部标注「非真机证据」：probe / unitResult / signal / wake /
+新增 `test/v0716.test.js`（12 例，全部标注「非真机证据」：probe / unitResult / signal / wake /
 agent.send / proactive.enqueue 均为替身）：N1 三例（exit 143 且过 deadline → timeout；exit 143 未过
 deadline 且 Result 查不到 → 正常结束；exit 0 → 正常结束）、N2（取消终态 cancelled 与「状态：已取消」
 回执）、N3 三例（唤醒成功 1 条主会话回执且不改状态；失败/预算耗尽只投兜底一条；兜底 task_status
 按终态映射）、N4 四例（`cancelBgJob` 的参数与原子迁移、`systemctl stop` 失败不假装成功、
-`task_cancel` 的 bg 分支与回执、`/停止任务` 文案）。全量 `ℹ tests 1650 / suites 67 / pass 1650 /
-fail 0`，三时区（UTC / Asia/Shanghai / America/New_York）各 exit=0。
+`task_cancel` 的 bg 分支与回执、`/停止任务` 文案）；复核增量 S1 补一例派发级接线判别
+（`/停止任务 <bg id>` 必须触发 `requestCancelBgJob`，删掉该调用即红）。全量
+另修复核 M0 的平台假绿：N4 用例显式钉死 `uid`（0 与 1000 两臂），不再依赖 `currentUid()`
+（Windows 0 / Linux 1000），把 50041 用户级实例的 `--user` stop 形状也钉住。
+`ℹ tests 1651 / suites 67 / pass 1651 / fail 0`，三时区（UTC / Asia/Shanghai /
+America/New_York）各 exit=0。
 
 ## [0.7.15] - 2026-11-23
 

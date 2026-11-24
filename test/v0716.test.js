@@ -8,6 +8,9 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { Store } from '../src/memory/store.js';
 import { createTaskRunner } from '../src/task/run.js';
@@ -15,10 +18,13 @@ import { cancelBgJob, monitorBgJobs, BG_JOB_STATES } from '../src/task/bg-jobs.j
 import { normalizeConfig } from '../src/config.js';
 import { createTools } from '../src/runtime/tools.js';
 import { formatStopTaskReply } from '../src/runtime/commands.js';
+import { FakeCtx } from './fakes/ctx.js';
+import { strictCtx } from './helpers/strict-ctx.js';
 import {
   deliverBgFallback,
   readReceiptDeliveryRecord,
   wakeBgJob,
+  apply as applyCordis,
 } from '../src/index.js';
 
 const NOW_MS = 1_700_000_000_000;
@@ -279,6 +285,9 @@ test('N4 非真机证据：cancelBgJob 按同一模式 systemctl stop，状态�
   const result = await cancelBgJob({
     store,
     jobId: 'bg-c1',
+    // 钉死 uid，与运行平台身份解耦：Linux（uid≠0）会走用户级 systemd，
+    // 若不传参，期望值会随 currentUid() 漂移（Windows 0 / Linux 1000）。
+    uid: 0,
     nowMs: NOW_MS,
     launcher: {
       signal: async (args) => {
@@ -301,6 +310,40 @@ test('N4 非真机证据：cancelBgJob 按同一模式 systemctl stop，状态�
   assert.equal(job.state, BG_JOB_STATES.cancelled);
   const audit = store.listEvents({}).find((event) => event.reason === 'bg_job_cancelled');
   assert.ok(audit, '取消要留审计');
+
+  // 同一用例第二臂：uid 1000（50041 ubuntu 生产实态）必须走用户级实例的 stop 形状。
+  const userStore = Store.open(':memory:');
+  userStore.insertBgJob({
+    id: 'bg-c2',
+    label: '训练2',
+    argv: ['python3', '/opt/work/train.py'],
+    cwd: '/opt/work',
+    child_session_id: 'child-2',
+    pid_or_unit: 'dsh-bg-c2',
+    started_at: NOW_S - 10,
+    deadline: NOW_S + 3600,
+    log_path: '/opt/logs/bg-c2/output.log',
+  });
+  const userCalls = [];
+  const userResult = await cancelBgJob({
+    store: userStore,
+    jobId: 'bg-c2',
+    nowMs: NOW_MS,
+    uid: 1000,
+    launcher: {
+      signal: async (args) => { userCalls.push(args); return true; },
+    },
+  });
+  userStore.close();
+  assert.equal(userResult.ok, true);
+  assert.deepEqual(userCalls[0], {
+    unit: 'dsh-bg-c2',
+    pid: null,
+    kind: 'linux',
+    signal: 'TERM',
+    user: true,
+    uid: 1000,
+  });
   // 监视器只扫 running：cancelled 行不会再被二次投递。
   const wakes = [];
   const summary = await monitorBgJobs({
@@ -414,4 +457,63 @@ test('N4：/停止任务 文案区分 task_run 与后台任务（含 label）', 
   });
   assert.match(bgReply, /后台任务 bg-1/u);
   assert.match(bgReply, /状态：已取消/u);
+});
+
+// ---------------------------------------------------------------- S1（复核增量）
+
+test('S1 非真机证据：/停止任务 <bg id> 走生产接线，回执为「已请求中止后台任务」', async () => {
+  // 判别力：删掉 /停止任务 的 bg 分支或 requestCancelBgJob 调用，回执会退回「没有在跑的任务」而非本断言。
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-v0716-s1-'));
+  const dbPath = join(dir, 'store.db');
+  try {
+    const ctx = new FakeCtx({ now: NOW_MS });
+    ctx.commands = {
+      registrations: [],
+      register(definition) { this.registrations.push(definition); return () => {}; },
+    };
+    ctx.tools = {
+      registrations: [],
+      register(definition) { this.registrations.push(definition); return () => {}; },
+    };
+    applyCordis(strictCtx(ctx), { dbPath });
+    const seed = Store.open(dbPath);
+    seed.insertBgJob({
+      id: 'bg-dispatch-1',
+      label: '训练分发',
+      argv: ['python3', '/opt/work/train.py'],
+      cwd: '/opt/work',
+      child_session_id: 'child-s1',
+      pid_or_unit: 'dsh-bg-dispatch-1',
+      started_at: NOW_S - 10,
+      deadline: NOW_S + 3600,
+      log_path: '/opt/logs/bg-dispatch-1/output.log',
+    });
+    assert.equal(seed.getBgJob('bg-dispatch-1').state, BG_JOB_STATES.running);
+    seed.close();
+
+    const stop = ctx.commands.registrations.find((entry) => entry.name === 'stop-task');
+    assert.ok(stop, 'stop-task 应已注册');
+    const reply = stop.handler({ rawInput: 'bg-dispatch-1' });
+    assert.equal(reply.kind, 'success');
+    assert.match(reply.text, /已请求中止后台任务 bg-dispatch-1/u);
+    assert.match(reply.text, /回执将送达/u);
+    // 生产接线判别：handler 同步返回后 requestCancelBgJob 会异步调 cancelBgJob。
+    // 成功会投回执（dedupeKey task-receipt:<id>），失败（本机/容器没有可停的 unit）会留 warn；
+    // 两者任一出现都证明接线被走到。删掉 requestCancelBgJob 调用即无任何痕迹。
+    let wired = false;
+    for (let i = 0; i < 100 && wired === false; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      wired = ctx.logs.some((entry) => String(entry.message).includes('bg job cancel'));
+    }
+    if (wired === false) {
+      const check = Store.open(dbPath);
+      wired = check.getBgJob('bg-dispatch-1')?.state === BG_JOB_STATES.cancelled;
+      check.close();
+    }
+    assert.equal(wired, true, '命令必须触发 requestCancelBgJob（生产接线）');
+  } finally {
+    // 插件的 Store 句柄仍开在 dbPath 上（测试里不跑宿主 dispose），Windows 删不掉临时目录；
+    // 这里尽力清理即可，清理失败不影响断言。
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* 保留临时目录 */ }
+  }
 });

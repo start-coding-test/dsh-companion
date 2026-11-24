@@ -12,7 +12,7 @@ test('package.json name 为 dsh-companion', () => {
   assert.equal(pkg.name, 'dsh-companion');
 });
 
-test('package.json version 为 0.7.14', () => {
+test('package.json version 为 0.7.16', () => {
   assert.equal(pkg.version, '0.7.16');
 });
 

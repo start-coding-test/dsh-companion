@@ -1409,9 +1409,9 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     ...(bgConfig !== null && typeof bgConfig === 'object' ? { bgConfig } : {}),
     ...(typeof mainSessionId === 'function' ? { mainSessionId } : {}),
     // D21-H4：自检失败时 bg_run 直接返回 {ok:false, reason:'bg-unavailable'}。
-  // H1（v0.7.15）：此前这里引用未声明的 state，bg_run 一调就抛
-  // ReferenceError；改由调用点传入闭包（见 activate 里的 registerTools 调用）。
-  bgAvailability: typeof bgAvailabilityFn === 'function' ? bgAvailabilityFn : undefined,
+    // H1（v0.7.15）：此前这里引用未声明的 state，bg_run 一调就抛
+    // ReferenceError；改由调用点传入闭包（见 activate 里的 registerTools 调用）。
+    bgAvailability: typeof bgAvailabilityFn === 'function' ? bgAvailabilityFn : undefined,
     vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
