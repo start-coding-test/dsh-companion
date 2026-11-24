@@ -35,6 +35,13 @@ const WAKE_META_PREFIX = 'bg_wake:';
 /** W-2：TERM 之后等这么久还活着就 KILL。 */
 export const BG_TERM_GRACE_MS = 10_000;
 
+/**
+ * L1（v0.7.17）：cancelBgJob 发出 TERM 后，进程若还在死透（systemd TimeoutStopSec
+ * 阶段），监视器等这么久仍活着就升级 KILL。与 bg-launcher 的 TERM→10s→KILL 先例同构，
+ * 但这里给更长的宽限：取消是用户意图，宁可多等一轮也不要误判成「仍在跑」。
+ */
+export const BG_CANCEL_GRACE_MS = 30_000;
+
 /** W-3：唤醒消息里附带的日志尾部字节数上限。 */
 export const BG_TAIL_BYTES = 2048;
 
@@ -48,6 +55,9 @@ export const BG_JOB_STATES = Object.freeze({
   timeout: 'timeout',
   lost: 'lost',
   // N4（v0.7.16）：用户主动取消（task_cancel / /停止任务）。
+  // L1（v0.7.17）：取消请求已受理、TERM 已发，等进程真退出（monitor 收敛）。
+  // 窗口期内的行不占并发槽（validateBgRun/countRunningBgJobs 仍只看 running）。
+  cancelling: 'cancelling',
   cancelled: 'cancelled',
 });
 
@@ -557,6 +567,8 @@ export async function monitorBgJobs({
   uid,
   recovering = false,
   graceMs = BG_TERM_GRACE_MS,
+  // L1（v0.7.17）：取消收敛的回执点（生产在 index.js 接 deliverBgReceipt）。
+  deliverCancel = null,
 }) {
   const probe = launcher.probeBgProcess ?? probeBgProcess;
   const signal = launcher.signalBgProcess ?? signalBgProcess;
@@ -567,8 +579,8 @@ export async function monitorBgJobs({
   // D21-H4：探针与信号查询要和拉起时同一模式（--user + DBus 环境）。
   const effectiveUid = Number.isInteger(uid) ? Number(uid) : currentUid();
   const userMode = resolveSystemdMode(effectiveUid) === 'user';
-  const jobs = store.listBgJobs({ state: BG_JOB_STATES.running, limit: 100 });
-  const summary = { checked: jobs.length, woken: 0, timedOut: 0, lost: 0, running: 0 };
+  const jobs = store.listBgJobs({ state: [BG_JOB_STATES.running, BG_JOB_STATES.cancelling], limit: 100 });
+  const summary = { checked: jobs.length, woken: 0, timedOut: 0, lost: 0, cancelled: 0, running: 0 };
   const nowSec = Math.floor(nowMs / 1000);
   // W77-L1（方案甲）：日志按 bg.logMaxMB 保留尾部。包装器可能被 RuntimeMaxSec 的
   // SIGKILL 直接杀掉（trap 不保证执行），所以截断放在监视器里每轮做一次，
@@ -585,6 +597,48 @@ export async function monitorBgJobs({
     try {
       probed = await probe({ unit: job.pid_or_unit, pid, exitPath, kind, ...(kind === 'linux' ? { user: userMode, uid: effectiveUid } : {}) });
     } catch {
+      summary.running += 1;
+      continue;
+    }
+
+    // L1（v0.7.17）：取消中（cancelling）的收敛，全链路唯一回执点。
+    // 取消意图压过超时归类：退出码 143/137/0 一律按「已取消」收敛，不走 exitedTimedOut。
+    if (job.state === BG_JOB_STATES.cancelling) {
+      if (probed.exited === true || probed.running !== true) {
+        const code = Number.isInteger(probed.exitCode) ? probed.exitCode : null;
+        const claimed = store.claimBgJobState(job.id, BG_JOB_STATES.cancelled, {
+          from: BG_JOB_STATES.cancelling,
+          exit_code: code,
+          finished_at: nowSec,
+        });
+        if (!claimed) continue; // 并发的另一轮已收敛，保证只投一条。
+        summary.cancelled += 1;
+        try {
+          store.appendEvent({
+            action: 'USED',
+            actor: 'scheduler',
+            table_name: 'bg_jobs',
+            row_id: job.id,
+            reason: 'bg_job_cancelled',
+            detail_json: { kind: 'bg_job_cancelled', state: BG_JOB_STATES.cancelled, exit_code: code, user_mode: userMode },
+          });
+        } catch {
+          // 审计失败不影响收敛。
+        }
+        if (typeof deliverCancel === 'function') {
+          try {
+            await deliverCancel({ job: store.getBgJob(job.id) ?? job, exitCode: code });
+          } catch {
+            // 投递失败交给 outbox/退避；状态已收敛，不能回滚。
+          }
+        }
+        continue;
+      }
+      // 进程还活着：宽限期内等 systemd 自己收尾，超时升级 KILL（下一轮再收敛）。
+      const cancelledAt = Number.isFinite(Number(job.finished_at)) ? Number(job.finished_at) : nowSec;
+      if (nowSec - cancelledAt >= Math.ceil(BG_CANCEL_GRACE_MS / 1000)) {
+        await signal({ unit: job.pid_or_unit, pid, kind, signal: 'KILL', ...(kind === 'linux' ? { user: userMode, uid: effectiveUid } : {}) });
+      }
       summary.running += 1;
       continue;
     }
@@ -763,6 +817,9 @@ export async function cancelBgJob({ store, jobId, launcher = {}, uid, nowMs } = 
     job = null;
   }
   if (job === null || job === undefined) return { ok: false, reason: 'not-found', job: null };
+  // L1（v0.7.17）：claim 先于 signal——窗口 A/B（TERM 已落地但进程在 claim 前/后退出）
+  // 由 cancelling 状态吸收，最终收敛只发生在 monitor 的 cancelling 分支。
+  if (job.state === BG_JOB_STATES.cancelling) return { ok: false, reason: 'already-cancelling', job };
   if (job.state !== BG_JOB_STATES.running) return { ok: false, reason: 'not-running', job };
   const kind = job.pid_or_unit !== null && String(job.pid_or_unit).startsWith('dsh-bg-') ? 'linux' : 'portable';
   const pid = kind === 'portable' && job.pid_or_unit !== null
@@ -771,6 +828,13 @@ export async function cancelBgJob({ store, jobId, launcher = {}, uid, nowMs } = 
   const effectiveUid = Number.isInteger(uid) ? Number(uid) : currentUid();
   const userMode = resolveSystemdMode(effectiveUid) === 'user';
   const signal = typeof launcher.signal === 'function' ? launcher.signal : signalBgProcess;
+  const seconds = Math.floor((Number.isFinite(nowMs) ? nowMs : Date.now()) / 1000);
+  const claimed = store.claimBgJobState(id, BG_JOB_STATES.cancelling, { finished_at: seconds });
+  if (!claimed) {
+    const current = store.getBgJob(id) ?? job;
+    if (current?.state === BG_JOB_STATES.cancelling) return { ok: false, reason: 'already-cancelling', job: current };
+    return { ok: false, reason: 'not-running', job: current };
+  }
   try {
     await signal({
       unit: job.pid_or_unit,
@@ -780,30 +844,27 @@ export async function cancelBgJob({ store, jobId, launcher = {}, uid, nowMs } = 
       ...(kind === 'linux' ? { user: userMode, uid: effectiveUid } : {}),
     });
   } catch (error) {
-    // stop 失败就不能假装取消成功：任务可能还在跑，交给监视器继续判定。
-    return { ok: false, reason: 'stop-failed', message: String(error?.message ?? error), job };
+    // stop 失败就不能假装取消：回滚 running 让 monitor 继续按普通任务监视。
+    store.claimBgJobState(id, BG_JOB_STATES.running, { from: BG_JOB_STATES.cancelling, finished_at: null });
+    return { ok: false, reason: 'stop-failed', message: String(error?.message ?? error), job: store.getBgJob(id) ?? job };
   }
-  const seconds = Math.floor((Number.isFinite(nowMs) ? nowMs : Date.now()) / 1000);
-  const claimed = store.claimBgJobState(id, BG_JOB_STATES.cancelled, { finished_at: seconds });
-  if (!claimed) return { ok: false, reason: 'not-running', job: store.getBgJob(id) ?? job };
-  const updated = store.getBgJob(id) ?? job;
   try {
     store.appendEvent({
       action: 'USED',
       actor: 'scheduler',
       table_name: 'bg_jobs',
       row_id: id,
-      reason: 'bg_job_cancelled',
+      reason: 'bg_job_cancel_requested',
       detail_json: {
-        kind: 'bg_job_cancelled',
-        state: updated.state,
+        kind: 'bg_job_cancel_requested',
+        state: BG_JOB_STATES.cancelling,
         user_mode: userMode,
       },
     });
   } catch {
-    // 审计失败不影响取消结果。
+    // 审计失败不影响取消受理。
   }
-  return { ok: true, job: updated };
+  return { ok: true, state: BG_JOB_STATES.cancelling, job: store.getBgJob(id) ?? job };
 }
 
 /**

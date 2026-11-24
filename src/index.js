@@ -136,6 +136,7 @@ import { JOB_IDS, createScheduler } from './runtime/scheduler.js';
 import { createTools } from './runtime/tools.js';
 // SA-B1/D6（v0.7.7 阶段 4）：task_run 执行槽上限由 config.subagent.concurrency 驱动。
 import { abortActiveTasks, configureTaskConcurrency, listActiveTasks, stopActiveTask } from './task/run.js';
+import { resolveStopTarget } from './task/stop-target.js';
 import {
   clearCompactionAttempts,
   clearCompactionFailures,
@@ -1132,10 +1133,13 @@ function publishOnThreadUnarchive(platform, store) {
  */
 function listRunningBgEntries(store) {
   try {
-    return store.listBgJobs({ state: BG_JOB_STATES.running, limit: 20 }).map((job) => ({
+    // L1（v0.7.17）：取消中（cancelling）的行也进清单，但打「取消中」标记，
+    // 避免用户以为还能再取消一次（再调会得 already-cancelling）。
+    return store.listBgJobs({ state: [BG_JOB_STATES.running, BG_JOB_STATES.cancelling], limit: 20 }).map((job) => ({
       id: job.id,
       label: typeof job.label === 'string' && job.label !== '' ? job.label : null,
       kind: 'bg',
+      state: job.state,
     }));
   } catch {
     return [];
@@ -1151,9 +1155,16 @@ function listRunningBgEntries(store) {
  * @returns {void}
  */
 function requestCancelBgJob(state, taskId) {
+  // L1（v0.7.17）：这里只「受理」取消（claim cancelling + TERM + 审计）。
+  // 回执由 monitor 的 cancelling 分支在进程真退出后发一次——回执点与状态收敛点合一，
+  // 避免窗口 A/B 里的双回执/错回执。命令 handler 必须同步返回，故 fire-and-forget。
   void cancelBgJob({ store: state.store, jobId: taskId, nowMs: state.platform.now() })
     .then((result) => {
       if (result.ok !== true) {
+        if (result.reason === 'already-cancelling') {
+          state.platform.log('info', '[dsh-companion] bg job already cancelling', { taskId });
+          return;
+        }
         state.platform.log('warn', '[dsh-companion] bg job cancel failed', {
           taskId,
           reason: result.reason ?? null,
@@ -1161,16 +1172,7 @@ function requestCancelBgJob(state, taskId) {
         });
         return;
       }
-      const job = result.job ?? {};
-      // L3（v0.7.17）：取消回执统一由 buildCancelMessage 生成（与 task_cancel 同文案）；
-      // `[任务] ` 前缀只由 deliverTaskReceipt 在最终投递层加一次。
-      deliverBgReceipt(
-        state,
-        job,
-        buildCancelMessage(job),
-        'cancelled',
-        { cancelled: true },
-      );
+      state.platform.log('info', '[dsh-companion] bg job cancel requested', { taskId });
     })
     .catch((error) => {
       state.platform.log('warn', '[dsh-companion] bg job cancel crashed', {
@@ -1233,38 +1235,51 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
                 text: formatStopTaskReply({ usage: true, active: listActiveTasks().concat(listRunningBgEntries(store)) }),
               };
             }
-            if (stopActiveTask(target)) {
+            // L4（v0.7.17）：解析统一走 resolveStopTarget——task_run → bg 直查（优先）→
+            // 已结束 task 的审计 sessionId 反查 bg；唯一才取消，多个只列候选。
+            const resolved = resolveStopTarget({ store, target, stopTask: stopActiveTask });
+            if (resolved.ok === true && resolved.kind === 'task') {
               return {
                 kind: 'success',
                 text: formatStopTaskReply({
-                  taskId: target,
-                  result: { ok: true, cancelled: 1, taskId: target },
+                  taskId: resolved.taskId,
+                  result: { ok: true, cancelled: 1, taskId: resolved.taskId },
                 }),
               };
             }
-            let bgJob = null;
-            try {
-              bgJob = store.getBgJob(target);
-            } catch {
-              bgJob = null;
-            }
-            if (bgJob !== null && bgJob.state === BG_JOB_STATES.running) {
-              // 命令 handler 必须同步返回文案：取消要等 systemctl，结果经主会话回执告知。
-              requestCancelBgJob(state, target);
+            if (resolved.ok === true && resolved.kind === 'bg') {
+              if (resolved.job.state === BG_JOB_STATES.cancelling) {
+                return {
+                  kind: 'success',
+                  text: formatStopTaskReply({
+                    taskId: resolved.job.id,
+                    kind: 'bg',
+                    result: { ok: false, cancelled: 0, taskId: resolved.job.id, reason: 'already-cancelling' },
+                  }),
+                };
+              }
+              // 命令 handler 必须同步返回文案：取消要等 systemctl 与进程退出，回执由 monitor 发。
+              requestCancelBgJob(state, resolved.job.id);
               return {
                 kind: 'success',
                 text: formatStopTaskReply({
-                  taskId: target,
+                  taskId: resolved.job.id,
                   kind: 'bg',
-                  result: { ok: true, cancelled: 1, taskId: target },
+                  result: { ok: true, cancelled: 1, taskId: resolved.job.id },
                 }),
+              };
+            }
+            if (resolved.reason === 'ambiguous') {
+              return {
+                kind: 'success',
+                text: formatStopTaskReply({ taskId: resolved.taskId, candidates: resolved.candidates }),
               };
             }
             return {
               kind: 'success',
               text: formatStopTaskReply({
-                taskId: target,
-                result: { ok: false, cancelled: 0, taskId: target, reason: 'not-found' },
+                taskId: resolved.taskId ?? target,
+                result: { ok: false, cancelled: 0, taskId: resolved.taskId ?? target, reason: 'not-found' },
               }),
             };
           }
@@ -5874,9 +5889,22 @@ async function runBgJobMonitor(state, options = {}) {
     wake: (info) => wakeBgJob(state, info),
     recovering: options.recovering === true,
     nowMs: state.platform.now(),
+    // L1（v0.7.17）：与 v0.7.16 手动取消同一条通道（deliverBgReceipt → deliverTaskReceipt），
+    // 因此重复取消/重启收敛都只有一条回执（dedupeKey `task-receipt:<jobId>`）。
+    deliverCancel: ({ job }) => deliverBgReceipt(
+      state,
+      job,
+      buildCancelMessage(job),
+      'cancelled',
+      { cancelled: true },
+    ),
   });
   if (summary.woken + summary.timedOut + summary.lost > 0) {
     state.platform.log('info', '[dsh-companion] bg jobs settled', summary);
+  }
+  // L1（v0.7.17）：cancelling 行的收敛回执（monitor 是唯一回执点，cancelBgJob 不发回执）。
+  if (summary.cancelled > 0) {
+    state.platform.log('info', '[dsh-companion] bg jobs cancelled', { cancelled: summary.cancelled });
   }
   return summary;
 }

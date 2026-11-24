@@ -22,10 +22,12 @@ import {
   readBackfillState,
 } from '../src/session/backfill.js';
 import { TEST_NOW, makeTempStore } from './e2e/helpers.js';
-import { readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { Store } from '../src/memory/store.js';
-import { BG_JOB_STATES, buildCancelMessage, monitorBgJobs } from '../src/task/bg-jobs.js';
+import { BG_JOB_STATES, buildCancelMessage, cancelBgJob, monitorBgJobs } from '../src/task/bg-jobs.js';
+import { resolveStopTarget } from '../src/task/stop-target.js';
 import { createTools } from '../src/runtime/tools.js';
 import { wakeBgJob } from '../src/index.js';
 
@@ -663,10 +665,30 @@ test('L3 非真机证据：取消回执只有一个生成器（两站点逐字�
   const cancel = tools.find((tool) => tool.name === 'task_cancel');
   const result = await cancel.execute({ taskId: 'bg-t1' });
   assert.equal(result.ok, true);
-  assert.equal(receipts.length, 1);
-  assert.equal(receipts[0].receipt, canonical, 'task_cancel 站点与生成器逐字一致');
+  // L1（v0.7.17）：task_cancel 只受理（claim cancelling + TERM），不再自己发回执；
+  // 取消回执的唯一消费站点是 monitor 的 deliverCancel，正文必须逐字来自生成器。
+  assert.equal(receipts.length, 0, '工具层不再直发取消回执');
+  assert.equal(result.state, 'cancelling');
+  const delivered = [];
+  const summary = await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    deliverCancel: async ({ job: settled }) => { delivered.push(buildCancelMessage(settled)); return { delivered: true }; },
+    nowMs: TEST_NOW * 1000,
+    launcher: {
+      probeBgProcess: async () => ({ running: false, exited: true, exitCode: 143 }),
+      signalBgProcess: async () => true,
+      unitResult: async () => null,
+      readExitCode: () => 143,
+      tailLog: () => '',
+      capLogFile: () => false,
+    },
+  });
+  assert.equal(summary.cancelled, 1);
+  assert.deepEqual(delivered, [canonical], 'monitor 站点回执与生成器逐字一致');
   const indexSource = readFileSync('src/index.js', 'utf8');
-  assert.match(indexSource, /buildCancelMessage\(job\),/u, '/停止任务 站点也走生成器');
+  assert.match(indexSource, /buildCancelMessage\(job\),/u, '/停止任务 的收敛回执也走生成器（deliverCancel 接线）');
   const hits = [];
   const walk = (dir) => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -678,4 +700,291 @@ test('L3 非真机证据：取消回执只有一个生成器（两站点逐字�
   walk('src');
   assert.deepEqual(hits.map((hit) => hit.replaceAll('\\', '/')).sort(), ['src/task/bg-jobs.js'], '字面量只允许出现在生成器里');
   store.close();
+});
+
+
+// ---------------------------------------------------------------- L1（v0.7.17 第 3 步）
+
+const NOW_S = Math.floor(TEST_NOW / 1000);
+
+/** 造一条 running 的 bg 行（其余列用测试默认值）。 */
+function seedBgJob(store, id, extra = {}) {
+  store.insertBgJob({
+    id,
+    label: extra.label ?? '训练',
+    argv: ['python3', '/opt/work/train.py'],
+    cwd: '/opt/work',
+    child_session_id: extra.child_session_id ?? 'child-1',
+    pid_or_unit: extra.pid_or_unit ?? `dsh-bg-${id}`,
+    started_at: NOW_S - 10,
+    deadline: NOW_S + 3600,
+    log_path: `/opt/logs/${id}/output.log`,
+  });
+}
+
+/** monitor 用的替身 launcher：probe 结果由入参决定，其余不关心。 */
+function fakeLauncher(probeResult, signals = []) {
+  return {
+    probeBgProcess: async () => probeResult,
+    signalBgProcess: async (args) => { signals.push(args); return true; },
+    unitResult: async () => null,
+    readExitCode: () => (Number.isInteger(probeResult.exitCode) ? probeResult.exitCode : null),
+    tailLog: () => '',
+    capLogFile: () => false,
+  };
+}
+
+test('L1 非真机证据：cancelling 收敛压过超时归类（exit 0 也按已取消，且零 wake）', async () => {
+  const store = Store.open(':memory:');
+  seedBgJob(store, 'bg-l1a');
+  const cancel = await cancelBgJob({
+    store, jobId: 'bg-l1a', uid: 0, nowMs: TEST_NOW,
+    launcher: { signal: async () => true },
+  });
+  assert.equal(cancel.ok, true);
+  assert.equal(cancel.state, 'cancelling');
+  const signatures = [];
+  const summary = await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => { throw new Error('取消不应走 wake 通道'); },
+    deliverCancel: async ({ job, exitCode }) => { signatures.push({ id: job.id, exitCode }); return { delivered: true }; },
+    nowMs: TEST_NOW,
+    launcher: fakeLauncher({ running: false, exited: true, exitCode: 0 }),
+  });
+  assert.equal(summary.checked, 1);
+  assert.equal(summary.cancelled, 1);
+  assert.equal(summary.woken, 0);
+  assert.equal(summary.timedOut, 0);
+  assert.deepEqual(signatures, [{ id: 'bg-l1a', exitCode: 0 }]);
+  assert.equal(store.getBgJob('bg-l1a').state, BG_JOB_STATES.cancelled);
+  store.close();
+});
+
+test('L1 非真机证据：TERM 抛错 → 回滚 running、零回执，monitor 之后按普通 running 处理', async () => {
+  const store = Store.open(':memory:');
+  seedBgJob(store, 'bg-l1b');
+  const failed = await cancelBgJob({
+    store, jobId: 'bg-l1b', uid: 0, nowMs: TEST_NOW,
+    launcher: { signal: async () => { throw new Error('Failed to connect to bus'); } },
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.reason, 'stop-failed');
+  assert.equal(store.getBgJob('bg-l1b').state, BG_JOB_STATES.running, '回滚 running');
+  assert.equal(store.getBgJob('bg-l1b').finished_at, null, '回滚要清掉抢占时间戳');
+  const delivered = [];
+  const summary = await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    deliverCancel: async (info) => { delivered.push(info); return { delivered: true }; },
+    nowMs: TEST_NOW,
+    launcher: fakeLauncher({ running: true, exited: false, exitCode: null }),
+  });
+  assert.equal(summary.running, 1);
+  assert.equal(delivered.length, 0, '回滚后不应有任何取消回执');
+  assert.equal(store.getBgJob('bg-l1b').state, BG_JOB_STATES.running);
+  store.close();
+});
+
+test('L1 非真机证据：cancelling 不占并发槽（busy 检查仍只看 running）', () => {
+  const store = Store.open(':memory:');
+  seedBgJob(store, 'bg-l1c');
+  store.updateBgJob('bg-l1c', { state: BG_JOB_STATES.cancelling, finished_at: NOW_S - 5 });
+  assert.equal(store.getBgJob('bg-l1c').state, 'cancelling');
+  assert.equal(store.countRunningBgJobs(), 0, '取消中不计入并发');
+  assert.deepEqual(store.listBgJobs({ state: BG_JOB_STATES.running }), [], 'running 清单里没有它');
+  assert.equal(store.listBgJobs({ state: BG_JOB_STATES.cancelling }).length, 1);
+  store.close();
+});
+
+test('L1 非真机证据：重复取消第二次 already-cancelling，全程仍只有一条回执', async () => {
+  const store = Store.open(':memory:');
+  seedBgJob(store, 'bg-l1d');
+  const first = await cancelBgJob({ store, jobId: 'bg-l1d', uid: 0, nowMs: TEST_NOW, launcher: { signal: async () => true } });
+  assert.equal(first.ok, true);
+  const second = await cancelBgJob({ store, jobId: 'bg-l1d', uid: 0, nowMs: TEST_NOW, launcher: { signal: async () => true } });
+  assert.equal(second.ok, false);
+  assert.equal(second.reason, 'already-cancelling');
+  const delivered = [];
+  await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    deliverCancel: async (info) => { delivered.push(info); return { delivered: true }; },
+    nowMs: TEST_NOW,
+    launcher: fakeLauncher({ running: false, exited: true, exitCode: 143 }),
+  });
+  assert.equal(delivered.length, 1, '只投一条');
+  store.close();
+});
+
+test('L1 非真机证据：宽限期超期升级 KILL，下一轮才收敛', async () => {
+  const store = Store.open(':memory:');
+  seedBgJob(store, 'bg-l1e');
+  await cancelBgJob({ store, jobId: 'bg-l1e', uid: 0, nowMs: TEST_NOW, launcher: { signal: async () => true } });
+  const requests = store.getBgJob('bg-l1e').finished_at;
+  const signals = [];
+  const delivered = [];
+  const stillAlive = await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    deliverCancel: async (info) => { delivered.push(info); return { delivered: true }; },
+    nowMs: (requests + 31) * 1000,
+    launcher: fakeLauncher({ running: true, exited: false, exitCode: null }, signals),
+  });
+  assert.equal(stillAlive.running, 1);
+  assert.equal(signals.length, 1, '超宽限必须升级一次 KILL');
+  assert.equal(signals[0].signal, 'KILL');
+  assert.equal(delivered.length, 0, '进程还活着时不发回执');
+  assert.equal(store.getBgJob('bg-l1e').state, BG_JOB_STATES.cancelling);
+  const settled = await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    deliverCancel: async (info) => { delivered.push(info); return { delivered: true }; },
+    nowMs: (requests + 60) * 1000,
+    launcher: fakeLauncher({ running: false, exited: true, exitCode: 137 }),
+  });
+  assert.equal(settled.cancelled, 1);
+  assert.equal(delivered.length, 1);
+  store.close();
+});
+
+test('L1 非真机证据：重启后 cancelling 行由同一 monitor 收敛（状态在库）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-v0717-l1-'));
+  const dbPath = join(dir, 'store.db');
+  const first = Store.open(dbPath);
+  seedBgJob(first, 'bg-l1f');
+  await cancelBgJob({ store: first, jobId: 'bg-l1f', uid: 0, nowMs: TEST_NOW, launcher: { signal: async () => true } });
+  first.close();
+  const reopened = Store.open(dbPath);
+  assert.equal(reopened.getBgJob('bg-l1f').state, BG_JOB_STATES.cancelling);
+  const delivered = [];
+  const summary = await monitorBgJobs({
+    store: reopened,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    deliverCancel: async (info) => { delivered.push(info); return { delivered: true }; },
+    nowMs: TEST_NOW,
+    launcher: fakeLauncher({ running: false, exited: true, exitCode: 143 }),
+    recovering: true,
+  });
+  assert.equal(summary.cancelled, 1);
+  assert.equal(delivered.length, 1);
+  assert.equal(reopened.getBgJob('bg-l1f').state, BG_JOB_STATES.cancelled);
+  reopened.close();
+  try { rmSync(dir, { recursive: true, force: true }); } catch { /* Windows 可能占用 */ }
+});
+
+// ---------------------------------------------------------------- L4（v0.7.17 第 3 步）
+
+function seedTaskAudit(store, taskId, sessionId) {
+  store.appendEvent({
+    at: NOW_S - 5,
+    action: 'USED',
+    actor: 'scheduler',
+    table_name: 'threads',
+    row_id: taskId,
+    reason: 'task_run:done',
+    detail_json: { kind: 'task_run', taskId, status: 'done', sessionId },
+  });
+}
+
+test('L4 非真机证据：已结束 task id → 审计 sessionId 反查唯一 running bg', async () => {
+  const store = Store.open(':memory:');
+  seedTaskAudit(store, 'task-l4a', 'child-l4a');
+  seedBgJob(store, 'bg-l4a', { child_session_id: 'child-l4a', label: '训练' });
+  const resolved = resolveStopTarget({ store, target: 'task-l4a', stopTask: () => false });
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.kind, 'bg');
+  assert.equal(resolved.job.id, 'bg-l4a');
+  assert.equal(resolved.viaSession, true);
+  // 工具层同一解析：task_cancel 用已结束 task id 也能落到这条 bg 上。
+  const tools = createTools({
+    store,
+    retrieve: () => [],
+    platform: { capabilities: {}, now: () => TEST_NOW * 1000, log() {} },
+    clock: () => TEST_NOW * 1000,
+    timeZone: 'UTC',
+    bgConfig: () => normalizeConfig({}),
+    bgLauncher: { signal: async () => true },
+  });
+  const cancelTool = tools.find((tool) => tool.name === 'task_cancel');
+  const toolResult = await cancelTool.execute({ taskId: 'task-l4a' });
+  assert.equal(toolResult.ok, true);
+  assert.equal(toolResult.kind, 'bg');
+  assert.equal(store.getBgJob('bg-l4a').state, BG_JOB_STATES.cancelling);
+  store.close();
+});
+
+test('L4 非真机证据：同 session 多个 running bg → 只列候选不取消', () => {
+  const store = Store.open(':memory:');
+  seedTaskAudit(store, 'task-l4b', 'child-l4b');
+  seedBgJob(store, 'bg-l4b1', { child_session_id: 'child-l4b', label: '训练 A' });
+  seedBgJob(store, 'bg-l4b2', { child_session_id: 'child-l4b', label: '训练 B' });
+  const resolved = resolveStopTarget({ store, target: 'task-l4b', stopTask: () => false });
+  assert.equal(resolved.ok, false);
+  assert.equal(resolved.reason, 'ambiguous');
+  assert.equal(resolved.candidates.length, 2);
+  assert.match(resolved.candidates[0].command, /train\.py/u);
+  store.close();
+});
+
+test('L4 非真机证据：审计无 sessionId / bg 已 woken → 都 not-found，不猜', () => {
+  const store = Store.open(':memory:');
+  seedTaskAudit(store, 'task-l4c', null);
+  const noSession = resolveStopTarget({ store, target: 'task-l4c', stopTask: () => false });
+  assert.equal(noSession.ok, false);
+  assert.equal(noSession.reason, 'not-found');
+  seedTaskAudit(store, 'task-l4d', 'child-l4d');
+  seedBgJob(store, 'bg-l4d', { child_session_id: 'child-l4d' });
+  store.updateBgJob('bg-l4d', { state: BG_JOB_STATES.woken });
+  const woken = resolveStopTarget({ store, target: 'task-l4d', stopTask: () => false });
+  assert.equal(woken.ok, false);
+  assert.equal(woken.reason, 'not-found', '已唤醒的行不是可取消目标');
+  store.close();
+});
+
+test('L4 非真机证据：bg 直查优先于审计回跳', () => {
+  const store = Store.open(':memory:');
+  // 一个 id 同时是 running bg id，也被别的 task 审计引用到另一个 bg：
+  seedBgJob(store, 'bg-l4e', { child_session_id: 'child-direct', label: '直查命中' });
+  seedBgJob(store, 'bg-l4e-other', { child_session_id: 'child-l4e' });
+  seedTaskAudit(store, 'bg-l4e', 'child-l4e');
+  const resolved = resolveStopTarget({ store, target: 'bg-l4e', stopTask: () => false });
+  assert.equal(resolved.ok, true);
+  assert.equal(resolved.job.id, 'bg-l4e');
+  assert.equal(resolved.viaSession, undefined, '直查命中优先，不走审计回跳');
+  store.close();
+});
+
+test('L4 非真机证据：/停止任务 <已结束 task id> 走生产接线，解析到 bg 并受理取消', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-v0717-l4-'));
+  const dbPath = join(dir, 'store.db');
+  try {
+    const seed = Store.open(dbPath);
+    seedTaskAudit(seed, 'task-l4f', 'child-l4f');
+    seedBgJob(seed, 'bg-l4f', { child_session_id: 'child-l4f', label: '训练' });
+    seed.close();
+    const ctx = new FakeCtx({ now: TEST_NOW });
+    ctx.commands = { registrations: [], register(definition) { this.registrations.push(definition); return () => {}; } };
+    ctx.tools = { registrations: [], register(definition) { this.registrations.push(definition); return () => {}; } };
+    applyCordis(strictCtx(ctx), { dbPath });
+    const stop = ctx.commands.registrations.find((entry) => entry.name === 'stop-task');
+    const reply = stop.handler({ rawInput: 'task-l4f' });
+    assert.equal(reply.kind, 'success');
+    assert.match(reply.text, /已请求中止后台任务 bg-l4f/u, 'reply 指向审计反查到的 bg');
+    let state = null;
+    for (let i = 0; i < 100 && state !== BG_JOB_STATES.cancelling; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const check = Store.open(dbPath);
+      state = check.getBgJob('bg-l4f')?.state ?? null;
+      check.close();
+    }
+    assert.equal(state, BG_JOB_STATES.cancelling, '生产接线要真的 claim cancelling');
+  } finally {
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* 保留临时目录 */ }
+  }
 });

@@ -2103,7 +2103,7 @@ export class Store {
 
   /**
    * W-2/W-4：按状态列任务。`state` 可传单值或数组。
-   * @param {{state?: string|string[], limit?: number}} [options]
+   * @param {{state?: string|string[], sessionId?: string, limit?: number}} [options]
    * @returns {object[]}
    */
   listBgJobs(options = {}) {
@@ -2114,6 +2114,12 @@ export class Store {
       if (states.length === 0) return [];
       where.push(`state IN (${states.map(() => '?').join(',')})`);
       for (const state of states) args.push(state);
+    }
+    // L4（v0.7.17）：按子代理会话反查——task_run 审计 detail_json.sessionId 到这里，
+    // 用来把「已结束的 task id」映射到它派出的 running 后台任务。
+    if (options.sessionId !== undefined) {
+      where.push('child_session_id = ?');
+      args.push(requireString(options.sessionId, 'bg_jobs.child_session_id'));
     }
     const limit = Number.isInteger(options.limit) && options.limit > 0
       ? Math.min(options.limit, 500)
@@ -2180,17 +2186,26 @@ export class Store {
   claimBgJobState(id, next, extra = {}) {
     const key = requireString(id, 'bg_jobs.id');
     const target = requireString(next, 'bg_jobs.state');
-    const finishedAt = Number.isInteger(extra.finished_at) ? extra.finished_at : nowSeconds();
+    // L1（v0.7.17）：`from` 默认 'running'——既有调用（woken/timeout/lost/cancelled）
+    // 全部走默认值，行为与 v0.7.16 一致；取消状态机用 from:'cancelling' 做
+    // 收敛（→cancelled）与回滚（→running），详见 bg-jobs.js 的 cancelBgJob/monitorBgJobs。
+    const from = requireString(extra.from ?? 'running', 'bg_jobs.from');
+    // finished_at 显式传 null 时写 NULL（cancelling→running 回滚要清掉抢占时间戳），
+    // 未传则沿用「现在」的旧语义。
+    const finishedAt = Object.hasOwn(extra, 'finished_at')
+      ? (Number.isInteger(extra.finished_at) ? extra.finished_at : null)
+      : nowSeconds();
     const info = this.#db
       .prepare(
         `UPDATE bg_jobs SET state = ?, exit_code = ?, finished_at = ?
-         WHERE id = ? AND state = 'running'`,
+         WHERE id = ? AND state = ?`,
       )
       .run(
         target,
         Number.isInteger(extra.exit_code) ? extra.exit_code : null,
         finishedAt,
         key,
+        from,
       );
     return Number(info.changes) === 1;
   }
@@ -4177,6 +4192,25 @@ export class Store {
           ORDER BY id DESC LIMIT ?`,
       )
       .all(...args, limit);
+  }
+
+  /**
+   * L4（v0.7.17）：按 table+row 取最新一条事件（task_run 审计 → detail_json.sessionId）。
+   * detail_json 保持 DB 原样（字符串），由调用方按需 JSON.parse。
+   * @param {string} table
+   * @param {string} rowId
+   * @returns {object|null}
+   */
+  latestEventForRow(table, rowId) {
+    const name = requireString(table, 'memory_events.table_name');
+    const key = requireString(rowId, 'memory_events.row_id');
+    const row = this.#db
+      .prepare(
+        `SELECT * FROM memory_events WHERE table_name = ? AND row_id = ?
+          ORDER BY id DESC LIMIT 1`,
+      )
+      .get(name, key);
+    return row === undefined ? null : row;
   }
 
   // -------------------------------------------------------------- search

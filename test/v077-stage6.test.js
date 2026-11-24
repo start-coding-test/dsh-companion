@@ -403,7 +403,7 @@ test('W-2/W-3：已退出 → 原子迁移 woken 并投递一次；再跑一轮�
     launcher,
     nowMs: NOW_MS,
   });
-  assert.deepEqual(first, { checked: 1, woken: 1, timedOut: 0, lost: 0, running: 0 });
+  assert.deepEqual(first, { checked: 1, woken: 1, timedOut: 0, lost: 0, cancelled: 0, running: 0 });
   assert.equal(wakes.length, 1);
   assert.equal(wakes[0].exitCode, 0);
   assert.match(wakes[0].message, /退出码：0/u);

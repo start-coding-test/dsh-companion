@@ -45,6 +45,21 @@
 - **H1-A 文档勘误**：README 历史回填段「水位后可回填 tokens」更正为「水位后不可回填 tokens」，
   与代码、测试、CHANGELOG 口径一致。
 
+### Fixed（v0.7.17 L1/L4）
+
+- **L1 取消改成 `cancelling` 状态机**：`cancelBgJob` 先原子 claim `cancelling`（重复取消返回
+  `already-cancelling`），再发 TERM，并只把「已受理」返回给调用方；进程真的退出后由 monitor 的
+  `cancelling` 分支 claim `cancelled` 并投递**唯一**一条「已取消」回执（退出码 143/137/0 一律按
+  取消，不走超时归类）。仍在运行的取消中任务超过 `BG_CANCEL_GRACE_MS`（30s）升级 KILL，下轮
+  收敛；TERM 抛错则回滚 `running`，不产生任何回执。取消中不占 `bgConcurrency` 槽，`/状态` 与
+  `/停止任务` 清单把它标成「取消中」；重启后残留的 `cancelling` 行由首轮 monitor 收敛。
+- **L4 已结束的 task id 也能停它派出的后台任务**：新增 `resolveStopTarget`
+  （`src/task/stop-target.js`），`/停止任务 <id>` 与 `task_cancel` 共用同一解析——先查在跑
+  task_run，再直查 bg id，最后用 task_run 审计里的 `sessionId` 反查 `child_session_id` 的
+  running/cancelling 后台任务；唯一命中才受理，多个只列候选，零个 `not-found`，绝不猜。
+  `store.listBgJobs` 新增 `sessionId` 过滤，`store.latestEventForRow` 提供按行取最近事件；
+  schema 仍 16，无新表/新列。
+
 ## [0.7.16] - 2026-11-24
 
 后台任务终态与取消链修正版：超时不再被记成「已结束」、取消不再显示成失败、每个后台任务结束时

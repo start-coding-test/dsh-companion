@@ -256,8 +256,9 @@ export function summarizeCost(store, now, timeZone = DEFAULT_TIMEZONE) {
  *
  * 三种调用形态：无参给用法 + 在跑清单（task_run 与后台任务并列）；带 taskId 给
  * 「已请求停止」；取消失败给原因。`active` 允许字符串或 `{id, label, kind}`。
- * @param {{usage?: boolean, active?: Array<string|{id: string, label?: string|null, kind?: string}>,
+ * @param {{usage?: boolean, active?: Array<string|{id: string, label?: string|null, kind?: string, state?: string}>,
  *   taskId?: string|null, kind?: string,
+ *   candidates?: Array<{id: string, label?: string|null, command?: string|null}>,
  *   result?: {ok: boolean, cancelled: number, taskId: string|null, reason?: string}}} input
  * @returns {string}
  */
@@ -272,6 +273,20 @@ export function formatStopTaskReply(input = {}) {
       ? '当前没有在跑的任务。'
       : `在跑的任务：${active.join('、')}`);
     return lines.join('\n');
+  }
+  // L4（v0.7.17）：一个 task 派出多个后台任务时只列候选，不替用户猜。
+  if (Array.isArray(input.candidates) && input.candidates.length > 0) {
+    const target = typeof input.taskId === 'string' && input.taskId !== '' ? input.taskId : '该任务';
+    const items = input.candidates.map((candidate) => {
+      const id = typeof candidate?.id === 'string' ? candidate.id : '';
+      const label = typeof candidate?.label === 'string' && candidate.label !== '' ? `（${candidate.label}）` : '';
+      const command = typeof candidate?.command === 'string' && candidate.command !== '' ? `：${candidate.command}` : '';
+      return `- ${id}${label}${command}`;
+    });
+    return [
+      `停止任务：${target} 派出了 ${input.candidates.length} 个在跑的后台任务，请用具体 id 再取消：`,
+      ...items,
+    ].join('\n');
   }
   const info = input.result !== null && typeof input.result === 'object'
     ? input.result
@@ -290,6 +305,9 @@ export function formatStopTaskReply(input = {}) {
   if (info.reason === 'not-found') {
     return `停止任务：没有在跑的任务：${target ?? ''}（可能已结束，可用 /status 查看）`;
   }
+  if (info.reason === 'already-cancelling') {
+    return `停止任务：${target ?? '该任务'} 已在取消中（进程退出后会收到「已取消」回执）`;
+  }
   return `停止任务：取消失败（${info.reason ?? 'unknown'}）`;
 }
 
@@ -305,7 +323,9 @@ function formatStopTaskEntry(entry) {
   if (id === '') return '';
   const label = typeof entry.label === 'string' && entry.label !== '' ? entry.label : null;
   if (entry.kind === 'bg') {
-    return label === null ? `${id}（后台任务）` : `${id}（${label}，后台任务）`;
+    const base = label === null ? `${id}（后台任务）` : `${id}（${label}，后台任务）`;
+    // L1（v0.7.17）：cancelling 的行仍在清单里，但要标明已受理取消。
+    return entry.state === 'cancelling' ? `${base}（取消中）` : base;
   }
   return id;
 }

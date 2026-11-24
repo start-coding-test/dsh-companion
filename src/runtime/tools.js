@@ -21,6 +21,7 @@ import {
   stopTaskById,
   tryAcquireExecSlot,
 } from '../task/run.js';
+import { resolveStopTarget } from '../task/stop-target.js';
 // D21-M2（v0.7.10）：宿主 sendToSubagent/prompt 的第 4 参必须是真的 AbortSignal，
 // 传 `{}` 时宿主会调 `signal.throwIfAborted()` 直接抛错。
 import { deliverySignal } from '../platform/adapter.js';
@@ -41,7 +42,7 @@ import {
 import { progressFromReceipt } from '../task/receipt.js';
 // W-1..W-5（v0.7.7 阶段 6）：后台长任务。
 // H2（v0.7.15）：bg_run 不再发「启动告知」，故 buildStartNotice 不再引入。
-import { buildCancelMessage, cancelBgJob, startBgJob } from '../task/bg-jobs.js';
+import { BG_JOB_STATES, cancelBgJob, startBgJob } from '../task/bg-jobs.js';
 import { sessionIdOfAgent } from '../session/identity.js';
 
 const FACT_KINDS = new Set(STORE_FACT_KINDS);
@@ -1167,19 +1168,53 @@ export function createTools({
       async execute(args = {}) {
         assertArgs(args, 'task_cancel');
         const taskId = requireString(args.taskId, 'task_cancel', 'taskId');
-        if (stopTaskById(taskId) === true) {
+        // L4（v0.7.17）：与 /停止任务 共用解析（task_run → bg 直查 → 审计 sessionId 反查）。
+        const resolved = resolveStopTarget({ store, target: taskId, stopTask: stopTaskById });
+        if (resolved.ok !== true) {
+          if (resolved.reason === 'ambiguous') {
+            return {
+              ok: false,
+              reason: 'ambiguous',
+              taskId,
+              candidates: resolved.candidates,
+              message: '这个任务派出了多个在跑的后台任务，请用具体 id 再取消',
+            };
+          }
+          return {
+            ok: false,
+            reason: 'not-found',
+            taskId,
+            message: '没有在跑的任务使用这个 taskId（可能已结束或 id 写错）',
+          };
+        }
+        if (resolved.kind === 'task') {
           return { ok: true, taskId, cancelled: true, kind: 'task', note: '已请求中止，回执稍后送达。' };
         }
-        // N4（v0.7.16）：task_run 里没有这个 id，再看是不是 running 的 bg 任务。
-        // 取消走 cancelBgJob（内部 signalBgProcess：与拉起同一模式与同一环境），
-        // 状态原子迁到 cancelled 后由 bg 监视器之外的这条路径投一条主会话回执。
+        if (resolved.job.state === BG_JOB_STATES.cancelling) {
+          return {
+            ok: false,
+            reason: 'already-cancelling',
+            taskId,
+            message: '已在取消中：进程退出后会收到「已取消」回执',
+          };
+        }
+        // L1（v0.7.17）：这里只受理取消（claim cancelling + TERM）；「已取消」回执由
+        // monitor 在进程真退出后发一次，避免回执点与状态收敛点分离。
         const bgResult = await cancelBgJob({
           store,
-          jobId: taskId,
+          jobId: resolved.job.id,
           launcher: bgLauncher !== null && typeof bgLauncher === 'object' ? bgLauncher : {},
           nowMs: nowMs(),
         });
         if (bgResult.ok !== true) {
+          if (bgResult.reason === 'already-cancelling') {
+            return {
+              ok: false,
+              reason: 'already-cancelling',
+              taskId,
+              message: '已在取消中：进程退出后会收到「已取消」回执',
+            };
+          }
           if (bgResult.reason === 'stop-failed') {
             return {
               ok: false,
@@ -1190,28 +1225,19 @@ export function createTools({
           }
           return {
             ok: false,
-            reason: bgResult.reason === 'not-running' ? 'not-found' : (bgResult.reason ?? 'not-found'),
+            reason: 'not-found',
             taskId,
             message: '没有在跑的任务使用这个 taskId（可能已结束或 id 写错）',
           };
         }
-        const job = bgResult.job ?? {};
-        if (typeof taskReceipt === 'function') {
-          try {
-            await taskReceipt({
-              taskId,
-              status: 'cancelled',
-            // L3（v0.7.17）：与 /停止任务 共用同一个生成器，正文逐字一致。
-            receipt: buildCancelMessage(job),
-              title: typeof job.label === 'string' ? job.label : null,
-              sessionId: typeof job.child_session_id === 'string' ? job.child_session_id : null,
-              reason: 'cancelled',
-            });
-          } catch {
-            // 回执失败不影响「已取消」这个事实；投递错误由 proactive 自己退避。
-          }
-        }
-        return { ok: true, taskId, cancelled: true, kind: 'bg', note: '已取消后台任务，主会话回执稍后送达。' };
+        return {
+          ok: true,
+          taskId,
+          cancelled: true,
+          kind: 'bg',
+          state: 'cancelling',
+          note: '已请求取消后台任务，进程退出后主会话会收到「已取消」回执。',
+        };
       },
     },
 

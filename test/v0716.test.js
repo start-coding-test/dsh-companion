@@ -320,9 +320,10 @@ test('N4 非真机证据：cancelBgJob 按同一模式 systemctl stop，状态�
     uid: 0,
   });
   const job = store.getBgJob('bg-c1');
-  assert.equal(job.state, BG_JOB_STATES.cancelled);
-  const audit = store.listEvents({}).find((event) => event.reason === 'bg_job_cancelled');
-  assert.ok(audit, '取消要留审计');
+  // L1（v0.7.17）：cancelBgJob 只受理（claim cancelling + TERM），收敛与回执由 monitor 负责。
+  assert.equal(job.state, BG_JOB_STATES.cancelling);
+  const requestAudit = store.listEvents({}).find((event) => event.reason === 'bg_job_cancel_requested');
+  assert.ok(requestAudit, '取消受理要留审计');
 
   // 同一用例第二臂：uid 1000（50041 ubuntu 生产实态）必须走用户级实例的 stop 形状。
   const userStore = Store.open(':memory:');
@@ -357,25 +358,43 @@ test('N4 非真机证据：cancelBgJob 按同一模式 systemctl stop，状态�
     user: true,
     uid: 1000,
   });
-  // 监视器只扫 running：cancelled 行不会再被二次投递。
+  // L1 收敛：probe 报「已退出 143」→ monitor 把 cancelling 收敛成 cancelled，
+  // 恰好一条取消回执（deliverCancel）且零 wake（判别是否误走 woken 收敛）。
   const wakes = [];
+  const delivered = [];
+  const launcher = {
+    probeBgProcess: async () => ({ running: false, exited: true, exitCode: 143 }),
+    signalBgProcess: async () => true,
+    unitResult: async () => null,
+    readExitCode: () => 143,
+    tailLog: () => '',
+    capLogFile: () => false,
+  };
   const summary = await monitorBgJobs({
     store,
     config: normalizeConfig({}),
     wake: async (info) => { wakes.push(info); return { delivered: true }; },
+    deliverCancel: async (info) => { delivered.push(info); return { delivered: true }; },
     nowMs: NOW_MS,
-    launcher: {
-      probeBgProcess: async () => ({ running: false, exited: false, exitCode: null }),
-      signalBgProcess: async () => true,
-      unitResult: async () => null,
-      readExitCode: () => null,
-      tailLog: () => '',
-      capLogFile: () => false,
-    },
+    launcher,
   });
-  store.close();
-  assert.equal(summary.checked, 0);
+  assert.equal(summary.checked, 1);
+  assert.equal(summary.cancelled, 1);
+  assert.equal(delivered.length, 1);
   assert.equal(wakes.length, 0);
+  assert.equal(store.getBgJob('bg-c1').state, BG_JOB_STATES.cancelled);
+  const finalAudit = store.listEvents({}).find((event) => event.reason === 'bg_job_cancelled');
+  assert.ok(finalAudit, '收敛要留审计');
+  const againSummary = await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    deliverCancel: async () => ({ delivered: true }),
+    nowMs: NOW_MS,
+    launcher,
+  });
+  assert.equal(againSummary.checked, 0);
+  assert.equal(delivered.length, 1);
 
   const again = await cancelBgJob({ store: { getBgJob: () => null }, jobId: 'bg-c1', nowMs: NOW_MS });
   assert.equal(again.ok, false);
@@ -444,12 +463,14 @@ test('N4 非真机证据：task_cancel 对 bg 任务走 cancelBgJob 并回执 ca
   const result = await cancel.execute({ taskId: 'bg-t1' });
   assert.equal(result.ok, true);
   assert.equal(result.kind, 'bg');
+  assert.equal(result.state, 'cancelling');
   assert.equal(signals.length, 1);
-  assert.equal(receipts.length, 1);
-  assert.equal(receipts[0].status, 'cancelled');
-  assert.match(receipts[0].receipt, /已取消（用户主动停止）/u);
-  assert.equal(store.getBgJob('bg-t1').state, BG_JOB_STATES.cancelled);
-
+  // L1（v0.7.17）：工具只受理；回执由 monitor 收敛后发一次（避免双回执），此刻零回执。
+  assert.equal(receipts.length, 0);
+  assert.equal(store.getBgJob('bg-t1').state, BG_JOB_STATES.cancelling);
+  const second = await cancel.execute({ taskId: 'bg-t1' });
+  assert.equal(second.ok, false);
+  assert.equal(second.reason, 'already-cancelling');
   const missing = await cancel.execute({ taskId: 'bg-nope' });
   assert.equal(missing.ok, false);
   assert.equal(missing.reason, 'not-found');
@@ -520,7 +541,7 @@ test('S1 非真机证据：/停止任务 <bg id> 走生产接线，回执为「�
     }
     if (wired === false) {
       const check = Store.open(dbPath);
-      wired = check.getBgJob('bg-dispatch-1')?.state === BG_JOB_STATES.cancelled;
+      wired = [BG_JOB_STATES.cancelling, BG_JOB_STATES.cancelled].includes(check.getBgJob('bg-dispatch-1')?.state);
       check.close();
     }
     assert.equal(wired, true, '命令必须触发 requestCancelBgJob（生产接线）');
