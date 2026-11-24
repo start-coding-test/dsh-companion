@@ -63,6 +63,7 @@ const RECEIPT_STATUS = Object.freeze({
   done: 'ok',
   timeout: 'timeout',
   partial: 'partial',
+  cancelled: 'cancelled',
   failed: 'error',
 });
 
@@ -320,7 +321,11 @@ export function createTaskRunner({ maxExec = MAX_EXEC_SLOTS, maxQueue = MAX_QUEU
           };
         }
 
-        const status = toStatus(workerResult.status);
+        // N2（v0.7.16）：用户取消是独立终态 cancelled。以前 worker 的
+        // {status:"error", reason:"cancelled"} 被 toStatus 映射成 failed，回执显示「失败」。
+        const status = workerResult.reason === 'cancelled'
+          ? 'cancelled'
+          : toStatus(workerResult.status);
         const durationMs = Number.isFinite(workerResult.durationMs)
           ? Number(workerResult.durationMs)
           : Math.max(0, clock() - startedAt);
@@ -681,11 +686,12 @@ function writeAudit({
   }
 }
 
-/** @param {string} status @returns {'done'|'timeout'|'partial'|'failed'} */
+/** @param {string} status @returns {'done'|'timeout'|'partial'|'cancelled'|'failed'} */
 function toStatus(status) {
   if (status === 'ok') return 'done';
   if (status === 'timeout') return 'timeout';
   if (status === 'partial') return 'partial';
+  if (status === 'cancelled') return 'cancelled';
   return 'failed';
 }
 

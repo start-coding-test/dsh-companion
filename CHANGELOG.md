@@ -2,6 +2,52 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.16] - 2026-11-24
+
+后台任务终态与取消链修正版：超时不再被记成「已结束」、取消不再显示成失败、每个后台任务结束时
+主会话都会收到一条回执，后台任务也终于有了取消入口；另修掉 `/停止任务` 无参文案、退回的
+`systemd-run` 退出码误判与三处注释缩进。
+
+> v0.7.15 尚未单独部署，其修复随本版一次上线。
+
+### Fixed
+
+- **N1（V715D-H1）后台任务超时被记成「已结束」**：`RuntimeMaxSec` 到期由 systemd 发 SIGTERM，
+  v0.7.15 加的 `trap 'exit 143' TERM` 让退出码文件可靠写出后，监视器的「已退出」分支会先命中，
+  把 143 当成正常退出。现在退出码为 143/137 时再判：已过 deadline，或（Linux）`systemctl show
+  -p Result --value` 返回 `timeout`，即按超时处理（claim `timeout`、回执「已超时被终止」、
+  `task_status = timeout`）；两者都不成立说明是被外部 TERM/KILL，仍按正常结束。
+  边界口径：已过 deadline + 143/137 + Result≠timeout 时按字面记 timeout（用户原文口径）。
+  137 臂是防御性冗余（SIGKILL 不触发 trap，正常不会出现在退出码文件里）。
+- **N2（V715D-M1）取消显示成「失败」**：`toStatus` 把 `cancelled` 落成 `failed`，回执写
+  「状态：失败」。现在 `cancelled` 是全链路独立终态：`RECEIPT_STATUS`、`toStatus`、
+  `STATUS_LABELS`（「已取消」）、`task_run` 事件与投递记录 `task_status` 都按 cancelled 落。
+  旧记录（`task_status = failed` + `reason = cancelled`）读取路径不变。
+- **N3（V715D-M2）后台任务结束只唤醒子代理，主会话 0 条回执**：唤醒成功路径也投一条主会话
+  notice（走 P1 的 session-notice 通道），正文复用唤醒文案并追加「已唤醒发起它的子代理继续处理。」；
+  唤醒失败/预算耗尽仍走原兜底，两条路径互斥且每个任务恰好一条（`dedupeKey = task-receipt:<jobId>`）。
+  成功路径不改 `bg_jobs.state`（状态由 `deliverWake` 落成 `woken`，不会变成 `woken-fallback`）。
+- **N4（V715-M1）后台任务没有取消入口**：`task_cancel` 先查 `task_run`，查不到再查 running 的
+  bg 任务，按拉起时的同一模式（`--user` + 同一环境）`systemctl stop` 对应 unit，claim
+  `cancelled`（新增 `BG_JOB_STATES.cancelled`，`bg_jobs.state` 无 CHECK，schema 仍 16），
+  并投一条「已取消」主会话回执；监视器只扫 `running`，取消后不会再被二次投递。
+  `/停止任务 <bg id>` 同样支持，无参清单并列显示后台任务（带 label）。
+  `task_run` / `bg_run` / `task_cancel` 三处说明统一写明「取消只能用 task_cancel，不要用
+  kill / pgrep / systemctl」。
+- **N5 注释与文案**：`state.im` 的 JSDoc 改成 session 通道形状；`deliverSessionNotice` 补已知限制
+  （`agent.send` 无幂等键，「已投递但未记账」窗口内重启会重复一条 notice，内容无害）；
+  `config.example.yml` 的 receipt 段说明改成「已停用、仅为兼容保留」（整段仍是注释，不参与 16 键自检）。
+
+### Tests
+
+新增 `test/v0716.test.js`（11 例，全部标注「非真机证据」：probe / unitResult / signal / wake /
+agent.send / proactive.enqueue 均为替身）：N1 三例（exit 143 且过 deadline → timeout；exit 143 未过
+deadline 且 Result 查不到 → 正常结束；exit 0 → 正常结束）、N2（取消终态 cancelled 与「状态：已取消」
+回执）、N3 三例（唤醒成功 1 条主会话回执且不改状态；失败/预算耗尽只投兜底一条；兜底 task_status
+按终态映射）、N4 四例（`cancelBgJob` 的参数与原子迁移、`systemctl stop` 失败不假装成功、
+`task_cancel` 的 bg 分支与回执、`/停止任务` 文案）。全量 `ℹ tests 1650 / suites 67 / pass 1650 /
+fail 0`，三时区（UTC / Asia/Shanghai / America/New_York）各 exit=0。
+
 ## [0.7.15] - 2026-11-23
 
 回执只交主会话版：子代理回执不再冒充用户发言、也不再直发 IM，改由主会话模型决定怎么告诉用户；

@@ -198,11 +198,11 @@ reminderTodoStaleDays: 7
 # 同时运行的后台任务上限（平铺键，默认 1 = 训练这类任务不并行）。
 # bgConcurrency: 1
 
-# ── 任务回执出站（R22-H1，v0.7.13，可选段，不参与 16 键安装自检）────────────
-# task_run / bg_run 的回执不再冒充用户发言进主会话，改为经 dsh-im 出站到 IM。
-# 依赖第三方插件 @xmanrui/dsh-im（contractVersion = 1）；未安装、未配置或发送失败时
-# 回执记为 delivery_error 并按退避重试，绝不退回 platform.prompt。
-# botId / targetId 必须显式填写（不自动猜）；/状态 有一行「回执通道」显示可用性与最近投递。
+# ── 任务回执通道（P1，v0.7.15：只交主会话 notice）───────────────
+# task_run / bg_run 的回执不冒充用户发言，也不再经 dsh-im 出站；改为以 notice
+# 形式交给主会话（空闲 next-turn 唤醒 / 忙 next-step），由主会话模型决定是否
+# 告诉用户；下面的 receipt.im.* 与 sessionNotice 仅为兼容保留，
+# v0.7.15 起不再读取。
 # receipt（v0.7.15 起：im 通道已停用，回执只交主会话；以下配置仅为兼容保留）:
 #   im:
 #     botId: ""

@@ -41,7 +41,7 @@ import {
 import { progressFromReceipt } from '../task/receipt.js';
 // W-1..W-5（v0.7.7 阶段 6）：后台长任务。
 // H2（v0.7.15）：bg_run 不再发「启动告知」，故 buildStartNotice 不再引入。
-import { startBgJob } from '../task/bg-jobs.js';
+import { cancelBgJob, startBgJob } from '../task/bg-jobs.js';
 import { sessionIdOfAgent } from '../session/identity.js';
 
 const FACT_KINDS = new Set(STORE_FACT_KINDS);
@@ -926,7 +926,7 @@ export function createTools({
         + '**立即返回** {ok, status:"started", taskId, title}，子代理在后台继续跑；'
         + '结果稍后以回执（task_report）送达会话，本轮先告诉用户「已派出」。'
         + '并发上限 2（subagentConcurrency），忙时排队最多 2 个，超出立即返回 busy；'
-        + '软超时 600s 只告警，硬超时 900s 中止。立即返回 started，结果稍后以回执送达。派出后直接回复用户，不要在本轮 sleep 或轮询等结果；要取消用 task_cancel。',
+        + '软超时 600s 只告警，硬超时 900s 中止。立即返回 started，结果稍后以回执送达。派出后直接回复用户，不要在本轮 sleep 或轮询等结果；要取消用 task_cancel，不要用 kill / pgrep / systemctl。',
       parameters: {
         type: 'object',
         properties: {
@@ -1025,7 +1025,7 @@ export function createTools({
         + '只该用于预计超过 10 分钟的任务；10 分钟以内的活直接用 task_run/thread_run，'
         + '否则光调度与轮询的开销就不划算。deadline_min 必填且不超过 bg.maxDeadlineMin。'
         + '同一时刻只跑 bgConcurrency（默认 1）个，满额会返回正在运行的任务。'
-        + '结束后会唤醒发起它的子代理并回执主会话（退出码 + 日志尾部 ≤2KB + 日志路径）。派出后直接回复用户，不要在本轮 sleep 或轮询等结果；要提前停下用 task_cancel。'
+        + '结束后会唤醒发起它的子代理，并给主会话投一条回执（终态 + 退出码 + 日志尾部 ≤2KB + 日志路径）。派出后直接回复用户，不要在本轮 sleep 或轮询等结果；要提前停下用 task_cancel（它按同一模式 systemctl stop 该 unit），不要用 kill / pgrep / systemctl。'
         + 'bg.workRoot 未配置时本工具不可用。',
       parameters: {
         type: 'object',
@@ -1149,33 +1149,69 @@ export function createTools({
     {
       name: 'task_cancel',
       description:
-        '取消一个 task_run 派出的在跑任务（taskId 来自 task_run 的返回）。'
-        + '取消后该任务以 cancelled 终态结束，回执按正常回执通道交给主会话；'
-        + '已结束或未知的 taskId 返回 not-found。bg_run 的后台任务不走这里（它在 systemd 里跑）。',
+        '取消一个在跑的任务：task_run 派出的子代理任务，或 bg_run 拉起的后台任务（同一个 id 空间）。'
+        + '取消后该任务以 cancelled 终态结束，主会话会收到一条「已取消」回执；'
+        + '已结束或未知的 taskId 返回 not-found。后台任务按拉起时的同一模式 systemctl stop 对应 unit。'
+        + '取消只能用本工具，不要用 kill / pgrep / systemctl。',
       parameters: {
         type: 'object',
         properties: {
           taskId: {
             type: 'string',
-            description: 'task_run 返回的 taskId',
+            description: 'task_run 或 bg_run 返回的 taskId',
           },
         },
         required: ['taskId'],
         additionalProperties: false,
       },
-      execute(args = {}) {
+      async execute(args = {}) {
         assertArgs(args, 'task_cancel');
         const taskId = requireString(args.taskId, 'task_cancel', 'taskId');
-        const cancelled = stopTaskById(taskId);
-        if (cancelled !== true) {
+        if (stopTaskById(taskId) === true) {
+          return { ok: true, taskId, cancelled: true, kind: 'task', note: '已请求中止，回执稍后送达。' };
+        }
+        // N4（v0.7.16）：task_run 里没有这个 id，再看是不是 running 的 bg 任务。
+        // 取消走 cancelBgJob（内部 signalBgProcess：与拉起同一模式与同一环境），
+        // 状态原子迁到 cancelled 后由 bg 监视器之外的这条路径投一条主会话回执。
+        const bgResult = await cancelBgJob({
+          store,
+          jobId: taskId,
+          launcher: bgLauncher !== null && typeof bgLauncher === 'object' ? bgLauncher : {},
+          nowMs: nowMs(),
+        });
+        if (bgResult.ok !== true) {
+          if (bgResult.reason === 'stop-failed') {
+            return {
+              ok: false,
+              reason: 'cancel-failed',
+              taskId,
+              message: `取消失败（${bgResult.message ?? 'systemctl stop 失败'}）`,
+            };
+          }
           return {
             ok: false,
-            reason: 'not-found',
+            reason: bgResult.reason === 'not-running' ? 'not-found' : (bgResult.reason ?? 'not-found'),
             taskId,
             message: '没有在跑的任务使用这个 taskId（可能已结束或 id 写错）',
           };
         }
-        return { ok: true, taskId, cancelled: true, note: '已请求中止，回执稍后送达。' };
+        const job = bgResult.job ?? {};
+        if (typeof taskReceipt === 'function') {
+          try {
+            const label = typeof job.label === 'string' && job.label !== '' ? job.label : '(无标签)';
+            await taskReceipt({
+              taskId,
+              status: 'cancelled',
+              receipt: `[后台任务] ${taskId} ${label} 已取消（用户主动停止）；日志：${job.log_path ?? ''}`,
+              title: typeof job.label === 'string' ? job.label : null,
+              sessionId: typeof job.child_session_id === 'string' ? job.child_session_id : null,
+              reason: 'cancelled',
+            });
+          } catch {
+            // 回执失败不影响「已取消」这个事实；投递错误由 proactive 自己退避。
+          }
+        }
+        return { ok: true, taskId, cancelled: true, kind: 'bg', note: '已取消后台任务，主会话回执稍后送达。' };
       },
     },
 

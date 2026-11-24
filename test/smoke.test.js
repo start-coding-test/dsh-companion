@@ -13,7 +13,7 @@ test('package.json name 为 dsh-companion', () => {
 });
 
 test('package.json version 为 0.7.14', () => {
-  assert.equal(pkg.version, '0.7.15');
+  assert.equal(pkg.version, '0.7.16');
 });
 
 test('package.json 定义了 node --test 脚本', () => {

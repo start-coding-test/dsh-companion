@@ -82,7 +82,7 @@ test('V710-L1：/停止任务 无参数时给出用法与在跑清单', async ()
   const reply = stop.handler({ rawInput: '' });
   assert.equal(reply.kind, 'success');
   assert.match(reply.text, /\/stop-task/u);
-  assert.match(reply.text, /当前没有在跑的 task_run/u);
+  assert.match(reply.text, /当前没有在跑的任务/u);
 });
 
 test('V710-L1：/停止任务 带未知 taskId → 没有在跑的任务', async () => {
@@ -94,7 +94,7 @@ test('V710-L1：/停止任务 带未知 taskId → 没有在跑的任务', async
 });
 
 test('V710-L1：formatStopTaskReply 覆盖用法 / 命中 / 未命中', () => {
-  assert.match(formatStopTaskReply({ usage: true, active: [] }), /没有在跑的 task_run/u);
+  assert.match(formatStopTaskReply({ usage: true, active: [] }), /没有在跑的任务/u);
   assert.match(formatStopTaskReply({ usage: true, active: ['task-a', 'task-b'] }), /task-a、task-b/u);
   assert.match(
     formatStopTaskReply({ taskId: 'task-a', result: { ok: true, cancelled: 1, taskId: 'task-a' } }),
@@ -142,7 +142,7 @@ test('V710-L1：stopTaskById / listActiveTasks 中止在跑任务并出 cancelle
 
   const result = await started.done;
   assert.equal(result.ok, true);
-  assert.equal(result.status, 'failed');
+  assert.equal(result.status, 'cancelled');
   assert.equal(result.reason, 'cancelled');
   assert.equal(platform.observed.disposed(), 1, '取消必须走 dispose（signal 停不掉运行中的子代理）');
   assert.equal(receipts.length, 1);
@@ -438,7 +438,7 @@ test('M2：排队中被取消不会错账槽位（over-admission 回归）', asy
   // 停掉排队者：它从未持有槽位，不能把在跑者的槽减掉或转交出去。
   assert.equal(runner.stopTaskById(second.taskId), true);
   const secondResult = await second.done;
-  assert.equal(secondResult.status, 'failed');
+  assert.equal(secondResult.status, 'cancelled');
   assert.equal(secondResult.reason, 'cancelled');
   assert.equal(runner.stats().active, 1, '在跑任务仍占 1 个槽');
   assert.equal(runner.stats().queued, 0, '排队队列必须清空');

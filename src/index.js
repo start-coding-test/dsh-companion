@@ -46,7 +46,7 @@ import {
 } from './memory/govern-auto.js';
 import { buildWeeklyMemoryReport } from './memory/weekly-report.js';
 // W-2/W-4（v0.7.7 阶段 6）：后台长任务的监视、重启恢复与唤醒文案。
-import { BG_JOB_STATES, monitorBgJobs } from './task/bg-jobs.js';
+import { BG_JOB_STATES, cancelBgJob, monitorBgJobs } from './task/bg-jobs.js';
 import { backoffAfter429 } from './runtime/quota.js';
 import { deferBackground, isQuotaError, readQuotaFile } from './runtime/quota-gate.js';
 import {
@@ -776,9 +776,10 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
      */
     bgSelfCheck: null,
     /**
-     * R22-H1（v0.7.13）：回执出站通道（dsh-im）状态。null = 尚未初始化；
-     * 初始化后为 {available, service, contractVersion, botId, targetId, reason,
- * message, lastDelivery}，/状态 与 deliverSessionNotice 都读它。
+     * P1（v0.7.15）：回执通道状态——只投主会话 notice（不再经 dsh-im 出站）。
+     * null = 尚未初始化；初始化后为 {mode, channel, available, imConfigured,
+     * botId, targetId, reason, message, lastDelivery}，/状态 与
+     * deliverSessionNotice 都读它。
      */
     im: null,
     /** M4：每日 token 累计（按配置时区的日键复位）。 */
@@ -1118,6 +1119,60 @@ function publishOnThreadUnarchive(platform, store) {
 }
 
 /**
+ * N4（v0.7.16）：/停止任务 无参清单里的 running bg 任务。
+ * @param {object} store
+ * @returns {Array<{id: string, label: string|null, kind: string}>}
+ */
+function listRunningBgEntries(store) {
+  try {
+    return store.listBgJobs({ state: BG_JOB_STATES.running, limit: 20 }).map((job) => ({
+      id: job.id,
+      label: typeof job.label === 'string' && job.label !== '' ? job.label : null,
+      kind: 'bg',
+    }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * N4（v0.7.16）：取消一个 bg 任务。命令 handler 必须同步返回，因此这里
+ * fire-and-forget：systemctl stop 成功、状态原子迁到 cancelled 之后，用
+ * N3 的主会话回执通道告知（同一个 dedupeKey `task-receipt:<jobId>`）。
+ * @param {object} state
+ * @param {string} taskId
+ * @returns {void}
+ */
+function requestCancelBgJob(state, taskId) {
+  void cancelBgJob({ store: state.store, jobId: taskId, nowMs: state.platform.now() })
+    .then((result) => {
+      if (result.ok !== true) {
+        state.platform.log('warn', '[dsh-companion] bg job cancel failed', {
+          taskId,
+          reason: result.reason ?? null,
+          message: result.message ?? null,
+        });
+        return;
+      }
+      const job = result.job ?? {};
+      const label = typeof job.label === 'string' && job.label !== '' ? job.label : '(无标签)';
+      deliverBgReceipt(
+        state,
+        job,
+        `[后台任务] ${job.id ?? taskId} ${label} 已取消（用户主动停止）\n日志：${job.log_path ?? ''}` ,
+        'cancelled',
+        { cancelled: true },
+      );
+    })
+    .catch((error) => {
+      state.platform.log('warn', '[dsh-companion] bg job cancel crashed', {
+        taskId,
+        message: errorMessage(error),
+      });
+    });
+}
+
+/**
  * 注册 6 个 ASCII 命令；handler 统一转给 handleCommand 或 P1-b 闲聊开关。
  * @param {object} platform
  * @param {Store} store
@@ -1160,22 +1215,47 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
           if (alias.name === 'stop-task') {
             // V710-L1（v0.7.11）：/停止任务 [taskId]，直接走执行器的取消入口。
             // 不进 handleCommand：MEMORY_COMMANDS 是中文四命令专用门（见 glm 终稿）。
+            // N4（v0.7.16）：同一个 id 空间先查 task_run，再查 running 的 bg 任务。
             const parts = rawInput.trim().split(/\s+/u).filter((part) => part !== '');
             const target = parts.length > 0 ? parts[0] : null;
             if (target === null) {
               return {
                 kind: 'success',
-                text: formatStopTaskReply({ usage: true, active: listActiveTasks() }),
+                text: formatStopTaskReply({ usage: true, active: listActiveTasks().concat(listRunningBgEntries(store)) }),
               };
             }
-            const stopped = stopActiveTask(target);
+            if (stopActiveTask(target)) {
+              return {
+                kind: 'success',
+                text: formatStopTaskReply({
+                  taskId: target,
+                  result: { ok: true, cancelled: 1, taskId: target },
+                }),
+              };
+            }
+            let bgJob = null;
+            try {
+              bgJob = store.getBgJob(target);
+            } catch {
+              bgJob = null;
+            }
+            if (bgJob !== null && bgJob.state === BG_JOB_STATES.running) {
+              // 命令 handler 必须同步返回文案：取消要等 systemctl，结果经主会话回执告知。
+              requestCancelBgJob(state, target);
+              return {
+                kind: 'success',
+                text: formatStopTaskReply({
+                  taskId: target,
+                  kind: 'bg',
+                  result: { ok: true, cancelled: 1, taskId: target },
+                }),
+              };
+            }
             return {
               kind: 'success',
               text: formatStopTaskReply({
                 taskId: target,
-                result: stopped
-                  ? { ok: true, cancelled: 1, taskId: target }
-                  : { ok: false, cancelled: 0, taskId: target, reason: 'not-found' },
+                result: { ok: false, cancelled: 0, taskId: target, reason: 'not-found' },
               }),
             };
           }
@@ -1329,9 +1409,9 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     ...(bgConfig !== null && typeof bgConfig === 'object' ? { bgConfig } : {}),
     ...(typeof mainSessionId === 'function' ? { mainSessionId } : {}),
     // D21-H4：自检失败时 bg_run 直接返回 {ok:false, reason:'bg-unavailable'}。
-            // H1（v0.7.15）：此前这里引用未声明的 state，bg_run 一调就抛
-            // ReferenceError；改由调用点传入闭包（见 activate 里的 registerTools 调用）。
-            bgAvailability: typeof bgAvailabilityFn === 'function' ? bgAvailabilityFn : undefined,
+  // H1（v0.7.15）：此前这里引用未声明的 state，bg_run 一调就抛
+  // ReferenceError；改由调用点传入闭包（见 activate 里的 registerTools 调用）。
+  bgAvailability: typeof bgAvailabilityFn === 'function' ? bgAvailabilityFn : undefined,
     vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
@@ -5443,6 +5523,9 @@ function noticeSummaryOf(text) {
  * source.kind）；kind 仍是 `companion-task-receipt`，三处排除集据此认出它不是
  * 用户发言。
  *
+ * 已知限制（N5/v0.7.16）：宿主 agent.send 没有幂等键（dsh-agent-loop/src/agent.ts:171-178）；
+ * 「已投递但尚未 recordSent」的窗口内进程重启，补投会重复一条 notice。回执本身
+ * 被 source.kind 标注为通知，重复一条无害，故不引入额外去重表。
  * 失败必须抛出：proactive 的 outbox 会用退避重试，且绝不退回 platform.prompt
  * （那会把回执伪装成用户发言，用户已明令禁止）。
  * @param {object} state
@@ -5604,6 +5687,17 @@ async function wakeBgJob(state, info) {
         await platform.sendToSubagent(sender, target, [{ type: 'text', text: info.message }], {
           signal: deliverySignal({ requestId: `companion-bg-wake:${job.id}` }),
         });
+        // N3（v0.7.16）：真机反馈「bg 结束只唤醒子代理，主会话 0 条回执」。
+        // 唤醒成功同样投一条主会话 notice（同一个 dedupeKey `task-receipt:<jobId>`，
+        // 不会与兜底路径重复）；这里只投递，不改 bg_jobs.state —— 状态由
+        // bg-jobs.js 的 deliverWake 落成 `woken`，不能变成 `woken-fallback`。
+        deliverBgReceipt(
+          state,
+          job,
+          `${info.message}\n已唤醒发起它的子代理继续处理。`,
+          'subagent-woken',
+          info,
+        );
         return { delivered: true, channel: 'subagent' };
       } catch (error) {
         platform.log('warn', '[dsh-companion] bg job wake failed; falling back to main session', {
@@ -5614,7 +5708,13 @@ async function wakeBgJob(state, info) {
       }
     }
   }
-return deliverBgFallback(state, job, info?.message, info?.allowWake === true ? 'wake-failed' : 'wake-budget-exhausted', info);
+  return deliverBgFallback(
+    state,
+    job,
+    info?.message,
+    info?.allowWake === true ? 'wake-failed' : 'wake-budget-exhausted',
+    info,
+  );
 }
 
 /**
@@ -5633,6 +5733,8 @@ return deliverBgFallback(state, job, info?.message, info?.allowWake === true ? '
  * @returns {string} ok | timeout | lost | failed
  */
 function bgFallbackTaskStatus(outcome) {
+  // N4（v0.7.16）：用户主动取消是独立终态。
+  if (outcome?.cancelled === true) return 'cancelled';
   if (outcome?.timedOut === true) return 'timeout';
   if (outcome?.lost === true) return 'lost';
   const code = outcome?.exitCode;
@@ -5640,12 +5742,23 @@ function bgFallbackTaskStatus(outcome) {
   return 'ok';
 }
 
-function deliverBgFallback(state, job, message, reason, outcome = null) {
+/**
+ * N3（v0.7.16）：只负责把 bg 终态回执投给主会话（走 P1 的 notice 通道），
+ * 不改 bg_jobs.state。唤醒成功的路径也必须投这一条，但状态要留在 `woken`
+ * （由 bg-jobs.js 的 deliverWake 落库），不能误改成 `woken-fallback`。
+ * @param {object} state
+ * @param {object} job
+ * @param {string} message
+ * @param {string} reason
+ * @param {object|null} [outcome]
+ * @returns {{delivered: boolean, channel: string}}
+ */
+function deliverBgReceipt(state, job, message, reason, outcome = null) {
   const text = typeof message === 'string' ? message : '';
   if (text !== '') {
     deliverTaskReceipt(state, {
       taskId: typeof job?.id === 'string' ? job.id : '',
-      // L1（v0.7.15）：以前固定 ok，把超时/丢失/失败都报成成功；改按终态如实记。
+      // L1（v0.7.15）：按终态如实记；N4（v0.7.16）补 cancelled。
       status: bgFallbackTaskStatus(outcome),
       receipt: text,
       title: typeof job?.label === 'string' ? job.label : null,
@@ -5653,12 +5766,17 @@ function deliverBgFallback(state, job, message, reason, outcome = null) {
       reason,
     });
   }
+  return { delivered: text !== '', channel: 'main' };
+}
+
+function deliverBgFallback(state, job, message, reason, outcome = null) {
+  const result = deliverBgReceipt(state, job, message, reason, outcome);
   try {
     state.store.updateBgJob(job?.id, { state: BG_JOB_STATES.wokenFallback });
   } catch {
     // 状态改装失败不影响已投递的卡片。
   }
-  return { delivered: text !== '', channel: 'main' };
+  return result;
 }
 
 /**
@@ -7054,6 +7172,8 @@ export {
   TASK_RECEIPT_SOURCE_KIND,
   // L1（v0.7.15）：回执通道状态行、bg 兜底终态映射，仅为单测可达（非公开 API）。
   bgFallbackTaskStatus,
+  /** N3（v0.7.16）：唤醒路径与兜底路径的互斥语义，仅为单测可达（非公开 API）。 */
+  wakeBgJob,
   deliverBgFallback,
   // D21-M1（v0.7.10）：巩固区间合并入 pending，仅为单测可达（非公开 API）。
   rememberConsolidatedRegion,

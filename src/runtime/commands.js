@@ -249,22 +249,24 @@ export function summarizeCost(store, now, timeZone = DEFAULT_TIMEZONE) {
 }
 
 /**
- * `/停止任务` 的回复文案（v0.7.11 V710-L1）。
+ * `/停止任务` 的回复文案（v0.7.11 V710-L1；v0.7.16 N4 扩展 bg 任务）。
  *
- * 三种调用形态：无参给用法 + 在跑清单；带 taskId 给「已请求停止」；取消失败给原因。
- * @param {{usage?: boolean, active?: string[], taskId?: string|null,
+ * 三种调用形态：无参给用法 + 在跑清单（task_run 与后台任务并列）；带 taskId 给
+ * 「已请求停止」；取消失败给原因。`active` 允许字符串或 `{id, label, kind}`。
+ * @param {{usage?: boolean, active?: Array<string|{id: string, label?: string|null, kind?: string}>,
+ *   taskId?: string|null, kind?: string,
  *   result?: {ok: boolean, cancelled: number, taskId: string|null, reason?: string}}} input
  * @returns {string}
  */
 export function formatStopTaskReply(input = {}) {
-  const active = Array.isArray(input.active) ? input.active.filter((id) => typeof id === 'string' && id !== '') : [];
+  const active = Array.isArray(input.active) ? input.active.map(formatStopTaskEntry).filter((entry) => entry !== '') : [];
   if (input.usage === true) {
     const lines = [
       '用法：/停止任务 [taskId]（内部命令名 /stop-task）',
-      '不带参数：查看用法与在跑清单；带 taskId：只中止该任务。',
+      '不带参数：查看用法与在跑清单；带 taskId：只中止该任务（task_run 或后台任务）。',
     ];
     lines.push(active.length === 0
-      ? '当前没有在跑的 task_run。'
+      ? '当前没有在跑的任务。'
       : `在跑的任务：${active.join('、')}`);
     return lines.join('\n');
   }
@@ -272,9 +274,13 @@ export function formatStopTaskReply(input = {}) {
     ? input.result
     : { ok: false, cancelled: 0, taskId: null };
   const target = typeof input.taskId === 'string' && input.taskId !== '' ? input.taskId : null;
+  const isBg = input.kind === 'bg';
   if (info.ok === true) {
     if (info.cancelled === 0) {
       return `停止任务：${target ?? '该任务'} 不在运行（可能已结束）`;
+    }
+    if (isBg === true) {
+      return `停止任务：已请求中止后台任务 ${target ?? '该任务'}，回执将送达（状态：已取消）`;
     }
     return `停止任务：已请求中止 ${target ?? '该任务'}，回执将送达（状态：已取消）`;
   }
@@ -282,6 +288,23 @@ export function formatStopTaskReply(input = {}) {
     return `停止任务：没有在跑的任务：${target ?? ''}（可能已结束，可用 /status 查看）`;
   }
   return `停止任务：取消失败（${info.reason ?? 'unknown'}）`;
+}
+
+/**
+ * 在跑清单里的一项：task_run 只给 id；后台任务带 label，标注来源（N4）。
+ * @param {string|{id?: string, label?: string|null, kind?: string}} entry
+ * @returns {string}
+ */
+function formatStopTaskEntry(entry) {
+  if (typeof entry === 'string') return entry;
+  if (entry === null || typeof entry !== 'object') return '';
+  const id = typeof entry.id === 'string' ? entry.id : '';
+  if (id === '') return '';
+  const label = typeof entry.label === 'string' && entry.label !== '' ? entry.label : null;
+  if (entry.kind === 'bg') {
+    return label === null ? `${id}（后台任务）` : `${id}（${label}，后台任务）`;
+  }
+  return id;
 }
 
 // ------------------------------------------------------------- 记忆

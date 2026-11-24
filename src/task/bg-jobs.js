@@ -47,6 +47,8 @@ export const BG_JOB_STATES = Object.freeze({
   failed: 'failed',
   timeout: 'timeout',
   lost: 'lost',
+  // N4（v0.7.16）：用户主动取消（task_cancel / /停止任务）。
+  cancelled: 'cancelled',
 });
 
 /**
@@ -450,10 +452,10 @@ export async function startBgJob({
 /**
  * W-3：唤醒消息正文——退出码、末尾 ≤2KB 输出、日志路径。
  * @param {object} job
- * @param {{exitCode: number|null, tail: string, timedOut?: boolean}} result
+ * @param {{exitCode: number|null, tail: string, timedOut?: boolean, cancelled?: boolean}} result
  * @returns {string}
  */
-export function buildWakeMessage(job, { exitCode, tail, timedOut = false }) {
+export function buildWakeMessage(job, { exitCode, tail, timedOut = false, cancelled = false }) {
   const label = job?.label === null || job?.label === undefined || job.label === ''
     ? '(无标签)'
     : String(job.label);
@@ -461,7 +463,9 @@ export function buildWakeMessage(job, { exitCode, tail, timedOut = false }) {
   const codeText = exitCode === null || exitCode === undefined
     ? '未知（未取到退出码）'
     : String(exitCode);
-  const stateText = timedOut === true ? '已超时被终止' : '已结束';
+  const stateText = cancelled === true
+    ? '已取消'
+    : (timedOut === true ? '已超时被终止' : '已结束');
   const tailText = typeof tail === 'string' && tail.trim() !== '' ? tail.trimEnd() : '（日志为空）';
   return [
     `[后台任务] ${job?.id ?? ''} ${label} ${stateText}`,
@@ -566,14 +570,32 @@ export async function monitorBgJobs({
     }
 
     if (probed.exited === true) {
-      const claimed = store.claimBgJobState(job.id, BG_JOB_STATES.woken, {
-        exit_code: probed.exitCode ?? null,
+      const code = Number.isInteger(probed.exitCode) ? probed.exitCode : null;
+      const deadlinePassed = Number.isFinite(Number(job.deadline)) && nowSec >= Number(job.deadline);
+      // N1（v0.7.16）：v0.7.15 加的 `trap 'exit 143' TERM` 让退出码文件可靠写出后，
+      // RuntimeMaxSec 超时杀掉的 unit 会先命中这个 exited 分支，被当成正常结束
+      // （回执写「已结束…退出码：143」）。退出码 143/137（SIGTERM/SIGKILL）时再判：
+      //   - 已过 deadline → 就是超时；
+      //   - 未过 deadline 但 systemd Result=timeout → 也是超时；
+      //   - 两者都不成立 = 被外部 TERM/KILL，按正常结束。
+      // 其余退出码保持原语义。
+      let exitedTimedOut = false;
+      if (code === 143 || code === 137) {
+        exitedTimedOut = deadlinePassed;
+        if (!exitedTimedOut && kind === 'linux') {
+          const exitedResult = await unitResultOf({ unit: job.pid_or_unit, user: userMode, uid: effectiveUid }).catch(() => null);
+          exitedTimedOut = exitedResult === 'timeout';
+        }
+      }
+      const claimed = store.claimBgJobState(job.id, exitedTimedOut ? BG_JOB_STATES.timeout : BG_JOB_STATES.woken, {
+        exit_code: code,
         finished_at: nowSec,
       });
       if (!claimed) continue; // 已被并发的另一轮抢到，保证只唤醒一次。
       const tail = readTail(job.log_path, BG_TAIL_BYTES);
-      summary.woken += 1;
-      await deliverWake({ store, config, wake, job, exitCode: probed.exitCode ?? null, tail, timedOut: false });
+      if (exitedTimedOut) summary.timedOut += 1;
+      else summary.woken += 1;
+      await deliverWake({ store, config, wake, job, exitCode: code, tail, timedOut: exitedTimedOut });
       continue;
     }
 
@@ -684,6 +706,71 @@ export async function monitorBgJobs({
     }
   }
   return summary;
+}
+
+/**
+ * N4（v0.7.16）：取消一个 running 的 bg 任务。
+ *
+ * 与拉起/探针同一模式（`systemctl [--user] stop <unit>`；user 模式带
+ * `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS`，见 bg-launcher.js 的
+ * `signalBgProcess` 与 `resolveSystemdMode`/`userModeEnv`）。stop 成功后用
+ * `claimBgJobState` 原子迁移到 `cancelled`：monitorBgJobs 只扫 running 行，
+ * 因此监视器不会再按 exited/timeout 二次投递。
+ *
+ * @param {{store: object, jobId: string, launcher?: object, uid?: number, nowMs?: number}} input
+ * @returns {Promise<{ok: boolean, reason?: string, message?: string, job: object|null}>}
+ */
+export async function cancelBgJob({ store, jobId, launcher = {}, uid, nowMs } = {}) {
+  const id = typeof jobId === 'string' ? jobId : '';
+  if (id === '') return { ok: false, reason: 'not-found', job: null };
+  let job = null;
+  try {
+    job = store.getBgJob(id);
+  } catch {
+    job = null;
+  }
+  if (job === null || job === undefined) return { ok: false, reason: 'not-found', job: null };
+  if (job.state !== BG_JOB_STATES.running) return { ok: false, reason: 'not-running', job };
+  const kind = job.pid_or_unit !== null && String(job.pid_or_unit).startsWith('dsh-bg-') ? 'linux' : 'portable';
+  const pid = kind === 'portable' && job.pid_or_unit !== null
+    ? Number.parseInt(String(job.pid_or_unit), 10)
+    : null;
+  const effectiveUid = Number.isInteger(uid) ? Number(uid) : currentUid();
+  const userMode = resolveSystemdMode(effectiveUid) === 'user';
+  const signal = typeof launcher.signal === 'function' ? launcher.signal : signalBgProcess;
+  try {
+    await signal({
+      unit: job.pid_or_unit,
+      pid,
+      kind,
+      signal: 'TERM',
+      ...(kind === 'linux' ? { user: userMode, uid: effectiveUid } : {}),
+    });
+  } catch (error) {
+    // stop 失败就不能假装取消成功：任务可能还在跑，交给监视器继续判定。
+    return { ok: false, reason: 'stop-failed', message: String(error?.message ?? error), job };
+  }
+  const seconds = Math.floor((Number.isFinite(nowMs) ? nowMs : Date.now()) / 1000);
+  const claimed = store.claimBgJobState(id, BG_JOB_STATES.cancelled, { finished_at: seconds });
+  if (!claimed) return { ok: false, reason: 'not-running', job: store.getBgJob(id) ?? job };
+  const updated = store.getBgJob(id) ?? job;
+  try {
+    store.appendEvent({
+      action: 'USED',
+      actor: 'scheduler',
+      table_name: 'bg_jobs',
+      row_id: id,
+      reason: 'bg_job_cancelled',
+      detail_json: {
+        kind: 'bg_job_cancelled',
+        state: updated.state,
+        user_mode: userMode,
+      },
+    });
+  } catch {
+    // 审计失败不影响取消结果。
+  }
+  return { ok: true, job: updated };
 }
 
 /**

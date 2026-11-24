@@ -279,7 +279,7 @@ test('D21-H2：abortAll() 能中止在跑的子代理（插件卸载路径）', 
   fake.resolve({ stopReason: 'aborted', output: [] });
   const result = await started.done;
   assert.equal(result.ok, true);
-  assert.equal(result.status, 'failed');
+  assert.equal(result.status, 'cancelled');
 });
 
 // ------------------------------------------------------------------ D21-H3
