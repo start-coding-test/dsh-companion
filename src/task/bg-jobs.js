@@ -603,6 +603,9 @@ export async function monitorBgJobs({
 
     // L1（v0.7.17）：取消中（cancelling）的收敛，全链路唯一回执点。
     // 取消意图压过超时归类：退出码 143/137/0 一律按「已取消」收敛，不走 exitedTimedOut。
+    // 注：probe 返回 running:null（例如客户端查不到 unit / 平台探针不可用）也按
+    // 「已取消」收敛——真机上残留的 unit 由 systemd 的 RuntimeMaxSec / --collect
+    // 兜底回收，这里不再无限等待。
     if (job.state === BG_JOB_STATES.cancelling) {
       if (probed.exited === true || probed.running !== true) {
         const code = Number.isInteger(probed.exitCode) ? probed.exitCode : null;

@@ -29,6 +29,16 @@ import { summarizeCost } from './commands.js';
 import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
 import { nextOccurrence, parseRRule } from '../scheduler/recurrence.js';
 import { FACT_KINDS as STORE_FACT_KINDS } from '../memory/store.js';
+// M1（v0.7.17）：memory_write 的近似查重、judge 裁决与跨 kind 关键串升级，
+// 与 consolidate.js 共用同一套纯函数（dedupe.js），避免两处口径漂移。
+import {
+  buildDedupeJudgePrompt,
+  buildKeyPhraseIndex,
+  classifyDraftFact,
+  collectActiveFactsByKind,
+  parseDedupeVerdicts,
+  upgradeVerdictWithKeyPhrases,
+} from '../memory/dedupe.js';
 // SA-B1/SA-B2（v0.7.7 阶段 4）：子代理命名与模型 allowlist 与 runner 共用一份口径。
 // T120-M1（v0.7.7 阶段 5）：线程回执要取「结论首句」回写 last_progress。
 import {
@@ -235,6 +245,12 @@ export function createTools({
   // `{ok:true, mode:'user'|'system', missingControllers}` 或
   // `{ok:false, reason, message}`；缺省视为「未做自检 = 可用」。
   bgAvailability,
+  // M1（v0.7.17）：memory_write ask 档的裁决回调（async (prompt) => JSON）。
+  // 生产接线层在 src/index.js registerTools 里注入 judgeFactDuplicates；缺省
+  // undefined 时 ask 档按 new 保守插入（与 consolidate.js 同一口径）。
+  judge,
+  // M1（v0.7.17）：查重阈值；缺省走 dedupe.js 的 DEFAULT_DEDUPE_SKIP/ASK。
+  dedupe,
   currentScope,
   budgetGate,
   metrics,
@@ -251,6 +267,27 @@ export function createTools({
     throw new TypeError(`createTools: unknown IANA time zone "${String(timeZone)}"`);
   }
   const nowMs = () => Number(clock());
+  // M1（v0.7.17）：judge 可选；显式传了就必须是函数，避免生产接线漏传被静默吞掉。
+  if (judge !== undefined && typeof judge !== 'function') {
+    throw new TypeError('createTools: judge must be a function');
+  }
+  const judgeFn = typeof judge === 'function' ? judge : null;
+  const dedupeOptions = {
+    dedupeSkip: Number.isFinite(dedupe?.dedupeSkip) ? dedupe.dedupeSkip : undefined,
+    dedupeAsk: Number.isFinite(dedupe?.dedupeAsk) ? dedupe.dedupeAsk : undefined,
+  };
+  // 一次裁决只有一组（memory_write 逐条写），失败/坏结构一律按 new 保守。
+  const judgeVerdict = async (factText, existingText) => {
+    if (judgeFn === null) return null;
+    try {
+      const payload = await judgeFn(buildDedupeJudgePrompt([{ fact: factText, existing: existingText }]));
+      const parsed = typeof payload === 'string' ? JSON.parse(payload) : payload;
+      const verdicts = parseDedupeVerdicts(parsed, 1);
+      return verdicts === null ? null : verdicts[0];
+    } catch {
+      return null;
+    }
+  };
   const defaultCwd = typeof cwd === 'string' && cwd.length > 0 ? cwd : undefined;
   // V10-H1：null/空串统一为「不传 preset」；非空字符串只 trim（合法性由宿主判定）。
   const threadPreset = typeof threadAgentPreset === 'string' && threadAgentPreset.trim() !== ''
@@ -358,7 +395,7 @@ export function createTools({
 
     {
       name: 'memory_write',
-      description: '写入一条用户显式给出的事实，返回落库后的 id 与摘要。',
+      description: '写入一条用户显式给出的事实；会先做近似查重（同义只强化、被取代则置 superseded），返回 id / duplicateOf / verdict。',
       parameters: {
         type: 'object',
         properties: {
@@ -375,7 +412,10 @@ export function createTools({
         required: ['statement'],
         additionalProperties: false,
       },
-      execute(args = {}) {
+      // M1（v0.7.17）：先查重再落库。skip=同 kind 高相似 → 只强化旧条；
+      // ask=字面拿不准或跨 kind 关键串命中 → 一次小模型裁决 same/update/new；
+      // 判定不可用（未注入/抛错/结构坏）一律按 new 保守插入，绝不静默丢写入。
+      async execute(args = {}) {
         assertArgs(args, 'memory_write');
         const statement = requireString(args.statement, 'memory_write', 'statement');
         const kind = optionalEnum(args.kind, FACT_KINDS, 'memory_write', 'kind') ?? 'other';
@@ -384,19 +424,56 @@ export function createTools({
         const requested = optionalString(args.scope, 'memory_write', 'scope');
         const resolved = resolveScope(requested);
         if (!resolved.ok) return resolved;
-        const row = store.insertFact({
-          scope: resolved.scope,
-          kind,
-          subject_text: optionalString(args.subject, 'memory_write', 'subject') ?? '我',
-          predicate: optionalString(args.predicate, 'memory_write', 'predicate') ?? '记住',
-          object_text: optionalString(args.object, 'memory_write', 'object') ?? null,
-          statement,
-          source_kind: 'user_explicit',
-          source_excerpt: optionalString(args.source_excerpt, 'memory_write', 'source_excerpt') ?? statement,
-          salience,
-          privacy,
-        });
-        return { ok: true, id: row.id, statement: row.statement, scope: row.scope, salience: row.salience };
+        const scope = resolved.scope;
+        const at = Math.floor(nowMs() / 1000);
+        const byKind = collectActiveFactsByKind(store, scope);
+        const classified = classifyDraftFact({ kind, statement }, byKind, dedupeOptions);
+        const verdict = upgradeVerdictWithKeyPhrases({ kind, statement }, classified, buildKeyPhraseIndex(byKind));
+        const insert = (label) => {
+          const row = store.insertFact({
+            scope,
+            kind,
+            subject_text: optionalString(args.subject, 'memory_write', 'subject') ?? '我',
+            predicate: optionalString(args.predicate, 'memory_write', 'predicate') ?? '记住',
+            object_text: optionalString(args.object, 'memory_write', 'object') ?? null,
+            statement,
+            source_kind: 'user_explicit',
+            source_excerpt: optionalString(args.source_excerpt, 'memory_write', 'source_excerpt') ?? statement,
+            salience,
+            privacy,
+          });
+          return { ok: true, id: row.id, duplicateOf: null, verdict: label, statement: row.statement, scope: row.scope };
+        };
+        const reinforce = (target, label) => {
+          if (typeof store.reinforceFact === 'function') store.reinforceFact({ id: target.id, scope, at });
+          return {
+            ok: true,
+            id: target.id,
+            duplicateOf: target.id,
+            verdict: label,
+            statement: typeof target.statement === 'string' ? target.statement : statement,
+            scope,
+          };
+        };
+        if (verdict.verdict === 'skip' && verdict.match !== null) return reinforce(verdict.match, 'reinforced');
+        if (verdict.verdict === 'ask' && verdict.match !== null) {
+          const target = verdict.match;
+          const judged = await judgeVerdict(statement, typeof target.statement === 'string' ? target.statement : '');
+          if (judged === 'same') return reinforce(target, 'reinforced');
+          if (judged === 'update') {
+            // 用户红线：pinned 不得被 update supersede；退化为插新条（不阻断显式写入）。
+            const existing = typeof store.getFact === 'function' ? store.getFact(target.id) : null;
+            if (existing?.salience === 'pinned') {
+              platform?.log?.('warn', '[dsh-companion] memory_write update target is pinned; inserted a new fact instead', { targetId: target.id });
+              return insert('inserted');
+            }
+            const row = insert('updated');
+            store.updateFact(target.id, { status: 'superseded', superseded_by: row.id });
+            return { ...row, duplicateOf: target.id };
+          }
+          return insert('inserted');
+        }
+        return insert('inserted');
       },
     },
 

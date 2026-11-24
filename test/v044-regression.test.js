@@ -528,7 +528,7 @@ test('V3-M4：memory_update 后旧值搜不到、新值搜得到（FTS + 向量�
     const searchTool = ctx.tools.registrations.find((definition) => definition.name === 'memory_search');
     assert.ok(writeTool && updateTool && searchTool);
 
-    const written = writeTool.execute({
+    const written = await writeTool.execute({
       statement: '下周四去杭州出差',
       subject: '行程',
       predicate: '计划',

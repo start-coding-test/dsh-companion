@@ -60,6 +60,25 @@
   `store.listBgJobs` 新增 `sessionId` 过滤，`store.latestEventForRow` 提供按行取最近事件；
   schema 仍 16，无新表/新列。
 
+### Fixed（v0.7.17 M1）
+
+- **M1 `memory_write` 写入前先查重**：写入不再是「无条件插一条」。`memory_write` 现在按
+  「同 kind 字面 Jaccard」分三档（口径与巩固同一套：`dedupeSkip` / `dedupeAsk`）——
+  `skip` 只强化旧条（`reinforceFact`，不新写行）；`ask` 走一次小模型裁决
+  `same`（强化）/ `update`（新行置 superseded、旧行保留历史）/ `new`（两条都留）；
+  `new` 直接插入。裁决不可用（未注入 / 抛错 / 结构坏）一律按 `new` 保守插入，**绝不
+  静默丢写入**。返回形状变为异步的
+  `{ ok, id, duplicateOf, verdict: 'reinforced'|'updated'|'inserted', statement, scope }`。
+- **M1 跨 kind 关键串只扩大 ask**：新增纯函数 `extractKeyPhrases` /
+  `buildKeyPhraseIndex` / `upgradeVerdictWithKeyPhrases`（`src/memory/dedupe.js`）——
+  同 kind 判 `new` 但项目名 / 代号等关键串命中**任意 kind** 的既有事实时升级为 `ask`，
+  让裁决看到「同一对象、不同说法」；关键串**永不触发 skip**（skip 仍只由同 kind 高
+  Jaccard 决定），最坏情况只是多一次裁决调用。纯版本号、纯日期/时间与停用词不入索引。
+- **M1 `pinned` 三处设防**：用户红线「pinned 记忆不得被 update 取代」——巩固的
+  supersede UPDATE 加 `AND salience <> 'pinned'`（模型显式 supersedes 与 judge update
+  共用），`memory_update`（`editMemoryFact`）对 pinned 返回 `reason: 'pinned'`，
+  `memory_write` 的 `update` 目标若是 pinned 则退化为插新条并 warn，不阻断用户显式写入。
+
 ## [0.7.16] - 2026-11-24
 
 后台任务终态与取消链修正版：超时不再被记成「已结束」、取消不再显示成失败、每个后台任务结束时

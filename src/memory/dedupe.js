@@ -147,3 +147,106 @@ export function parseDedupeVerdicts(payload, expected) {
   // 缺项按 new 保守补：宁可多写一条，也不误删/误合并。
   return verdicts.map((verdict) => verdict ?? 'new');
 }
+
+// ---------------------------------------------------------------- M1（v0.7.17）
+// memory_write 的「关键串」升级。
+//
+// 同 kind 的 bigram Jaccard 只衡量**措辞**；跨 kind 的实体串（项目名、人名、
+// 代号）才说明「同一对象」。口径（用户 m01525 裁决）：
+// - 关键串**只扩大 ask**，永不触发 skip —— skip 仍只由同 kind 高 Jaccard 决定，
+//   所以最坏情况只是多一次 judge 调用，不会误合并两条事实；
+// - 抽取是纯字符串处理：拉丁标识符（dsh-companion / Node / 50041）与 CJK 短段，
+//   排除纯版本号、纯日期/时间与停用词，最多取 KEY_PHRASE_MAX 个；
+// - 倒排索引在 collectActiveFactsByKind 的结果上现算，不新增任何 DB 查询。
+
+/** 单条事实最多参与升级的关键串数量。 */
+export const KEY_PHRASE_MAX = 5;
+/** 关键串的字符数下界。 */
+export const KEY_PHRASE_MIN_LENGTH = 2;
+/** 关键串的字符数上界（超过它基本是整句，不做跨事实比较）。 */
+export const KEY_PHRASE_MAX_LENGTH = 24;
+
+/** 已知停用词：出现频率高但不指向任何实体。 */
+const KEY_PHRASE_STOPWORDS = new Set([
+  '我们', '你们', '他们', '这个', '那个', '什么', '怎么', '因为', '所以',
+  '但是', '然后', '已经', '可以', '就是', '还是', '不是', '没有', '一个',
+  '一些', '现在', '今天', '明天', '昨天', '以后', '之前', '需要', '应该',
+  'the', 'and', 'for', 'with', 'that', 'this',
+]);
+
+const VERSION_ONLY = /^\d+(?:\.\d+)+$/u;
+const DATE_TIME_ONLY = /^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}(?::\d{2})?|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}[日号])$/u;
+
+/**
+ * 从一条事实里抽关键串（纯函数，无 I/O）。
+ * @param {string} statement
+ * @returns {string[]} 按出现顺序去重，最多 {@link KEY_PHRASE_MAX} 个
+ */
+export function extractKeyPhrases(statement) {
+  const text = typeof statement === 'string' ? statement : '';
+  if (text === '') return [];
+  const phrases = [];
+  const seen = new Set();
+  const push = (raw) => {
+    const phrase = typeof raw === 'string' ? raw.trim() : '';
+    if (phrase.length < KEY_PHRASE_MIN_LENGTH || phrase.length > KEY_PHRASE_MAX_LENGTH) return;
+    if (VERSION_ONLY.test(phrase) || DATE_TIME_ONLY.test(phrase)) return;
+    const key = phrase.toLowerCase();
+    if (KEY_PHRASE_STOPWORDS.has(key) || seen.has(key)) return;
+    seen.add(key);
+    phrases.push(phrase);
+  };
+  for (const match of text.matchAll(/[A-Za-z][A-Za-z0-9._+-]{1,23}/gu)) push(match[0]);
+  // CJK 段常带着虚词边界（「项目在」「上用」），先削掉首尾的功能字再当关键串。
+  for (const match of text.matchAll(/[\u4e00-\u9fff]{2,24}/gu)) {
+    const trimmed = match[0]
+      .replace(/^[在的了是和与把被给对从到就也还很都又再更最上下中里]+/u, '')
+      .replace(/[在的了是和与把被给对从到就也还很都又再更最上下中里]+$/u, '');
+    push(trimmed);
+  }
+  return phrases.slice(0, KEY_PHRASE_MAX);
+}
+
+/**
+ * 把 active 事实建成「关键串 → 命中行」倒排（跨 kind）。
+ * @param {Map<string, {id: string, statement: string}[]>} byKind
+ * @returns {Map<string, {id: string, kind: string, statement: string}[]>}
+ */
+export function buildKeyPhraseIndex(byKind) {
+  const index = new Map();
+  if (byKind === null || typeof byKind?.forEach !== 'function') return index;
+  byKind.forEach((rows, kind) => {
+    for (const row of rows ?? []) {
+      for (const phrase of extractKeyPhrases(row?.statement)) {
+        const key = phrase.toLowerCase();
+        const hit = {
+          id: typeof row?.id === 'string' ? row.id : String(row?.id ?? ''),
+          kind: typeof kind === 'string' ? kind : '',
+          statement: typeof row?.statement === 'string' ? row.statement : '',
+        };
+        const bucket = index.get(key);
+        if (bucket === undefined) index.set(key, [hit]);
+        else bucket.push(hit);
+      }
+    }
+  });
+  return index;
+}
+
+/**
+ * classifyDraftFact 判 new 时，用关键串把它升级成 ask（不升级 skip）。
+ * @param {{kind: string, statement: string}} fact
+ * @param {{verdict: string, match: object|null, score: number}} verdict
+ * @param {Map<string, object[]>} index {@link buildKeyPhraseIndex} 的结果
+ * @returns {{verdict: string, match: object|null, score: number, keyPhrase?: string}}
+ */
+export function upgradeVerdictWithKeyPhrases(fact, verdict, index) {
+  if (verdict === null || typeof verdict !== 'object' || verdict.verdict !== 'new') return verdict;
+  if (index === null || typeof index?.get !== 'function') return verdict;
+  for (const phrase of extractKeyPhrases(fact?.statement)) {
+    const hits = index.get(phrase.toLowerCase());
+    if (!Array.isArray(hits) || hits.length === 0) continue;
+    return { verdict: 'ask', match: hits[0], score: verdict.score, keyPhrase: phrase };
+  }
+  return verdict;
+}

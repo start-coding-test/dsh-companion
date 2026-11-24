@@ -205,7 +205,7 @@ test('真实 apply 注册 12 个工具；/记忆 拦截与 memory_update 端到�
     assert.equal(ctx.tools.registrations.some((definition) => definition.name === 'memory_update'), true);
 
     const write = ctx.tools.registrations.find((definition) => definition.name === 'memory_write');
-    const written = write.execute({ statement: '每周五交周报', kind: 'project' });
+    const written = await write.execute({ statement: '每周五交周报', kind: 'project' });
     assert.equal(written.ok, true);
 
     const memory = ctx.commands.registrations.find((definition) => definition.name === 'memory');

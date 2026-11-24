@@ -674,6 +674,9 @@ export function apply(ctx, rawConfig, hooks = {}) {
       // H1（v0.7.15）：bg_run 的可用性闸门闭包。此前 registerTools 内部直接引用
       // 未声明的 state，任何 bg_run 调用都会抛 ReferenceError（v0.7.10 起）。
       () => state.bgSelfCheck,
+      // M1（v0.7.17）：memory_write 的 ask 档裁决（与巩固共用同一 LLM 路由；
+      // 未接线时 ask 档按 new 保守插入，绝不静默丢写入）。
+      (prompt) => judgeFactDuplicates(state, prompt),
     );
     track(startScheduler(state));
   } catch (error) {
@@ -1406,7 +1409,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
  * @param {(info: object) => object} [taskReceipt] SA-B3：回执投递入口
  * @param {string} [subagentModel] SA-B1/D3：子代理模型（空 = 沿用主会话路由）
  */
-function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg, recordTokenUsage, taskReceipt, subagentModel, bgConfig, mainSessionId, bgAvailabilityFn) {
+function registerTools(platform, store, config, track, currentScope, budgetGate, metrics, retrieveFn, vectorCfg, recordTokenUsage, taskReceipt, subagentModel, bgConfig, mainSessionId, bgAvailabilityFn, judgeFn) {
   // V7-H1 审计：tools 是声明的 inject，apply 前就绪；工具注册只能在 apply
   // 阶段完成，故保留 apply 时判断。线程能力见下方 execute 内的调用时判断。
   if (!platform.capabilities.tools) return;
@@ -1438,6 +1441,10 @@ function registerTools(platform, store, config, track, currentScope, budgetGate,
     // H1（v0.7.15）：此前这里引用未声明的 state，bg_run 一调就抛
     // ReferenceError；改由调用点传入闭包（见 activate 里的 registerTools 调用）。
     bgAvailability: typeof bgAvailabilityFn === 'function' ? bgAvailabilityFn : undefined,
+    // M1（v0.7.17）：memory_write 的 ask 档裁决（与巩固共用同一 LLM 路由；
+    // 未接线时该档按 new 保守插入，绝不静默丢写入）。
+    judge: typeof judgeFn === 'function' ? judgeFn : undefined,
+    dedupe: { dedupeSkip: config.consolidate?.dedupeSkip, dedupeAsk: config.consolidate?.dedupeAsk },
     vector: vectorCfg ?? config.vector,
   });
   for (const tool of tools) {
@@ -7085,6 +7092,11 @@ export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date
   }
   if (confidence.deleted_at !== null || confidence.status !== 'active') {
     return { ok: false, reason: 'not_active', message: `记忆 ${id} 不是 active 状态` };
+  }
+  // M1（v0.7.17）：pinned 事实不允许被 update 取代（用户红线）。要换内容先显式改
+  // salience，避免一次「改措辞」把长期置顶的约束悄悄换成新表述。
+  if (confidence.salience === 'pinned') {
+    return { ok: false, reason: 'pinned', message: 'pinned 记忆不允许被 update 取代，请先显式改 salience' };
   }
 
   const nowMs = toMillis(now);

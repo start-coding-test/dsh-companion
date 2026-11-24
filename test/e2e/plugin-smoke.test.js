@@ -117,7 +117,7 @@ test('注册的命令与工具真的连到 Store', async () => {
   assert.match(emptyReply.text, /记忆（共 0 条）/);
 
   const writeTool = ctx.tools.registrations.find((definition) => definition.name === 'memory_write');
-  const written = writeTool.execute({ statement: '每周五要交周报。', kind: 'project' });
+  const written = await writeTool.execute({ statement: '每周五要交周报。', kind: 'project' });
   assert.equal(written.ok, true);
   assert.ok(written.id);
 

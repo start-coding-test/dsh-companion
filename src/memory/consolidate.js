@@ -1455,10 +1455,13 @@ export async function consolidate(input = {}) {
       if (plan.mode === 'supersede' && plan.targetId) targets.add(plan.targetId);
       if (fact.supersedes !== null && candidateIds.has(fact.supersedes)) targets.add(fact.supersedes);
       for (const targetId of targets) {
+        // M1（v0.7.17）：用户红线——pinned 记忆不得被任何 update 路（模型显式
+        // supersedes 与 judge 判 update 共用同一条 UPDATE）整条取代；命不中
+        // 即改变 0 行，supersededFacts 计数自然不增。
         const info = store.db
           .prepare(
             `UPDATE facts SET status = 'superseded', superseded_by = ?, updated_at = ?
-              WHERE id = ? AND scope = ? AND status = 'active'`,
+              WHERE id = ? AND scope = ? AND status = 'active' AND salience <> 'pinned'`,
           )
           .run(inserted.id, at, targetId, scope);
         supersededFacts += Number(info.changes) || 0;

@@ -127,10 +127,10 @@ test('memory_search：走注入的 retrieve，并透传 query/scope/limit', asyn
   }
 });
 
-test('memory_write/memory_forget：写入事实并标记遗忘', () => {
+test('memory_write/memory_forget：写入事实并标记遗忘（M1 起为异步查重写入）', async () => {
   const harness = makeHarness();
   try {
-    const written = harness.byName.memory_write.execute({
+    const written = await harness.byName.memory_write.execute({
       statement: '我每天早上跑步',
       kind: 'preference',
       subject: '我',
@@ -141,7 +141,7 @@ test('memory_write/memory_forget：写入事实并标记遗忘', () => {
     const row = harness.store.getFact(written.id);
     assert.equal(row.statement, '我每天早上跑步');
     assert.equal(row.source_kind, 'user_explicit');
-    assert.throws(() => harness.byName.memory_write.execute({}), /statement/);
+    await assert.rejects(() => harness.byName.memory_write.execute({}), /statement/);
 
     const forgotten = harness.byName.memory_forget.execute({ id: written.id });
     assert.equal(forgotten.ok, true);

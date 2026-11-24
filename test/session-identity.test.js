@@ -286,12 +286,12 @@ test('工具作用域：thread 默认写自己的 scope，显式 main 被拒绝�
     addThread(store, { key: 't1', session_id: 'sess-thread' });
     const { byName, searches } = makeTools(store, () => threadScope('t1'));
 
-    const written = byName.memory_write.execute({ statement: '线程里的偏好' });
+    const written = await byName.memory_write.execute({ statement: '线程里的偏好' });
     assert.equal(written.ok, true);
     assert.equal(written.scope, threadScope('t1'));
     assert.equal(store.listFacts({ scope: threadScope('t1') }).length, 1);
 
-    const denied = byName.memory_write.execute({ statement: '越界', scope: 'main' });
+    const denied = await byName.memory_write.execute({ statement: '越界', scope: 'main' });
     assert.deepEqual(denied, { ok: false, reason: 'scope_denied', scope: 'main' });
 
     const searched = await byName.memory_search.execute({ query: '偏好' });
@@ -316,7 +316,7 @@ test('工具作用域：subagent（currentScope=null）拒绝记忆读写与遗�
       { ok: false, reason: 'scope_denied', scope: null },
     );
     assert.deepEqual(
-      byName.memory_write.execute({ statement: '子会话不该记住' }),
+      await byName.memory_write.execute({ statement: '子会话不该记住' }),
       { ok: false, reason: 'scope_denied', scope: null },
     );
     assert.deepEqual(
