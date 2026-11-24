@@ -209,3 +209,14 @@ reminderTodoStaleDays: 7
 #     targetId: ""
 #   # v0.7.15 起不再读取：回执一律以 notice 交主会话并唤醒（空闲 next-turn / 忙 next-step）。
 #   sessionNotice: true
+
+# ── 历史回填（v0.7.17 H1-A，可选段，不参与 16 键安装自检）────────────
+# 把「正常压缩水位之前、历史上从未被插件压缩过」的原文，按批交给同一套巩固 →
+# 压缩流程逐段处理。本版只提供配置、只读预演（/记忆 回填）与 /状态 展示，
+# 执行（真正改写 surface 与水位）在 H1-B 才接线；enabled=true 目前不会产生
+# 任何写操作，可安全先观察预演数字。
+# compact:
+#   backfill:
+#     enabled: false          # true 才允许以后台回填执行（本版仅预演）
+#     chunkTokens: 32768      # 单批 token 上限（1024..262144）
+#     maxPerDay: 6            # 每日最多推进批数（1..50）

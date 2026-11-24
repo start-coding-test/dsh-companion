@@ -121,6 +121,9 @@ persona:
 | `budget.dailyHardLimit` | `3000000` | 每日 token 硬上限 |
 | `quota.source` | `none` | 设为 `file` 时读额度快照，额度紧张只停后台 |
 | `compact.minIncrementTokens` / `compact.cooldownTurns` | `4096` / `3` | 压缩迟滞，防止每轮空转 |
+| `compact.backfill.enabled` | `false` | 历史回填开关（v0.7.17 H1-A：只影响预演提示，执行留 H1-B） |
+| `compact.backfill.chunkTokens` | `32768` | 回填单批 token 上限（1024..262144） |
+| `compact.backfill.maxPerDay` | `6` | 回填每日最多推进批数（1..50） |
 | `consolidate.dedupeSkip` / `consolidate.dedupeAsk` | `0.85` / `0.5` | 巩固写库前的近似查重：≥ skip 只强化旧条，ask–skip 之间交模型判定 same/update/new |
 | `consolidate.maxProjectFacts` | `5` | 每次巩固新增 project + knowledge 事实的上限（`0` 表示不写工程类事实） |
 | `govern.autoDedupeThreshold` | `0.6` | deep-sleep 自动去重的配对下限（判 same 才 supersede，不物理删） |
@@ -154,6 +157,20 @@ token 四档须满足 `retainTokens < compactAtTokens < workingMemoryTokens < co
 
 部署时请在 profile 显式配置 `defaultContextWindow`（0.2.2 起未写容量的模型默认 1,000,000），
 否则压缩阈值会按错误的窗口算：插件用它换算「还剩多少上下文」，不填等于把上限放大到 1M tokens。
+
+## 历史回填（v0.7.17 H1-A）
+
+插件从 v0.7.10 起只为「正常压缩水位之后」的区间维护 pending 压缩；水位之前、历史上从未被
+插件压缩过的原文一直留在宿主 surface 里。历史回填把它们按批交给同一套「巩固 → 压缩摘要」
+流程处理，压缩后水位前移、context 变小。
+
+- `/记忆 回填`：只读预演。列出可回填批数（每批 seq 区间 / tokens / 节点数）、水位后可回填
+  tokens、理论压后底上限、预计模型调用次数（每批 1 次巩固 + 1 次压缩摘要；巩固内的去重
+  裁决 0..1 次/批未计入）。预演不写库、不推进游标、不调模型。
+- `/状态`：配置了 `compact.backfill` 时多一行「回填：…」，显示开关、游标、今日批数、
+  最近一次压后底。
+- 选区语义：水位比较按 seq 在 surface 里的**位置**而不是数值大小（压缩替换会让 seq 非单调）；
+  起点跳过系统提示词，终点按工具调用配对收缩，跨摘要节点继续下探。
 
 ## 人格与情绪
 

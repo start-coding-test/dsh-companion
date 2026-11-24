@@ -174,10 +174,19 @@ Object.defineProperty(DEFAULT_VALUES, 'persona', {
   configurable: false,
 });
 
+// v0.7.17 H1-A：历史回填。enabled 默认关，H1-A 只提供只读预演能力；真正执行在 H1-B。
+// chunkTokens 是单批原文预算；maxPerDay 是每日批数上限（按插件本地日界线计）。
+const BACKFILL_DEFAULTS = Object.freeze({
+  enabled: false,
+  chunkTokens: 32_768,
+  maxPerDay: 6,
+});
+
 // v0.4.13 A6：压缩迟滞。minIncrementTokens = 压后实测水位之上还要涨多少才值得再压；
 // cooldownTurns = 同一 scope 两次 threshold 压缩之间至少隔几轮（hard/idle 不受限）。
 // 该节同样不参与 16 键安装自检（与 vector/recall/session/consolidation/thread/timing/persona 一致）。
 const COMPACT_DEFAULTS = Object.freeze({
+  backfill: BACKFILL_DEFAULTS,
   minIncrementTokens: 4_096,
   cooldownTurns: 3,
 });
@@ -998,13 +1007,57 @@ export function normalizeBudget(raw, warnings = []) {
   return Object.freeze({ dailyHardLimit: daily, window5hLimit: window });
 }
 
+/**
+ * 校验 compact.backfill（v0.7.17 H1-A，历史回填）。
+ *
+ * - `enabled`：默认 false；H1-A 即使为 true 也不执行，只影响 /状态 展示与 H1-B 闸门。
+ * - `chunkTokens`：单批原文预算，1024..262144 的整数（默认 32768）。
+ * - `maxPerDay`：每日批数上限，1..50 的整数（默认 6）。
+ *
+ * 旧配置没有该节时直接回落默认值，且不产生任何 warning。
+ *
+ * @param {unknown} raw
+ * @param {string[]} [warnings]
+ * @returns {Readonly<{enabled: boolean, chunkTokens: number, maxPerDay: number}>}
+ */
+export function normalizeBackfill(raw, warnings = []) {
+  const defaults = DEFAULTS.compact.backfill;
+  if (raw === undefined) return defaults;
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ConfigError('compact.backfill', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
+  }
+  const allowed = new Set(['enabled', 'chunkTokens', 'maxPerDay']);
+  for (const key of Object.keys(raw)) {
+    if (!allowed.has(key)) warnings.push(`unknown config field "compact.backfill.${key}" ignored`);
+  }
+  const enabled = raw.enabled === undefined ? defaults.enabled : raw.enabled;
+  if (typeof enabled !== 'boolean') {
+    throw new ConfigError('compact.backfill.enabled', `must be a boolean, got ${JSON.stringify(enabled)}`);
+  }
+  const chunkTokens = raw.chunkTokens === undefined ? defaults.chunkTokens : raw.chunkTokens;
+  if (!Number.isInteger(chunkTokens) || chunkTokens < 1024 || chunkTokens > 262_144) {
+    throw new ConfigError(
+      'compact.backfill.chunkTokens',
+      `must be an integer within 1024..262144, got ${JSON.stringify(chunkTokens)}`,
+    );
+  }
+  const maxPerDay = raw.maxPerDay === undefined ? defaults.maxPerDay : raw.maxPerDay;
+  if (!Number.isInteger(maxPerDay) || maxPerDay < 1 || maxPerDay > 50) {
+    throw new ConfigError(
+      'compact.backfill.maxPerDay',
+      `must be an integer within 1..50, got ${JSON.stringify(maxPerDay)}`,
+    );
+  }
+  return Object.freeze({ enabled, chunkTokens, maxPerDay });
+}
+
 export function normalizeCompact(raw, warnings = []) {
   const defaults = DEFAULTS.compact;
   if (raw === undefined) return defaults;
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new ConfigError('compact', `must be a plain object, got ${raw === null ? 'null' : typeof raw}`);
   }
-  const allowed = new Set(['minIncrementTokens', 'cooldownTurns']);
+  const allowed = new Set(['minIncrementTokens', 'cooldownTurns', 'backfill']);
   for (const key of Object.keys(raw)) {
     if (!allowed.has(key)) warnings.push(`unknown config field "compact.${key}" ignored`);
   }
@@ -1023,7 +1076,11 @@ export function normalizeCompact(raw, warnings = []) {
       `must be an integer within 0..50, got ${JSON.stringify(cooldownTurns)}`,
     );
   }
-  return Object.freeze({ minIncrementTokens, cooldownTurns });
+  const backfill = normalizeBackfill(raw.backfill, warnings);
+  // H1-A：只有用户显式写了 compact.backfill 才在 /状态 展示回填行；
+  // 默认值仍生效（预演始终可用），但旧配置的 /状态 golden 不变。
+  const backfillConfigured = Object.prototype.hasOwnProperty.call(raw, 'backfill');
+  return Object.freeze({ minIncrementTokens, cooldownTurns, backfill, backfillConfigured });
 }
 
 /**

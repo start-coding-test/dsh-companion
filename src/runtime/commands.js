@@ -155,6 +155,8 @@ export function handleCommand({
   // D21-H4（v0.7.10）：后台任务 systemd 模式与自检结果（只由接线层传入）。
   // R22-H1（v0.7.13）：回执出站通道（dsh-im）状态（只由接线层传入）。
   receipt,
+  // v0.7.17 H1-A：回填只读状态（未配置该节时 undefined → 省行）。
+  backfill,
   bg,
   // V710-L1（v0.7.11）：取消在跑 task_run；null = 全部。
 } = {}) {
@@ -190,6 +192,7 @@ export function handleCommand({
   return {
     handled: true,
     reply: formatStatus(store, scope, metrics, timeZone, budget, {
+      backfill,
       threadsSupported,
       mainSession,
       compactionSupported,
@@ -687,6 +690,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // R22-H1（v0.7.13）：回执出站通道（dsh-im）状态；只在接线层传入 receipt 时输出。
   const receiptLine = formatReceiptLine(options.receipt);
   if (receiptLine !== null) lines.push(receiptLine);
+  // v0.7.17 H1-A：历史回填只读状态（未传 options 时整行省略，保持旧 golden）。
+  const backfillLine = formatBackfillLine(options.backfill);
+  if (backfillLine !== null) lines.push(backfillLine);
   // G0-9：最近一次压缩/巩固实际耗时（只观测，不设超时）；无样本显示 —。
   // timing 只在接线层传入时输出，保持旧调用方（单测）的 /状态 格式不变。
   if (options.timing !== null && options.timing !== undefined && typeof options.timing === 'object') {
@@ -785,6 +791,99 @@ function formatBgLine(bg) {
     line += `；MemoryMax/CPUQuota 不生效（缺 ${missing.join('/')}）`;
   }
   return line;
+}
+
+/**
+ * `/状态` 的历史回填只读行（v0.7.17 H1-A）。
+ *
+ * 未传 `backfill` 时返回 null —— 命令层必须整行省略，避免破坏既有 golden。
+ * 只读：数据来自 `compact_backfill:*` meta（H1-B 才写），缺失时显示明确默认值。
+ *
+ * @param {{enabled?: boolean, cursorSeq?: number|null, todayCount?: number,
+ *          maxPerDay?: number, chunkTokens?: number, lastFloor?: number|null}|null|undefined} backfill
+ * @returns {string|null}
+ */
+function formatBackfillLine(backfill) {
+  if (backfill === null || backfill === undefined || typeof backfill !== 'object') return null;
+  if (backfill.enabled !== true) return '回填：关（compact.backfill.enabled=false）';
+  const bits = ['回填：开'];
+  bits.push(backfill.cursorSeq === null || backfill.cursorSeq === undefined
+    ? '游标 无（从水位后第一段起）'
+    : `游标 seq ${backfill.cursorSeq}`);
+  const maxPerDay = Number.isFinite(Number(backfill.maxPerDay)) ? Math.trunc(Number(backfill.maxPerDay)) : 0;
+  const todayCount = Number.isFinite(Number(backfill.todayCount)) ? Math.trunc(Number(backfill.todayCount)) : 0;
+  bits.push(`今日 ${todayCount}/${maxPerDay} 批`);
+  bits.push(backfill.lastFloor !== null && backfill.lastFloor !== undefined && Number.isFinite(Number(backfill.lastFloor))
+    ? `最近压后底 ${Math.trunc(Number(backfill.lastFloor))} tokens`
+    : '最近压后底 无记录');
+  return bits.join(' · ');
+}
+
+/**
+ * `/记忆 回填` 的只读预演文本（v0.7.17 H1-A）。
+ *
+ * 纯渲染：选区与估算由 `session/backfill.js` 算好传入；这里不查库、不调模型。
+ * 模型调用次数按「每批巩固 1 + 压缩摘要 1」分项给出，去重裁决明确标注未计入。
+ *
+ * @param {{scope: string, enabled: boolean, chunkTokens: number, maxPerDay: number,
+ *          watermarkSeq: number|null, status: object, plan: object, estimate: object}} input
+ * @returns {string}
+ */
+export function formatBackfillPreview(input = {}) {
+  const scope = typeof input.scope === 'string' ? input.scope : 'main';
+  const plan = input.plan ?? {};
+  const estimate = input.estimate ?? {};
+  const status = input.status ?? {};
+  const chunks = Array.isArray(plan.chunks) ? plan.chunks : [];
+  const lines = [
+    `回填预演（只读；不写库、不推进游标、不调模型）`,
+    `作用域：${scope} · 开关：${input.enabled === true ? '开' : '关（compact.backfill.enabled=false）'}`,
+  ];
+  const rawWatermark = input.watermarkSeq;
+  const watermarkSeq = rawWatermark === null || rawWatermark === undefined
+    ? null
+    : (Number.isFinite(Number(rawWatermark)) ? Number(rawWatermark) : null);
+  lines.push(`水位：${watermarkSeq === null ? '无（尚无压缩水位）' : `seq ${watermarkSeq}`} · 游标：${plan.cursorSeq === null || plan.cursorSeq === undefined ? '无' : `seq ${plan.cursorSeq}`}`);
+  if (chunks.length === 0) {
+    lines.push(`可回填：0 批（${backfillReasonText(plan.reason)}）`);
+  } else {
+    const total = chunks.reduce((sum, chunk) => sum + (Number(chunk.tokens) || 0), 0);
+    lines.push(`可回填：${chunks.length} 批 / ${total} tokens（单批上限 ${input.chunkTokens ?? 0} tokens）`);
+    for (let index = 0; index < chunks.length; index += 1) {
+      const chunk = chunks[index];
+      lines.push(`  #${index + 1} seq ${chunk.startSeq}–${chunk.endSeq} · ${chunk.tokens} tokens · ${chunk.count} 节点`);
+    }
+  }
+  lines.push(`水位后不可回填：${estimate.unreclaimableTokens ?? 0} tokens（本轮回填碰不到）`);
+  lines.push(`理论压后底上限：${estimate.floorUpperBound ?? 0} tokens（= 剩余 ${Math.max(0, (estimate.totalTokens ?? 0) - (estimate.reclaimableTokens ?? 0))} + 摘要上限 ${estimate.summaryTokensUpper ?? 0}，每批按 2048 估）`);
+  const calls = estimate.modelCalls ?? {};
+  lines.push(`预计模型调用：${calls.total ?? 0} 次（巩固 ${calls.consolidate ?? 0} + 压缩摘要 ${calls.compact ?? 0}；去重裁决未计入，至多 1 次/批，视候选而定）`);
+  const todayCount = Number.isFinite(Number(status.todayCount)) ? Math.trunc(Number(status.todayCount)) : 0;
+  const maxPerDay = Number.isFinite(Number(input.maxPerDay)) ? Math.trunc(Number(input.maxPerDay)) : 0;
+  lines.push(`今日批数：${todayCount}/${maxPerDay}`);
+  return lines.join('\n');
+}
+
+/**
+ * 选区停止原因的中文短句（预演用）。
+ * @param {string} reason
+ * @returns {string}
+ */
+function backfillReasonText(reason) {
+  switch (reason) {
+    case 'no-watermark': return '尚无正常压缩水位，暂无可回填区间';
+    case 'stale-watermark': return '水位不在当前 surface（可能刚被压缩替换）';
+    case 'stale-cursor': return '游标不在当前 surface，需先重置游标';
+    case 'watermark-before-cursor': return '游标已到水位之前，没有剩余区间';
+    case 'system-boundary': return '下一段遇到系统节点，已收尾';
+    case 'summary-boundary': return '下一段是压缩摘要节点，已跳过';
+    case 'unbalanced-boundary': return '工具配对不平衡，本批作废';
+    case 'empty-surface': return '当前会话没有 surface';
+    case 'no-replaceable-range': return '起点之后没有可替换节点';
+    case 'no-chunk': return '没有满足预算的连续原文区间';
+    case 'budget': return '已按单批预算切分到水位';
+    default: return '没有可回填区间';
+  }
 }
 
 /**

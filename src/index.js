@@ -122,7 +122,13 @@ import {
   isCredentialError,
   retryDelayMs,
 } from './runtime/retry.js';
-import { COMMAND_HINT_SOURCE_KIND, commandHintMessage, formatStopTaskReply, handleCommand } from './runtime/commands.js';
+import {
+  COMMAND_HINT_SOURCE_KIND,
+  commandHintMessage,
+  formatBackfillPreview,
+  formatStopTaskReply,
+  handleCommand,
+} from './runtime/commands.js';
 import { elapsedMs, nowMs, recordTimingSample } from './runtime/timing.js';
 import { createMetrics } from './runtime/metrics.js';
 import { createProactive } from './runtime/proactive.js';
@@ -155,6 +161,7 @@ import {
   surfaceSeqs,
   watermarkAfterCompact,
 } from './session/surface.js';
+import { estimateBackfill, planBackfillChunks, readBackfillState } from './session/backfill.js';
 import * as threadRegistry from './thread/registry.js';
 import { zonedDayKey, zonedParts } from './time.js';
 
@@ -1209,6 +1216,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
               scope,
               timeZone: config.timezone,
               cwd: typeof platform.cwd === 'function' ? platform.cwd() : undefined,
+              backfillPreview: () => buildBackfillPreview(state, store, config, scope),
             });
             if (custom !== null) return { kind: 'success', text: custom };
           }
@@ -1283,6 +1291,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             bg: state.bgSelfCheck,
             // R22-H1：回执出站通道（dsh-im）与最近一次投递结果。
             receipt: state.im,
+            // v0.7.17 H1-A：回填只读状态（未配置该节时 undefined → 命令层省行）。
+            backfill: backfillStatusOf(state, store, config, scope),
             // V7-H1：每次命令调用时读能力位，不用 apply 时快照（宿主可能晚挂载）。
             threadsSupported: platform.capabilities.threadTools === true,
             // V3-M2：/状态 展示当前主会话与绑定模式。
@@ -3363,6 +3373,72 @@ function thresholdTurnsOf(state, scope, config) {
   }
   map.set(scope, restored);
   return restored;
+}
+
+/**
+ * H1-A（v0.7.17）：`/记忆 回填` 的只读预演。
+ *
+ * 只读约束：只用缓存里的 surface 快照与 meta（`compact_backfill:*`），不写库、
+ * 不推进游标、不改水位、不调模型。snapshot 还没建立时按空 surface 预演。
+ *
+ * @param {object} state
+ * @param {object} store
+ * @param {object} config
+ * @param {string} scope
+ * @returns {string}
+ */
+function buildBackfillPreview(state, store, config, scope) {
+  const cfg = config.compact?.backfill ?? {};
+  const snapshot = state.surfaceSnapshot ?? { seqs: [], nodes: [], records: [] };
+  const status = readBackfillState(store, scope);
+  let watermarkSeq = null;
+  try {
+    const raw = store.getWatermark(scope);
+    const value = Number(raw);
+    if (Number.isFinite(value) && value >= 0) watermarkSeq = value;
+  } catch {
+    watermarkSeq = null;
+  }
+  const plan = planBackfillChunks(snapshot, {
+    watermarkSeq,
+    cursorSeq: status.cursorSeq,
+    chunkTokens: cfg.chunkTokens,
+  });
+  const estimate = estimateBackfill({ snapshot, plan, chunkTokens: cfg.chunkTokens });
+  return formatBackfillPreview({
+    scope,
+    enabled: cfg.enabled === true,
+    chunkTokens: cfg.chunkTokens,
+    maxPerDay: cfg.maxPerDay,
+    watermarkSeq,
+    status,
+    plan,
+    estimate,
+  });
+}
+
+/**
+ * H1-A（v0.7.17）：`/状态` 用的回填只读快照。
+ * @param {object} state
+ * @param {object} store
+ * @param {object} config
+ * @param {string} scope
+ * @returns {object|undefined} 未配置 compact.backfill 时 undefined（命令层省行）
+ */
+function backfillStatusOf(state, store, config, scope) {
+  // H1-A：只在用户显式配置 compact.backfill 时展示该行（旧配置 /状态 golden 不变）。
+  if (config.compact?.backfillConfigured !== true) return undefined;
+  const cfg = config.compact?.backfill;
+  if (cfg === null || cfg === undefined || typeof cfg !== 'object') return undefined;
+  const status = readBackfillState(store, scope);
+  return {
+    enabled: cfg.enabled === true,
+    cursorSeq: status.cursorSeq,
+    todayCount: status.todayCount,
+    maxPerDay: cfg.maxPerDay,
+    chunkTokens: cfg.chunkTokens,
+    lastFloor: status.lastFloor,
+  };
 }
 
 function compactFloorOf(state, scope) {
@@ -7057,6 +7133,7 @@ export function editMemoryFact({ store, scope = SCOPE, id, statement, now = Date
  * @param {{text: string, store: Store, now?: number, scope?: string, timeZone?: string,
  *          cwd?: string, dir?: string}} input
  * @returns {string|null}
+ * @param {() => string} [backfillPreview] H1-A：`/记忆 回填` 的只读预演渲染
  */
 export function handleMemoryCommand({
   text,
@@ -7066,6 +7143,7 @@ export function handleMemoryCommand({
   timeZone,
   cwd,
   dir,
+  backfillPreview,
 } = {}) {
   const body = String(text ?? '').replace(/^\/记忆/u, '').trim();
   const [verb] = body.split(/\s+/u);
@@ -7113,6 +7191,13 @@ export function handleMemoryCommand({
     });
     return report.text;
   }
+  // H1-A（v0.7.17）：回填预演只读——选区/估算都在 session/backfill.js 里算好，
+  // 这里只负责渲染；不写库、不推进游标、不调模型。
+  if (verb === '回填' || verb === 'backfill') {
+    if (typeof backfillPreview === 'function') return backfillPreview();
+    return '回填预演：当前环境不可用（缺少会话 surface 或未接线）。';
+  }
+
   if (LEGACY_MEMORY_VERBS.includes(verb)) return null;
   return formatMemoryList({ store, scope, text: body, timeZone: timeZone ?? 'Asia/Shanghai' });
 }
