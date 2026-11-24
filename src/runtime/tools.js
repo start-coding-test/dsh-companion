@@ -41,7 +41,7 @@ import {
 import { progressFromReceipt } from '../task/receipt.js';
 // W-1..W-5（v0.7.7 阶段 6）：后台长任务。
 // H2（v0.7.15）：bg_run 不再发「启动告知」，故 buildStartNotice 不再引入。
-import { cancelBgJob, startBgJob } from '../task/bg-jobs.js';
+import { buildCancelMessage, cancelBgJob, startBgJob } from '../task/bg-jobs.js';
 import { sessionIdOfAgent } from '../session/identity.js';
 
 const FACT_KINDS = new Set(STORE_FACT_KINDS);
@@ -1198,11 +1198,11 @@ export function createTools({
         const job = bgResult.job ?? {};
         if (typeof taskReceipt === 'function') {
           try {
-            const label = typeof job.label === 'string' && job.label !== '' ? job.label : '(无标签)';
             await taskReceipt({
               taskId,
               status: 'cancelled',
-              receipt: `[后台任务] ${taskId} ${label} 已取消（用户主动停止）；日志：${job.log_path ?? ''}`,
+            // L3（v0.7.17）：与 /停止任务 共用同一个生成器，正文逐字一致。
+            receipt: buildCancelMessage(job),
               title: typeof job.label === 'string' ? job.label : null,
               sessionId: typeof job.child_session_id === 'string' ? job.child_session_id : null,
               reason: 'cancelled',

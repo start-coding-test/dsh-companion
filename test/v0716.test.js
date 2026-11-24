@@ -219,33 +219,46 @@ test('N3 非真机证据：唤醒成功 → 子代理 1 次 + 主会话恰好 1 
   assert.equal(updates.length, 0, '成功路径不得把状态改成 woken-fallback');
 });
 
-test('N3 非真机证据：唤醒失败 / 预算耗尽 → 只有兜底一条，子代理 0 次', async () => {
-  for (const [allowWake, reason] of [[true, 'wake-failed'], [false, 'wake-budget-exhausted']]) {
+test('L2 非真机证据：兜底投递只在 woken 行降级 woken-fallback（timeout/lost/failed/cancelled 保持终态）', async () => {
+  const arms = [
+    { settled: 'woken', allowWake: false, downgrade: true },
+    { settled: 'woken', allowWake: true, wakeFails: true, downgrade: true },
+    { settled: 'timeout', allowWake: false, downgrade: false },
+    { settled: 'lost', allowWake: false, downgrade: false },
+    { settled: 'failed', allowWake: false, downgrade: false },
+    { settled: 'cancelled', allowWake: false, downgrade: false },
+  ];
+  for (const arm of arms) {
     const sends = [];
     const { state, updates, enqueued } = makeState({
       platform: {
         sendToSubagent: async () => {
           sends.push(1);
-          throw new Error('UNAUTHORIZED');
+          if (arm.wakeFails === true) throw new Error('UNAUTHORIZED');
+          return 'sent';
         },
       },
     });
-    const job = { id: 'bg-2', label: '训练', child_session_id: 'child-2', log_path: '/opt/logs/bg-2/output.log' };
+    state.store.getBgJob = () => ({ id: 'bg-2', state: arm.settled });
     const info = {
-      job,
+      job: { id: 'bg-2', label: '训练', child_session_id: 'child-2', log_path: '/opt/logs/bg-2/output.log' },
       message: '[后台任务] bg-2 训练 已结束\n退出码：1',
       exitCode: 1,
       timedOut: false,
       lost: false,
-      allowWake,
-      state: BG_JOB_STATES.woken,
+      allowWake: arm.allowWake,
+      state: arm.settled,
     };
     const result = await wakeBgJob(state, info);
     assert.equal(result.channel, 'main');
-    assert.equal(enqueued.length, 1, `allowWake=${allowWake} 只投一条`);
-    assert.equal(updates.length, 1);
-    assert.equal(updates[0].patch.state, 'woken-fallback');
-    assert.equal(reason === 'wake-failed' ? sends.length : 0, allowWake ? 1 : 0);
+    assert.equal(sends.length, arm.allowWake ? 1 : 0, `${arm.settled}/${arm.allowWake} 唤醒调用次数`);
+    assert.equal(enqueued.length, 1, `${arm.settled}/${arm.allowWake} 只投一条`);
+    assert.equal(updates.length, arm.downgrade ? 1 : 0, `${arm.settled}/${arm.allowWake} 状态写入次数`);
+    if (arm.downgrade) {
+      assert.equal(updates[0].patch.state, 'woken-fallback');
+    } else {
+      assert.doesNotMatch(JSON.stringify(updates), /woken-fallback/u, `${arm.settled} 不得被兜底抹掉`);
+    }
   }
 });
 

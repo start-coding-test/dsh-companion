@@ -22,6 +22,12 @@ import {
   readBackfillState,
 } from '../src/session/backfill.js';
 import { TEST_NOW, makeTempStore } from './e2e/helpers.js';
+import { readFileSync, readdirSync } from 'node:fs';
+import { join, relative } from 'node:path';
+import { Store } from '../src/memory/store.js';
+import { BG_JOB_STATES, buildCancelMessage, monitorBgJobs } from '../src/task/bg-jobs.js';
+import { createTools } from '../src/runtime/tools.js';
+import { wakeBgJob } from '../src/index.js';
 
 const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
@@ -421,4 +427,255 @@ test('H1-A 接线：handleMemoryCommand 的回填分支可注入渲染；缺省�
   assert.equal(injected, '注入的预演文本');
   const missing = handleMemoryCommand({ text: '/记忆 回填', store: makeMetaStore() });
   assert.match(missing, /回填预演：当前环境不可用/u);
+});
+
+
+// ---------------------------------------------------------------- L2 / L3 / L5（v0.7.17）
+
+/** 读 memory_events 里最后一条指定 kind 的 detail。 */
+function lastDetail(store, kind) {
+  const rows = store.listEvents({ table_name: 'bg_jobs', limit: 50 });
+  for (const row of rows) {
+    const detail = typeof row.detail_json === 'string' ? JSON.parse(row.detail_json) : row.detail_json;
+    if (detail?.kind === kind) return detail;
+  }
+  return null;
+}
+
+function seedJob(store, overrides = {}) {
+  store.insertBgJob({
+    id: 'bg-l5',
+    label: '训练',
+    argv: ['python3', '/opt/work/train.py'],
+    cwd: '/opt/work',
+    child_session_id: 'child-1',
+    pid_or_unit: 'dsh-bg-l5',
+    started_at: TEST_NOW - 10,
+    deadline: TEST_NOW + 600,
+    log_path: '/opt/logs/bg-l5/output.log',
+    ...overrides,
+  });
+}
+
+test('L2 非真机证据：monitor 的兜底（主会话通道）不抹掉 timeout 终态，且审计 channel=main', async () => {
+  const store = Store.open(':memory:');
+  seedJob(store);
+  const config = normalizeConfig({});
+  const state = {
+    store,
+    config,
+    platform: { now: () => TEST_NOW * 1000, log() {}, agentBySessionId: () => ({ id: 'agent-main' }), sendToSubagent: async () => { throw new Error('UNAUTHORIZED'); } },
+    proactive: { enqueue: () => ({ queued: true, duplicate: false }), flush: async () => ({}) },
+    im: { available: true, mode: 'session' },
+    mainSessionId: 's-main',
+  };
+  await monitorBgJobs({
+    store,
+    config,
+    wake: (info) => wakeBgJob(state, info),
+    nowMs: TEST_NOW * 1000,
+    launcher: {
+      probeBgProcess: async () => ({ running: false, exited: true, exitCode: 143 }),
+      unitResult: async () => 'timeout',
+      readExitCode: () => 143,
+      tailLog: () => '',
+      capLogFile: () => false,
+      signalBgProcess: async () => true,
+    },
+  });
+  assert.equal(store.getBgJob('bg-l5').state, BG_JOB_STATES.timeout, '终态保持 timeout');
+  const detail = lastDetail(store, 'bg_job_finished');
+  assert.equal(detail.channel, 'main', '兜底仍算送达主会话');
+  assert.equal(detail.unit_result, 'timeout');
+  store.close();
+});
+
+test('L2 非真机证据：预算耗尽时 bg-jobs 的兜底也只在 woken 行降级（终态不被抹掉）', async () => {
+  const arms = [
+    { exitCode: 0, deadline: TEST_NOW + 600, expect: BG_JOB_STATES.wokenFallback },
+    { exitCode: 143, deadline: TEST_NOW - 5, expect: BG_JOB_STATES.timeout },
+  ];
+  for (const arm of arms) {
+    const store = Store.open(':memory:');
+    seedJob(store, { deadline: arm.deadline });
+    const config = normalizeConfig({ bg: { wakeBudgetPerAgent: 0 } });
+    const wakes = [];
+    await monitorBgJobs({
+      store,
+      config,
+      wake: async (info) => { wakes.push(info); return { delivered: true, channel: 'main' }; },
+      nowMs: TEST_NOW * 1000,
+      launcher: {
+        probeBgProcess: async () => ({ running: false, exited: true, exitCode: arm.exitCode }),
+        unitResult: async () => 'timeout',
+        readExitCode: () => arm.exitCode,
+        tailLog: () => '',
+        capLogFile: () => false,
+        signalBgProcess: async () => true,
+      },
+    });
+    assert.equal(wakes.length, 1);
+    assert.equal(wakes[0].allowWake, false, '预算为 0 时不允许唤醒');
+    assert.equal(store.getBgJob('bg-l5').state, arm.expect, `exit=${arm.exitCode} 的终态`);
+    store.close();
+  }
+});
+
+test('L2 非真机证据：failed / cancelled 行在 monitor 轮扫后原样保持', async () => {
+  const store = Store.open(':memory:');
+  seedJob(store, { id: 'bg-failed', state: 'failed' });
+  seedJob(store, { id: 'bg-cancelled', state: 'cancelled' });
+  const ran = [];
+  const summary = await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    nowMs: TEST_NOW * 1000,
+    launcher: { probeBgProcess: async () => { ran.push(1); return { running: true }; } },
+  });
+  assert.equal(summary.checked, 0, '只扫 running 行');
+  assert.equal(ran.length, 0);
+  assert.equal(store.getBgJob('bg-failed').state, 'failed');
+  assert.equal(store.getBgJob('bg-cancelled').state, 'cancelled');
+  store.close();
+});
+
+test('L5 非真机证据：lost + Result=timeout → 按 timeout 且 detail.unit_result=timeout', async () => {
+  const store = Store.open(':memory:');
+  seedJob(store);
+  const wakes = [];
+  await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async (info) => { wakes.push(info); return { delivered: true }; },
+    nowMs: TEST_NOW * 1000,
+    launcher: {
+      probeBgProcess: async () => ({ running: false }),
+      unitResult: async () => 'timeout',
+      readExitCode: () => null,
+      tailLog: () => '',
+      capLogFile: () => false,
+      signalBgProcess: async () => true,
+    },
+  });
+  assert.equal(store.getBgJob('bg-l5').state, BG_JOB_STATES.timeout);
+  assert.equal(wakes.length, 1);
+  assert.equal(wakes[0].timedOut, true);
+  const detail = lastDetail(store, 'bg_job_finished');
+  assert.equal(detail.unit_result, 'timeout');
+  store.close();
+});
+
+test('L5 非真机证据：lost + 查询不到（null）→ state lost 且 detail 无 unit_result 键', async () => {
+  const store = Store.open(':memory:');
+  seedJob(store);
+  await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    nowMs: TEST_NOW * 1000,
+    launcher: {
+      probeBgProcess: async () => ({ running: false }),
+      unitResult: async () => null,
+      readExitCode: () => null,
+      tailLog: () => '',
+      capLogFile: () => false,
+      signalBgProcess: async () => true,
+    },
+  });
+  assert.equal(store.getBgJob('bg-l5').state, BG_JOB_STATES.lost);
+  const detail = lastDetail(store, 'bg_job_finished');
+  assert.equal(Object.hasOwn(detail, 'unit_result'), false, '没查过/查不到都不写该键');
+  store.close();
+});
+
+test('L5 非真机证据：exit 143 且已过 deadline（短路未查 Result）→ 无 unit_result 键', async () => {
+  const store = Store.open(':memory:');
+  seedJob(store, { deadline: TEST_NOW - 5 });
+  let queried = 0;
+  await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    nowMs: TEST_NOW * 1000,
+    launcher: {
+      probeBgProcess: async () => ({ running: false, exited: true, exitCode: 143 }),
+      unitResult: async () => { queried += 1; return null; },
+      readExitCode: () => 143,
+      tailLog: () => '',
+      capLogFile: () => false,
+      signalBgProcess: async () => true,
+    },
+  });
+  assert.equal(queried, 0, '已过 deadline 时不再查 Result');
+  assert.equal(store.getBgJob('bg-l5').state, BG_JOB_STATES.timeout);
+  const detail = lastDetail(store, 'bg_job_finished');
+  assert.equal(Object.hasOwn(detail, 'unit_result'), false);
+  store.close();
+});
+
+test('L5 非真机证据：超时兜底分支（墙钟到期）同样不写 unit_result', async () => {
+  const store = Store.open(':memory:');
+  seedJob(store, { deadline: TEST_NOW - 5 });
+  let queried = 0;
+  await monitorBgJobs({
+    store,
+    config: normalizeConfig({}),
+    wake: async () => ({ delivered: true }),
+    nowMs: TEST_NOW * 1000,
+    graceMs: 0,
+    launcher: {
+      probeBgProcess: async () => ({ running: true }),
+      unitResult: async () => { queried += 1; return null; },
+      readExitCode: () => null,
+      tailLog: () => '',
+      capLogFile: () => false,
+      signalBgProcess: async () => true,
+    },
+  });
+  assert.equal(queried, 0);
+  assert.equal(store.getBgJob('bg-l5').state, BG_JOB_STATES.timeout);
+  const detail = lastDetail(store, 'bg_job_finished');
+  assert.equal(Object.hasOwn(detail, 'unit_result'), false);
+  store.close();
+});
+
+test('L3 非真机证据：取消回执只有一个生成器（两站点逐字一致 + 全库字面量唯一）', async () => {
+  const job = { id: 'bg-t1', label: '训练', argv: ['python3', '/opt/work/train.py'], log_path: '/opt/logs/bg-t1/output.log' };
+  const canonical = buildCancelMessage(job);
+  assert.equal(
+    canonical,
+    '[后台任务] bg-t1 训练 已取消（用户主动停止）\n命令：python3 /opt/work/train.py\n日志：/opt/logs/bg-t1/output.log',
+  );
+  const store = Store.open(':memory:');
+  store.insertBgJob({ id: 'bg-t1', label: '训练', argv: ['python3', '/opt/work/train.py'], cwd: '/opt/work', child_session_id: 'child-1', pid_or_unit: 'dsh-bg-t1', started_at: TEST_NOW - 1, deadline: TEST_NOW + 60, log_path: '/opt/logs/bg-t1/output.log' });
+  const receipts = [];
+  const tools = createTools({
+    store,
+    retrieve: () => [],
+    platform: { capabilities: {}, now: () => TEST_NOW * 1000, log() {} },
+    clock: () => TEST_NOW * 1000,
+    timeZone: 'UTC',
+    bgConfig: () => normalizeConfig({}),
+    bgLauncher: { signal: async () => true },
+    taskReceipt: async (info) => { receipts.push(info); },
+  });
+  const cancel = tools.find((tool) => tool.name === 'task_cancel');
+  const result = await cancel.execute({ taskId: 'bg-t1' });
+  assert.equal(result.ok, true);
+  assert.equal(receipts.length, 1);
+  assert.equal(receipts[0].receipt, canonical, 'task_cancel 站点与生成器逐字一致');
+  const indexSource = readFileSync('src/index.js', 'utf8');
+  assert.match(indexSource, /buildCancelMessage\(job\),/u, '/停止任务 站点也走生成器');
+  const hits = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) walk(full);
+      else if (entry.name.endsWith('.js') && readFileSync(full, 'utf8').includes('已取消（用户主动停止）')) hits.push(relative('.', full));
+    }
+  };
+  walk('src');
+  assert.deepEqual(hits.map((hit) => hit.replaceAll('\\', '/')).sort(), ['src/task/bg-jobs.js'], '字面量只允许出现在生成器里');
+  store.close();
 });

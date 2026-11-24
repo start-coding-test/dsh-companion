@@ -46,7 +46,7 @@ import {
 } from './memory/govern-auto.js';
 import { buildWeeklyMemoryReport } from './memory/weekly-report.js';
 // W-2/W-4（v0.7.7 阶段 6）：后台长任务的监视、重启恢复与唤醒文案。
-import { BG_JOB_STATES, cancelBgJob, monitorBgJobs } from './task/bg-jobs.js';
+import { BG_JOB_STATES, buildCancelMessage, cancelBgJob, monitorBgJobs } from './task/bg-jobs.js';
 import { backoffAfter429 } from './runtime/quota.js';
 import { deferBackground, isQuotaError, readQuotaFile } from './runtime/quota-gate.js';
 import {
@@ -1162,11 +1162,12 @@ function requestCancelBgJob(state, taskId) {
         return;
       }
       const job = result.job ?? {};
-      const label = typeof job.label === 'string' && job.label !== '' ? job.label : '(无标签)';
+      // L3（v0.7.17）：取消回执统一由 buildCancelMessage 生成（与 task_cancel 同文案）；
+      // `[任务] ` 前缀只由 deliverTaskReceipt 在最终投递层加一次。
       deliverBgReceipt(
         state,
         job,
-        `[后台任务] ${job.id ?? taskId} ${label} 已取消（用户主动停止）\n日志：${job.log_path ?? ''}` ,
+        buildCancelMessage(job),
         'cancelled',
         { cancelled: true },
       );
@@ -5848,7 +5849,12 @@ function deliverBgReceipt(state, job, message, reason, outcome = null) {
 function deliverBgFallback(state, job, message, reason, outcome = null) {
   const result = deliverBgReceipt(state, job, message, reason, outcome);
   try {
-    state.store.updateBgJob(job?.id, { state: BG_JOB_STATES.wokenFallback });
+    // L2（v0.7.17）：与 bg-jobs.js deliverWake 同一条规则——只有 woken 行才降级；
+    // timeout / lost / failed / cancelled 是终态分类，兜底投递不得抹掉。
+    const settled = state.store.getBgJob?.(job?.id)?.state ?? null;
+    if (settled === BG_JOB_STATES.woken) {
+      state.store.updateBgJob(job?.id, { state: BG_JOB_STATES.wokenFallback });
+    }
   } catch {
     // 状态改装失败不影响已投递的卡片。
   }

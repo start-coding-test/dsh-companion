@@ -478,6 +478,26 @@ export function buildWakeMessage(job, { exitCode, tail, timedOut = false, cancel
 }
 
 /**
+ * L3（v0.7.17）：取消回执的唯一生成器。
+ * tools.js 的 `task_cancel` 与 index.js 的 `/停止任务` 两个站点都调它，避免文案分叉；
+ * `[任务] ` 前缀只由最终投递层 deliverTaskReceipt 加一次（src/index.js:5676 一带），
+ * 这里与唤醒回执同款式，自带 `[后台任务] ` 头。
+ * @param {object} job
+ * @returns {string}
+ */
+export function buildCancelMessage(job) {
+  const label = job?.label === null || job?.label === undefined || job.label === ''
+    ? '(无标签)'
+    : String(job.label);
+  const command = Array.isArray(job?.argv) ? job.argv.join(' ') : '';
+  return [
+    `[后台任务] ${job?.id ?? ''} ${label} 已取消（用户主动停止）`,
+    `命令：${command}`,
+    `日志：${job?.log_path ?? ''}`,
+  ].join('\n');
+}
+
+/**
  * W-3：唤醒预算——按发起子代理（child_session_id）聚合计数。
  * @param {object} store
  * @param {string} childSessionId
@@ -580,10 +600,11 @@ export async function monitorBgJobs({
       //   - 两者都不成立 = 被外部 TERM/KILL，按正常结束。
       // 其余退出码保持原语义。
       let exitedTimedOut = false;
+      let exitedResult;
       if (code === 143 || code === 137) {
         exitedTimedOut = deadlinePassed;
         if (!exitedTimedOut && kind === 'linux') {
-          const exitedResult = await unitResultOf({ unit: job.pid_or_unit, user: userMode, uid: effectiveUid }).catch(() => null);
+          exitedResult = await unitResultOf({ unit: job.pid_or_unit, user: userMode, uid: effectiveUid }).catch(() => null);
           exitedTimedOut = exitedResult === 'timeout';
         }
       }
@@ -595,7 +616,17 @@ export async function monitorBgJobs({
       const tail = readTail(job.log_path, BG_TAIL_BYTES);
       if (exitedTimedOut) summary.timedOut += 1;
       else summary.woken += 1;
-      await deliverWake({ store, config, wake, job, exitCode: code, tail, timedOut: exitedTimedOut });
+      await deliverWake({
+        store,
+        config,
+        wake,
+        job,
+        exitCode: code,
+        tail,
+        timedOut: exitedTimedOut,
+        // L5（v0.7.17）：只在真的查过 Result 时传（已过 deadline 短路时是 undefined）。
+        unitResult: exitedResult,
+      });
       continue;
     }
 
@@ -670,6 +701,7 @@ export async function monitorBgJobs({
         job,
         exitCode: code ?? null,
         tail: readTail(job.log_path, BG_TAIL_BYTES),
+        unitResult,
         timedOut: true,
       });
       continue;
@@ -684,6 +716,7 @@ export async function monitorBgJobs({
       job,
       exitCode: readExitCode(exitPath),
       tail: readTail(job.log_path, BG_TAIL_BYTES),
+      unitResult,
       timedOut: false,
       lost: true,
     });
@@ -778,8 +811,10 @@ export async function cancelBgJob({ store, jobId, launcher = {}, uid, nowMs } = 
  * 直接投主会话（A2 兜底）。
  * @param {object} input
  * @returns {Promise<object>}
+ * L5（v0.7.17）：`unitResult` 只在真的查过 systemd Result 时传字符串；
+ * 未查（短路/超时兜底分支）传 undefined，审计 detail 就不写 `unit_result` 键。
  */
-async function deliverWake({ store, config, wake, job, exitCode, tail, timedOut, lost = false }) {
+async function deliverWake({ store, config, wake, job, exitCode, tail, timedOut, lost = false, unitResult }) {
   const budget = Number.isInteger(config?.bg?.wakeBudgetPerAgent) ? config.bg.wakeBudgetPerAgent : 3;
   const used = readWakeCount(store, job.child_session_id);
   const allowWake = used < budget;
@@ -803,8 +838,13 @@ async function deliverWake({ store, config, wake, job, exitCode, tail, timedOut,
     writeWakeCount(store, job.child_session_id, used + 1);
     store.updateBgJob(job.id, { wake_count: job.wake_count + 1 });
   } else if (!allowWake) {
-    // 预算耗尽：状态落成 fallback，便于 /状态 与排查区分「唤醒」与「直接通知」。
-    store.updateBgJob(job.id, { state: BG_JOB_STATES.wokenFallback });
+    // L2（v0.7.17）：兜底投递不得覆盖终态分类。只有正常退出被 claim 成 woken 的
+    // 行才降级为 woken-fallback；timeout / lost / failed / cancelled 保持原终态
+    // （否则 /状态 分类与下面 bg_job_finished 审计的 state 会被抹掉）。
+    const settled = store.getBgJob(job.id)?.state ?? null;
+    if (settled === BG_JOB_STATES.woken) {
+      store.updateBgJob(job.id, { state: BG_JOB_STATES.wokenFallback });
+    }
   }
   try {
     store.appendEvent({
@@ -823,6 +863,8 @@ async function deliverWake({ store, config, wake, job, exitCode, tail, timedOut,
         wake_used: used,
         channel: outcome?.channel ?? null,
         delivered: outcome?.delivered === true,
+        // L5（v0.7.17）：只有真查过 Result 才记；查不到/没查都不写这个键。
+        ...(typeof unitResult === 'string' ? { unit_result: unitResult } : {}),
       },
     });
   } catch {

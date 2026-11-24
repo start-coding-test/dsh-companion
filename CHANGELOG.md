@@ -27,6 +27,24 @@
   非单调，按数值会误选区间。起点跳过系统提示词，终点按工具调用配对收缩，跨压缩摘要节点
   继续下探，配平后为空则整批作废。
 
+### Fixed（v0.7.17 L2/L3/L5）
+
+- **L2 兜底投递不再覆盖终态分类**：monitor 先 claim 终态（timeout / lost / failed /
+  cancelled），之后的兜底投递只在「正常退出、状态为 woken」的行上降级为 `woken-fallback`；
+  `src/task/bg-jobs.js` 的 `deliverWake` 与 `src/index.js` 的 `deliverBgFallback` 同一条规则。
+  此前预算耗尽/唤醒失败会把 timeout/lost 抹成 woken-fallback，`/状态` 分类与 `bg_job_finished`
+  审计的 state 失真（回执正文本身不受影响）。
+- **L3 取消回执统一生成器**：新增 `buildCancelMessage(job)`（`src/task/bg-jobs.js`），
+  `task_cancel` 与 `/停止任务 <bg id>` 两个站点都调它——此前两处手搓文案已经分叉（一处 `；日志：`
+  内联、一处换行）。`[任务] ` 前缀仍只由 `deliverTaskReceipt` 在最终投递层加一次。
+- **L5 `bg_job_finished` 只在真查过 systemd Result 时记 `unit_result`**：`deliverWake` 增加
+  可选 `unitResult` 参数，monitor 只在实际查询的两个分支传入；短路（143/137 且已过 deadline）
+  与墙钟超时兜底分支不写该键，避免把「没查」伪装成「查了但不是 timeout」。判定逻辑与查询次数
+  均未变（超时主判据仍是墙钟）。
+
+- **H1-A 文档勘误**：README 历史回填段「水位后可回填 tokens」更正为「水位后不可回填 tokens」，
+  与代码、测试、CHANGELOG 口径一致。
+
 ## [0.7.16] - 2026-11-24
 
 后台任务终态与取消链修正版：超时不再被记成「已结束」、取消不再显示成失败、每个后台任务结束时
