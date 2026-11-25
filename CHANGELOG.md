@@ -53,6 +53,8 @@
     故本项定性为预防性加固）。
   - 碰撞审计 `backfill_key_collision` 的 `actor` 用合法枚举 `'scheduler'`（`src/memory/store.js:155`
     `EVENT_ACTORS`；`'backfill'` 会被 `appendEvent` 的 CHECK 拒绝），`reason` 取同名自由文本。
+- **L5 复核增量**：(b) 只在真正发起 judge 调用时计数（`judgeFn === null` 时 ask 档不计）；
+  `/状态` 的「查重裁决（今日）」排除跨日陈旧计数（昨日数字不再被当成今日显示）。
 
 ### Docs
 

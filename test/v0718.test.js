@@ -302,7 +302,7 @@ test('L5（v0.7.18 非真机证据）：生产接线把 dedupe_judge 计数接�
   const dbPath = join(dir, 'store.db');
   try {
     const seed = Store.open(dbPath);
-    seed.setMeta('dedupe_judge:main', JSON.stringify({ date: '2026-11-25', count: 4 }));
+    seed.setMeta('dedupe_judge:main', JSON.stringify({ date: '2026-11-05', count: 4 }));
     seed.close();
 
     const ctx = new FakeCtx({ now: NOW_MS });
@@ -327,6 +327,64 @@ test('L5（v0.7.18 非真机证据）：生产接线把 dedupe_judge 计数接�
   }
 });
 
+
+// ------------------------------------------------- L5 复核增量（(b) + 跨日陈旧）
+
+test("L5 复核增量（v0.7.18 非真机证据）：judgeFn 未注入时 ask 档不计数", async (t) => {
+  const store = openStore(t);
+  addFact(store, { statement: '青柠计划的代号是蓝鲸。' });
+  // 判别力：删掉 src/runtime/tools.js 的 `if (judgeFn !== null)` 守卫 → 本用例红。
+  const { write, calls } = makeJudgeWriter(store, { extra: { judge: undefined } });
+  // 0.1 的 ask 阈值让近义句进入 ask 档；未注入 judge 时 judgeVerdict 直接返回 null（未发 LLM 调用）。
+  const result = await write.execute({
+    kind: 'preference',
+    salience: 'normal',
+    privacy: 'normal',
+    statement: '青柠计划的代号是白鲸。',
+  });
+  assert.equal(result.ok, true);
+  assert.equal(result.verdict, 'inserted', '无 judge 时按 new 保守插入');
+  assert.equal(calls.length, 0);
+  assert.equal(judgeMeta(store), null, '没有真实裁决调用就不得计数（口径 (b)）');
+});
+
+test('L5 复核增量（v0.7.18 非真机证据）：/状态 不把昨日计数当今日（跨日陈旧省行）', () => {
+  // 判别力：删掉 src/index.js dedupeJudgeStatusOf 的 `date !== day` 校验 → 第一条断言红。
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-v0718-l5b-'));
+  const dbPath = join(dir, 'store.db');
+  try {
+    const seed = Store.open(dbPath);
+    // 昨日计数：今天还没发生任何写入，不能显示成「今日」。
+    seed.setMeta('dedupe_judge:main', JSON.stringify({ date: '2026-11-04', count: 5 }));
+    seed.close();
+
+    const ctx = new FakeCtx({ now: NOW_MS });
+    ctx.commands = {
+      registrations: [],
+      register(definition) { this.registrations.push(definition); return () => {}; },
+    };
+    ctx.tools = { registrations: [], register(definition) { this.registrations.push(definition); return () => {}; } };
+    applyCordis(strictCtx(ctx), { dbPath });
+
+    const status = ctx.commands.registrations.find((entry) => entry.name === 'status');
+    assert.ok(status, 'status 命令应已注册');
+    const stale = status.handler({ rawInput: '' });
+    assert.equal(stale.kind, 'success');
+    assert.doesNotMatch(stale.text, /查重裁决/u, '昨日计数不得显示为今日');
+
+    const side = Store.open(dbPath);
+    side.setMeta('dedupe_judge:main', JSON.stringify({ date: '2026-11-05', count: 2 }));
+    side.close();
+    const fresh = status.handler({ rawInput: '' });
+    assert.match(fresh.text, /查重裁决（今日）：2 次/u, '当天计数照常显示');
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows 上插件仍持有连接时删不掉，留给系统清理。
+    }
+  }
+});
 
 // ---------------------------------------------------------------------------
 // L1（v0.7.18 非真机证据）：UNIQUE 键碰撞甄别（预防性加固）

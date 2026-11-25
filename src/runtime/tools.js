@@ -488,8 +488,11 @@ export function createTools({
         if (verdict.verdict === 'skip' && verdict.match !== null) return reinforce(verdict.match, 'reinforced');
         if (verdict.verdict === 'ask' && verdict.match !== null) {
           const target = verdict.match;
-          // L5（v0.7.18）：bump 点必须在 judge 调用之前——成败都算一次裁决调用。
-          bumpDedupeJudge(scope);
+          // L5（v0.7.18 复核增量 (b)）：只在真正发起 judge 调用时 +1。`judgeFn === null` 时
+          // `judgeVerdict` 直接返回 null、没有 LLM 调用，计入会与本版 CHANGELOG 的
+          // 「只计真实裁决调用」矛盾（用户意图是观察 LLM 成本）；生产恒注入 judge
+          // （`src/index.js` 的 createTools 接线），故对生产行为零影响。
+          if (judgeFn !== null) bumpDedupeJudge(scope);
           const judged = await judgeVerdict(statement, typeof target.statement === 'string' ? target.statement : '');
           if (judged === 'same') return reinforce(target, 'reinforced');
           if (judged === 'update') {
