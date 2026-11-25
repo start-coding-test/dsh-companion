@@ -126,6 +126,19 @@
   过滤），`/记忆 周报` 与 `buildWeeklyMemoryReport` 只数 `nap`/`deep`，回填行不计入
   written/empty/failed——需云端对账时按此区分。
 
+### Tests
+
+六步各自独立 commit，最终统一 bump 到 0.7.17。新增 `test/v0717.test.js`（H1-A 选区/只读预演/
+`/状态` 行 + L2/L3/L5 + L1/L4 回归）、`test/v0717-m1.test.js`（M1）、`test/v0717-m2.test.js`
+（M2）、`test/v0717-h1b.test.js`（H1-B，15 例）；本地不能真实验证的宿主 `compactRegion`
+替换、用户级 systemd 时序、LLM 巩固与 505k 真实 surface 全部用替身并标注「非真机证据」。
+每条均有「删生产接线或守卫必红」的判别力用例（H1-A 位置水位反例、H1-B 重开 Store 主水位
+不变 + 恢复态重拉 + 位置漂移、L1 重启收敛、M1 judge 接线、M2 批量分支、L3 取消文案唯一
+等）。另含 M2 搭车的 `ep_*` 前缀测试修正（`/^ep-/` → `/^ep_/`）与 `PRAGMA foreign_keys`
+包裹。`ℹ tests 1722 / suites 67 / pass 1722 / fail 0`；Windows（Node v24.9.0）与
+Linux（Node v24.22.2，tx-yun 隔离目录）各三时区（UTC / Asia/Shanghai /
+America/New_York）三遍，共六遍均 exit=0。
+
 ## [0.7.16] - 2026-11-24
 
 后台任务终态与取消链修正版：超时不再被记成「已结束」、取消不再显示成失败、每个后台任务结束时
