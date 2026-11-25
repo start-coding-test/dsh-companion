@@ -187,6 +187,12 @@ export const KEY_PHRASE_PATH_STOPWORDS = new Set([
 const VERSION_ONLY = /^\d+(?:\.\d+)+$/u;
 const DATE_TIME_ONLY = /^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}(?::\d{2})?|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}[日号])$/u;
 
+// V718-L2（v0.7.19）：英文段正则会把 `index.js` 整体取出，`index.js` 不等于 `index`
+// ⇒ 绕过路径停用词。比对停用词前先剥掉末尾扩展名（`index.js` → `index`），
+// 通用文件名（`data.json` / `config.ts` / `app.py` / `index.ts`）才能被拦住。
+// 只影响停用词比对：长度/版本/日期 gate、seen 去重与最终入键仍用原始 key。
+const FILE_EXTENSION = /\.(?:js|mjs|cjs|jsx|ts|tsx|py|json|md|yaml|yml|txt|css|html|go|rs|java|rb|cpp|c|h|sql|xml|csv|toml|ini|cfg|conf|log)$/iu;
+
 /**
  * 从一条事实里抽关键串（纯函数，无 I/O）。
  * @param {string} statement
@@ -202,7 +208,9 @@ export function extractKeyPhrases(statement) {
     if (phrase.length < KEY_PHRASE_MIN_LENGTH || phrase.length > KEY_PHRASE_MAX_LENGTH) return;
     if (VERSION_ONLY.test(phrase) || DATE_TIME_ONLY.test(phrase)) return;
     const key = phrase.toLowerCase();
-    if (KEY_PHRASE_STOPWORDS.has(key) || KEY_PHRASE_PATH_STOPWORDS.has(key) || seen.has(key)) return;
+    // V718-L2：停用词比对用剥掉扩展名的 `bare`（`index.js` → `index`）。
+    const bare = key.replace(FILE_EXTENSION, '');
+    if (KEY_PHRASE_STOPWORDS.has(bare) || KEY_PHRASE_PATH_STOPWORDS.has(bare) || seen.has(key)) return;
     seen.add(key);
     phrases.push(phrase);
   };
@@ -217,6 +225,12 @@ export function extractKeyPhrases(statement) {
     // （每段仍走 push 的长度/停用词 gate）。切不出有效段时整段丢弃。
     if (trimmed.length > 12) {
       for (const piece of trimmed.split(/[在的了是和与把被给对从到就也还很都又再更最上下中里]+/u)) {
+        // V718-L1（v0.7.19）：不含虚词的 13–24 字整句切完仍是一个长段（实测
+        // 「用户喜欢珞然邻居姐姐人格卡版本四号定稿」18 字）。与 CHANGELOG 口径
+        // 「切不出有效段时整段丢弃」对齐：切分后仍 >12 字的段丢弃。
+        // 只作用在 CJK 切分产物上——全局 push 的 24 字上界仍保留，13 字符英文
+        // 项目名（dsh-companion）不受影响。
+        if (piece.length > 12) continue;
         push(piece);
       }
       continue;
