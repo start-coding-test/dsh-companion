@@ -437,3 +437,35 @@ test('M2（v0.7.15 非真机证据）：stop-task 声明 input.hint，宿主 UI 
     handle.dispose();
   }
 });
+
+test('M1（v0.7.18 非真机证据）：memory 声明 input.hint，注册层透传后带参子命令可达', () => {
+  const temp = makeTempStore();
+  const { ctx } = makeApplyCtx();
+  const handle = apply(ctx, { dbPath: temp.dbPath });
+  try {
+    const memory = ctx.commands.registrations.find((command) => command.name === 'memory');
+    assert.ok(memory, 'memory 命令已注册');
+    // 宿主契约：D:\dsh\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-commands\src\index.ts:68-69
+    // 的 `readonly input?: CommandInputDescriptor`（`:192-214` 校验 hint 为非空字符串）；
+    // 客户端 D:\dsh\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-client-ui-commands\src\client\service.ts:270/:299
+    // 只在 desc.input 存在时认领带参输入。注册层透传见 src/index.js:1216。
+    assert.deepEqual(memory.input, { hint: '子命令' });
+    // 对照：stop-task 仍是 taskId —— 两条命令共享同一处透传，删掉 :1216 展开会同时红。
+    const stopTask = ctx.commands.registrations.find((command) => command.name === 'stop-task');
+    assert.deepEqual(stopTask.input, { hint: 'taskId' });
+
+    // rawInput 边界：走真实注册层 handler（test/p1a.test.js 直调 handler，覆盖不到注册/拼接）。
+    const call = (rawInput) => memory.handler({ rawInput });
+    assert.match(call('').text, /^记忆（共 \d+ 条）/u, '空参数落列表');
+    assert.match(call(' 回填').text, /^回填预演（只读/u, '前导空格 + 回填落预演分支');
+    assert.match(call('列表 关键词').text, /^记忆（匹配「关键词」共 \d+ 条）/u, '列表 + 关键词');
+    assert.equal(call('改').text, '用法：/记忆 改 <id> <新内容>', '改缺参给用法');
+    assert.match(call('治理 --dry-run').text, /^记忆治理（dry-run，不写库）/u, '治理 dry-run');
+    assert.match(call('周报').text, /^记忆周报（/u, '周报');
+    // UI 可能把整串 `/记忆 列表` 塞进 rawInput：拼接后双前缀，仍不得抛错、仍落列表分支。
+    assert.match(call('/记忆 列表').text, /^记忆（匹配/u);
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});

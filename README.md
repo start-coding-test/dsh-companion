@@ -94,6 +94,14 @@ persona:
 | `/chat-off` / `/chat-on` | 关闭 / 恢复轻闲聊 | 开关写库，重启后仍有效 |
 | `/stop-task` | 停止任务（中文 `/停止任务`） | 无参数：查看用法与在跑清单；带 taskId：只中止该任务 |
 
+> **带参命令的平台差异（v0.7.18）**：`/memory` 现在向宿主声明了参数输入（宿主契约见
+> `@deepseek-ai/dsh-commands` 的 `CommandInputDescriptor`）。Web UI 会据此弹参数输入框：
+> 裸 `/memory` 回车先出输入框，**留空提交等价于无参**（落列表，输出与以前逐字一致）；
+> **QQ / IM 侧只支持无参命令**，`/memory` 落列表，带参操作（改、治理、导出、周报、回填）
+> 由模型调用现有工具完成（`memory_write` / `memory_update` / `memory_forget`；
+> 治理、导出、回填目前没有对应工具，请到 Web UI 执行）。本版不识别消息文本里的命令，
+> 也不新增 `memory_*` 工具。
+
 ### 模型可用的工具
 
 `memory_search`、`memory_write`、`memory_update`、`memory_forget`、`reminder_add`、`reminder_done`、`thread_list`、`thread_run`、`task_run`、`cost_report`。宿主不支持会话控制时，线程类工具会返回 `capability_missing`，其余不受影响。

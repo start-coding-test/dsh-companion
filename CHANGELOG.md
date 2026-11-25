@@ -2,6 +2,28 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.18] - 2026-11-25
+
+命令通道修正（M1）：让 Web UI 的 `/memory` 真正接受子命令参数。这是**通道声明**修复，
+不是「QQ 已修好」——QQ / IM 仍只支持无参命令（见下）。
+
+### Fixed
+
+- **M1 命令声明**：`memory` 命令补 `input: { hint: '子命令' }`（与 `/stop-task` 的
+  `taskId` 同形，宿主契约 `@deepseek-ai/dsh-commands` 的 `readonly input?:
+  CommandInputDescriptor`）。不声明时 Web UI 不会为带参输入认领，`/memory 列表 关键词`
+  这类写法拿不到参数。
+- **M1 拼接空格化**：memory 专用分发拼接改为 `` `/记忆 ${rawInput}` ``（防御性加固；
+  宿主 `parseCommand` 的 `rawInput` 本就自带前导空格，故零行为差异，仅为可读与后续
+  安全），通用拼接未动；`handleMemoryCommand` 的 `replace(/^\/记忆/u, '').trim()`
+  也未动，空参链路逐字不变。
+
+### Docs
+
+- README 命令表下新增「带参命令的平台差异」：Web UI 声明 input 后裸 `/memory` 回车会先弹
+  参数输入框（留空提交等价无参）；**QQ / IM 仅支持无参命令**，带参操作由模型调用现有
+  工具完成，治理 / 导出 / 回填目前需在 Web UI 执行；本版不加消息识别钩子、不新增工具。
+
 ## [0.7.17] - 2026-11-24
 
 历史回填第一部分（H1-A）：给出回填的配置、只读选区与预演，先把「能回填多少、要花几次模型

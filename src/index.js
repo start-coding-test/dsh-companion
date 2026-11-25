@@ -367,6 +367,12 @@ const COMMAND_ALIASES = Object.freeze([
     definitionId: 'dsh-companion/command-memory',
     description: '查看或管理长期记忆（对应 /记忆；子命令 列表|改|治理|导出|周报）',
     prefix: '/记忆',
+    // M1（v0.7.18）：声明 input 让 Web UI 在 `/memory` 之后接受子命令参数（宿主契约：
+    // D:\dsh\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-commands\src\index.ts:68-69
+    // 的 `readonly input?: CommandInputDescriptor`，校验/规范化见 :192-214；
+    // D:\dsh\resources\app.asar\dsh\node_modules\@deepseek-ai\dsh-client-ui-commands\src\client\service.ts:270/:299
+    // 只在 desc.input 存在时认领带参输入）。不声明则 `/记忆 列表 关键词` 在 UI 里不可达。
+    input: Object.freeze({ hint: '子命令' }),
   }),
   Object.freeze({
     name: 'cost',
@@ -1222,7 +1228,7 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
         try {
           if (alias.name === 'memory') {
             const custom = handleMemoryCommand({
-              text: `${alias.prefix}${rawInput}`,
+              text: `${alias.prefix} ${rawInput}`,
               store,
               now: platform.now(),
               scope,
