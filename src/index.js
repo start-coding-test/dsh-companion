@@ -906,6 +906,21 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     /** G0-9：超阈值 warn 去重标记；同类出现一次不超过阈值的样本后重置。 */
     compactSlowWarned: false,
     consolidateSlowWarned: false,
+    /**
+     * T1（v0.7.19）：宿主 `toolResultPruner` 缺失只 warn 一次（不报错、不阻断压缩）。
+     * 服务未安装/未启用时每次压缩都会走到这里，只留一条 warn 免得刷屏。
+     */
+    prunerMissingWarned: false,
+    /**
+     * T1（v0.7.19）：启动后首个空闲窗口的存量裁剪是否已跑过。idle-probe 与
+     * pre-step 两个入口共用，保证「只跑一次」。
+     */
+    pruneBootstrapDone: false,
+    /**
+     * T1（v0.7.19）：idle-probe 的 job 回调没有 agent 句柄，缓存最近一次
+     * pre-step 带来的 agent，供首个空闲窗口做存量裁剪。
+     */
+    lastAgent: null,
     /** P2-b：最近一次召回注入里由向量路命中并实际注入的条数。 */
     lastVectorHits: 0,
     /** dispose 后后台任务不再碰已关闭的 Store。 */
@@ -1329,6 +1344,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             // L5（v0.7.18）：今日查重裁决次数（只读 schema_meta；0 或缺失 → 省行）。
             // 复核增量：传当天 key，跨日陈旧计数直接省行（bump 侧写的本就是当天）。
             dedupe: dedupeJudgeStatusOf(store, scope, zonedDayKey(platform.now(), config.timezone)),
+            // T1（v0.7.19）：工具输出裁剪累计（只读 schema_meta；缺失/0 → 省行）。
+            prune: pruneStatsOf(store, scope),
             // V7-H1：每次命令调用时读能力位，不用 apply 时快照（宿主可能晚挂载）。
             threadsSupported: platform.capabilities.threadTools === true,
             // V3-M2：/状态 展示当前主会话与绑定模式。
@@ -1936,6 +1953,11 @@ async function runPreStep(state, payload) {
   const scope = identity.scope ?? SCOPE;
   state.currentScope = scope;
   state.watermarkSeq = watermarkOf(state, scope);
+  // T1（v0.7.19）：idle-probe 的 job 回调拿不到 agent，这里缓存最近一个（子代理已在
+  // 上面早退，不会缓存到别人的会话）；同一 helper 兜底跑「启动后首个窗口」的存量裁剪，
+  // 与 idle-probe 共用 done 标志，只跑一次。
+  if (payload?.agent !== null && payload?.agent !== undefined) state.lastAgent = payload.agent;
+  maybeBootstrapPrune(state);
   if (state.lastConsolidationResult !== null) {
     // M3：上一轮 step 结束后跑的巩固在这里收账；失败只记录，不影响当前轮。
     const previous = state.lastConsolidationResult;
@@ -3325,6 +3347,8 @@ async function runBackfillCompaction(state, payload, scope, pending) {
     forgetPendingBackfill(state, scope);
     return false;
   }
+  // T1（v0.7.19）：压缩前先裁工具输出（同步调用，失败不阻断回填）。
+  pruneBeforeCompact(state, payload?.agent);
   try {
     await platform.compactRegion(pending.chunk.startSeq, pending.chunk.endSeq, payload?.agent);
   } catch (error) {
@@ -4229,6 +4253,173 @@ function alignPendingRegion(snapshot, startIdx, endIdx) {
   return null;
 }
 
+/**
+ * T1（v0.7.19）：压缩前先让宿主 `toolResultPruner` 裁掉过长的工具输出。
+ *
+ * 为什么在插件侧调：宿主只在 `compaction-basic` 自己压缩时才裁
+ * （`compaction-basic/lib/index.js:926` 用 `this.ctx.get("toolResultPruner")`），
+ * 而插件走的是 `ctx.compaction.compactRegion`，不经过那一段，所以必须自己先裁。
+ *
+ * 契约要点（宿主 `tool-result-pruner`）：
+ * - `pruneSession(session)` 返回 `{ pruned, charsRemoved }`；
+ * - 内容不超过阈值时 `pruneContent` 返回 null（:93）→ **幂等**，重复调用不二次裁、
+ *   不重复计数；无候选时 `pruned=[]`、`charsRemoved=0`、零副作用。
+ * - 阈值沿用宿主默认（8192/4096/1024），插件不传参、不自行截断，也不改宿主配置。
+ *
+ * 服务缺失（未装/未启用）只 warn 一次并直接返回：不报错、不阻断压缩。
+ * 审计与累计只在**真的裁到东西**时写，保证幂等调用不会重复计数。
+ *
+ * @param {object} state
+ * @param {object|null|undefined} agent pre-step 的 agent 句柄（带 session）
+ * @returns {void}
+ */
+function pruneBeforeCompact(state, agent) {
+  if (state === null || typeof state !== 'object') return;
+  const { platform, store } = state;
+  if (platform === null || typeof platform !== 'object') return;
+
+  let result;
+  try {
+    result = typeof platform.pruneToolResults === 'function'
+      ? platform.pruneToolResults(agent)
+      : undefined;
+  } catch (error) {
+    // 适配层契约是不抛；真抛了也不能让工具输出裁剪毁掉压缩。
+    platform.log('warn', '[dsh-companion] toolResultPruner failed; continuing with compaction', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return;
+  }
+
+  if (result === null || result === undefined) {
+    if (state.prunerMissingWarned !== true) {
+      state.prunerMissingWarned = true;
+      platform.log('warn', '[dsh-companion] toolResultPruner unavailable; skipping tool output pruning');
+    }
+    return;
+  }
+
+  const pruned = Array.isArray(result.pruned) ? result.pruned : [];
+  if (pruned.length === 0) return;
+  const charsRemovedRaw = Number(result.charsRemoved);
+  const charsRemoved = Number.isFinite(charsRemovedRaw) && charsRemovedRaw > 0
+    ? Math.trunc(charsRemovedRaw)
+    : 0;
+  const scope = typeof state.currentScope === 'string' && state.currentScope !== ''
+    ? state.currentScope
+    : SCOPE;
+
+  // 审计：actor/action 只能用 store 的现有枚举（EVENT_ACTORS / EVENT_ACTIONS，
+  // src/memory/store.js:147-155）；table_name 是自由文本，不做 DDL。
+  try {
+    store.appendEvent({
+      action: 'USED',
+      actor: 'scheduler',
+      table_name: 'tool_prune',
+      row_id: scope,
+      reason: 'tool_result_prune',
+      detail_json: JSON.stringify({
+        kind: 'tool_result_prune',
+        count: pruned.length,
+        charsRemoved,
+      }),
+    });
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] tool output prune audit failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  // 累计计数走 schema_meta（零 DDL）：用户要的是「累计 N 条 / M 字符」，不分日。
+  try {
+    const key = `prune_stats:${scope}`;
+    withPruneStats(store, key, (previous) => ({
+      count: previous.count + pruned.length,
+      charsRemoved: previous.charsRemoved + charsRemoved,
+    }));
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] tool output prune stats update failed', {
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * T1（v0.7.19）：读-改-写 `prune_stats:<scope>`（坏数据按 0 起算，不让统计拖垮压缩）。
+ * @param {object} store
+ * @param {string} key
+ * @param {(previous: {count: number, charsRemoved: number}) => {count: number, charsRemoved: number}} next
+ * @returns {void}
+ */
+function withPruneStats(store, key, next) {
+  const raw = store.getMeta(key);
+  let previous = { count: 0, charsRemoved: 0 };
+  if (typeof raw === 'string' && raw !== '') {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed !== null && typeof parsed === 'object') {
+        const count = Number(parsed.count);
+        const charsRemoved = Number(parsed.charsRemoved);
+        previous = {
+          count: Number.isFinite(count) && count > 0 ? Math.trunc(count) : 0,
+          charsRemoved: Number.isFinite(charsRemoved) && charsRemoved > 0 ? Math.trunc(charsRemoved) : 0,
+        };
+      }
+    } catch {
+      // 坏数据：从 0 起算。
+    }
+  }
+  const merged = next(previous);
+  store.setMeta(key, JSON.stringify({ count: merged.count, charsRemoved: merged.charsRemoved }));
+}
+
+/**
+ * T1（v0.7.19）：启动后**首个空闲窗口**清一次工具输出存量（含水位之前的旧工具输出）。
+ *
+ * `idle-probe` 的 job 回调没有 agent 句柄，所以用 pre-step 缓存的最近 agent；
+ * pre-step 里同一 helper 兜底，保证启动后从未等到 idle tick 也能清。两处共用
+ * `state.pruneBootstrapDone`，**只跑一次**。
+ *
+ * 已置 done 后再调用是纯空转（工具输出裁剪本身也幂等，这里是双保险）。
+ *
+ * @param {object} state
+ * @returns {void}
+ */
+function maybeBootstrapPrune(state) {
+  if (state === null || typeof state !== 'object') return;
+  if (state.pruneBootstrapDone === true) return;
+  const agent = state.lastAgent;
+  if (agent === null || agent === undefined) return;
+  // 先置位再裁：裁剪链路里的意外不该让每个 60s tick 反复重试同一批内容。
+  state.pruneBootstrapDone = true;
+  pruneBeforeCompact(state, agent);
+}
+
+/**
+ * T1（v0.7.19）：读工具输出裁剪累计计数（`prune_stats:<scope>`，schema_meta）。
+ * 只读；没写过/解析失败/计数为 0 一律返回 undefined（命令层据此省行）。
+ * 写入由 {@link pruneBeforeCompact} 累加，此处不写。
+ *
+ * @returns {{count: number, charsRemoved: number}|undefined}
+ */
+function pruneStatsOf(store, scope) {
+  try {
+    const raw = store.getMeta('prune_stats:' + scope);
+    if (typeof raw !== 'string' || raw === '') return undefined;
+    const parsed = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object') return undefined;
+    const count = Number(parsed.count);
+    if (!Number.isFinite(count) || count <= 0) return undefined;
+    const charsRemoved = Number(parsed.charsRemoved);
+    return {
+      count: Math.trunc(count),
+      charsRemoved: Number.isFinite(charsRemoved) && charsRemoved > 0 ? Math.trunc(charsRemoved) : 0,
+    };
+  } catch {
+    return undefined;
+  }
+}
+
 async function maybeCompact(state, payload, scope = SCOPE) {
   const { platform, store, config } = state;
   const pending = peekPendingCompact(state.pendingCompact, scope);
@@ -4288,6 +4479,9 @@ async function maybeCompact(state, payload, scope = SCOPE) {
 
   const start = seqs[startIdx];
   const end = seqs[stopIdx];
+  // T1（v0.7.19）：压缩前先裁工具输出（同步调用，失败不阻断压缩）。
+  // 放在 startedMs 之前：`/状态` 的压缩耗时仍旧只含 compactRegion 本身。
+  pruneBeforeCompact(state, payload?.agent);
   // V7-L2：压缩耗时用平台毫秒时钟单独计时；事件时间戳仍是秒级。
   const startedMs = platform.now();
   try {
@@ -5947,6 +6141,9 @@ export function startScheduler(state) {
 
   const jobs = {
     'idle-probe': async () => {
+      // T1（v0.7.19）：启动后首个空闲窗口清一次工具输出存量（阈值沿用宿主默认）。
+      // 必须放在 proactiveBlocked 早退之前：降级/熔断期间也要清。
+      maybeBootstrapPrune(state);
       // t17：巩固失败的重试优先于闲聊/主动消息，且不受预算降级影响。
       maybeRetryConsolidation(state);
       // M4：每 60s 读一次 RSS；warn 只记 metric，stop_dispatch/main_only 降级。

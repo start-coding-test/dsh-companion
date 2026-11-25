@@ -161,6 +161,8 @@ export function handleCommand({
   fts,
   // L5（v0.7.18）：今日查重裁决次数（计数为 0 或未接线时省行）。
   dedupe,
+  // T1（v0.7.19）：工具输出裁剪累计（计数为 0 或未接线时省行）。
+  prune,
   bg,
   // V710-L1（v0.7.11）：取消在跑 task_run；null = 全部。
 } = {}) {
@@ -199,6 +201,7 @@ export function handleCommand({
       backfill,
       fts,
       dedupe,
+      prune,
       threadsSupported,
       mainSession,
       compactionSupported,
@@ -725,6 +728,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // L5（v0.7.18）：今日查重裁决次数（0 或未接线时整行省略，旧 golden 不变）。
   const dedupeLine = formatDedupeLine(options.dedupe);
   if (dedupeLine !== null) lines.push(dedupeLine);
+  // T1（v0.7.19）：工具输出裁剪累计（0 或未接线时整行省略，旧 golden 不变）。
+  const pruneLine = formatPruneLine(options.prune);
+  if (pruneLine !== null) lines.push(pruneLine);
   // G0-9：最近一次压缩/巩固实际耗时（只观测，不设超时）；无样本显示 —。
   // timing 只在接线层传入时输出，保持旧调用方（单测）的 /状态 格式不变。
   if (options.timing !== null && options.timing !== undefined && typeof options.timing === 'object') {
@@ -893,6 +899,26 @@ function formatDedupeLine(dedupe) {
   const count = Number.isFinite(Number(dedupe.count)) ? Math.max(0, Math.trunc(Number(dedupe.count))) : 0;
   if (count === 0) return null;
   return `查重裁决（今日）：${count} 次`;
+}
+
+/**
+ * T1（v0.7.19）：`/状态` 的「工具输出裁剪」一行。
+ *
+ * 照 {@link formatDedupeLine} 的 null-省行先例：未接线（undefined）、计数为 0 或
+ * 坏数据时返回 null，整行省略——旧 golden 零波及；只有真的裁过工具输出才多一行。
+ * 口径是**累计**（`prune_stats:<scope>` 跨日/跨重启累加），与「今日查重裁决」不同。
+ *
+ * @param {{count?: number, charsRemoved?: number}|null|undefined} prune
+ * @returns {string|null}
+ */
+function formatPruneLine(prune) {
+  if (prune === null || prune === undefined || typeof prune !== 'object') return null;
+  const count = Number.isFinite(Number(prune.count)) ? Math.max(0, Math.trunc(Number(prune.count))) : 0;
+  if (count === 0) return null;
+  const charsRemoved = Number.isFinite(Number(prune.charsRemoved))
+    ? Math.max(0, Math.trunc(Number(prune.charsRemoved)))
+    : 0;
+  return `工具输出裁剪：累计 ${count} 条 / ${charsRemoved} 字符`;
 }
 
 /**

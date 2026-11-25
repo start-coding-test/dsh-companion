@@ -538,6 +538,33 @@ export function createAdapter(ctx, opts = {}) {
   }
 
   /**
+   * T1（v0.7.19）：让宿主 `toolResultPruner` 裁掉本会话里过长的工具输出。
+   *
+   * `toolResultPruner` 不在插件 inject 名单里（它必须可缺省：未安装/未启用时
+   * entry 不能停在 waiting），所以只能走 `service()`，直接读 `ctx['toolResultPruner']`
+   * 在 cordis 4 下会抛 `cannot get property "x" without inject`。
+   *
+   * 宿主契约（`@deepseek-ai/dsh-tool-result-pruner/lib/index.js:187-190`）：
+   * `pruneSession(session)` 返回 `{ pruned, charsRemoved }`；`pruned[]` 元素含
+   * originalSeq/replacementSeq/callId/charsBefore/charsAfter，`charsRemoved` 按
+   * Unicode code point 累加。内容不超过阈值时 `pruneContent` 返回 null（:93），
+   * 因此重复调用幂等：无候选时 `pruned=[]`、`charsRemoved=0`、零副作用。
+   * 阈值由宿主配置（默认 8192/4096/1024），插件不传参、不自行截断。
+   *
+   * 服务缺失或 agent 没有 session 时返回 undefined，**绝不抛**；调用方据此
+   * warn 一次并继续压缩。审计与计数不在适配层做（这里没有 store）。
+   *
+   * @param {object|null|undefined} agent
+   * @returns {{pruned?: object[], charsRemoved?: number}|undefined}
+   */
+  function pruneToolResults(agent) {
+    const pruner = service('toolResultPruner');
+    return typeof pruner?.pruneSession === 'function' && agent?.session
+      ? pruner.pruneSession(agent.session)
+      : undefined;
+  }
+
+  /**
    * 开一个会话（C5-H1b）。
    *
    * 宿主服务 `sessionController` 实际是 `ApiSessionList`，公开方法是
@@ -1109,6 +1136,7 @@ export function createAdapter(ctx, opts = {}) {
     onTurnStopping,
     every,
     compactRegion,
+    pruneToolResults,
     createSession,
     prompt,
     cancel,
