@@ -988,7 +988,8 @@ export function buildConsolidationPrompt(input = {}) {
  * @param {string} input.scope
  * @param {object[]} input.facts 已过敏感/遗忘过滤的草稿事实
  * @param {{dedupeSkip?: number, dedupeAsk?: number, maxProjectFacts?: number,
- *          judge?: Function}} [input.options]
+ *          judge?: Function}} [input.options] `judge(prompt)` 契约：返回**已解析对象**
+ *          （`{items:[{index,verdict}]}`），不是 JSON 字符串；`parseDedupeVerdicts` 直接消费对象。
  * @returns {Promise<{plans: object[], dropped: object, judged: object}>}
  */
 async function planFactWrites(input) {

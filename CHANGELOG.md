@@ -98,6 +98,26 @@
   时整行省略（旧 golden 不变）；不新增 `/诊断` 命令。
 - **M2 搭车化妆**：`src/memory/consolidate.js` 中 M1 引入的 4 行行尾空白清理，纯空白改动。
 
+### Added（v0.7.17 H1-B）
+
+- **H1-B 独立 pendingBackfill 历史回填**：`compact.backfill.enabled=true` 时，每个新一轮的
+  pre-step 在正常 `maybeCompact` 之后再看一次回填窗口（本轮已做过正常压缩则跳过，避免同窗口
+  两次 `compactRegion`）。窗口 N 只做**纯函数**选批（`planBackfillChunks`，位置法水位比较）
+  并登记独立 pending（`state.pendingBackfillByScope` + `compact_backfill:pending:<scope>`），
+  巩固用 `setImmediate` 在 turn 外跑；窗口 N+1 才 `compactRegion` 替换并把游标推进到「区间后
+  第一条未压缩记录」。当轮回复只等纯函数部分，不等模型。
+- **回填行不参与主水位（方案 E）**：回填巩固行落 `kind="forget_flush"` + `trigger="backfill"`，
+  借仓储现成的「不参与水位」语义桶——`getWatermark` 明确排除 `forget_flush`，
+  `recoverPendingCompacts` 只认 `nap`。因此回填路径**零水位锚、零 `retargetConsolidation`、
+  零 `setWatermark`、零 schema 变更**：低 `upto_seq` 的回填行按构造不可能把主水位带偏，
+  重启也不会复活成正常 pending。
+- **崩溃窗预检**：巩固阶段重放时先按 `(scope, upto_seq, kind=forget_flush, trigger=backfill)`
+  查一次；命中就只把 pending 置 `ready`、不重复调模型（`UNIQUE constraint failed` 同样按
+  「已巩固」重放处理）。
+- **口径注记**：回填行会出现在 `consolidationStatusCounts()` 的全量统计里（该函数不带 kind
+  过滤），`/记忆 周报` 与 `buildWeeklyMemoryReport` 只数 `nap`/`deep`，回填行不计入
+  written/empty/failed——需云端对账时按此区分。
+
 ## [0.7.16] - 2026-11-24
 
 后台任务终态与取消链修正版：超时不再被记成「已结束」、取消不再显示成失败、每个后台任务结束时

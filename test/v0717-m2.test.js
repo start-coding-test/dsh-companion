@@ -108,7 +108,7 @@ test('M2 forgetMany：混合批 1 坏 + 2 好 —— 2 条 tombstoned、summary 
   }
 });
 
-test('M2 forgetMany：id 前缀优先 —— `ep-*` 即使 kind=fact 也按 episode 遗忘', () => {
+test('M2 forgetMany：id 前缀优先 —— `ep_*` 即使 kind=fact 也按 episode 遗忘', () => {
   const { store, cleanup } = makeTempStore();
   try {
     const seeded = seedMemory(store);
@@ -126,10 +126,17 @@ test('M2 forgetMany：无前缀 id 回落 kind 参数；顺序与去重保持不
   const { store, cleanup } = makeTempStore();
   try {
     const seeded = seedMemory(store);
-    const bareEpisodeId = seeded.episodeId.replace(/^ep-/, 'x-');
-    store.db
-      .prepare('UPDATE episodes SET id = ? WHERE id = ?')
-      .run(bareEpisodeId, seeded.episodeId);
+    const bareEpisodeId = seeded.episodeId.replace(/^ep_/, 'x_');
+    // 造一个「无已知前缀」的 episode id：先关外键校验（生产永远不会出现这种 id，
+    // 这里只为覆盖 kind 回落分支；FK 在 UPDATE 过程中会挡住改主键）。
+    store.db.exec('PRAGMA foreign_keys = OFF');
+    try {
+      store.db
+        .prepare('UPDATE episodes SET id = ? WHERE id = ?')
+        .run(bareEpisodeId, seeded.episodeId);
+    } finally {
+      store.db.exec('PRAGMA foreign_keys = ON');
+    }
     const result = forgetMany({
       store,
       ids: [bareEpisodeId, bareEpisodeId],
@@ -179,7 +186,7 @@ test('M2 forgetMany：immediate 无 confirm 逐条 needs_confirm 且不软删', 
   }
 });
 
-test('M2 forgetMany：immediate+confirm 只调用一次 purgeIds，且 PURGED 审计只有一条', () => {
+test('M2 forgetMany：immediate+confirm 只调用一次 purgeIds，且 PURGED 审计只有两条（facts/episodes 各一）', () => {
   const { store, cleanup } = makeTempStore();
   try {
     const seeded = seedMemory(store);

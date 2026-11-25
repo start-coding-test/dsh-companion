@@ -271,7 +271,7 @@ const EPISODE_ID_PREFIX = 'ep_';
 
 /**
  * 按 id 前缀判定记忆种类（M2）：`newId('fact')` / `newId('ep')` 的产物（形如 `fact_ab12…` / `ep_ab12…`）。
- * 前缀优先于调用方给的 kind，防止 `ep-*` 被当成 fact 软删（两者都查不到时
+ * 前缀优先于调用方给的 kind，防止 `ep_*` 被当成 fact 软删（两者都查不到时
  * 会走 not_found，比误删安全）。
  * @param {string} id
  * @param {'fact'|'episode'} fallback
@@ -318,7 +318,7 @@ function normalizeBatchIds(raw) {
  *
  * @param {object} input
  * @param {import('./store.js').Store} input.store
- * @param {string[]} input.ids 记忆 id 列表（`fact-*` / `ep-*`，≤50）
+ * @param {string[]} input.ids 记忆 id 列表（`fact_*` / `ep_*`，≤50）
  * @param {'fact'|'episode'} [input.kind='fact'] 无前缀 id 的默认种类
  * @param {string} [input.scope] 作用域守卫（跨 scope 的条目逐条拒绝）
  * @param {Date|number} [input.at] 遗忘时刻（默认当前时间）

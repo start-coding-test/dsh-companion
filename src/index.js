@@ -158,11 +158,17 @@ import {
   alignRegionToToolPairing,
   createSurfaceIndex,
   firstReplaceableIndex,
+  isInjectedRecord,
   planRegion,
   surfaceSeqs,
   watermarkAfterCompact,
 } from './session/surface.js';
-import { estimateBackfill, planBackfillChunks, readBackfillState } from './session/backfill.js';
+import {
+  BACKFILL_META_PREFIX,
+  estimateBackfill,
+  planBackfillChunks,
+  readBackfillState,
+} from './session/backfill.js';
 import * as threadRegistry from './thread/registry.js';
 import { zonedDayKey, zonedParts } from './time.js';
 
@@ -874,7 +880,7 @@ function createWiringState({ platform, store, config, metrics, embedder = null, 
     quotaPausedUntil: null,
     quotaBackoffAttempt: 0,
     /** N-M1：每个 scope 一个待压缩槽，跨 scope 不再互相覆盖。 */
-    pendingCompact: createPendingCompacts(),
+    pendingCompact: createPendingCompacts(),    // H1-B（v0.7.17）：历史回填的独立 pending（与 pendingCompact 天然不相交）。    pendingBackfillByScope: new Map(),    compactedThisTurn: false,
     /** M3：待执行的巩固任务（pre-step 只登记，不 await）。 */
     pendingConsolidation: null,
     /** M3：同一时刻只跑一个巩固任务。 */
@@ -1992,7 +1998,11 @@ async function runPreStep(state, payload) {
 
   if (isNewTurn) {
     // 先补上一轮写库后未完成的两段式压缩（平台只允许 turn 内压缩）。
+    state.compactedThisTurn = false;
     await maybeCompact(state, payload, scope);
+    // H1-B（v0.7.17）：上一窗口登记的回填若已巩固完，本窗口压缩它；
+    // 否则只做纯函数选区 + 登记（模型调用在 turn 之外的后台任务里跑）。
+    await maybeBackfill(state, payload, scope);
     // M3：只登记巩固，立即返回；模型调用在 step 之后由后台任务执行。
     scheduleConsolidation(state, payload, scope);
   }
@@ -2864,6 +2874,476 @@ function noteQuota429(state, error) {
  * @param {object} payload
  * @param {string} [scope] 当前会话作用域
  */
+/**
+ * H1-B（v0.7.17）：历史回填执行层。
+ *
+ * 与正常巩固/压缩完全分离：
+ * - 自己的 pending（`state.pendingBackfillByScope` + `schema_meta:compact_backfill:pending:<scope>`）；
+ * - 自己的游标/日计数/压后底（H1-A `readBackfillState` 读的三个键，这里是唯一写入方）；
+ * - 绝不调用 `rememberConsolidatedRegion` / `setWatermark` / `resetThresholdCooldown`：
+ *   回填区间在水位之前，推进主水位会把已压缩文本重新算成「待巩固」（灾难）；
+ * - 用户裁决方案 E：回填巩固行用 `kind="forget_flush"` + `trigger="backfill"`，
+ *   借仓储现成的「不参与水位」语义桶——`src/memory/store.js:3933-3942` `getWatermark`
+ *   明确排除 `kind <> "forget_flush"`，`src/state/pending-compact.js:203`
+ *   `recoverPendingCompacts` 只认 `kind="nap"`。因此回填路径零水位锚、零 `retargetConsolidation`、
+ *   零 `findConsolidation`、零 `setWatermark`、零 schema 变更：低 `upto_seq` 的回填行按构造
+ *   就不可能把主水位带偏，也不会在重启后复活成一个正常 pending。
+ */
+const BACKFILL_PENDING_PREFIX = 'compact_backfill:pending:';
+const BACKFILL_DONE_PREFIX = 'compact_backfill:done:';
+
+/**
+ * 读 pending 回填（内存 → schema_meta），Map 里存 null 表示「查过、没有」。
+ * @param {object} state
+ * @param {string} scope
+ * @returns {object|null}
+ */
+function pendingBackfillOf(state, scope) {
+  if (!(state.pendingBackfillByScope instanceof Map)) state.pendingBackfillByScope = new Map();
+  if (state.pendingBackfillByScope.has(scope)) return state.pendingBackfillByScope.get(scope);
+  let pending = null;
+  try {
+    const raw = state.store.getMeta(`${BACKFILL_PENDING_PREFIX}${scope}`);
+    if (typeof raw === 'string' && raw.trim() !== '') {
+      const parsed = JSON.parse(raw);
+      const chunk = parsed?.chunk ?? null;
+      if (chunk !== null && Number.isFinite(Number(chunk.endSeq))) {
+        pending = {
+          chunk: {
+            startIdx: Math.max(0, Number(chunk.startIdx) || 0),
+            endIdx: Math.max(0, Number(chunk.endIdx) || 0),
+            startSeq: Number(chunk.startSeq),
+            endSeq: Number(chunk.endSeq),
+            tokens: Number(chunk.tokens) || 0,
+            count: Number(chunk.count) || 0,
+          },
+          stage: parsed?.stage === 'ready' ? 'ready' : 'consolidating',
+          consolidationId: Number.isInteger(parsed?.consolidationId) ? parsed.consolidationId : null,
+          nextSeq: Number.isFinite(Number(parsed?.nextSeq)) ? Number(parsed.nextSeq) : null,
+          atWatermark: parsed?.atWatermark === true,
+          // 快照不进 meta（重启后由当前 surface 重建正文）。
+          snapshot: null,
+          transcript: [],
+        };
+      }
+    }
+  } catch {
+    pending = null;
+  }
+  state.pendingBackfillByScope.set(scope, pending);
+  return pending;
+}
+
+/**
+ * 登记 pending 回填（内存 + schema_meta）。
+ * @param {object} state
+ * @param {string} scope
+ * @param {object} pending
+ */
+function persistPendingBackfill(state, scope, pending) {
+  if (!(state.pendingBackfillByScope instanceof Map)) state.pendingBackfillByScope = new Map();
+  state.pendingBackfillByScope.set(scope, pending);
+  try {
+    state.store.setMeta(`${BACKFILL_PENDING_PREFIX}${scope}`, JSON.stringify({
+      chunk: pending.chunk,
+      stage: pending.stage,
+      consolidationId: pending.consolidationId ?? null,
+      nextSeq: Number.isFinite(pending.nextSeq) ? pending.nextSeq : null,
+      atWatermark: pending.atWatermark === true,
+    }));
+  } catch (error) {
+    state.platform.log('warn', '[dsh-companion] backfill pending persist failed', {
+      scope,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  }
+}
+
+/**
+ * 清掉 pending 回填（内存 + schema_meta）。
+ * @param {object} state
+ * @param {string} scope
+ */
+function forgetPendingBackfill(state, scope) {
+  if (!(state.pendingBackfillByScope instanceof Map)) state.pendingBackfillByScope = new Map();
+  state.pendingBackfillByScope.set(scope, null);
+  try {
+    state.store.deleteMeta(`${BACKFILL_PENDING_PREFIX}${scope}`);
+  } catch {
+    // meta 写失败只影响重启恢复，不阻断主流程。
+  }
+}
+
+/**
+ * 「已回填到水位」哨兵：值是该水位 seq；主水位前进后自然失效。
+ * @param {object} state
+ * @param {string} scope
+ * @returns {number|null}
+ */
+function backfillDoneAt(state, scope) {
+  try {
+    const raw = state.store.getMeta(`${BACKFILL_DONE_PREFIX}${scope}`);
+    if (typeof raw !== 'string' || raw.trim() === '') return null;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 今日批数（按配置时区的自然日重置）。
+ * @param {object} state
+ * @param {string} scope
+ * @returns {{today: string, count: number}}
+ */
+function backfillDayState(state, scope) {
+  const today = zonedDayKey(state.platform.now(), state.config.timezone);
+  const stored = readBackfillState(state.store, scope);
+  return { today, count: stored.todayDate === today ? stored.todayCount : 0 };
+}
+
+/**
+ * 压缩成功后 +1（失败/中止不计数）。
+ * @param {object} state
+ * @param {string} scope
+ */
+function bumpBackfillDay(state, scope) {
+  const { today, count } = backfillDayState(state, scope);
+  try {
+    state.store.setMeta(
+      `${BACKFILL_META_PREFIX}day:${scope}`,
+      JSON.stringify({ date: today, count: count + 1 }),
+    );
+  } catch {
+    // 计数失败最多多跑几批，不阻断。
+  }
+}
+
+/**
+ * 压缩成功后推进游标：优先用「区间后第一条未压缩记录」的 seq；到水位则写哨兵。
+ * @param {object} state
+ * @param {string} scope
+ * @param {object} pending
+ */
+function advanceBackfillCursor(state, scope, pending) {
+  if (pending?.atWatermark === true) {
+    try {
+      state.store.deleteMeta(`${BACKFILL_META_PREFIX}cursor:${scope}`);
+      state.store.setMeta(`${BACKFILL_DONE_PREFIX}${scope}`, String(watermarkOf(state, scope)));
+    } catch {
+      // 哨兵写失败：下一窗口按 surface 重新选区（区间已成摘要节点，会被跳过）。
+    }
+    return;
+  }
+  if (!Number.isFinite(pending?.nextSeq)) return;
+  try {
+    state.store.setMeta(`${BACKFILL_META_PREFIX}cursor:${scope}`, String(pending.nextSeq));
+  } catch {
+    // 游标写失败：下一窗口从 firstReplaceableIndex 重扫，最多重复一批。
+  }
+}
+
+/**
+ * 记录压后实测总 tokens（/状态「最近压后底」）。
+ * @param {object} state
+ * @param {string} scope
+ * @param {object|null} snapshot
+ */
+function recordBackfillFloor(state, scope, snapshot) {
+  const nodes = Array.isArray(snapshot?.nodes) ? snapshot.nodes : [];
+  let total = 0;
+  for (const node of nodes) total += Number(node?.tokens) || 0;
+  try {
+    state.store.setMeta(`${BACKFILL_META_PREFIX}floor:${scope}`, String(total));
+  } catch {
+    // 统计字段，写失败不影响回填。
+  }
+}
+
+/**
+ * 本块是否已经巩固过（崩溃窗重放检测）。
+ *
+ * 成功批写入的是 `kind='forget_flush', trigger='backfill'` 的 consolidations 行；
+ * `insertConsolidation` 只会就地复用 failed/empty 行，written/compacted 同键会抛 UNIQUE。
+ * 模型调用发生在写库之前，所以必须在调模型前先查一次，才能真正做到「不重跑模型」。
+ * @param {object} store
+ * @param {string} scope
+ * @param {number} endSeq
+ * @returns {string|null} 已存在的巩固行 id
+ */
+function backfillChunkConsolidated(store, scope, endSeq) {
+  try {
+    const row = store.db.prepare(
+      "SELECT id FROM consolidations WHERE scope = ? AND kind = 'forget_flush' AND trigger = 'backfill'" +
+        " AND upto_seq = ? AND status IN ('written', 'compacted', 'empty') ORDER BY started_at DESC LIMIT 1",
+    ).get(scope, Number(endSeq));
+    return row?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把一批选区拼成巩固输入（`role: text` 逐条；注入块与缺失节点跳过）。
+ * @param {{records?: object[]}|null|undefined} snapshot
+ * @param {{startIdx: number, endIdx: number}} chunk
+ * @returns {string}
+ */
+function backfillRegionText(snapshot, chunk) {
+  const records = Array.isArray(snapshot?.records) ? snapshot.records : [];
+  const from = Math.max(0, Number(chunk?.startIdx) || 0);
+  const to = Math.min(records.length - 1, Number(chunk?.endIdx) || -1);
+  const out = [];
+  for (let index = from; index <= to; index += 1) {
+    const record = records[index] ?? null;
+    if (record === null || record.missing === true || isInjectedRecord(record)) continue;
+    const text = typeof record.text === 'string' ? record.text : '';
+    if (text === '') continue;
+    out.push(`${record?.role ?? 'unknown'}: ${text}`);
+  }
+  return out.join('\n');
+}
+
+/**
+ * 后台回填巩固（setImmediate 里跑，绝不 await 在 turn 路径上）。
+ * @param {object} state
+ * @param {string} scope
+ * @param {object} pending
+ * @returns {Promise<void>}
+ */
+async function runBackfillJob(state, scope, pending) {
+  const { platform, store } = state;
+  if (state.disposed) return;
+  const snapshot = pending.snapshot ?? null;
+  const regionText = backfillRegionText(snapshot, pending.chunk);
+  // 崩溃窗重放：本块已巩固过（成功批 + pending meta 丢失）→ 直接进压缩相，不调模型。
+  if (backfillChunkConsolidated(store, scope, pending.chunk.endSeq) !== null) {
+    platform.log('info', '[dsh-companion] backfill chunk already consolidated; skipping model', {
+      scope,
+      startSeq: pending.chunk.startSeq,
+      endSeq: pending.chunk.endSeq,
+    });
+    pending.consolidationId = null;
+    pending.stage = 'ready';
+    pending.snapshot = null;
+    persistPendingBackfill(state, scope, pending);
+    return;
+  }
+  try {
+    const llm = await resolveConsolidationLlm(state);
+    if (typeof llm !== 'function') {
+      platform.log('warn', '[dsh-companion] backfill skipped: no model available', { scope });
+      forgetPendingBackfill(state, scope);
+      return;
+    }
+    const at = Math.floor(platform.now() / 1000);
+    const result = await consolidate({
+      store,
+      scope,
+      seqFrom: pending.chunk.startSeq,
+      seqTo: pending.chunk.endSeq,
+      regionText,
+      // 注册时固化的转录快照；后台运行时只作选区缺失的兜底。
+      transcript: Array.isArray(pending.transcript) && pending.transcript.length > 0
+        ? pending.transcript
+        : state.transcript,
+      llm,
+      now: at,
+      clock: platform.now,
+      // 用户裁决方案 E（v0.7.17 H1-B）：回填巩固行落在现成的「不参与水位」语义桶里。
+      // `src/memory/store.js:3933-3942` getWatermark 明确 `kind <> 'forget_flush'`；
+      // `src/state/pending-compact.js:203` recoverPendingCompacts 只认 kind='nap'，重启零复活；
+      // 因此不需要批前写锚、也不需要批后 retarget（nap 行 retarget 到主水位会撞
+      // `src/memory/store.js:410` 的 (scope, upto_seq, kind) 唯一索引）。
+      kind: 'forget_flush',
+      trigger: 'backfill',
+      sessionId: scope,
+      existingFactsLimit: state.config?.consolidate?.existingFactsLimit,
+      dedupeSkip: state.config?.consolidate?.dedupeSkip,
+      dedupeAsk: state.config?.consolidate?.dedupeAsk,
+      maxProjectFacts: state.config?.consolidate?.maxProjectFacts,
+      judge: (prompt) => judgeFactDuplicates(state, prompt),
+      timeZone: state.config.timezone,
+      // 水位前区间必须放行（这正是回填的目的）；forget_flush 在 consolidate.js:1198-1200 本就豁免。
+      guardWatermark: false,
+    });
+    // 同块重放（成功批后压缩失败、pending meta 又丢失的崩溃窗）：整块已巩固过，
+    // 直接进压缩相，不重跑模型、不推游标。`insertConsolidation` 对同键 written 行会抛
+    // `src/memory/store.js:3853-3885` 的 UNIQUE（failed/empty 行则就地复用不抛）。
+    pending.consolidationId = null;
+    pending.stage = 'ready';
+    pending.snapshot = null;
+    persistPendingBackfill(state, scope, pending);
+    platform.log('info', '[dsh-companion] backfill consolidation finished', {
+      scope,
+      startSeq: pending.chunk.startSeq,
+      endSeq: pending.chunk.endSeq,
+      skipped: result?.skipped === true,
+      empty: result?.empty === true,
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (reason.includes('UNIQUE constraint failed')) {
+      // 崩溃窗重放：本块在上一轮已成功巩固，只是压缩没跑完。直接转压缩相。
+      platform.log('info', '[dsh-companion] backfill chunk already consolidated; skipping model', {
+        scope,
+        startSeq: pending.chunk.startSeq,
+        endSeq: pending.chunk.endSeq,
+      });
+      pending.consolidationId = null;
+      pending.stage = 'ready';
+      pending.snapshot = null;
+      persistPendingBackfill(state, scope, pending);
+      return;
+    }
+    platform.log('warn', '[dsh-companion] backfill consolidation failed', {
+      scope,
+      message: reason,
+    });
+    // 失败丢弃本批：不清游标，下一窗口重选（同一区间会再试一次）。
+    forgetPendingBackfill(state, scope);
+  }
+}
+
+/**
+ * 窗口 N+1：把上一窗口巩固好的区间交给宿主压缩，再收尾（游标/日计数/压后底）。
+ * @param {object} state
+ * @param {object} payload
+ * @param {string} scope
+ * @param {object} pending
+ * @returns {Promise<boolean>} 是否完成了一次回填压缩
+ */
+async function runBackfillCompaction(state, payload, scope, pending) {
+  const { platform } = state;
+  if (!platform.capabilities?.compaction) return false;
+  const snapshot = await refreshSurface(state, payload);
+  const seqs = Array.isArray(snapshot?.seqs) ? snapshot.seqs : [];
+  const startIdx = seqs.indexOf(pending.chunk.startSeq);
+  const endIdx = seqs.indexOf(pending.chunk.endSeq);
+  if (startIdx < 0 || endIdx < startIdx) {
+    platform.log('warn', '[dsh-companion] backfill region expired; dropping pending', {
+      scope,
+      startSeq: pending.chunk.startSeq,
+      endSeq: pending.chunk.endSeq,
+    });
+    forgetPendingBackfill(state, scope);
+    return false;
+  }
+  try {
+    await platform.compactRegion(pending.chunk.startSeq, pending.chunk.endSeq, payload?.agent);
+  } catch (error) {
+    platform.log('warn', '[dsh-companion] backfill compactRegion failed', {
+      scope,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    forgetPendingBackfill(state, scope);
+    return false;
+  }
+  advanceBackfillCursor(state, scope, pending);
+  bumpBackfillDay(state, scope);
+  const next = await refreshSurface(state, payload, null, { forceRebuild: true });
+  recordBackfillFloor(state, scope, next);
+  forgetPendingBackfill(state, scope);
+  state.metrics?.inc?.('backfills');
+  platform.log('info', '[dsh-companion] backfill chunk compacted', {
+    scope,
+    startSeq: pending.chunk.startSeq,
+    endSeq: pending.chunk.endSeq,
+    tokens: pending.chunk.tokens,
+    atWatermark: pending.atWatermark === true,
+  });
+  return true;
+}
+
+/**
+ * H1-B 入口：每个新 turn 的 pre-step 调一次。
+ *
+ * 两段式：本窗口只做「纯函数选区 + 登记 pending + setImmediate 后台巩固」；
+ * 下一窗口再压缩。isNewTurn 路径只 await 纯函数部分，不 await 模型调用。
+ * @param {object} state
+ * @param {object} payload
+ * @param {string} [scope]
+ * @returns {Promise<void>}
+ */
+async function maybeBackfill(state, payload, scope = SCOPE) {
+  const cfg = state.config?.compact?.backfill;
+  // enabled=false 第一行短路：零 meta、零后台任务、零模型调用。
+  if (cfg?.enabled !== true) return;
+  const { platform, store } = state;
+  // 同一窗口 maybeCompact 已经压过一次：宿主每 pre-step 窗口至多一次压缩。
+  if (state.compactedThisTurn === true) {
+    platform.log('debug', '[dsh-companion] backfill skipped: compaction already ran this turn', { scope });
+    return;
+  }
+  const pending = pendingBackfillOf(state, scope);
+  if (pending !== null) {
+    if (pending.stage !== 'ready') return;
+    await runBackfillCompaction(state, payload, scope, pending);
+    return;
+  }
+  const watermark = watermarkOf(state, scope);
+  if (!(watermark > 0)) return;
+  if (backfillDoneAt(state, scope) === watermark) return;
+  const { count } = backfillDayState(state, scope);
+  const maxPerDay = Number(cfg.maxPerDay);
+  if (Number.isFinite(maxPerDay) && maxPerDay > 0 && count >= maxPerDay) {
+    platform.log('debug', '[dsh-companion] backfill skipped: daily cap', { scope, count, maxPerDay });
+    return;
+  }
+  const snapshot = state.surfaceSnapshotByScope.get(scope) ?? state.surfaceSnapshot;
+  if (snapshot === null || snapshot === undefined) return;
+  const stored = readBackfillState(store, scope);
+  const plan = planBackfillChunks(snapshot, {
+    watermarkSeq: watermark,
+    cursorSeq: stored.cursorSeq,
+    chunkTokens: cfg.chunkTokens,
+  });
+  if (plan.reason === 'stale-cursor') {
+    // 游标被宿主压缩换掉：清游标，下一轮从 firstReplaceableIndex 重扫。
+    platform.log('warn', '[dsh-companion] backfill cursor is stale; resetting', {
+      scope,
+      cursorSeq: stored.cursorSeq,
+    });
+    try {
+      store.deleteMeta(`${BACKFILL_META_PREFIX}cursor:${scope}`);
+    } catch {
+      // 清不掉也只是下轮再报一次。
+    }
+    return;
+  }
+  if (plan.chunks.length === 0) return;
+  const chunk = plan.chunks[0];
+  const afterIdx = chunk.endIdx + 1;
+  const afterRecord = Array.isArray(snapshot.records) ? snapshot.records[afterIdx] ?? null : null;
+  const nextSeq = Number.isFinite(Number(afterRecord?.seq))
+    ? Number(afterRecord.seq)
+    : (Array.isArray(snapshot.seqs) && Number.isFinite(Number(snapshot.seqs[afterIdx]))
+      ? Number(snapshot.seqs[afterIdx])
+      : null);
+  const entry = {
+    chunk,
+    stage: 'consolidating',
+    consolidationId: null,
+    nextSeq,
+    atWatermark: afterIdx >= plan.watermarkIdx,
+    snapshot,
+    transcript: state.transcript.map((row) => ({ role: row.role, text: row.text })),
+  };
+  persistPendingBackfill(state, scope, entry);
+  platform.log('info', '[dsh-companion] backfill chunk scheduled', {
+    scope,
+    startSeq: chunk.startSeq,
+    endSeq: chunk.endSeq,
+    tokens: chunk.tokens,
+    count: chunk.count,
+    atWatermark: entry.atWatermark,
+  });
+  setImmediate(() => {
+    void runBackfillJob(state, scope, entry);
+  });
+}
+
 function scheduleConsolidation(state, payload, scope = SCOPE) {
   if (state.disposed) return;
   const { platform, config } = state;
@@ -3651,6 +4131,8 @@ async function maybeCompact(state, payload, scope = SCOPE) {
       store.markConsolidated(pending.id, { status: 'compacted' });
     }
     state.metrics.inc('compactions');
+    // H1-B（v0.7.17）：宿主每个 pre-step 窗口至多一次 compactRegion，回填让路。
+    state.compactedThisTurn = true;
     // C120-H2/L1：成功后清掉连续失败与区间尝试计数（`/状态` 只显示未恢复的失败）。
     clearCompactionFailures(store, scope);
     clearCompactionAttempts(store, scope);
@@ -7281,7 +7763,14 @@ function renderToolValue(value) {
 }
 
 export {
-  captureTranscript,
+  // H1-B（v0.7.17）：历史回填的纯函数与两段式执行器，仅为单测可达（非公开 API）。
+  advanceBackfillCursor,
+  backfillChunkConsolidated,
+  backfillRegionText,
+  maybeBackfill,
+  pendingBackfillOf,
+  runBackfillCompaction,
+  runBackfillJob,  captureTranscript,
   // R22-H1（v0.7.13）：生产接线层（scheduler 注入 + 回执入队），仅为单测可达（非公开 API）。
   deliverTaskReceipt,
   expireStaleReminders,
