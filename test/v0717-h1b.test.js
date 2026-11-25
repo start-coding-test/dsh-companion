@@ -116,10 +116,15 @@ function makeState(options = {}) {
     companion: {},
   };
   if (options.llm !== false) {
+    // 默认空草稿会触发 consolidate.js:1292-1304 的 C120-M3「再问一次」；需要精确调用次数
+    // 的用例可传 `llmResponse` 返回非空草稿。
+    const respond = typeof options.llmResponse === 'function'
+      ? options.llmResponse
+      : () => ({ episode: null, facts: [], reminders: [] });
     state.companion = {
       consolidationLlm: async (input) => {
         llmCalls.push(input);
-        return { episode: null, facts: [], reminders: [] };
+        return respond(input);
       },
     };
   }
@@ -656,5 +661,147 @@ test('H1-B 非真机证据：pre-step 生产接线会登记回填 pending（删�
     }
   } finally {
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* 插件仍持连接时留下临时目录 */ }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// M1（v0.7.17 复核）：恢复态 pending 不得永久死锁
+// ---------------------------------------------------------------------------
+
+/**
+ * 持久化一条「恢复形」pending（模拟崩溃/重部署：meta 有 chunk，内存无快照）。
+ * @param {object} store
+ * @param {object} chunk
+ * @param {string} [stage]
+ * @returns {void}
+ */
+function seedRecoveredPending(store, chunk, stage = 'consolidating') {
+  store.setMeta(`compact_backfill:pending:${SCOPE}`, JSON.stringify({
+    chunk,
+    stage,
+    consolidationId: null,
+    nextSeq: chunk.endSeq + 1,
+    atWatermark: false,
+  }));
+}
+
+test('H1-B 非真机证据（M1）：恢复态且已写行 → 重拉只转 ready，不重复调模型', async (t) => {
+  const { store, cleanup } = makeTempStore({ t, prefix: 'dsh-v0717-h1b-rec1-' });
+  try {
+    seedConsolidation(store, 6, Math.floor(TEST_NOW / 1000) - 60, 'compacted');
+    const specs = [];
+    for (let seq = 1; seq <= 10; seq += 1) specs.push({ seq, role: 'user', tokens: 800 });
+    const { state, llmCalls, logs } = makeState({ store, snapshot: makeSnapshot(specs), watermark: 6 });
+    seedRecoveredPending(store, {
+      startIdx: 0,
+      endIdx: 1,
+      startSeq: 1,
+      endSeq: 2,
+      tokens: 1600,
+      count: 2,
+    });
+    // 上一轮巩固已成功落行（崩溃发生在压缩前）。
+    store.insertConsolidation({
+      scope: SCOPE,
+      session_id: SCOPE,
+      kind: 'forget_flush',
+      trigger: 'backfill',
+      upto_seq: 2,
+      status: 'written',
+      started_at: Math.floor(TEST_NOW / 1000) - 30,
+      finished_at: Math.floor(TEST_NOW / 1000) - 30,
+    });
+    // 恢复后内存缓存必须为空，才会走 meta 恢复路径。
+    state.pendingBackfillByScope = new Map();
+    await maybeBackfill(state, PAYLOAD);
+    await settle();
+    assert.equal(llmCalls.length, 0, '已写行不得再调模型');
+    const pending = pendingBackfillOf(state, SCOPE);
+    assert.equal(pending?.stage, 'ready', '重拉后应进入 ready 等待压缩');
+    assert.ok(
+      logs.some((row) => String(row.message).includes('already consolidated')),
+      '应记录「已巩固」日志',
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test('H1-B 非真机证据（M1）：恢复态但未写行 → 用当前 surface 重建正文并重新巩固', async (t) => {
+  const { store, cleanup } = makeTempStore({ t, prefix: 'dsh-v0717-h1b-rec2-' });
+  try {
+    seedConsolidation(store, 6, Math.floor(TEST_NOW / 1000) - 60, 'compacted');
+    const specs = [];
+    for (let seq = 1; seq <= 10; seq += 1) specs.push({ seq, role: 'user', tokens: 800, text: `第 ${seq} 句正文` });
+    const { state, llmCalls, logs } = makeState({
+      store,
+      snapshot: makeSnapshot(specs),
+      watermark: 6,
+      // 非空草稿：避免 C120-M3 的重问干扰「恰好重跑一次」的计数。
+      llmResponse: () => ({
+        episode: null,
+        facts: [{
+          statement: '回填期间提取的事实',
+          subject_text: '历史回填',
+          predicate: '提取出',
+          object_text: '一条事实',
+          kind: 'knowledge',
+        }],
+        reminders: [],
+      }),
+    });
+    seedRecoveredPending(store, {
+      startIdx: 0,
+      endIdx: 1,
+      startSeq: 1,
+      endSeq: 2,
+      tokens: 1600,
+      count: 2,
+    });
+    state.pendingBackfillByScope = new Map();
+    await maybeBackfill(state, PAYLOAD);
+    await settle();
+    assert.equal(llmCalls.length, 1, `未写行应重跑一次巩固：${JSON.stringify(llmCalls.map((c) => ({ f: c.seqFrom, t: c.seqTo, len: String(c.regionText ?? '').length })))}`);
+    assert.match(String(llmCalls[0]?.regionText ?? ''), /user: 第 1 句正文/u, '注入的快照必须真的切出正文');
+    const pending = pendingBackfillOf(state, SCOPE);
+    assert.equal(pending?.stage, 'ready', `重新巩固后应进入 ready；logs=${JSON.stringify(logs)}`);
+  } finally {
+    cleanup();
+  }
+});
+
+test('H1-B 非真机证据（M1）：恢复态且位置漂移 → 丢弃本批 + 清游标重扫，不死锁', async (t) => {
+  const { store, cleanup } = makeTempStore({ t, prefix: 'dsh-v0717-h1b-rec3-' });
+  try {
+    seedConsolidation(store, 6, Math.floor(TEST_NOW / 1000) - 60, 'compacted');
+    const specs = [];
+    for (let seq = 1; seq <= 10; seq += 1) specs.push({ seq, role: 'user', tokens: 800 });
+    const { state, logs } = makeState({ store, snapshot: makeSnapshot(specs), watermark: 6 });
+    // 漂移：记录里的 endSeq 在新 surface 的 endIdx 位置上并不存在。
+    seedRecoveredPending(store, {
+      startIdx: 0,
+      endIdx: 1,
+      startSeq: 1,
+      endSeq: 99,
+      tokens: 1600,
+      count: 2,
+    });
+    store.setMeta(`compact_backfill:cursor:${SCOPE}`, '3');
+    state.pendingBackfillByScope = new Map();
+    await maybeBackfill(state, PAYLOAD);
+    await settle();
+    assert.equal(store.getMeta(`compact_backfill:pending:${SCOPE}`), null, '漂移的 pending 应被丢弃');
+    assert.equal(store.getMeta(`compact_backfill:cursor:${SCOPE}`), null, '游标应被清掉以便重扫');
+    assert.ok(
+      logs.some((row) => String(row.message).includes('drifted')),
+      '应记录位置漂移 warn',
+    );
+    // 下一窗口必须能重新选批（否则就是死锁）。
+    await maybeBackfill(state, PAYLOAD);
+    const pending = pendingBackfillOf(state, SCOPE);
+    assert.ok(pending !== null, '重扫后应能重新登记一批');
+    assert.notEqual(pending.chunk.endSeq, 99, '新批次必须来自当前 surface');
+  } finally {
+    cleanup();
   }
 });

@@ -111,6 +111,14 @@
   `recoverPendingCompacts` 只认 `nap`。因此回填路径**零水位锚、零 `retargetConsolidation`、
   零 `setWatermark`、零 schema 变更**：低 `upto_seq` 的回填行按构造不可能把主水位带偏，
   重启也不会复活成正常 pending。
+- **恢复态重拉（复核 M1）**：崩溃/重部署会让 meta 留下 `stage="consolidating"`、内存无快照的
+  pending（崩溃窗横跨整个巩固 LLM 调用）。现在 `maybeBackfill` 会用当前 surface 重建：先校验
+  `seqs[chunk.startIdx]` / `seqs[chunk.endIdx]` 与 `chunk.startSeq` / `chunk.endSeq` 是否仍一致
+  （H1-A 按位置选区），一致才注入快照并重拉巩固（已写行则只转 `ready`、零模型）；位置漂移或
+  取不到快照则丢弃本批 + 清 `compact_backfill:cursor:<scope>`，下轮从 `firstReplaceableIndex`
+  重扫，避免拿旧位置切新快照污染巩固结果。
+- **口径注记（用户 2026-11-25 裁决）**：m01525 原定的「批后 retarget 回主水位」字面动作
+  不再执行——方案 E 用 `kind=forget_flush` 让回填行天然不参与主水位，见上条。
 - **崩溃窗预检**：巩固阶段重放时先按 `(scope, upto_seq, kind=forget_flush, trigger=backfill)`
   查一次；命中就只把 pending 置 `ready`、不重复调模型（`UNIQUE constraint failed` 同样按
   「已巩固」重放处理）。

@@ -2921,7 +2921,9 @@ function pendingBackfillOf(state, scope) {
           consolidationId: Number.isInteger(parsed?.consolidationId) ? parsed.consolidationId : null,
           nextSeq: Number.isFinite(Number(parsed?.nextSeq)) ? Number(parsed.nextSeq) : null,
           atWatermark: parsed?.atWatermark === true,
-          // 快照不进 meta（重启后由当前 surface 重建正文）。
+          // 快照不进 meta；恢复态（stage !== "ready" 且 snapshot === null）由 `maybeBackfill`
+          // 用当前 surface 重建：先校验 chunk 的位置一致性（H1-A 按 seqs.indexOf 位置选区），
+          // 一致才注入并重拉巩固，漂移/取不到快照则丢本批 + 清游标重扫。
           snapshot: null,
           transcript: [],
         };
@@ -3278,8 +3280,53 @@ async function maybeBackfill(state, payload, scope = SCOPE) {
   }
   const pending = pendingBackfillOf(state, scope);
   if (pending !== null) {
-    if (pending.stage !== 'ready') return;
-    await runBackfillCompaction(state, payload, scope, pending);
+    if (pending.stage === 'ready') {
+      await runBackfillCompaction(state, payload, scope, pending);
+      return;
+    }
+    // M1（v0.7.17 复核）：恢复态重拉。崩溃窗横跨整个巩固 LLM 调用，插件重部署/崩溃
+    // 后 meta 里留下 stage="consolidating"、snapshot=null 的 pending；若不重拉，该 scope
+    // 的回填会永久停摆（此前这里直接 return）。内存里已有快照（同 turn 内 job 在跑）则不动。
+    if (pending.snapshot === null || pending.snapshot === undefined) {
+      const snapshot = state.surfaceSnapshotByScope?.get?.(scope) ?? state.surfaceSnapshot;
+      if (snapshot !== null && snapshot !== undefined) {
+        // 位置一致性：H1-A 用 `seqs.indexOf` 按位置比较水位（src/session/backfill.js:137-140），
+        // 重启期间宿主若压缩过 surface，旧 startIdx/endIdx 会指向别的记录——那样切出来的
+        // 正文会污染巩固结果。seq 一致才注入快照重拉，否则按漂移处理。
+        const seqs = Array.isArray(snapshot.seqs) ? snapshot.seqs : [];
+        const sameStart = Number(seqs[pending.chunk.startIdx]) === Number(pending.chunk.startSeq);
+        const sameEnd = Number(seqs[pending.chunk.endIdx]) === Number(pending.chunk.endSeq);
+        if (sameStart && sameEnd) {
+          pending.snapshot = snapshot;
+          persistPendingBackfill(state, scope, pending);
+          setImmediate(() => {
+            void runBackfillJob(state, scope, pending);
+          });
+          return;
+        }
+        platform.log('warn', '[dsh-companion] backfill recovered chunk drifted; dropping pending and rescanning', {
+          scope,
+          startIdx: pending.chunk.startIdx,
+          endIdx: pending.chunk.endIdx,
+          startSeq: pending.chunk.startSeq,
+          endSeq: pending.chunk.endSeq,
+          seqAtStart: seqs[pending.chunk.startIdx] ?? null,
+          seqAtEnd: seqs[pending.chunk.endIdx] ?? null,
+        });
+      } else {
+        platform.log('warn', '[dsh-companion] backfill recovered pending has no snapshot; dropping and rescanning', {
+          scope,
+        });
+      }
+      // 保守：丢本批 + 清游标，下轮从 firstReplaceableIndex 重扫（零事实污染）。
+      forgetPendingBackfill(state, scope);
+      try {
+        store.deleteMeta(`${BACKFILL_META_PREFIX}cursor:${scope}`);
+      } catch {
+        // 清不掉也只是下轮再报一次。
+      }
+      return;
+    }
     return;
   }
   const watermark = watermarkOf(state, scope);
