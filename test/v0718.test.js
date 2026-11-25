@@ -14,6 +14,13 @@ import assert from 'node:assert/strict';
 
 import { Store } from '../src/memory/store.js';
 import { createTools } from '../src/runtime/tools.js';
+import { extractKeyPhrases } from '../src/memory/dedupe.js';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { FakeCtx } from './fakes/ctx.js';
+import { strictCtx } from './helpers/strict-ctx.js';
+import { apply as applyCordis } from '../src/index.js';
 import { formatStopTaskReply, handleCommand } from '../src/runtime/commands.js';
 
 const NOW_MS = Date.UTC(2026, 10, 5, 9, 0, 0);
@@ -160,5 +167,160 @@ test('L3（v0.7.18 非真机证据）：取消受理文案不主张终态，两�
     assert.match(text, /取消中，收尾后回执送达/u, label + ' 应说明取消中而非终态');
     assert.ok(text.includes(target), label + ' 保留任务标识');
     assert.doesNotMatch(text, /已取消/u, label + ' 不应提前主张已取消');
+  }
+});
+
+
+// ------------------------------------------------------ L5（关键串收窄）
+
+test('L5（v0.7.18 非真机证据）：路径通用段不入关键串，项目名仍保留', () => {
+  // 判别力：删掉 KEY_PHRASE_PATH_STOPWORDS 判断 → opt/data/work/src 会重新出现即红。
+  const phrases = extractKeyPhrases('/opt/data/work/dsh-companion/src/index.js');
+  for (const noise of ['opt', 'data', 'work', 'src']) {
+    assert.ok(!phrases.some((phrase) => phrase.toLowerCase() === noise), noise + ' 不应成为关键串：' + JSON.stringify(phrases));
+  }
+  assert.ok(phrases.includes('dsh-companion'), '项目名应保留：' + JSON.stringify(phrases));
+});
+
+test('L5（v0.7.18 非真机证据）：超长 CJK 整句不整体入索引，按虚词切分', () => {
+  // 判别力：把 CJK 分支改回整体 push → 整句会出现在结果里即红。
+  const sentence = '后台任务在云端服务器上运行很好的';
+  const phrases = extractKeyPhrases(sentence);
+  assert.ok(!phrases.includes(sentence), '整句不应整体入索引：' + JSON.stringify(phrases));
+  assert.ok(phrases.length > 0, '仍应切出有效短段：' + JSON.stringify(phrases));
+  for (const phrase of phrases) {
+    assert.ok(phrase.length <= 12, '切分后每段都应短于整句：' + phrase);
+  }
+});
+
+test('L5（v0.7.18 非真机证据）：短有效锚点与既有版本/日期 gate 不变', () => {
+  // 防「顺手提高 MIN_LENGTH」误杀 dsh / QQ 这类短实体；版本号/日期仍被 gate 挡住。
+  const phrases = extractKeyPhrases('dsh 和 QQ 都在 50041 上跑，升级到 24.3.1，2026-11-24 10:30 上线');
+  for (const keep of ['dsh', 'QQ']) {
+    assert.ok(phrases.includes(keep), keep + ' 应仍可入索引：' + JSON.stringify(phrases));
+  }
+  assert.ok(!phrases.includes('24.3.1'), '纯版本号仍被 gate 挡住');
+  assert.ok(!phrases.some((phrase) => /^\d{4}-\d{2}-\d{2}$/u.test(phrase)), '纯日期仍被 gate 挡住');
+});
+
+// ------------------------------------------------------ L5（裁决计数）
+
+function makeJudgeWriter(store, options = {}) {
+  let now = options.now ?? NOW_MS;
+  const calls = [];
+  const write = createTools({
+    store,
+    retrieve: () => ({ ok: true, items: [] }),
+    platform: { log: () => {}, now: () => now, capabilities: {} },
+    clock: () => now,
+    timeZone: 'UTC',
+    currentScope: () => 'main',
+    judge: async (prompt) => {
+      calls.push(prompt);
+      return JSON.stringify({ items: [{ index: 1, verdict: 'new' }] });
+    },
+    dedupe: { dedupeSkip: 0.99, dedupeAsk: 0.1 },
+    ...options.extra,
+  }).find((tool) => tool.name === 'memory_write');
+  return { write, calls, advance: (ms) => { now += ms; } };
+}
+
+function judgeMeta(store) {
+  const raw = store.getMeta('dedupe_judge:main');
+  return raw === null ? null : JSON.parse(raw);
+}
+
+test('L5（v0.7.18 非真机证据）：ask 档每次裁决 +1，skip/new 不计', async (t) => {
+  const store = openStore(t);
+  addFact(store, { statement: '青柠计划的代号是蓝鲸。' });
+  const { write, calls } = makeJudgeWriter(store);
+
+  assert.equal(judgeMeta(store), null, '初始没有计数键');
+
+  const sameKind = { kind: 'preference', salience: 'normal', privacy: 'normal' };
+  const first = await write.execute({ ...sameKind, statement: '青柠计划的代号是白鲸。' });
+  assert.equal(first.ok, true);
+  assert.equal(judgeMeta(store).count, 1);
+  assert.equal(calls.length, 1);
+
+  const second = await write.execute({ ...sameKind, statement: '青柠计划的代号是灰鲸。' });
+  assert.equal(second.ok, true);
+  assert.equal(judgeMeta(store).count, 2);
+
+  // skip：同句高相似直接强化，不发 judge、不计数。
+  await write.execute({ ...sameKind, statement: '青柠计划的代号是蓝鲸。' });
+  assert.equal(calls.length, 2, 'skip 不应触发 judge');
+  assert.equal(judgeMeta(store).count, 2);
+
+  // new：完全无关的句子不触发 judge、不计数。
+  await write.execute({ ...sameKind, statement: '周末去修自行车链条。' });
+  assert.equal(calls.length, 2);
+  assert.equal(judgeMeta(store).count, 2);
+});
+
+test('L5（v0.7.18 非真机证据）：跨日从 1 重新计数（坏数据也按新一天重置）', async (t) => {
+  const store = openStore(t);
+  addFact(store, { statement: '青柠计划的代号是蓝鲸。' });
+  const { write, advance } = makeJudgeWriter(store);
+
+  // 每次换一句：同一句第二次写会走 skip（高 Jaccard），不触发 judge。
+  const statements = ['青柠计划的代号是白鲸。', '青柠计划的代号是灰鲸。', '青柠计划的代号是红鲸。', '青柠计划的代号是金鲸。'];
+  const base = { kind: 'preference', salience: 'normal', privacy: 'normal' };
+  await write.execute({ ...base, statement: statements[0] });
+  await write.execute({ ...base, statement: statements[1] });
+  assert.equal(judgeMeta(store).count, 2);
+
+  advance(24 * 3600 * 1000);
+  await write.execute({ ...base, statement: statements[2] });
+  assert.equal(judgeMeta(store).count, 1, '跨日后应重置为 1');
+
+  // 坏数据防御：非 JSON 都不抛错，按新一天从 1 记。
+  store.setMeta('dedupe_judge:main', 'not-json');
+  await write.execute({ ...base, statement: statements[3] });
+  assert.equal(judgeMeta(store).count, 1);
+});
+
+// ------------------------------------------------------ L5（/状态 省行与接线）
+
+test('L5（v0.7.18 非真机证据）：0 计数省行，非零才多一行', (t) => {
+  const store = openStore(t);
+  const base = handleCommand({ text: '/状态', store, now: NOW_MS, timeZone: 'UTC' }).reply;
+  assert.doesNotMatch(base, /查重裁决/u, '未接线/无计数时整行省略');
+
+  const zero = handleCommand({ text: '/状态', store, now: NOW_MS, timeZone: 'UTC', dedupe: { count: 0 } }).reply;
+  assert.doesNotMatch(zero, /查重裁决/u, 'count=0 也省行');
+
+  const some = handleCommand({ text: '/状态', store, now: NOW_MS, timeZone: 'UTC', dedupe: { count: 3 } }).reply;
+  assert.match(some, /查重裁决（今日）：3 次/u);
+});
+
+test('L5（v0.7.18 非真机证据）：生产接线把 dedupe_judge 计数接进 /状态', () => {
+  // 判别力：删掉 src/index.js 的 dedupe 注入行（dedupeJudgeStatusOf）→ 本用例红。
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-v0718-l5-'));
+  const dbPath = join(dir, 'store.db');
+  try {
+    const seed = Store.open(dbPath);
+    seed.setMeta('dedupe_judge:main', JSON.stringify({ date: '2026-11-25', count: 4 }));
+    seed.close();
+
+    const ctx = new FakeCtx({ now: NOW_MS });
+    ctx.commands = {
+      registrations: [],
+      register(definition) { this.registrations.push(definition); return () => {}; },
+    };
+    ctx.tools = { registrations: [], register(definition) { this.registrations.push(definition); return () => {}; } };
+    applyCordis(strictCtx(ctx), { dbPath });
+
+    const status = ctx.commands.registrations.find((entry) => entry.name === 'status');
+    assert.ok(status, 'status 命令应已注册');
+    const reply = status.handler({ rawInput: '' });
+    assert.equal(reply.kind, 'success');
+    assert.match(reply.text, /查重裁决（今日）：4 次/u);
+  } finally {
+    try {
+      rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows 上插件仍持有连接时删不掉，留给系统清理。
+    }
   }
 });

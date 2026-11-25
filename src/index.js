@@ -1326,6 +1326,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
             backfill: backfillStatusOf(state, store, config, scope),
             // v0.7.17 M2：FTS 投影自检（只读；全零时命令层省行）。
             fts: typeof store.ftsHealth === 'function' ? store.ftsHealth() : undefined,
+            // L5（v0.7.18）：今日查重裁决次数（只读 schema_meta；0 或缺失 → 省行）。
+            dedupe: dedupeJudgeStatusOf(store, scope),
             // V7-H1：每次命令调用时读能力位，不用 apply 时快照（宿主可能晚挂载）。
             threadsSupported: platform.capabilities.threadTools === true,
             // V3-M2：/状态 展示当前主会话与绑定模式。
@@ -3997,6 +3999,27 @@ function backfillStatusOf(state, store, config, scope) {
     chunkTokens: cfg.chunkTokens,
     lastFloor: status.lastFloor,
   };
+}
+
+/**
+ * L5（v0.7.18）：读今日查重裁决计数（`dedupe_judge:<scope>`，schema_meta）。
+ * 只读；解析失败/没写过一律返回 undefined（命令层省行）。
+ * 计数由 `createTools` 的 ask 档 bump（src/runtime/tools.js），此处不写。
+ *
+ * @returns {{count: number, date: string}|undefined}
+ */
+function dedupeJudgeStatusOf(store, scope) {
+  try {
+    const raw = store.getMeta('dedupe_judge:' + scope);
+    if (typeof raw !== 'string' || raw === '') return undefined;
+    const parsed = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object') return undefined;
+    const count = Number(parsed.count);
+    if (!Number.isFinite(count) || count <= 0) return undefined;
+    return { count: Math.trunc(count), date: typeof parsed.date === 'string' ? parsed.date : '' };
+  } catch {
+    return undefined;
+  }
 }
 
 function compactFloorOf(state, scope) {

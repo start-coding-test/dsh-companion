@@ -174,6 +174,16 @@ const KEY_PHRASE_STOPWORDS = new Set([
   'the', 'and', 'for', 'with', 'that', 'this',
 ]);
 
+// L5（v0.7.18）：路径里的通用目录段——它们几乎不指向任何实体，却会把
+// `/opt/data/work/<项目>/src/index.js` 拆成一串高频词，抬高 ask 档的裁决调用。
+// 只收「纯路径/工程结构词」，不收 dsh / 50041 / feat 这类可能指向实体的段。
+export const KEY_PHRASE_PATH_STOPWORDS = new Set([
+  'opt', 'data', 'work', 'src', 'dist', 'build', 'lib', 'tmp', 'var', 'etc',
+  'usr', 'home', 'dev', 'prod', 'test', 'config', 'index', 'utils', 'core', 'api',
+  'app', 'bin', 'logs', 'cache', 'public', 'static', 'docs', 'scripts', 'packages',
+  'plugins', 'assets',
+]);
+
 const VERSION_ONLY = /^\d+(?:\.\d+)+$/u;
 const DATE_TIME_ONLY = /^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}:\d{2}(?::\d{2})?|\d{4}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}[日号])$/u;
 
@@ -192,7 +202,7 @@ export function extractKeyPhrases(statement) {
     if (phrase.length < KEY_PHRASE_MIN_LENGTH || phrase.length > KEY_PHRASE_MAX_LENGTH) return;
     if (VERSION_ONLY.test(phrase) || DATE_TIME_ONLY.test(phrase)) return;
     const key = phrase.toLowerCase();
-    if (KEY_PHRASE_STOPWORDS.has(key) || seen.has(key)) return;
+    if (KEY_PHRASE_STOPWORDS.has(key) || KEY_PHRASE_PATH_STOPWORDS.has(key) || seen.has(key)) return;
     seen.add(key);
     phrases.push(phrase);
   };
@@ -202,6 +212,15 @@ export function extractKeyPhrases(statement) {
     const trimmed = match[0]
       .replace(/^[在的了是和与把被给对从到就也还很都又再更最上下中里]+/u, '')
       .replace(/[在的了是和与把被给对从到就也还很都又再更最上下中里]+$/u, '');
+    // L5（v0.7.18）：超过 12 字的连续 CJK 基本是「一整句话」。整句入索引会让
+    // 任意两句中文都共享一个关键串，直接拉高 ask 档；改为按虚词/标点切分成短段
+    // （每段仍走 push 的长度/停用词 gate）。切不出有效段时整段丢弃。
+    if (trimmed.length > 12) {
+      for (const piece of trimmed.split(/[在的了是和与把被给对从到就也还很都又再更最上下中里]+/u)) {
+        push(piece);
+      }
+      continue;
+    }
     push(trimmed);
   }
   return phrases.slice(0, KEY_PHRASE_MAX);

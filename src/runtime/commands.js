@@ -159,6 +159,8 @@ export function handleCommand({
   backfill,
   // v0.7.17 M2：FTS 投影自检（只读；undefined/全零时省行）。
   fts,
+  // L5（v0.7.18）：今日查重裁决次数（计数为 0 或未接线时省行）。
+  dedupe,
   bg,
   // V710-L1（v0.7.11）：取消在跑 task_run；null = 全部。
 } = {}) {
@@ -196,6 +198,7 @@ export function handleCommand({
     reply: formatStatus(store, scope, metrics, timeZone, budget, {
       backfill,
       fts,
+      dedupe,
       threadsSupported,
       mainSession,
       compactionSupported,
@@ -719,6 +722,9 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
   // v0.7.17 M2：FTS 投影自检（异常或非零才输出；全零/未接线时整行省略）。
   const ftsLine = formatFtsLine(options.fts);
   if (ftsLine !== null) lines.push(ftsLine);
+  // L5（v0.7.18）：今日查重裁决次数（0 或未接线时整行省略，旧 golden 不变）。
+  const dedupeLine = formatDedupeLine(options.dedupe);
+  if (dedupeLine !== null) lines.push(dedupeLine);
   // G0-9：最近一次压缩/巩固实际耗时（只观测，不设超时）；无样本显示 —。
   // timing 只在接线层传入时输出，保持旧调用方（单测）的 /状态 格式不变。
   if (options.timing !== null && options.timing !== undefined && typeof options.timing === 'object') {
@@ -870,6 +876,23 @@ function formatFtsLine(fts) {
   if (missing > 0) bits.push(`缺投影 ${missing}`);
   if (inactive > 0) bits.push(`已遗忘仍留索引 ${inactive}（S2 清理）`);
   return `FTS 自检：${bits.join(' · ')}`;
+}
+
+/**
+ * L5（v0.7.18）：`/状态` 的「今日查重裁决」一行。
+ *
+ * 参照 {@link formatFtsLine} / {@link formatBackfillLine} 的 null-省行先例：
+ * 未接线（undefined）或计数为 0 时返回 null，整行省略——旧 golden 零波及；
+ * 只有当日确实发生过 ask 档裁决才多一行。
+ *
+ * @param {{count?: number, date?: string}|null|undefined} dedupe
+ * @returns {string|null}
+ */
+function formatDedupeLine(dedupe) {
+  if (dedupe === null || dedupe === undefined || typeof dedupe !== 'object') return null;
+  const count = Number.isFinite(Number(dedupe.count)) ? Math.max(0, Math.trunc(Number(dedupe.count))) : 0;
+  if (count === 0) return null;
+  return `查重裁决（今日）：${count} 次`;
 }
 
 /**

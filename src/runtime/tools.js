@@ -26,7 +26,7 @@ import { resolveStopTarget } from '../task/stop-target.js';
 // 传 `{}` 时宿主会调 `signal.throwIfAborted()` 直接抛错。
 import { deliverySignal } from '../platform/adapter.js';
 import { summarizeCost } from './commands.js';
-import { DEFAULT_TIMEZONE, isValidTimeZone } from '../time.js';
+import { DEFAULT_TIMEZONE, isValidTimeZone, zonedDayKey } from '../time.js';
 import { nextOccurrence, parseRRule } from '../scheduler/recurrence.js';
 import { FACT_KINDS as STORE_FACT_KINDS } from '../memory/store.js';
 // M1（v0.7.17）：memory_write 的近似查重、judge 裁决与跨 kind 关键串升级，
@@ -277,6 +277,36 @@ export function createTools({
     dedupeAsk: Number.isFinite(dedupe?.dedupeAsk) ? dedupe.dedupeAsk : undefined,
   };
   // 一次裁决只有一组（memory_write 逐条写），失败/坏结构一律按 new 保守。
+  // L5（v0.7.18）：查重裁决次数（用户 m02319 观察项：关键串偏宽 → 裁决调用偏多，
+  // 只增成本不误判）。只统计 ask 档真正发起的 judge 调用，skip/new 不计。
+  // 落 schema_meta（键 `dedupe_judge:<scope>`，值 {date,count}），不算加表；
+  // 与 `compact_backfill:day:<scope>` / `bg_wake:*` 同一先例。计数失败绝不阻断写入。
+  const DEDUPE_JUDGE_META_PREFIX = 'dedupe_judge:';
+  const bumpDedupeJudge = (scope) => {
+    try {
+      const key = `${DEDUPE_JUDGE_META_PREFIX}${scope}`;
+      const day = zonedDayKey(nowMs(), timeZone);
+      const meta = typeof store.getMeta === 'function' ? store.getMeta(key) : null;
+      let count = 0;
+      if (typeof meta === 'string' && meta !== '') {
+        try {
+          const parsed = JSON.parse(meta);
+          if (
+            parsed !== null && typeof parsed === 'object' && parsed.date === day
+            && Number.isFinite(Number(parsed.count))
+          ) {
+            count = Math.max(0, Math.trunc(Number(parsed.count)));
+          }
+        } catch {
+          count = 0;
+        }
+      }
+      if (typeof store.setMeta === 'function') store.setMeta(key, JSON.stringify({ date: day, count: count + 1 }));
+    } catch {
+      // 观察数据：任何异常都静默，不影响 memory_write 主流程。
+    }
+  };
+
   const judgeVerdict = async (factText, existingText) => {
     if (judgeFn === null) return null;
     try {
@@ -458,6 +488,8 @@ export function createTools({
         if (verdict.verdict === 'skip' && verdict.match !== null) return reinforce(verdict.match, 'reinforced');
         if (verdict.verdict === 'ask' && verdict.match !== null) {
           const target = verdict.match;
+          // L5（v0.7.18）：bump 点必须在 judge 调用之前——成败都算一次裁决调用。
+          bumpDedupeJudge(scope);
           const judged = await judgeVerdict(statement, typeof target.statement === 'string' ? target.statement : '');
           if (judged === 'same') return reinforce(target, 'reinforced');
           if (judged === 'update') {

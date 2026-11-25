@@ -177,6 +177,8 @@ token 四档须满足 `retainTokens < compactAtTokens < workingMemoryTokens < co
   裁决 0..1 次/批未计入）。预演不写库、不推进游标、不调模型。
 - `/状态`：配置了 `compact.backfill` 时多一行「回填：…」，显示开关、游标、今日批数、
   最近一次压后底。
+- `/状态`：当日发生过查重裁决时多一行「查重裁决（今日）：N 次」（计数在 `schema_meta` 的
+  `dedupe_judge:<scope>`；为 0 时整行省略）。
 - 选区语义：水位比较按 seq 在 surface 里的**位置**而不是数值大小（压缩替换会让 seq 非单调）；
   起点跳过系统提示词，终点按工具调用配对收缩，跨摘要节点继续下探。
 

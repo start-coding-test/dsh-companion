@@ -24,6 +24,21 @@
 - **L3 取消受理文案**：`/停止任务` 的 task_run 与后台任务两条受理分支不再提前主张
   「（状态：已取消）」，改为「取消中，收尾后回执送达」；真正的「已取消」只由监视器
   收敛后的终态回执给出（`task_cancel` 工具的 note 本就不是终态措辞，未改）。
+- **L5 关键串收窄 + 裁决计数**（用户 m02319 观察项：关键串偏宽 → 裁决调用偏多，只增成本
+  不误判）：
+  - `extractKeyPhrases` 新增 `KEY_PHRASE_PATH_STOPWORDS`（`opt data work src dist build lib tmp
+    var etc usr home dev prod test config index utils core api app bin logs cache public static
+    docs scripts packages plugins assets`，纯路径/工程结构词；不含 `dsh` / `50041` / `feat`
+    这类可能指向实体的段），命中段直接不入索引。
+  - **超长 CJK 选「切分」**：>12 字的连续 CJK 不再整体入索引，按既有虚词字符类切分成短段
+    （每段仍走长度/停用词 gate）；切不出有效段时整段丢弃。
+  - `KEY_PHRASE_MAX/MIN_LENGTH/MAX_LENGTH`、`VERSION_ONLY`、`DATE_TIME_ONLY` 三条既有 gate
+    **未动**（`dsh` / `QQ` 这类短锚点仍可入）。
+  - 新增「今日查重裁决次数」计数：`schema_meta` 键 `dedupe_judge:<scope>`，值
+    `{date,count}`（**不算加表**）；只在 ask 档真正发起 judge 调用前 +1，skip/new 不计；
+    跨日或数据损坏按新一天从 1 重记。
+  - `/状态` 新增一行「查重裁决（今日）：N 次」：未接线或计数为 0 时**整行省略**（旧 golden
+    零波及）。
 
 ### Docs
 
