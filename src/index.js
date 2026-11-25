@@ -3098,7 +3098,9 @@ function backfillChunkConsolidated(store, scope, endSeq) {
 /**
  * 外来回填行探测：同一 (scope, upto_seq, kind) 键上是否存在 trigger 非 backfill 的行。
  * 唯一索引只看 (scope, upto_seq, kind)（`src/memory/store.js:410`），不看 trigger，
- * 所以外来 `forget_flush` 行与自家回填行可以同键共存，也是下面碰撞处理的判据。
+ * 所以外来 `forget_flush` 行会先占用该键、自家回填行随后 INSERT 必然撞 UNIQUE（两行不可能共存），
+ * 这是下面碰撞处理的判据。只查 written/compacted/empty：failed 行会被 insertConsolidation
+ * 就地 UPDATE 复用并改写 trigger，无需当作碰撞、语义无害。
  * @param {object} store
  * @param {string} scope
  * @param {number} endSeq

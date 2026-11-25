@@ -43,7 +43,8 @@
 - **L1 回填键碰撞甄别**（预防性加固）：回填巩固行落 `kind='forget_flush'` +
   `trigger='backfill'`，而唯一索引只看 `(scope, upto_seq, kind)`（不含 trigger，
   `src/memory/store.js:410`）⇒ 外来的 `forget_flush` 行（`trigger='forget'`，
-  `src/memory/forget.js:104` 的实际产出）可能与回填批同键共存，若直接 INSERT 会撞唯一索引。
+  `src/memory/forget.js:104` 的实际产出）会先占用该键，自家回填行再 INSERT 必然撞唯一索引
+  （两行不可能共存）。
   现在 `runBackfillJob` 在调模型前先做外来行预检，UNIQUE catch 里再甄别一次：命中外来行 →
   按「键碰撞」收尾（预检臂省一次模型调用），否则维持原有崩溃窗重放语义。
   - **该批原文永久留底**：不调 `compactRegion`、不物理删任何行，原文继续留在 surface；
@@ -81,7 +82,7 @@
 调用」摊开给用户核对；本版**不执行**回填，不写库、不推进水位，enabled=false 时连回填 meta
 都不写。
 
-> v0.7.15 已部署到云端；v0.7.16、v0.7.17 尚未单独部署。
+> v0.7.15 已部署到云端；v0.7.16 于 2026-11-24 13:18:54 部署；v0.7.17 于 2026-11-25 10:33:33 部署。
 
 ### Added
 
