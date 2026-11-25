@@ -3095,6 +3095,75 @@ function backfillChunkConsolidated(store, scope, endSeq) {
 }
 
 /**
+ * 外来回填行探测：同一 (scope, upto_seq, kind) 键上是否存在 trigger 非 backfill 的行。
+ * 唯一索引只看 (scope, upto_seq, kind)（`src/memory/store.js:410`），不看 trigger，
+ * 所以外来 `forget_flush` 行与自家回填行可以同键共存，也是下面碰撞处理的判据。
+ * @param {object} store
+ * @param {string} scope
+ * @param {number} endSeq
+ * @returns {object|null}
+ */
+function backfillKeyCollision(store, scope, endSeq) {
+  try {
+    const row = store.db.prepare(
+      "SELECT id, kind, status, trigger, started_at FROM consolidations" +
+        " WHERE scope = ? AND kind = 'forget_flush' AND trigger <> 'backfill'" +
+        " AND upto_seq = ? AND status IN ('written', 'compacted', 'empty')" +
+        " ORDER BY started_at DESC LIMIT 1",
+    ).get(scope, Number(endSeq));
+    return row ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 键碰撞处理体（L1 v0.7.18，预检臂与 UNIQUE catch 臂共用）：
+ * 该批原文永久留底（不压缩、不删任何行），只清 pending 并推游标防空转。
+ * actor 必须是 `src/memory/store.js:155` EVENT_ACTORS 里的合法枚举（scheduler = 插件后台审计）。
+ * @param {object} state
+ * @param {string} scope
+ * @param {object} pending
+ * @param {object} foreign
+ */
+function handleBackfillCollision(state, scope, pending, foreign) {
+  const { platform, store } = state;
+  const startSeq = Number(pending?.chunk?.startSeq) || null;
+  const endSeq = Number(pending?.chunk?.endSeq) || null;
+  platform.log('warn', '[dsh-companion] backfill key collision; foreign consolidation occupies the chunk', {
+    scope,
+    startSeq,
+    endSeq,
+    foreignTrigger: foreign?.trigger ?? null,
+    foreignId: foreign?.id ?? null,
+  });
+  try {
+    store.appendEvent({
+      at: Math.floor(platform.now() / 1000),
+      action: 'USED',
+      table_name: 'consolidations',
+      row_id: null,
+      actor: 'scheduler',
+      reason: 'backfill_key_collision',
+      detail_json: {
+        kind: 'backfill_key_collision',
+        scope,
+        startSeq,
+        endSeq,
+        foreignTrigger: foreign?.trigger ?? null,
+        foreignKind: foreign?.kind ?? null,
+        foreignStatus: foreign?.status ?? null,
+        foreignId: foreign?.id ?? null,
+      },
+    });
+  } catch {
+    // 审计失败不阻断：碰撞仍要清 pending 并推游标。
+  }
+  forgetPendingBackfill(state, scope);
+  advanceBackfillCursor(state, scope, pending);
+}
+
+/**
  * 把一批选区拼成巩固输入（`role: text` 逐条；注入块与缺失节点跳过）。
  * @param {{records?: object[]}|null|undefined} snapshot
  * @param {{startIdx: number, endIdx: number}} chunk
@@ -3138,6 +3207,13 @@ async function runBackfillJob(state, scope, pending) {
     pending.stage = 'ready';
     pending.snapshot = null;
     persistPendingBackfill(state, scope, pending);
+    return;
+  }
+  // L1（v0.7.18）：自家预检在前（trigger=backfill 的崩溃窗重放走上面）；命中外来行说明该键
+  // 已被别的 forget_flush 行占用，本批若继续跑必撞唯一索引 => 直接碰撞收尾，不调模型。
+  const foreignCollision = backfillKeyCollision(store, scope, pending.chunk.endSeq);
+  if (foreignCollision !== null) {
+    handleBackfillCollision(state, scope, pending, foreignCollision);
     return;
   }
   try {
@@ -3195,6 +3271,12 @@ async function runBackfillJob(state, scope, pending) {
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     if (reason.includes('UNIQUE constraint failed')) {
+      // L1（v0.7.18）：先甄别撞键的是外来行还是自家行——外来行绝不能当「已巩固」进压缩相。
+      const catchCollision = backfillKeyCollision(store, scope, pending.chunk.endSeq);
+      if (catchCollision !== null) {
+        handleBackfillCollision(state, scope, pending, catchCollision);
+        return;
+      }
       // 崩溃窗重放：本块在上一轮已成功巩固，只是压缩没跑完。直接转压缩相。
       platform.log('info', '[dsh-companion] backfill chunk already consolidated; skipping model', {
         scope,
@@ -7842,11 +7924,14 @@ export {
   // H1-B（v0.7.17）：历史回填的纯函数与两段式执行器，仅为单测可达（非公开 API）。
   advanceBackfillCursor,
   backfillChunkConsolidated,
+  backfillKeyCollision,
+  handleBackfillCollision,
   backfillRegionText,
   maybeBackfill,
   pendingBackfillOf,
   runBackfillCompaction,
-  runBackfillJob,  captureTranscript,
+  runBackfillJob,
+  captureTranscript,
   // R22-H1（v0.7.13）：生产接线层（scheduler 注入 + 回执入队），仅为单测可达（非公开 API）。
   deliverTaskReceipt,
   expireStaleReminders,

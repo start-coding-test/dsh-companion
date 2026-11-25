@@ -21,7 +21,9 @@ import { join } from 'node:path';
 import { FakeCtx } from './fakes/ctx.js';
 import { strictCtx } from './helpers/strict-ctx.js';
 import { apply as applyCordis } from '../src/index.js';
+import { backfillKeyCollision, maybeBackfill } from '../src/index.js';
 import { formatStopTaskReply, handleCommand } from '../src/runtime/commands.js';
+import { normalizeConfig } from '../src/config.js';
 
 const NOW_MS = Date.UTC(2026, 10, 5, 9, 0, 0);
 const NOW_SEC = Math.floor(NOW_MS / 1000);
@@ -323,4 +325,179 @@ test('L5（v0.7.18 非真机证据）：生产接线把 dedupe_judge 计数接�
       // Windows 上插件仍持有连接时删不掉，留给系统清理。
     }
   }
+});
+
+
+// ---------------------------------------------------------------------------
+// L1（v0.7.18 非真机证据）：UNIQUE 键碰撞甄别（预防性加固）
+//
+// 外来行 = kind='forget_flush' 且 trigger<>'backfill'（生产实际值 trigger='forget'，
+// 见 `src/memory/forget.js:104` 的 consolidate 调用）；唯一索引只看 (scope, upto_seq, kind)
+// （`src/memory/store.js:410`），所以外来行与自家回填行能同键共存，「谁占了该键」才是判据。
+// 覆盖边界：catch 臂只在「预检通过后、INSERT 之前」有外来行落库的并发窗口才触发，单线程测试
+// 无法构造；这里用预检臂端到端 + helper 单元甄别（共用同一处理体）覆盖，不假装有 catch 端到端用例。
+// ---------------------------------------------------------------------------
+const L1_SCOPE = 'main';
+const L1_PAYLOAD = { agent: { id: 'agent-main', session: { id: 'session-l1' } } };
+const L1_META_CURSOR = 'compact_backfill:cursor:main';
+const L1_META_DONE = 'compact_backfill:done:main';
+const L1_META_PENDING = 'compact_backfill:pending:main';
+
+function l1Snapshot(seqs) {
+  return {
+    seqs: seqs.map(Number),
+    nodes: seqs.map((seq) => ({ seq: Number(seq), tokens: 600, heuristicTokens: 600 })),
+    records: seqs.map((seq) => ({
+      seq: Number(seq),
+      role: 'user',
+      text: `第 ${seq} 句`,
+      tokens: 600,
+      toolDelta: 0,
+      sourceKind: null,
+      missing: false,
+    })),
+    missing: 0,
+    incomplete: false,
+  };
+}
+
+function l1State(store, options = {}) {
+  const logs = [];
+  const compactCalls = [];
+  const llmCalls = [];
+  const snapshot = options.snapshot ?? l1Snapshot([1, 2, 3, 4, 5]);
+  const state = {
+    store,
+    platform: {
+      now: () => NOW_MS,
+      log: (level, message, detail) => logs.push({ level, message, detail }),
+      capabilities: { compaction: true },
+      compactRegion: async (start, end, agent) => { compactCalls.push({ start, end, agent }); },
+    },
+    config: normalizeConfig({ compact: { backfill: { enabled: true, chunkTokens: 1024, maxPerDay: 6 } } }),
+    metrics: { inc: () => {}, observe: () => {} },
+    surface: { snapshot: async () => snapshot },
+    surfaceSnapshot: snapshot,
+    surfaceSnapshotByScope: new Map([[L1_SCOPE, snapshot]]),
+    prevSurfaceSeqsByScope: new Map(),
+    currentScope: L1_SCOPE,
+    watermarkByScope: new Map([[L1_SCOPE, options.watermark ?? 5]]),
+    pendingBackfillByScope: new Map(),
+    pendingCompact: new Map(),
+    compactedThisTurn: false,
+    transcript: [],
+    disposed: false,
+    companion: {
+      consolidationLlm: async (input) => {
+        llmCalls.push(input);
+        return { episode: null, facts: [], reminders: [] };
+      },
+    },
+  };
+  return { state, logs, compactCalls, llmCalls };
+}
+
+function seedWatermarkRow(store, uptoSeq) {
+  const at = Math.floor(NOW_MS / 1000) - 100;
+  return store.insertConsolidation({
+    scope: L1_SCOPE,
+    session_id: 'session-l1',
+    kind: 'nap',
+    trigger: 'threshold',
+    upto_seq: uptoSeq,
+    status: 'written',
+    started_at: at,
+    finished_at: at,
+  });
+}
+
+function seedForgetFlushRow(store, uptoSeq, trigger) {
+  const at = Math.floor(NOW_MS / 1000);
+  return store.insertConsolidation({
+    scope: L1_SCOPE,
+    session_id: 'session-l1',
+    kind: 'forget_flush',
+    trigger,
+    upto_seq: uptoSeq,
+    status: 'written',
+    started_at: at,
+    finished_at: at,
+  });
+}
+
+function l1Settle() {
+  return new Promise((resolve) => setTimeout(resolve, 30));
+}
+
+function collisionEvents(store) {
+  return store.listEvents({ action: 'USED' }).filter((event) => event.reason === 'backfill_key_collision');
+}
+
+function plannedChunk(store) {
+  const raw = store.getMeta(L1_META_PENDING);
+  assert.notEqual(raw, null, '本批应先登记 pending');
+  return JSON.parse(raw).chunk;
+}
+
+test('L1（v0.7.18 非真机证据）：预检命中外来 forget_flush 行 => 零模型、零压缩、审计 + 推游标', async (t) => {
+  const store = openStore(t);
+  seedWatermarkRow(store, 5);
+  const { state, compactCalls, llmCalls, logs } = l1State(store);
+
+  await maybeBackfill(state, L1_PAYLOAD, L1_SCOPE);
+  // 选区由纯函数决定（水位 5 前、chunkTokens 600 => 单节点批）；在 setImmediate 之前把外来行
+  // 种到该批 endSeq 上，构造「同一 (scope, upto_seq, kind) 键已被外来行占用」的现场。
+  const chunk = plannedChunk(store);
+  seedForgetFlushRow(store, chunk.endSeq, 'forget');
+  await l1Settle();
+
+  // 删预检臂的外来查 => 会照常调模型并撞 UNIQUE，这几条立刻红。
+  assert.equal(llmCalls.length, 0, '撞键批不得再调模型');
+  assert.equal(compactCalls.length, 0, '撞键批不得进压缩相');
+  const events = collisionEvents(store);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].actor, 'scheduler', '审计 actor 必须落在 EVENT_ACTORS 合法枚举内');
+  const detail = JSON.parse(events[0].detail_json);
+  assert.equal(detail.kind, 'backfill_key_collision');
+  assert.equal(detail.startSeq, chunk.startSeq);
+  assert.equal(detail.endSeq, chunk.endSeq);
+  assert.equal(detail.foreignTrigger, 'forget');
+  assert.equal(detail.foreignStatus, 'written');
+  assert.equal(store.getMeta(L1_META_PENDING), null, '碰撞后 pending 必须清空');
+  // 游标推到区间后第一条未压缩记录（seq 2，单节点批）=> 下一窗口从 seq 2 起选，不会空转。
+  assert.equal(store.getMeta(L1_META_CURSOR), String(chunk.endSeq + 1));
+  assert.equal(store.getMeta(L1_META_DONE), null);
+  assert.ok(logs.some((row) => row.level === 'warn' && row.message.includes('backfill key collision')));
+});
+
+test('L1（v0.7.18 非真机证据）：自家 trigger=backfill 行仍走崩溃窗重放，甄别不误伤', async (t) => {
+  const store = openStore(t);
+  seedWatermarkRow(store, 5);
+  const { state, compactCalls, llmCalls } = l1State(store);
+
+  await maybeBackfill(state, L1_PAYLOAD, L1_SCOPE);
+  const chunk = plannedChunk(store);
+  seedForgetFlushRow(store, chunk.endSeq, 'backfill');
+  await l1Settle();
+
+  assert.equal(llmCalls.length, 0, '崩溃窗重放不调模型');
+  assert.equal(collisionEvents(store).length, 0, '自家行不得记碰撞审计');
+  const raw = store.getMeta(L1_META_PENDING);
+  assert.notEqual(raw, null);
+  assert.equal(JSON.parse(raw).stage, 'ready', '自家行应转压缩相等待下一窗口');
+  assert.equal(store.getMeta(L1_META_CURSOR), null, '重放不推游标');
+  assert.equal(compactCalls.length, 0);
+});
+
+test('L1（v0.7.18 非真机证据）：backfillKeyCollision 三态（外来命中 / 自家不命中 / 无行）', (t) => {
+  const store = openStore(t);
+  assert.equal(backfillKeyCollision(store, L1_SCOPE, 3), null, '无行 => null');
+  seedForgetFlushRow(store, 3, 'backfill');
+  assert.equal(backfillKeyCollision(store, L1_SCOPE, 3), null, '自家 trigger=backfill 不算碰撞');
+  // 唯一索引 (scope, upto_seq, kind) 不允许同键两行，外来行落在另一个 upto_seq 上验证命中。
+  seedForgetFlushRow(store, 4, 'forget');
+  const row = backfillKeyCollision(store, L1_SCOPE, 4);
+  assert.notEqual(row, null);
+  assert.equal(row.trigger, 'forget');
+  assert.equal(row.kind, 'forget_flush');
 });

@@ -40,6 +40,20 @@
   - `/状态` 新增一行「查重裁决（今日）：N 次」：未接线或计数为 0 时**整行省略**（旧 golden
     零波及）。
 
+- **L1 回填键碰撞甄别**（预防性加固）：回填巩固行落 `kind='forget_flush'` +
+  `trigger='backfill'`，而唯一索引只看 `(scope, upto_seq, kind)`（不含 trigger，
+  `src/memory/store.js:410`）⇒ 外来的 `forget_flush` 行（`trigger='forget'`，
+  `src/memory/forget.js:104` 的实际产出）可能与回填批同键共存，若直接 INSERT 会撞唯一索引。
+  现在 `runBackfillJob` 在调模型前先做外来行预检，UNIQUE catch 里再甄别一次：命中外来行 →
+  按「键碰撞」收尾（预检臂省一次模型调用），否则维持原有崩溃窗重放语义。
+  - **该批原文永久留底**：不调 `compactRegion`、不物理删任何行，原文继续留在 surface；
+    只清 pending 并推游标越过该批，避免每窗口重选同一批空转（日闸门只在压缩成功 +1，挡不住空转）。
+  - 只甄别 UNIQUE catch、不采「相邻 seq 迁就」方案；`src/memory/forget.js` 的 llm 通道与
+    `planTargetedConsolidation` 均未撤、未改（当前生产路径恒 `no-llm` skip，外来行生产不可达，
+    故本项定性为预防性加固）。
+  - 碰撞审计 `backfill_key_collision` 的 `actor` 用合法枚举 `'scheduler'`（`src/memory/store.js:155`
+    `EVENT_ACTORS`；`'backfill'` 会被 `appendEvent` 的 CHECK 拒绝），`reason` 取同名自由文本。
+
 ### Docs
 
 - README 命令表下新增「带参命令的平台差异」：Web UI 声明 input 后裸 `/memory` 回车会先弹
