@@ -150,18 +150,23 @@ test('apply：情绪启用时 context 注册一次，name/order/interpolate 正�
   ctx.addSession({ id: 'session-register' });
   const handle = applyCordis(strictCtx(ctx), { dbPath: temp.dbPath, persona: { cardPath } });
   try {
-    assert.equal(ctx.callsOf('systemPrompt.context').length, 1, '必须只注册一次');
-    assert.equal(ctx.contexts.length, 1);
-    const entry = ctx.contexts[0].context;
+    // v0.7.19 T4.2 起 apply 还会注册 companion-thread-offload，按 name 过滤只数情绪项。
+    const emotionCalls = ctx.callsOf('systemPrompt.context')
+      .filter((call) => call?.args?.[0]?.name === 'companion-emotion');
+    assert.equal(emotionCalls.length, 1, '必须只注册一次');
+    const emotionContexts = ctx.contexts
+      .filter((item) => item.context?.name === 'companion-emotion');
+    assert.equal(emotionContexts.length, 1);
+    const entry = emotionContexts[0].context;
     assert.equal(entry.name, 'companion-emotion');
     assert.equal(entry.order, 320);
     assert.equal(entry.interpolate, false);
     assert.equal(typeof entry.text, 'function');
     assert.ok(entry.order > 210, '必须排在宿主已用的 100-210 之后');
-    assert.equal(ctx.contexts[0].disposed, false);
+    assert.equal(emotionContexts[0].disposed, false);
 
     handle.dispose();
-    assert.equal(ctx.contexts[0].disposed, true, 'dispose 时必须注销 context');
+    assert.equal(emotionContexts[0].disposed, true, 'dispose 时必须注销 context');
   } finally {
     handle.dispose();
   }
@@ -169,8 +174,15 @@ test('apply：情绪启用时 context 注册一次，name/order/interpolate 正�
 
 test('apply：情绪关闭时不注册 context，也不读写情绪表', async (t) => {
   const { temp, ctx, session } = boot(t, { enabled: false });
-  assert.equal(ctx.callsOf('systemPrompt.context').length, 0);
-  assert.equal(ctx.contexts.length, 0);
+  // 情绪关闭：情绪 context 一条都不注册（T4.2 的线程提示仍常驻）。
+  assert.equal(
+    ctx.callsOf('systemPrompt.context').filter((call) => call?.args?.[0]?.name === 'companion-emotion').length,
+    0,
+  );
+  assert.equal(
+    ctx.contexts.filter((item) => item.context?.name === 'companion-emotion').length,
+    0,
+  );
 
   const message = userMessage('你好呀');
   const payload = turnPayload(session, 'turn-disabled', [message]);

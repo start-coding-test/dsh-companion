@@ -29,6 +29,8 @@ const EXPECTED_TOOLS = [
   'reminder_done',
   'task_cancel',
   'task_run',
+  // v0.7.19 T4 新增只读 thread_history。
+  'thread_history',
   'thread_list',
   'thread_run',
 ];

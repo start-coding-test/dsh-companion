@@ -510,8 +510,15 @@ test('pre-step：默认未启用 → 不注入 companion-emotion，情绪表零�
     const injected = (decision?.messages ?? [])
       .filter((item) => item?.source?.kind === EMOTION_SOURCE_KIND);
     assert.equal(injected.length, 0, '默认路径不得注入情绪消息');
-    assert.equal(ctx.contexts.length, 0, '默认路径不得注册情绪 context');
-    assert.equal(ctx.callsOf('systemPrompt.context').length, 0);
+    assert.equal(
+      ctx.contexts.filter((item) => item.context?.name === 'companion-emotion').length,
+      0,
+      '默认路径不得注册情绪 context',
+    );
+    assert.equal(
+      ctx.callsOf('systemPrompt.context').filter((call) => call?.args?.[0]?.name === 'companion-emotion').length,
+      0,
+    );
     assert.equal(temp.store.getEmotionState('main'), null);
     assert.equal(temp.store.countEmotionEvents('main'), 0);
   } finally {
@@ -533,9 +540,13 @@ test('pre-step：启用后注册 context，provider 返回「你此刻：」文�
   const payload = turnPayload(session, 'turn-enabled', [message]);
   const handle = applyCordis(strictCtx(ctx), { dbPath: temp.dbPath, persona: { cardPath } });
   try {
-    assert.equal(ctx.callsOf('systemPrompt.context').length, 1, '启用后必须注册一次 context');
-    assert.equal(ctx.contexts.length, 1);
-    const entry = ctx.contexts[0].context;
+    const emotionCalls = ctx.callsOf('systemPrompt.context')
+      .filter((call) => call?.args?.[0]?.name === 'companion-emotion');
+    assert.equal(emotionCalls.length, 1, '启用后必须注册一次 context');
+    const emotionContexts = ctx.contexts
+      .filter((item) => item.context?.name === 'companion-emotion');
+    assert.equal(emotionContexts.length, 1);
+    const entry = emotionContexts[0].context;
     assert.equal(entry.name, 'companion-emotion');
     assert.equal(entry.order, 320);
     assert.equal(entry.interpolate, false);
@@ -655,9 +666,11 @@ test('pre-step：子代理会话不注入、不写情绪状态', async (t) => {
     const injected = (decision?.messages ?? [])
       .filter((item) => item?.source?.kind === EMOTION_SOURCE_KIND);
     assert.equal(injected.length, 0, '子代理不应注入情绪消息');
-    assert.equal(ctx.contexts.length, 1, '启用时 context 仍只注册一次');
+    const emotionContexts = ctx.contexts
+      .filter((item) => item.context?.name === 'companion-emotion');
+    assert.equal(emotionContexts.length, 1, '启用时情绪 context 仍只注册一次');
     assert.equal(
-      ctx.contexts[0].context.text({ agent: payload.agent }),
+      emotionContexts[0].context.text({ agent: payload.agent }),
       '',
       '子代理的 provider 必须返回空串',
     );

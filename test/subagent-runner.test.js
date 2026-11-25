@@ -341,7 +341,8 @@ test('SA-B2：有锚的线程续跑走 sendToSubagent，不再 createSession', a
     assert.equal(harness.platform.calls.sent.length, 1);
     const [sent] = harness.platform.calls.sent;
     assert.equal(sent.targetId, created.sessionId);
-    assert.deepEqual(sent.content, [{ type: 'text', text: '再查一次' }]);
+    // v0.7.19 T4.1：续派文本前面带一行线程常驻职责（description 兜底为新建时的 goal）。
+    assert.deepEqual(sent.content, [{ type: 'text', text: '线程职责：查预算\n再查一次' }]);
   } finally {
     harness.store.close();
   }

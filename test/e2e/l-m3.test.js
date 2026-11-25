@@ -191,7 +191,11 @@ test('thread_run：goal 超过 2000 码点返回 goal_too_long，恰好 2000 通
     assert.equal(accepted.ok, true);
     assert.equal(accepted.action, 'reuse');
     assert.equal(accepted.prompted, true);
-    assert.equal(Array.from(ctx.callsOf('sessionController.prompt').at(-1).args[0].content[0].text).length, 2000);
+    // v0.7.19 T4.1：投递文本前面多一行「线程职责：<description>」，goal 仍是完整 2000 码点。
+    assert.equal(
+      ctx.callsOf('sessionController.prompt').at(-1).args[0].content[0].text,
+      `线程职责：线程：研究目标\n${'好'.repeat(2000)}`,
+    );
   } finally {
     handle.dispose();
     temp.cleanup();

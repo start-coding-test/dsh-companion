@@ -197,11 +197,12 @@ function makePluginCtx() {
   return ctx;
 }
 
-test('真实 apply 注册 12 个工具；/记忆 拦截与 memory_update 端到端', async () => {
+test('真实 apply 注册 13 个工具；/记忆 拦截与 memory_update 端到端', async () => {
   const ctx = makePluginCtx();
   const handle = apply(ctx, { dbPath: ':memory:' });
   try {
-    assert.equal(ctx.tools.registrations.length, 12);
+    // 12 → 13：v0.7.19 T4 新增只读 thread_history。
+    assert.equal(ctx.tools.registrations.length, 13);
     assert.equal(ctx.tools.registrations.some((definition) => definition.name === 'memory_update'), true);
 
     const write = ctx.tools.registrations.find((definition) => definition.name === 'memory_write');

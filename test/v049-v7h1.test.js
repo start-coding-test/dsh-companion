@@ -46,6 +46,8 @@ const ALL_TOOL_NAMES = [
   'reminder_done',
   'task_cancel',
   'task_run',
+  // v0.7.19 T4 新增只读 thread_history。
+  'thread_history',
   'thread_list',
   'thread_run',
 ];
@@ -90,12 +92,13 @@ function commandText(ctx, name) {
   return definition.handler({ rawInput: '' }).text;
 }
 
-test('V7-H1：apply 时无 sessionController 也注册全部 12 个工具', (t) => {
+test('V7-H1：apply 时无 sessionController 也注册全部 13 个工具', (t) => {
   const ctx = makeCtx();
   const handle = apply(ctx, { dbPath: ':memory:' });
   t.after(() => handle.dispose());
 
-  assert.equal(ctx.tools.registrations.length, 12);
+  // 12 → 13：v0.7.19 T4 新增只读 thread_history。
+  assert.equal(ctx.tools.registrations.length, 13);
   assert.deepEqual(
     ctx.tools.registrations.map((entry) => entry.name).sort(),
     ALL_TOOL_NAMES,

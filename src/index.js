@@ -656,6 +656,24 @@ export function apply(ctx, rawConfig, hooks = {}) {
         });
       }
     }
+    // v0.7.19 T4.2：重活交线程的常驻提示（只改文案，不加拦截逻辑）。
+    // order 330 排在 emotion（320）之后，避开宿主已用的 100-210；静态文案也显式
+    // 关闭插值——宿主的 interpolate() 遇到未注册的 {{…}} 会整轮抛错。宿主缺
+    // context() 能力时直接跳过（不 warn，降级路径与 emotion 的「只 warn 一次」不叠加）。
+    if (platform.capabilities.systemPromptContext) {
+      try {
+        track(platform.context({
+          name: 'companion-thread-offload',
+          order: 330,
+          interpolate: false,
+          text: '预计要读大文件、批量跑命令、抓网页或日志的活交 task_run / thread_run，主会话只收结论，不把原始输出贴回主会话。',
+        }));
+      } catch (error) {
+        platform.log('warn', '[dsh-companion] thread offload context unavailable; offload hint disabled', {
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
     // P2（v0.5.0）：遮蔽宿主默认人设。off 时连监听器都不注册，默认路径与旧版
     // 完全一致；失败只 warn，不挡装配。
     state.shadowMode = registerDeploymentShadow(platform, config, track, state.card, state.assembly, store);

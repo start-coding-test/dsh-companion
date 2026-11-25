@@ -54,6 +54,8 @@ const ALL_TOOL_NAMES = [
   'reminder_done',
   'task_cancel',
   'task_run',
+  // v0.7.19 T4 新增只读 thread_history。
+  'thread_history',
   'thread_list',
   'thread_run',
 ];
@@ -170,8 +172,8 @@ test('v0.4.9 集成：宿主晚挂载 sessionController 前后，线程工具与
     temp.cleanup();
   });
 
-  // apply 时没有 sessionController：仍然注册全部 12 个工具。
-  assert.equal(ctx.tools.registrations.length, 12);
+  // apply 时没有 sessionController：仍然注册全部 13 个工具（v0.7.19 T4 新增 thread_history）。
+  assert.equal(ctx.tools.registrations.length, 13);
   assert.deepEqual(ctx.tools.registrations.map((entry) => entry.name).sort(), ALL_TOOL_NAMES);
 
   // 调用时判能力：三个线程/任务工具返回稳定错误对象。

@@ -72,6 +72,23 @@ const THREAD_STATUSES = new Set(['active', 'archived', 'retired']);
 const GOAL_MAX_CODEPOINTS = 2000;
 
 /**
+ * v0.7.19 T4.1：线程常驻职责（charter）长度上限，按 Unicode 码点计。
+ * 职责直接写进现有的 `threads.description`（TEXT，不加列），超限只拒绝本次调用。
+ */
+const THREAD_CHARTER_MAX_CODEPOINTS = 300;
+
+/**
+ * v0.7.19 T4.3：每个线程滚动保留的投递历史条数，以及 thread_history 的默认页大小。
+ * 历史存 `schema_meta`（键 `thread_history:<key>`），零 DDL、最新在前；口径沿用
+ * v0.7.18 L5 的 `dedupe_judge:<scope>` 键惯例。
+ */
+const THREAD_HISTORY_MAX_ENTRIES = 30;
+const THREAD_HISTORY_DEFAULT_LIMIT = 10;
+
+/** 投递历史里「goal 首句 / 回执首句」的展示长度上限（码点）。 */
+const THREAD_HISTORY_FIRST_SENTENCE_MAX = 80;
+
+/**
  * N-M2：thread_run 占槽后等线程空闲的上限；超时强制释放，避免槽位泄漏。
  * 与 worker 硬超时 900s 对齐。
  */
@@ -743,17 +760,75 @@ export function createTools({
     },
 
     {
+      // v0.7.19 T4.3：只读的投递历史。独立工具而不是给 thread_list 加参数，
+      // 因为 thread_list 是无参目录（required: []），加参会改变其返回形态。
+      name: 'thread_history',
+      description:
+        '查看某个线程最近做过什么：返回最近 N 次投递的时间、目标首句、回执首句与终态。'
+        + '只读，不新建线程也不投递；不传 limit 默认 10 条，最多 30 条。',
+      parameters: {
+        type: 'object',
+        properties: {
+          key: { type: 'string', description: '线程 key' },
+          limit: {
+            type: 'integer',
+            minimum: 1,
+            maximum: 1000,
+            description: '返回条数（可选，默认 10；超过 30 按 30 计）',
+          },
+          offset: { type: 'integer', minimum: 0, maximum: 1000, description: '分页偏移（可选，默认 0）' },
+        },
+        required: ['key'],
+        additionalProperties: false,
+      },
+      execute(args = {}) {
+        assertArgs(args, 'thread_history');
+        const key = requireString(args.key, 'thread_history', 'key');
+        // 规格口径是「上限 30 → 超出钳到 30」，所以 limit 不用 optionalInt 的
+        // 范围拒绝，而是校验正整数后自己钳；schema 的 maximum 只挡明显异常入参。
+        const rawLimit = args.limit ?? THREAD_HISTORY_DEFAULT_LIMIT;
+        if (!Number.isInteger(rawLimit) || rawLimit < 1) {
+          throw new TypeError('[tools] thread_history.limit must be a positive integer');
+        }
+        const limit = Math.min(rawLimit, THREAD_HISTORY_MAX_ENTRIES);
+        const offset = optionalInt(args.offset, 'thread_history', 'offset', 0, 1000) ?? 0;
+        const all = readThreadHistory(store, key);
+        const items = all.slice(offset, offset + limit).map((entry) => ({
+          ...entry,
+          atText: threadHistoryTimeText(entry.at),
+        }));
+        return {
+          key,
+          count: items.length,
+          total: all.length,
+          limit,
+          offset,
+          items,
+        };
+      },
+    },
+
+    {
       name: 'thread_run',
       description:
         '需要多天反复推进、同类事沿用的用这个：复用或新建一个线程会话，并把目标投递进去；'
         + '一次性的活直接用 task_run。新建之前先用 thread_list 找同类 key，'
-        + '已有同类线程就复用（key 传已有 key），确实没有再用 key=new 新建。',
+        + '已有同类线程就复用（key 传已有 key），确实没有再用 key=new 新建。'
+        // v0.7.19 T4.2：重活交线程（只改文案，不加拦截逻辑）。
+        + '预计要读大文件、批量跑命令、抓网页或日志的活交 thread_run，主会话只收结论，不把原始输出贴回主会话。',
       parameters: {
         type: 'object',
         properties: {
           key: { type: 'string', description: '线程 key；新建时传 new' },
           name: { type: 'string', description: '线程名（key=new 时必填）' },
           goal: { type: 'string', description: '投递给线程的目标/任务（可选）' },
+          // v0.7.19 T4.1：线程常驻职责。additionalProperties:false，必须显式声明。
+          charter: {
+            type: 'string',
+            maxLength: THREAD_CHARTER_MAX_CODEPOINTS,
+            description: '线程常驻职责（可选，≤300 字）：写入/更新线程 description，'
+              + '之后每次投递都带一行「线程职责：…」',
+          },
           cwd: { type: 'string', description: '新会话工作目录（可选）' },
         },
         required: ['key'],
@@ -765,6 +840,10 @@ export function createTools({
         const name = optionalString(args.name, 'thread_run', 'name');
         const goal = optionalString(args.goal, 'thread_run', 'goal');
         if (exceedsGoalLimit(goal)) return { ok: false, reason: 'goal_too_long' };
+        const charter = optionalString(args.charter, 'thread_run', 'charter');
+        if (charter !== undefined && Array.from(charter).length > THREAD_CHARTER_MAX_CODEPOINTS) {
+          return { ok: false, reason: 'charter_too_long' };
+        }
         const gate = gateNow();
         if (gate !== null && gate.allowThread === false) {
           return { ok: false, reason: gate.threadReason ?? 'memory_main_only' };
@@ -791,11 +870,26 @@ export function createTools({
 
         const run = async () => {
           const nowSec = Math.floor(nowMs() / 1000);
+          // v0.7.19 T4.3（G1=A 授权的写入点）：每次 thread_run 只追加一条滚动历史，
+          // 记在 schema_meta 里（零 DDL）。回执落地后按 requestId 更新同一条，所以
+          // 续派失败重建不会产生两条；没有 activation.result 的路径停在 dispatched。
+          appendThreadHistory(store, plan.key, {
+            at: nowSec,
+            goalFirst: threadHistoryFirstSentence(goal),
+            receiptFirst: null,
+            status: 'dispatched',
+            requestId,
+            action: plan.action,
+          });
           if (plan.action === 'reuse') {
             let thread = store.getThread(plan.key);
             if (!thread) {
               return { ok: false, action: 'reuse', key: plan.key, reason: 'thread-row-missing' };
             }
+            // v0.7.19 T4.1：复用时传了 charter 就覆盖常驻职责，不传沿用库里的值。
+            // description 列 NOT NULL，upsert 展开 `...thread` 时显式覆盖即可。
+            const description = charter ?? thread.description;
+            const charterPatch = charter === undefined ? {} : { description: charter };
             // SA-B2：有续派锚 → 走宿主 sendMessage（运行中下一 step 收、空闲开新
             // turn、冷目标在树根下恢复，`dsh-subagent/src/index.ts:356-375`）。
             const anchor = typeof thread.child_session_id === 'string' && thread.child_session_id !== ''
@@ -811,7 +905,7 @@ export function createTools({
                   await platform.sendToSubagent(
                     sender,
                     anchor,
-                    [{ type: 'text', text: goal }],
+                    [{ type: 'text', text: `线程职责：${description}\n${goal}` }],
                     { signal: exec?.signal ?? deliverySignal({ requestId }) },
                   );
                   continued = true;
@@ -832,6 +926,7 @@ export function createTools({
               }
               const updated = store.upsertThread({
                 ...thread,
+                ...charterPatch,
                 status: 'active',
                 child_session_id: anchor,
                 last_progress: goal ?? thread.last_progress,
@@ -862,11 +957,16 @@ export function createTools({
               await platform.unarchiveSession(thread.session_id);
               thread = store.upsertThread({
                 ...thread,
+                ...charterPatch,
                 status: 'active',
                 last_progress: goal ?? thread.last_progress,
                 last_active_at: nowSec,
               });
               reactivated = true;
+            }
+            // 只更新职责、没有新目标时也必须落库（下面的 upsert 只在有 goal 时执行）。
+            if (charter !== undefined && goal === undefined) {
+              thread = store.upsertThread({ ...thread, description: charter });
             }
             let prompted = false;
             if (goal !== undefined) {
@@ -880,10 +980,15 @@ export function createTools({
               }
               await platform.prompt({
                 sessionId: thread.session_id,
-                content: [{ type: 'text', text: goal }],
+                content: [{ type: 'text', text: `线程职责：${description}\n${goal}` }],
                 requestId,
               });
-              store.upsertThread({ ...thread, last_progress: goal, last_active_at: nowSec });
+              store.upsertThread({
+                ...thread,
+                ...charterPatch,
+                last_progress: goal,
+                last_active_at: nowSec,
+              });
               prompted = true;
             }
             return {
@@ -932,11 +1037,13 @@ export function createTools({
             throw new Error('[tools] thread_run: createSession() returned no session id');
           }
 
+          // v0.7.19 T4.1：新建时职责优先用 charter，其次 goal，最后兜底短名。
+          const threadDescription = charter ?? goal ?? `线程：${plan.key}`;
           const thread = store.upsertThread({
             key: plan.key,
             name: name ?? plan.key,
             session_id: sessionId,
-            description: goal ?? `线程：${plan.key}`,
+            description: threadDescription,
             last_progress: goal ?? null,
             last_active_at: nowSec,
             status: 'active',
@@ -946,7 +1053,7 @@ export function createTools({
           if (goal !== undefined) {
             await platform.prompt({
               sessionId,
-              content: [{ type: 'text', text: goal }],
+              content: [{ type: 'text', text: `线程职责：${threadDescription}\n${goal}` }],
               requestId,
             });
             prompted = true;
@@ -975,6 +1082,9 @@ export function createTools({
          */
         async function createThreadSession({ goal: threadGoal, name: threadName, key: threadKey, nowSec, requestId, sender }) {
           const hostName = normalizeSubagentName(threadSubagentName(threadKey));
+          // v0.7.19 T4.1：startSubagent 的 prompt 在 upsert 之前，职责必须先算成
+          // 局部变量（不能读库）；charter 直接从 execute 闭包取，不层层传参。
+          const threadDescription = charter ?? threadGoal ?? `线程：${threadKey}`;
           let activation;
           try {
             activation = await platform.startSubagent({
@@ -984,7 +1094,7 @@ export function createTools({
               maxDepth: 1,
               label: threadName ?? threadKey,
               ...(hostName === null ? {} : { name: hostName }),
-              prompt: [{ type: 'text', text: threadGoal }],
+              prompt: [{ type: 'text', text: `线程职责：${threadDescription}\n${threadGoal}` }],
               parent: sender,
               signal: exec?.signal ?? new AbortController().signal,
               ...(subagentModelResolved === null ? {} : { agentOptions: { model: subagentModelResolved } }),
@@ -1009,7 +1119,7 @@ export function createTools({
             name: threadName ?? threadKey,
             session_id: sessionId,
             child_session_id: sessionId,
-            description: threadGoal ?? `线程：${threadKey}`,
+            description: threadDescription,
             last_progress: threadGoal ?? null,
             last_active_at: nowSec,
             status: 'active',
@@ -1031,6 +1141,12 @@ export function createTools({
                   durationMs: 0,
                 });
                 const progress = progressFromReceipt(receipt);
+                // v0.7.19 T4.3：回执按 requestId 回填同一条历史（首句 + 终态）；
+                // progress 为空时也回填终态，threads.last_progress 的既有写法不动。
+                updateThreadHistoryReceipt(store, threadKey, requestId, {
+                  receiptFirst: progress,
+                  status: outcome.status,
+                });
                 if (progress === null) return;
                 const latest = store.getThread(threadKey) ?? thread;
                 store.upsertThread({
@@ -1090,6 +1206,8 @@ export function createTools({
       description:
         '一次性的活用这个：把一件独立任务交给子代理执行，跑完就结束。'
         + '需要多天反复推进、同类事沿用的用 thread_run。'
+        // v0.7.19 T4.2：重活交任务（只改文案，不加拦截逻辑）。
+        + '预计要读大文件、批量跑命令、抓网页或日志的活交 task_run，主会话只收结论，不把原始输出贴回主会话。'
         + '**立即返回** {ok, status:"started", taskId, title}，子代理在后台继续跑；'
         + '结果稍后以回执（task_report）送达会话，本轮先告诉用户「已派出」。'
         + '并发上限 2（subagentConcurrency），忙时排队最多 2 个，超出立即返回 busy；'
@@ -1422,6 +1540,115 @@ export function createTools({
       },
     },
   ];
+}
+
+// ------------------------------------------------ v0.7.19 T4.3 线程投递历史
+
+/**
+ * 线程投递历史的 schema_meta 键。零 DDL：沿用 v0.7.18 L5 `dedupe_judge:<scope>`
+ * 的键惯例，每个线程一个键。
+ * @param {string} key
+ * @returns {string}
+ */
+function threadHistoryKey(key) {
+  return `thread_history:${key}`;
+}
+
+/**
+ * 读取线程投递历史（最新在前）。键不存在、JSON 损坏、值不是数组都返回空数组：
+ * 历史是尽力而为的只读目录，坏一条不能挡住 thread_run / thread_history。
+ * @param {object} store
+ * @param {string} key
+ * @returns {object[]}
+ */
+function readThreadHistory(store, key) {
+  try {
+    const raw = store.getMeta(threadHistoryKey(key));
+    if (typeof raw !== 'string' || raw === '') return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((entry) => entry !== null && typeof entry === 'object');
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * 覆盖写入线程投递历史，滚动保留最新 `THREAD_HISTORY_MAX_ENTRIES` 条。
+ * 写失败只丢历史，不挡投递本身（schema_meta 只是滚动目录）。
+ * @param {object} store
+ * @param {string} key
+ * @param {object[]} entries
+ */
+function writeThreadHistory(store, key, entries) {
+  try {
+    store.setMeta(
+      threadHistoryKey(key),
+      JSON.stringify(entries.slice(0, THREAD_HISTORY_MAX_ENTRIES)),
+    );
+  } catch {
+    // 历史是附加信息：写不进去也不影响线程投递与回执。
+  }
+}
+
+/**
+ * 追加一条投递记录（最新在前）。每个 thread_run 调用只追加一条，回执落地后
+ * 再按 requestId 更新同一条，避免续派失败重建时产生两条。
+ * @param {object} store
+ * @param {string} key
+ * @param {object} entry
+ */
+function appendThreadHistory(store, key, entry) {
+  const entries = readThreadHistory(store, key);
+  entries.unshift(entry);
+  writeThreadHistory(store, key, entries);
+}
+
+/**
+ * 按 requestId 把回执首句与终态写回对应记录；找不到匹配记录就不动。
+ * @param {object} store
+ * @param {string} key
+ * @param {string} requestId
+ * @param {{receiptFirst?: string|null, status?: string}} patch
+ */
+function updateThreadHistoryReceipt(store, key, requestId, patch) {
+  const entries = readThreadHistory(store, key);
+  let matched = false;
+  const next = entries.map((entry) => {
+    if (entry.requestId !== requestId) return entry;
+    matched = true;
+    return { ...entry, ...patch };
+  });
+  if (matched) writeThreadHistory(store, key, next);
+}
+
+/**
+ * 取一段文本的首句（投递历史的 goalFirst / receiptFirst 口径）：按中英文句读与
+ * 换行切分，压掉空白，超长截到 `THREAD_HISTORY_FIRST_SENTENCE_MAX` 码点。
+ * @param {unknown} text
+ * @returns {string|null}
+ */
+function threadHistoryFirstSentence(text) {
+  const raw = typeof text === 'string' ? text.trim() : '';
+  if (raw === '') return null;
+  const part = raw
+    .split(/[。！？!?\r\n，,；;：:]/u)
+    .map((segment) => segment.replace(/\s+/gu, ' ').trim())
+    .find((segment) => segment !== '');
+  if (part === undefined) return null;
+  const chars = Array.from(part);
+  return chars.length > THREAD_HISTORY_FIRST_SENTENCE_MAX
+    ? `${chars.slice(0, THREAD_HISTORY_FIRST_SENTENCE_MAX).join('')}…`
+    : part;
+}
+
+/**
+ * 把 epoch 秒格式化成 UTC ISO 串；非法值返回 null（历史条目容错）。
+ * @param {unknown} seconds
+ * @returns {string|null}
+ */
+function threadHistoryTimeText(seconds) {
+  return Number.isFinite(seconds) ? new Date(seconds * 1000).toISOString() : null;
 }
 
 /** @param {unknown} args @param {string} tool */

@@ -22,6 +22,8 @@ const TOOL_NAMES = [
   'bg_run',
   // M2（v0.7.15）：按 taskId 取消 task_run 派出的任务。
   'task_cancel',
+  // v0.7.19 T4：线程投递历史（只读）。
+  'thread_history',
 ];
 
 function makeHarness() {
@@ -80,12 +82,12 @@ function addFact(store, overrides = {}) {
   });
 }
 
-test('11 个工具描述符：name 唯一，parameters 为合法 JSON Schema', () => {
+test('12 个工具描述符：name 唯一，parameters 为合法 JSON Schema', () => {
   const harness = makeHarness();
   try {
-    assert.equal(harness.tools.length, 11);
+    assert.equal(harness.tools.length, 12);
     const names = harness.tools.map((tool) => tool.name);
-    assert.equal(new Set(names).size, 11);
+    assert.equal(new Set(names).size, 12);
     assert.deepEqual([...names].sort(), [...TOOL_NAMES].sort());
 
     for (const tool of harness.tools) {
@@ -215,7 +217,8 @@ test('thread_run：新建线程会话、写 threads 行并投递目标', async (
     // V10-H1：未配置 thread.agentPreset 时不传该参数，走宿主默认 preset。
     assert.equal(Object.hasOwn(harness.platform.sessions[0], 'agentPreset'), false);
     assert.equal(harness.platform.prompts[0].sessionId, 'sess-created');
-    assert.equal(harness.platform.prompts[0].content[0].text, '帮我找两居室');
+    // v0.7.19 T4.1：新建时 description 兜底为 goal，投递文本前面带一行常驻职责。
+    assert.equal(harness.platform.prompts[0].content[0].text, '线程职责：帮我找两居室\n帮我找两居室');
 
     const thread = harness.store.getThread(result.key);
     assert.equal(thread.session_id, 'sess-created');
