@@ -76,6 +76,24 @@
     既有 `user` 桶，**零 schema 变更**（未升 schema、未改 CHECK/`EVENT_ACTORS`）。
 
 
+### Tests
+
+按用户裁决的六步顺序各自独立 commit（M1 → L4 → L2+L3 → L5 → L1 → L6），另含 L5 复核增量
+与统一 bump 两条，最终 bump 到 0.7.18。新增 `test/v0718.test.js`（本版共用），各项对应测试
+（均标「v0.7.18 非真机证据」）：
+- M1：`test/e2e/apply-turn.test.js`「memory 注册快照与 rawInput 分发」（真实 apply →
+  `ctx.commands.registrations` → `memory.handler({ rawInput })` 七断言）。
+- L4：`test/v0718.test.js`「默认路径保持」「skip 强化」「ask→same 强化」三例。
+- L2：`test/v0718.test.js`「直插回填行后最近 job 仍显示 nap」；L3：「取消受理双分支文案一致性」。
+- L5：`test/v0718.test.js`「路径段 / 超长 CJK / 短锚点」「计数 0→1→2 / 跨日重置」「省行 + 接线」，
+  L5 复核增量「judgeFn 未注入不计数」「昨日省行 / 当天显示」。
+- L1：`test/v0718.test.js`「预检臂端到端」「自家行仍重放零审计」「helper 三态」。
+每条均有「删生产接线或守卫必红」的判别力自验（M1 删 input / 透传、L4 删两参 / 改默认值、
+L2 删 SQL 过滤、L3 改回旧文案、L5 删 PATH gate / bump / 注入、L1 预检 helper→null /
+trigger 改 '=' / 删游标推进、增量删 judgeFn 守卫 / 删跨日过滤），还原后全绿。
+`ℹ tests 1740 / suites 67 / pass 1740 / fail 0`；Windows（Node v24.9.0）与 Linux（Node v24.22.2，
+tx-yun 隔离目录）各三时区（UTC / Asia/Shanghai / America/New_York）三遍，共六遍均 exit=0。
+
 ## [0.7.17] - 2026-11-24
 
 历史回填第一部分（H1-A）：给出回填的配置、只读选区与预演，先把「能回填多少、要花几次模型
