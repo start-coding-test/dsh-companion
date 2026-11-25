@@ -445,7 +445,7 @@ export function createTools({
           return { ok: true, id: row.id, duplicateOf: null, verdict: label, statement: row.statement, scope: row.scope };
         };
         const reinforce = (target, label) => {
-          if (typeof store.reinforceFact === 'function') store.reinforceFact({ id: target.id, scope, at });
+          if (typeof store.reinforceFact === 'function') store.reinforceFact({ id: target.id, scope, at, reason: 'dedupe_write', actor: 'user' });
           return {
             ok: true,
             id: target.id,

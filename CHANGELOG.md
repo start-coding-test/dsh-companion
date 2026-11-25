@@ -22,7 +22,20 @@
 
 - README 命令表下新增「带参命令的平台差异」：Web UI 声明 input 后裸 `/memory` 回车会先弹
   参数输入框（留空提交等价无参）；**QQ / IM 仅支持无参命令**，带参操作由模型调用现有
-  工具完成，治理 / 导出 / 回填目前需在 Web UI 执行；本版不加消息识别钩子、不新增工具。
+  工具完成，治理 / 导出 / 回填 / 周报目前需在 Web UI 执行（周报无对应工具，属豁免项，
+  复核后归类勘误）；本版不加消息识别钩子、不新增工具。
+
+### Changed
+
+- **L4 强化审计来源**：`Store.reinforceFact` 新增可选 `reason` / `actor`，**默认保持
+  `used_in_reply` / `consolidator`** ⇒ 巩固与召回强化路径零行为差异（`test/reinforce.test.js`
+  的默认断言原样通过）；`memory_write` 的查重强化（skip 与 ask→same 共用一处 helper）
+  改记 `reason='dedupe_write'`、`actor='user'`，审计可区分「查重写入」与「巩固/召回」。
+  - 与计划不一致：计划原文为 `actor='tool'`，但 schema 16 的
+    `memory_events.actor CHECK (actor IN ('consolidator','user','scheduler','migrator'))`
+    会抛 `TypeError: [store] invalid memory_events.actor: tool`；用户 2026-11-25 裁决改用
+    既有 `user` 桶，**零 schema 变更**（未升 schema、未改 CHECK/`EVENT_ACTORS`）。
+
 
 ## [0.7.17] - 2026-11-24
 

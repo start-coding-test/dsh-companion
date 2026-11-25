@@ -2786,16 +2786,22 @@ export class Store {
    * 能力约定：缺行 / 墓碑（deleted_at 非空）/ pinned / 非 active 一律返回
    * {ok:false, reason}，不抛；只有参数类型错误才抛 TypeError。
    *
-   * @param {{id: string, scope?: string, at?: number|Date, alpha?: number}} input
+   * `reason` / `actor` 只影响审计事件（memory_write 查重强化记 dedupe_write/tool）；
+   * 默认保持 used_in_reply/consolidator ⇒ 巩固与召回强化路径零行为差异。
+   *
+   * @param {{id: string, scope?: string, at?: number|Date, alpha?: number,
+   *          reason?: string, actor?: string}} input
    * @returns {{ok: boolean, id?: string, strengthDays?: number,
    *            recallCount?: number, alpha?: number, reason?: string}}
    */
-  reinforceFact({ id, scope = 'main', at, alpha = DEFAULT_ALPHA } = {}) {
+  reinforceFact({ id, scope = 'main', at, alpha = DEFAULT_ALPHA, reason = 'used_in_reply', actor = 'consolidator' } = {}) {
     if (typeof id !== 'string' || id === '') {
       throw new TypeError('[store] reinforceFact requires a non-empty id');
     }
     let effectiveAlpha = Number(alpha);
     if (!Number.isFinite(effectiveAlpha) || effectiveAlpha < 0) effectiveAlpha = DEFAULT_ALPHA;
+    const eventReason = typeof reason === 'string' && reason !== '' ? reason : 'used_in_reply';
+    const eventActor = typeof actor === 'string' && actor !== '' ? actor : 'consolidator';
 
     const run = () => {
       const row = this.#db
@@ -2833,8 +2839,8 @@ export class Store {
         action: 'REINFORCE',
         table_name: 'facts',
         row_id: id,
-        actor: 'consolidator',
-        reason: 'used_in_reply',
+        actor: eventActor,
+        reason: eventReason,
         detail_json: { alpha: effectiveAlpha, from, to },
       });
       const updated = this.getFact(id);
