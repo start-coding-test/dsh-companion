@@ -2,6 +2,171 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.19] - 2026-11-25
+
+零 DDL 版：工具输出裁剪接入宿主裁剪器、召回作用域按「用户亲口」放行、例程护栏、
+线程常驻职责与投递历史、v0.7.18 评审遗留两处关键串修复。**本版未加表、未加列、
+未升 schema（仍 16）**；五项按 T1 → T2 → T3 → T4 → T5 各自独立 commit。
+
+### Added
+
+- **T1 工具输出裁剪接入宿主 `toolResultPruner`（H）**：现网 `compaction-basic` 的
+  `auto:false` 使宿主自带的裁剪器从不运行（`compaction-basic/lib/index.js:827` 只在
+  `auto:true` 注册自动路径，调用点 `:938/:954/:962`）。现在插件在**每次**
+  `platform.compactRegion(...)` 之前先调 `ctx.get('toolResultPruner')?.pruneSession(agent.session)`
+  （`src/platform/adapter.js:560` `pruneToolResults(agent)` 用 `service()` 读未声明 inject 的
+  service，缺失返回 `undefined` 不抛；`src/index.js` 两处调用点 `:3351` 回填路径与 `:4484`
+  主压缩路径之前各插一处 `pruneBeforeCompact`）。服务缺失/agent 无 session 时**跳过并
+  warn 一次**（`state.prunerMissingWarned`），不报错、不阻断压缩。
+  - 启动后首个空闲窗口也跑一次清存量：`state.lastAgent`（`runPreStep` 缓存最近 preStep
+    的 agent）+ `state.pruneBootstrapDone` + `jobs['idle-probe']` 回调开头（在
+    `proactiveBlocked` 早退之前）与 `runPreStep` 兜底，共用 helper 保证**只跑一次**。
+    **妥协口径**：`idle-probe` 回调本身没有 agent 句柄，故缓存最近 preStep 的 agent，
+    并以 preStep 兜底保证启动后从未有 turn 时也能清存量。
+  - 审计与累计：每次 `pruned.length > 0` 写一条
+    `appendEvent({action:'USED', actor:'scheduler', table_name:'tool_prune', row_id:scope,
+    reason:'tool_result_prune', detail_json:{kind:'tool_result_prune', count, charsRemoved}})`
+    （`actor` 用 `EVENT_ACTORS` 既有枚举 `scheduler`，v0.7.18 L4 已踩过 `'tool'` 非法）；
+    `schema_meta` 键 `prune_stats:<scope>` 存 JSON `{count, charsRemoved}` **累加旧值**（沿用
+    v0.7.18 L5 `dedupe_judge:<scope>` 惯例，**不算加表**）。`pruneSession` 返回
+    `{pruned, charsRemoved}`（宿主 `lib/index.js:187-189`），且 ≤ 阈值返回 null
+    （`:93`）⇒ 幂等，`pruned.length === 0` 时零副作用、不写审计、不加计数。
+  - `/状态` 新增一行「工具输出裁剪：累计 N 条 / M 字符」（`src/runtime/commands.js`
+    `formatPruneLine`，`count===0` 或键缺失 → `return null` **整行省略**，旧 golden 零波及）；
+    `handleCommand` 的 `formatStatus` 显式白名单形参同步补 `prune`。
+  - **不改宿主配置**、阈值沿用宿主默认（`dsh-base/cordis.patch.yml:435-440`
+    `thresholdChars 8192 / headChars 4096 / tailChars 1024`）、**插件不自行截断**。
+  - **已知缺口（本版不做）**：宿主 `measureContent`（`lib/index.js:79-83`）只对 `text`
+    块计数，非文本块计 0 ⇒ 图片等非文本块原样保留；base64 以 text 块出现会被裁、
+    以 image 块出现不会。**mock 用例不算真机证据**，真机裁剪效果另由云端预演验证。
+
+- **T4 线程常驻职责、重活提示与投递历史（M）**：主会话沟通、线程干活。
+  - **T4.1 常驻职责 `charter`**：`thread_run` 新增可选参数 `charter`（schema
+    `maxLength:300` + `additionalProperties:false` 显式声明，execute 再按 Unicode 码点
+    >300 返回 `charter_too_long`）；新建时 `description = charter ?? goal ?? \`线程：<key>\``，
+    复用时传了 `charter` 就覆盖 `description`、不传沿用库值；**不加列**。
+    每次投递 goal 前都带一行「线程职责：`<description>`」，四个文本构造点全覆盖：
+    续派 `sendToSubagent`、无锚复用 `platform.prompt`、新建无子代理 `platform.prompt`、
+    `createThreadSession` 的 `startSubagent` prompt（同时覆盖续派失败重建）。
+  - **T4.2 重活交线程（只改文案、不加拦截逻辑）**：`task_run` / `thread_run` 两条工具
+    description 各补一句；系统提示走 apply 内 `platform.context`
+    （`name:'companion-thread-offload'`, `order:330`, `interpolate:false`,
+    `capabilities.systemPromptContext` 守卫 + try/catch 静默降级，不额外 warn）。
+    **不改人格卡 `buildSections(card)`、不动 `registerSections`、不加拦截**。
+  - **T4.3 查线程做过什么**：新增只读工具 **`thread_history`**（**没有**选
+    `thread_list` 加 `key + history:true`，因为 `thread_list` 是无参目录列表、加可选参会
+    改变其返回形态；独立工具语义干净且便于「删接线必红」）。参数 `key` 必填、
+    `limit` 默认 10 **上限 30**（超出钳到 30）、`offset` 默认 0。按用户裁决 **G1=A**：
+    历史只写既有 `schema_meta` 键 `thread_history:<key>`，值 JSON 数组
+    `[{at, goalFirst, receiptFirst, status, requestId, action}]` 最新在前、滚动 ≤30 条
+    （**零 DDL，不算加表**）；曾评估 `memory_events` 追加事件方案，未采用。
+    每个 `thread_run` 调用**只写一条**，回执落地后按 `requestId` 回填 `receiptFirst`
+    与终态，避免续派失败重建产生两条；无 `activation.result` 的投递
+    （`sendToSubagent` / `platform.prompt`）保持 `status:'dispatched'`、`receiptFirst:null`。
+    读写失败只丢历史，不挡投递本身。
+
+- **T3 活跃提醒 50 条上限护栏（L）**：`reminder_add` 在 `store.insertReminder` **之前**
+  校验同 scope 待触发提醒条数，`count >= 50` 拒绝本次新增，返回
+  `{ok:false, reason:'reminder_cap', message:'…请先用 reminder_done / reminder_cancel 清理…',
+  count, limit:50}`（拒绝不落行）。零 DDL 只读 helper `Store.countActiveReminders(scope, statuses)`
+  用参数化 `COUNT(*)`；**不能用** `listReminders` 数（只支持单 status、
+  `clampLimit(options.limit, 100)` 会截断）。
+  - **计数口径**：`status IN ('pending','snoozed','delivering') AND deleted_at IS NULL`，
+    同 scope；`fired` 已触发、`done`/`cancelled`/`expired` 终态与软删行均不计入。
+
+### Fixed
+
+- **T2 召回作用域按 `source_kind` 放行用户亲口事实（M）**：作用域口径改为
+  **用户亲口的事实（`source_kind='user_explicit'`）全线程可见，线程学到的
+  （`turn`/`task`/`consolidated`/`inferred`）留在线程**。
+  - ① 线程召回 main 的放行条件由「仅 `kind ∈ identity/preference`」扩为
+    「`kind ∈ identity/preference` **或** `source_kind='user_explicit'`」
+    （`src/memory/retrieve.js` `scopeAllows` 末行）；② 主会话召回 `thread:*` 的 facts
+    **只取 `source_kind='user_explicit'`**，其余线程事实不再上浮
+    （`scopeAllows` 新增 `threadFactSourceKindSet` 分支）。
+  - 接线：`recallScopes`（`src/index.js`）新增返回 `threadScopes` /
+    `threadFactSourceKinds`（main：活跃线程 scope + `['user_explicit']`；线程与自定义
+    scope 均为 `null` —— 线程必须能读本 scope 全部 facts），经 `injectRecall` 透传给
+    `retrieve`；`searchBigram` 的 fact SELECT 补 `f.source_kind`（零 DDL，只改投影列），
+    4 个 `scopeAllows` 调用点都传 source_kind。未传新参数的旧调用方行为**完全不变**。
+  - **行为变更提示**：v0.7.18 及以前「线程巩固出的 project 事实可在主会话召回」
+    **已取消**，需靠 `user_explicit` 才跨线程；这正是 `test/v077-stage5.test.js` 的
+    T120-M2 用例被改写（**改写不删除**）与 `test/e2e/session-scope.test.js` 口径升级
+    （原「线程不得看到 main 的 user_explicit fact」改为可见，并加强两条反向断言）的依据。
+
+- **T5 v0.7.18 评审遗留两处关键串（L）**：只改纯函数 `extractKeyPhrases`，零 DDL。
+  - **V718-L1**：`src/memory/dedupe.js` 超长 CJK 切分后仍 >12 字的段**直接丢弃**
+    （`:233 if (piece.length > 12) continue;`），与 0.7.18 CHANGELOG「切不出有效段时
+    整段丢弃」对齐。实测「用户喜欢珞然邻居姐姐人格卡版本四号定稿」（18 字、不含虚词）
+    由整段入键变为 `[]`。该 gate **只作用于 CJK 切分产物**，没有加进全局 `push`，
+    所以 13 字符英文项目名 `dsh-companion` 仍保留、含虚词的超长 CJK 仍能切出有效短段。
+  - **V718-L2**：新增 `FILE_EXTENSION` 正则（`:194`，覆盖
+    `.js/.mjs/.cjs/.jsx/.ts/.tsx/.py/.json/.md/...`），`push()` 里**比对两个停用词集合前
+    先剥掉末尾扩展名**（`:212 const bare = key.replace(FILE_EXTENSION, '')`），
+    `index.js` → `index` 命中 `KEY_PHRASE_PATH_STOPWORDS` 被拦。长度 gate、
+    `VERSION_ONLY` / `DATE_TIME_ONLY` gate、`seen` 去重与最终入键字符串仍用原始 `key`
+    ⇒ `24.3.1` / `2026-11-24` 等既有 gate 行为不变。按扩展名通用判定，
+    不往停用词表堆具体文件名，`data.json` / `config.ts` / `app.py` / `utils.mjs` 同样被拦。
+  - `test/v0718.test.js` 三个既有用例（路径通用段 / 超长 CJK 按虚词切分 /
+    短锚点与版本日期 gate）**全部仍绿且未改动**。
+
+### Changed
+
+- **T3.2 现状确认（用户裁决保持现状）**：`index.js:5998` 与失败置 expired 无关；
+  实际失败路径 `src/index.js:6115-6124` attempts≥3 → `store.expireReminder`，
+  `src/memory/store.js:3294-3306` 直接 `UPDATE reminders SET status='expired'`
+  （对 `rrule` 系列**无**「本次跳过 / 推进下一次」分支），只有成功路径
+  `settleReminderSent` 才 `advanceReminderOccurrence`。即**失败 3 次是「整个系列 expired」，
+  不是「本次跳过」** ⇒ 清单条件句「若是后者，加系列连续失败计数」不触发，本版
+  **不加连续失败计数、不改失败路径**。T3.3 主动闲聊沿用现有 quota-gate，未改。
+
+### Docs
+
+- **版本/行号偏差说明**：本机 Windows 的宿主源码快照是 `0.2.1-rc.5` 过期版
+  （pruner 在 `dsh-base/cordis.patch.yml:425-430`），用户清单对应的是**云端生产
+  0.2.2-rc.5**（`/usr/lib/node_modules/@deepseek-ai/dsh`，`cordis.patch.yml:435-440`）；
+  已在云端逐条核实契约一致（服务名 `toolResultPruner`、`pruneSession` 返回
+  `{pruned, charsRemoved}`、`:93` 幂等、阈值 8192/4096/1024、
+  `compaction-basic/lib/index.js:827/938/954/962` 的 `auto` 门控与 `ctx.get` 取值法）。
+
+### Tests
+
+按用户裁决顺序各自独立 commit（T1 → T2 → T3 → T4 → T5），另含统一 bump 一条。
+新增 `test/v0719.test.js`（T1）、`test/v0719-t2.test.js`、`test/v0719-t3.test.js`、
+`test/v0719-t4.test.js`、`test/v0719-t5.test.js`，并改写 `test/v077-stage5.test.js`
+（T120-M2）与 `test/e2e/session-scope.test.js`（T2 口径升级）。各项对应测试
+（均标「v0.7.19 非真机证据」）：
+- T1（7 例）：调用顺序（pruneSession 在 compactRegion 之前且传 `agent.session`）、缺服务降级
+  （不抛 / compactRegion 仍调 / 连续两次只一条 warn）、审计与累计（2 条 / 123 字符 →
+  一条 appendEvent + schema_meta 累加；`pruned=[]` 零副作用）、`/状态` 有值显示 / 0 时
+  整行省略、首个 idle-probe tick 用缓存 agent 跑一次且第二次不跑。
+- T2（2 例）：线程召回 main 的 `user_explicit` 非 identity/preference 事实可见；主会话召回
+  `thread:*` 时 `consolidated` 不可见 / `user_explicit` 可见；T120-M2 改写不删除。
+  判别式自验 M1–M5（删 `|| rowSourceKind === 'user_explicit'`、删线程早退块、删
+  `f.source_kind` 投影、main 分支改 `null`、删 `injectRecall` 透传）。
+- T3（3 例）：49→第 50 条 ok / 50→第 51 条 `reminder_cap`；`reason`/message 与「不落新行」；
+  其他 scope 隔离 + `fired/done/cancelled/expired` 与软删行不计入（M1–M5 变异表）。
+- T4（10 例，`T4-001`–`T4-010`）：charter 新建 prompt / 续派 `sendToSubagent` 各一、
+  description 更新、`charter_too_long`、history 分页 offset 与上限 30、回执按 requestId
+  回填、`dispatched` 初值、系统提示段注册守卫；**M1–M10 逐项实删接线必红**
+  （startSubagent 职责前缀 / sendToSubagent 职责前缀 / `charterPatch={}` / 新建去掉
+  `charter ??` / 删 `charter_too_long` / `slice(0,limit)` 代替 offset / 去掉 30 钳位 /
+  删回执回填 / `dispatched`→`done` / context 守卫 `if(false)`）。golden 适配：
+  工具数 12→13、`EXPECTED_TOOLS` 加 `thread_history`、emotion context 断言改按
+  name 过滤（**不放宽为 `>=`**，保留「emotion 只注册一次」语义）。
+- T5（2 例）：V718-L1 无虚词超长 CJK 整句丢弃（含「含虚词仍能切出短段」「13 字符英文
+  项目名不误杀」对照）；V718-L2 `index.js` 及 4 个其它扩展名变体不入键、项目名保留、
+  版本/日期 gate 不变。判别式自验：删 `if (piece.length > 12) continue;` → 仅 L1 红；
+  把 `bare` 改回 `key` → 仅 L2 红；`test/v0718.test.js` 三个旧用例全绿。
+每条均有「删生产接线或守卫必红」的判别力自验，还原后全绿。
+`ℹ tests 1764 / suites 67 / pass 1764 / fail 0`（cancelled/skipped/todo 全 0）。
+**Windows（Node v24.9.0）与 Linux（Node v24.22.2，tx-yun 隔离 clone）各三时区
+（UTC / Asia/Shanghai / America/New_York）三遍，共六遍均 `1764 / 67 / 1764 / 0`、exit=0**
+（六遍在五项功能 commit 树 `319b5e6` 上执行）；
+发版门前另跑过 T1、T1+T2、T1+T2+T3 三个 Linux 增量门禁，均三时区全绿。
+统一 bump 只改 `package.json` 版本号、`CHANGELOG.md` 与 `test/smoke.test.js` 的版本快照
+断言，另在本机三时区复跑，仍 `1764 / 67 / 1764 / 0`、exit=0。
+
 ## [0.7.18] - 2026-11-25
 
 命令通道修正（M1）：让 Web UI 的 `/memory` 真正接受子命令参数。这是**通道声明**修复，
