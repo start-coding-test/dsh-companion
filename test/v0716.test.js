@@ -490,7 +490,7 @@ test('N4：/停止任务 文案区分 task_run 与后台任务（含 label）', 
     result: { ok: true, cancelled: 1, taskId: 'bg-1' },
   });
   assert.match(bgReply, /后台任务 bg-1/u);
-  assert.match(bgReply, /状态：已取消/u);
+  assert.match(bgReply, /取消中，收尾后回执送达/u);
 });
 
 // ---------------------------------------------------------------- S1（复核增量）
@@ -530,7 +530,7 @@ test('S1 非真机证据：/停止任务 <bg id> 走生产接线，回执为「�
     const reply = stop.handler({ rawInput: 'bg-dispatch-1' });
     assert.equal(reply.kind, 'success');
     assert.match(reply.text, /已请求中止后台任务 bg-dispatch-1/u);
-    assert.match(reply.text, /回执将送达/u);
+    assert.match(reply.text, /收尾后回执送达/u);
     // 生产接线判别：handler 同步返回后 requestCancelBgJob 会异步调 cancelBgJob。
     // 成功会投回执（dedupeKey task-receipt:<id>），失败（本机/容器没有可停的 unit）会留 warn；
     // 两者任一出现都证明接线被走到。删掉 requestCancelBgJob 调用即无任何痕迹。

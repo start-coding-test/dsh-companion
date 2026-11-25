@@ -301,9 +301,9 @@ export function formatStopTaskReply(input = {}) {
       return `停止任务：${target ?? '该任务'} 不在运行（可能已结束）`;
     }
     if (isBg === true) {
-      return `停止任务：已请求中止后台任务 ${target ?? '该任务'}，回执将送达（状态：已取消）`;
+      return `停止任务：已请求中止后台任务 ${target ?? '该任务'}，取消中，收尾后回执送达`;
     }
-    return `停止任务：已请求中止 ${target ?? '该任务'}，回执将送达（状态：已取消）`;
+    return `停止任务：已请求中止 ${target ?? '该任务'}，取消中，收尾后回执送达`;
   }
   if (info.reason === 'not-found') {
     return `停止任务：没有在跑的任务：${target ?? ''}（可能已结束，可用 /status 查看）`;
@@ -1406,13 +1406,20 @@ function formatVectorText(budget) {
     + `·回填超时 ${timeouts}·占用 ${busy}`;
 }
 
-/** @param {object} store @param {string} scope */
+/**
+ * L2（v0.7.18）：`/状态` 的「最近 job：」只看正常巩固/深睡行；回填批
+ * （kind='forget_flush' + trigger='backfill'）不占展示面——回填进度只在
+ * `formatBackfillLine` 里显示。`consolidations.trigger` 是 `TEXT NOT NULL`
+ * （src/memory/store.js:368），故无需 NULL 守卫。
+ *
+ * @param {object} store @param {string} scope
+ */
 function latestConsolidation(store, scope) {
   if (!hasDb(store)) return null;
   return store.db
     .prepare(
       `SELECT * FROM consolidations
-        WHERE scope = ?
+        WHERE scope = ? AND trigger <> 'backfill'
         ORDER BY started_at DESC, id DESC LIMIT 1`,
     )
     .get(scope) ?? null;

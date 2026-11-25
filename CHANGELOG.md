@@ -17,6 +17,13 @@
   宿主 `parseCommand` 的 `rawInput` 本就自带前导空格，故零行为差异，仅为可读与后续
   安全），通用拼接未动；`handleMemoryCommand` 的 `replace(/^\/记忆/u, '').trim()`
   也未动，空参链路逐字不变。
+- **L2 回执展示**：`/状态` 的「最近 job：」只展示正常巩固 / 深睡行；回填批
+  （`kind='forget_flush'` + `trigger='backfill'`）不再占据该行——回填进度只在「回填：」
+  行体现。判定用 `trigger <> 'backfill'`（`consolidations.trigger` 是 `TEXT NOT NULL`，
+  无需 NULL 守卫）。
+- **L3 取消受理文案**：`/停止任务` 的 task_run 与后台任务两条受理分支不再提前主张
+  「（状态：已取消）」，改为「取消中，收尾后回执送达」；真正的「已取消」只由监视器
+  收敛后的终态回执给出（`task_cancel` 工具的 note 本就不是终态措辞，未改）。
 
 ### Docs
 
