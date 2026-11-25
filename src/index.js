@@ -210,6 +210,16 @@ const RECALL_BUDGET_TOKENS = 2050;
 const RECALL_MAIN_THREAD_FACT_KINDS = Object.freeze(['identity', 'preference']);
 
 /**
+ * v0.7.19（T2）：主会话召回线程事实时放行的 `source_kind` 白名单。
+ *
+ * 口径 = 「用户亲口的事实全线程可见，线程学到的留在线程」：用户在任意会话里
+ * 亲口写下的事实（`memory_write` → `source_kind='user_explicit'`）主会话可见；
+ * 线程自己巩固/推断出来的事实（`consolidated` / `inferred` / `turn` / `task`）
+ * 留在本线程，不往主会话灌。线程会话永不设此限制（线程要读自己 scope 的全部事实）。
+ */
+const RECALL_THREAD_FACT_SOURCE_KINDS = Object.freeze(['user_explicit']);
+
+/**
  * 召回注入消息的 `source.kind`（v0.4.4 / V3-H1）。
  *
  * 平台把 `decision.messages` 的每一项都当**完整消息**处理：
@@ -4899,17 +4909,21 @@ function emotionContextText(state, context) {
 /**
  * v0.7.7 阶段 5（T120-M2，依据设计 05 A5）：按会话作用域算召回可见范围。
  *
- * - 主会话（scope='main'）：facts 可见 main + 各活跃线程（**不限 kind**，
- *   线程里巩固出的 project/knowledge 事实要能在主会话召回）；episodes 只可见
- *   main（线程情景原文不外泄）。
+ * - 主会话（scope='main'）：facts 可见 main + 各活跃线程里 `source_kind='user_explicit'`
+ *   的行（用户亲口的事实全线程可见；线程自己巩固出的 project/knowledge 留在线程）；
+ *   episodes 只可见 main（线程情景原文不外泄）。
  * - 线程（scope='thread:<key>'）：facts 可见本线程 + main，但来自 main 的候选
- *   只放行身份偏好类（identity / preference）；episodes 只可见本线程。
+ *   只放行身份偏好类（identity / preference）**或 `source_kind='user_explicit'`**
+ *   （用户亲口的事实全线程可见）；episodes 只可见本线程。
+ * - v0.7.19（T2）：主会话召回线程 facts 时只放 `source_kind='user_explicit'` 的行
+ *   （`threadFactSourceKinds`）；线程里巩固/推断出来的事实留在本线程。
  * - 其它自定义 scope：保持单值行为。
  *
  * @param {Store} store
  * @param {string} scope
  * @returns {{factScopes: string[]|null, episodeScopes: string[]|null,
- *   attachedScopes: string[]|null, attachedKinds: string[]|null}}
+ *   attachedScopes: string[]|null, attachedKinds: string[]|null,
+ *   threadScopes: string[]|null, threadFactSourceKinds: string[]|null}}
  */
 export function recallScopes(store, scope) {
   const threadKeyOf = (value) => (typeof value === 'string' ? value.slice('thread:'.length) : '');
@@ -4928,6 +4942,8 @@ export function recallScopes(store, scope) {
       episodeScopes: [SCOPE],
       attachedScopes: null,
       attachedKinds: null,
+      threadScopes,
+      threadFactSourceKinds: [...RECALL_THREAD_FACT_SOURCE_KINDS],
     };
   }
   const text = String(scope);
@@ -4937,6 +4953,9 @@ export function recallScopes(store, scope) {
       episodeScopes: [text],
       attachedScopes: [SCOPE],
       attachedKinds: [...RECALL_MAIN_THREAD_FACT_KINDS],
+      threadScopes: null,
+      // 线程必须能读本线程 scope 的全部 facts（含自己巩固出来的），不能限制。
+      threadFactSourceKinds: null,
     };
   }
   return {
@@ -4944,6 +4963,8 @@ export function recallScopes(store, scope) {
     episodeScopes: [text],
     attachedScopes: null,
     attachedKinds: null,
+    threadScopes: null,
+    threadFactSourceKinds: null,
   };
 }
 
@@ -5001,6 +5022,8 @@ async function injectRecall(state, payload, messages, turnKey, scope = SCOPE) {
       episodeScopes: scopes.episodeScopes,
       attachedScopes: scopes.attachedScopes,
       attachedKinds: scopes.attachedKinds,
+      threadScopes: scopes.threadScopes,
+      threadFactSourceKinds: scopes.threadFactSourceKinds,
       now: platform.now(),
       budgetTokens: RECALL_BUDGET_TOKENS,
       vector: vectorConfig(state),

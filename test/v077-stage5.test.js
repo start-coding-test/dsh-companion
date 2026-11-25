@@ -2,12 +2,17 @@
  * v0.7.7 阶段 5：跨作用域召回范围（T120-M2）、线程进展（T120-M1）、工具文案（T120-L1）。
  *
  * 覆盖面（任务书 5 条验收）：
- *   ① 线程里巩固出的 project 事实能在主会话召回（kind 不限）；
- *   ② 线程召回命中 main 的 identity / preference，main 的 project / knowledge 不出现；
+ *   ① 线程里用户亲口的 project 事实能在主会话召回（kind 不限）；
+ *   ② 线程召回命中 main 的 identity / preference（或 user_explicit），
+ *      main 里非用户亲口的 project / knowledge 不出现；
  *   ③ 主会话召回不出现线程情景原文；
  *   ④ threads.last_progress 取回执结论首句（含无结论段的降级截断）；
  *   ⑤ task_run / thread_run 描述含 T120-L1 的三句文案。
  * 另含 5a：Store.searchBigram / listEpisodes 的 scope 集合支持。
+ *
+ * v0.7.19（T2）改写：①② 的放行口径从「只看 kind」扩成「kind ∈ identity/preference
+ * **或** source_kind='user_explicit'」，且主会话召回线程 facts 只放 user_explicit。
+ * 原断言全部保留，另补 source_kind 断言（见「v0.7.19 T2 改写」注释）。
  *
  * ⚠️ 非真机证据：事实/情景/线程行全部构造，未回放 50041 云端快照；
  * 宿主子代理与模型调用均为 mock。
@@ -53,11 +58,15 @@ function seedEpisode(store, input) {
 
 /** 与 index.js 的 recallScopes 同一口径（主会话）。 */
 function mainScopes(threadKeys) {
+  const threadScopes = threadKeys.map((key) => `thread:${key}`);
   return {
-    factScopes: ['main', ...threadKeys.map((key) => `thread:${key}`)],
+    factScopes: ['main', ...threadScopes],
     episodeScopes: ['main'],
     attachedScopes: null,
     attachedKinds: null,
+    // v0.7.19（T2）：主会话召回线程 facts 只放用户亲口的事实。
+    threadScopes,
+    threadFactSourceKinds: ['user_explicit'],
   };
 }
 
@@ -68,6 +77,9 @@ function threadScopes(key) {
     episodeScopes: [`thread:${key}`],
     attachedScopes: ['main'],
     attachedKinds: ['identity', 'preference'],
+    // v0.7.19（T2）：线程必须能读本线程 scope 的全部 facts，不设 source_kind 限制。
+    threadScopes: null,
+    threadFactSourceKinds: null,
   };
 }
 
@@ -119,24 +131,42 @@ describe('T120-M2（5a）：scope 集合 API', () => {
 
 // ------------------------------------------------- 验收① 线程事实回主会话
 
-describe('验收①：线程巩固出的 project 事实能在主会话召回', () => {
-  test('主会话 scope 集含线程时命中 project 事实（不限 kind）', async (t) => {
+describe('验收①：线程里用户亲口的 project 事实能在主会话召回', () => {
+  test('主会话 scope 集含线程时命中 user_explicit 的 project 事实（不限 kind）', async (t) => {
     const store = openStore(t);
+    // v0.7.19（T2）改写：主会话召回线程 facts 只放 `source_kind='user_explicit'`。
+    // 原用例的「线程巩固出的 project 事实」改成用户亲口写下的那条；另加一条
+    // `consolidated`（线程自己学到的）断言它在主会话不可见。
     seedFact(store, {
       scope: 'thread:deploy',
       kind: 'project',
+      source_kind: 'user_explicit',
       subject_text: 'flux',
       predicate: '训练用数据集',
       object_text: 'flux 数据集',
       statement: 'LoRA 训练用 flux 数据集，路径在 D:/data/flux。',
+    });
+    seedFact(store, {
+      scope: 'thread:deploy',
+      kind: 'project',
+      source_kind: 'consolidated',
+      subject_text: 'flux 缓存',
+      predicate: '位于',
+      object_text: '本地磁盘',
+      statement: 'flux 缓存落在本地磁盘第三分区。',
     });
 
     const before = await retrieve({ store, query: 'flux 数据集', now: NOW_MS, ...mainScopes([]) });
     assert.deepEqual(before.items, [], '没有线程 scope 时主会话看不到线程事实');
 
     const after = await retrieve({ store, query: 'flux 数据集', now: NOW_MS, ...mainScopes(['deploy']) });
-    assert.ok(after.items.length >= 1, '主会话应召回线程里的 project 事实');
+    assert.ok(after.items.length >= 1, '主会话应召回线程里用户亲口的 project 事实');
     assert.match(after.items[0].text, /flux 数据集/u);
+
+    // 判别力：把 retrieve.js `scopeAllows` 里 threadScopeSet 那条早退（return
+    // threadFactSourceKindSet.has(...)）删掉 → 下面这条 consolidated 断言红。
+    const learned = await retrieve({ store, query: 'flux 缓存 本地磁盘', now: NOW_MS, ...mainScopes(['deploy']) });
+    assert.deepEqual(learned.items, [], '线程自己巩固出的（consolidated）事实留在本线程');
   });
 
   test('recallScopes：主会话 facts 含活跃线程、episodes 只含 main', (t) => {
@@ -148,12 +178,19 @@ describe('验收①：线程巩固出的 project 事实能在主会话召回', (
     assert.deepEqual(scopes.factScopes, ['main', 'thread:deploy']);
     assert.deepEqual(scopes.episodeScopes, ['main']);
     assert.equal(scopes.attachedScopes, null);
+    // v0.7.19（T2）改写：主会话召回线程 facts 只放用户亲口的事实。
+    // 断言点：把 recallScopes main 分支的 threadFactSourceKinds 改回 null → 这里红。
+    assert.deepEqual(scopes.threadScopes, ['thread:deploy']);
+    assert.deepEqual(scopes.threadFactSourceKinds, ['user_explicit']);
 
     const thread = recallScopes(store, 'thread:deploy');
     assert.deepEqual(thread.factScopes, ['thread:deploy', 'main']);
     assert.deepEqual(thread.episodeScopes, ['thread:deploy']);
     assert.deepEqual(thread.attachedScopes, ['main']);
     assert.deepEqual(thread.attachedKinds, ['identity', 'preference']);
+    // v0.7.19（T2）改写：线程不得限制自己 scope 的 source_kind。
+    assert.equal(thread.threadScopes, null);
+    assert.equal(thread.threadFactSourceKinds, null);
   });
 });
 
@@ -187,6 +224,31 @@ describe('验收②：线程召回 main 的身份偏好，不召回 main 的工�
 
     const project = await retrieve({ store, query: '部署 冒烟', now: NOW_MS, ...threadScopes('deploy') });
     assert.deepEqual(project.items, [], 'main 的 project/knowledge 不往线程灌');
+
+    // v0.7.19（T2）改写：放行口径由「只看 kind」扩成「kind ∈ identity/preference
+    // **或** source_kind='user_explicit'」——用户亲口说的事实全线程可见，
+    // 即使它被标成 project；非用户亲口（consolidated）的仍留在 main。
+    // 判别力：把 retrieve.js `scopeAllows` 末行的 `|| rowSourceKind === 'user_explicit'`
+    // 删掉 → 下面 explicit 断言红。
+    seedFact(store, {
+      scope: 'main', kind: 'project', source_kind: 'user_explicit',
+      subject_text: '结账日', predicate: '定在', object_text: '每周五',
+      statement: '用户亲口说结账日固定在每周五。',
+    });
+    seedFact(store, {
+      scope: 'main', kind: 'project', source_kind: 'consolidated',
+      subject_text: '发布窗口', predicate: '定在', object_text: '周四晚',
+      statement: '巩固记录：发布窗口定在周四晚。',
+    });
+
+    const explicit = await retrieve({ store, query: '结账日 每周五', now: NOW_MS, ...threadScopes('deploy') });
+    assert.ok(
+      explicit.items.some((item) => /结账日/u.test(item.text)),
+      '用户亲口的事实跨线程可见（kind 非 identity/preference 也放行）',
+    );
+
+    const consolidated = await retrieve({ store, query: '发布窗口 周四晚', now: NOW_MS, ...threadScopes('deploy') });
+    assert.deepEqual(consolidated.items, [], 'main 里非用户亲口（consolidated）的事实不往线程灌');
 
     // 同一批候选在主会话（无 kind 限制）里是可见的。
     const mainView = await retrieve({ store, query: '部署 冒烟', now: NOW_MS, ...mainScopes([]) });

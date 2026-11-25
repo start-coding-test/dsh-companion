@@ -4241,7 +4241,7 @@ export class Store {
     const factRows = this.#db
       .prepare(
         `SELECT f.id, f.scope, f.kind, f.statement, f.subject_text, f.predicate,
-                f.object_text, f.salience, f.status, bm25(fts_facts) AS rank
+                f.object_text, f.salience, f.status, f.source_kind, bm25(fts_facts) AS rank
            FROM fts_facts JOIN facts f ON f.rowid = fts_facts.rowid
           WHERE fts_facts MATCH ? AND f.deleted_at IS NULL${factScoped.sql}
           ORDER BY rank ASC

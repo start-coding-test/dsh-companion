@@ -125,7 +125,7 @@ function toolOf(ctx, name) {
   return ctx.tools.registrations.find((tool) => tool.name === name);
 }
 
-test('main/thread 隔离：同一进程内各自召回自己的 facts，线程不串主记忆', async () => {
+test('main/thread 隔离：用户亲口的事实双向可见，线程学到的主记忆不串（v0.7.19 T2 口径）', async () => {
   const temp = makeTempStore();
   const { ctx } = makeCtx();
   const mainSession = ctx.addSession({ id: 'main-1' });
@@ -138,8 +138,29 @@ test('main/thread 隔离：同一进程内各自召回自己的 facts，线程�
     last_active_at: Math.floor(TEST_NOW / 1000),
     status: 'active',
   });
+  // seedFact 一律 source_kind='user_explicit'（用户亲口），按 v0.7.19 T2 口径全线程可见。
   seedFact(temp.store, 'main', '蓝鲸是海洋哺乳动物');
   seedFact(temp.store, 'thread:study', '极光出现在高纬度夜空');
+  // 非用户亲口（巩固来的）主记忆：线程不得召回。
+  temp.store.insertFact({
+    scope: 'main',
+    kind: 'knowledge',
+    subject_text: '企鹅',
+    predicate: '生活在',
+    object_text: '企鹅生活在南半球',
+    statement: '企鹅生活在南半球',
+    source_kind: 'consolidated',
+  });
+  // 线程自己巩固出来的事实：不得进主会话（v0.7.19 T2）。
+  temp.store.insertFact({
+    scope: 'thread:study',
+    kind: 'knowledge',
+    subject_text: '地磁暴',
+    predicate: '会扰动',
+    object_text: '地磁暴会扰动极光带',
+    statement: '地磁暴会扰动极光带',
+    source_kind: 'consolidated',
+  });
 
   const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4 });
   try {
@@ -157,15 +178,36 @@ test('main/thread 隔离：同一进程内各自召回自己的 facts，线程�
     );
     const threadText = decisionText(thread);
     assert.match(threadText, /极光出现在高纬度夜空/u);
-    assert.doesNotMatch(threadText, /蓝鲸是海洋哺乳动物/u);
+    assert.doesNotMatch(threadText, /企鹅生活在南半球/u);
 
     // 同一个 turn 号不会因为 main 已经注入而抑制 thread 注入（按 scope 去重）。
+    // v0.7.19（T2）：main 的 user_explicit 事实全线程可见——线程问「蓝鲸」应召回它。
+    // 判别力：把 retrieve.js `scopeAllows` 末行的 `|| rowSourceKind === 'user_explicit'`
+    // 删掉 → 这里红（线程只放 identity/preference）。
     const threadOther = await ctx.dispatch(
       'agent/pre-step',
       payload(ctx, threadSession, 2, '蓝鲸是什么动物？'),
       { kind: 'enter', messages: [] },
     );
-    assert.doesNotMatch(decisionText(threadOther), /蓝鲸是海洋哺乳动物/u);
+    assert.match(decisionText(threadOther), /蓝鲸是海洋哺乳动物/u);
+
+    // 但线程自己巩固出来的事实不串回 main，main 里巩固出来的也不往线程灌。
+    const threadLearned = await ctx.dispatch(
+      'agent/pre-step',
+      payload(ctx, threadSession, 3, '企鹅 南半球'),
+      { kind: 'enter', messages: [] },
+    );
+    assert.doesNotMatch(decisionText(threadLearned), /企鹅生活在南半球/u);
+
+    // 反方向：线程巩固出来的事实不得进主会话（v0.7.19 T2「线程学到的留在线程」）。
+    // 判别力：把 src/index.js `injectRecall` 里 `threadFactSourceKinds:
+    // scopes.threadFactSourceKinds` 这行删掉 → 本断言红（consolidated 线程事实漏进主会话）。
+    const mainLearned = await ctx.dispatch(
+      'agent/pre-step',
+      payload(ctx, mainSession, 2, '地磁暴 极光带'),
+      { kind: 'enter', messages: [] },
+    );
+    assert.doesNotMatch(decisionText(mainLearned), /地磁暴会扰动极光带/u);
 
     assert.equal(temp.store.getMeta('main_session_id'), 'main-1');
   } finally {

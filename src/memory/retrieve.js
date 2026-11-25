@@ -506,6 +506,10 @@ export function looksTechnicalText(text) {
  *   facts 与 episodes 分开是为了「主会话召回不出现线程情景原文」。
  * - `attachedScopes` + `attachedKinds`：行级过滤——候选来自这些「被附加」的
  *   scope 且 kind 不在放行集时直接跳过（线程召回 main 只放 identity/preference）。
+ * - v0.7.19（T2）`threadScopes` + `threadFactSourceKinds`：作用域口径「用户亲口的
+ *   事实全线程可见，线程学到的留在线程」。主会话召回线程事实时只放
+ *   `source_kind` 在放行集里的行（`user_explicit`）；线程会话传 `null`，
+ *   因为线程必须能读自己 scope 的全部事实。
  *
  * @param {{
  *   store: import('./store.js').Store,
@@ -515,6 +519,8 @@ export function looksTechnicalText(text) {
  *   episodeScopes?: string[],
  *   attachedScopes?: string[],
  *   attachedKinds?: string[],
+ *   threadScopes?: string[],
+ *   threadFactSourceKinds?: string[],
  *   now?: number|Date,
  *   budgetTokens?: number,
  *   limit?: number,
@@ -533,6 +539,8 @@ export async function retrieve({
   episodeScopes = null,
   attachedScopes = null,
   attachedKinds = null,
+  threadScopes = null,
+  threadFactSourceKinds = null,
   now = Date.now(),
   budgetTokens = DEFAULT_BUDGET_TOKENS,
   limit = DEFAULT_LIMIT,
@@ -634,18 +642,41 @@ export async function retrieve({
   const attachedKindSet = new Set(
     Array.isArray(attachedKinds) ? attachedKinds.filter((item) => typeof item === 'string') : [],
   );
+  // v0.7.19（T2）：作用域口径「用户亲口的事实全线程可见，线程学到的留在线程」。
+  // - `threadScopeSet`：本次可见范围里的线程 scope。`recallScopes` 会显式给
+  //   `threadScopes`；只有 `factScopes` 的旧调用按 `thread:` 前缀兜底，两者并集。
+  // - `threadFactSourceKindSet`：主会话召回线程事实时放行的 `source_kind` 集合
+  //   （`user_explicit`）。线程会话为 null → 空集 → 不限制本线程自己的事实。
+  const threadScopeSet = new Set(
+    [...(Array.isArray(threadScopes) ? threadScopes : []), ...factScopeSet]
+      .filter((item) => typeof item === 'string' && item.startsWith('thread:')),
+  );
+  const threadFactSourceKindSet = new Set(
+    Array.isArray(threadFactSourceKinds)
+      ? threadFactSourceKinds.filter((item) => typeof item === 'string' && item !== '')
+      : [],
+  );
   /**
    * @param {'fact'|'episode'} type
    * @param {string} rowScope
    * @param {string} [rowKind]
+   * @param {string} [rowSourceKind] `facts.source_kind`（episode 传 undefined）
    * @returns {boolean}
    */
-  const scopeAllows = (type, rowScope, rowKind) => {
+  const scopeAllows = (type, rowScope, rowKind, rowSourceKind) => {
     const allowed = type === 'fact' ? factScopeSet : episodeScopeSet;
     if (!allowed.includes(rowScope)) return false;
-    if (type !== 'fact' || attachedScopeSet.size === 0) return true;
+    if (type !== 'fact') return true;
+    // 主会话召回线程事实：只放用户亲口写下的行。线程里巩固/推断出来的事实
+    // （consolidated / inferred / turn / task）留在本线程，不往主会话灌。
+    if (threadFactSourceKindSet.size > 0 && threadScopeSet.has(rowScope)) {
+      return threadFactSourceKindSet.has(rowSourceKind);
+    }
+    if (attachedScopeSet.size === 0) return true;
     if (!attachedScopeSet.has(rowScope)) return true;
-    return attachedKindSet.has(rowKind);
+    // 线程召回 main：kind 在放行集，或 `source_kind='user_explicit'`（用户亲口
+    // 说的事实全线程可见，即使它被标成 project/knowledge）。
+    return attachedKindSet.has(rowKind) || rowSourceKind === 'user_explicit';
   };
 
   /** @type {Map<string, {type:'fact'|'episode', id:string, rrf?:number, vector?:boolean}>} */
@@ -677,7 +708,7 @@ export async function retrieve({
       for (const hit of store.searchBigram(token, { scope: searchScope, limit: dfSearchLimit }) ?? []) {
         if (!hit || (hit.type !== 'fact' && hit.type !== 'episode')) continue;
         // df 只统计本轮可见范围内的行，否则跨线程命中会把「稀有」判成「常见」。
-        if (!scopeAllows(hit.type, hit.scope, hit.kind)) continue;
+        if (!scopeAllows(hit.type, hit.scope, hit.kind, hit.source_kind)) continue;
         df += 1;
         const key = `${hit.type}:${hit.id}`;
         let entry = lexicalHits.get(key);
@@ -746,7 +777,7 @@ export async function retrieve({
     // v0.7.7 阶段 5：recency 补位按各自 scope 集逐个取，facts 与 episodes 不同集合。
     for (const listScope of factScopeSet) {
       for (const row of store.listFacts({ scope: listScope, limit: listLimit }) ?? []) {
-        if (!scopeAllows('fact', row.scope, row.kind)) continue;
+        if (!scopeAllows('fact', row.scope, row.kind, row.source_kind)) continue;
         const ts = toMillis(row.observed_at);
         if (ts !== null && ts >= nowMs - RECENT_WINDOW_MS) {
           recent.push({ type: 'fact', id: row.id, ts });
@@ -792,8 +823,11 @@ export async function retrieve({
     // v0.7.7 阶段 5（T120-M2）：行级 scope 过滤。
     // - 主会话：facts 允许 main + 各活跃线程，episodes 只允许 main（线程情景不外泄）；
     // - 线程：facts 允许本线程 + main，但来自 main 的候选只放身份偏好类
-    //   （attachedScopes/attachedKinds），episodes 只允许本线程。
-    if (!scopeAllows(candidate.type, row.scope, row.kind)) continue;
+    //   （attachedScopes/attachedKinds）或用户亲口的事实（source_kind='user_explicit'），
+    //   episodes 只允许本线程。
+    // - v0.7.19（T2）：主会话召回线程 facts 时只放 source_kind='user_explicit'
+    //   （threadScopes/threadFactSourceKinds），线程自己学到的留在线程。
+    if (!scopeAllows(candidate.type, row.scope, row.kind, row.source_kind)) continue;
 
     const pinned = row.salience === 'pinned'
       || row.strength_days === null || row.strength_days === undefined;
