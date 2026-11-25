@@ -3417,6 +3417,36 @@ export class Store {
   }
 
   /**
+   * v0.7.19 T3.1：某 scope 下「待触发」提醒的精确条数（reminder_add 护栏用）。
+   *
+   * 口径固定为 `status IN ('pending','snoozed','delivering') AND deleted_at IS NULL`：
+   * `fired` 已触发过、`done`/`cancelled`/`expired` 都是终态，都不算「待触发」。
+   * 不能复用 {@link listReminders} 来数：它只支持单个 status、且
+   * `clampLimit(options.limit, 100)` 会截断（超过 100 条就漏），这里直接 COUNT(*)。
+   * 零 DDL：只读查询，不改表结构。
+   * @param {string} scope
+   * @param {string[]} [statuses]
+   * @returns {number}
+   */
+  countActiveReminders(scope, statuses = ['pending', 'snoozed', 'delivering']) {
+    const scopeKey = requireString(scope, 'reminders.scope');
+    const list = Array.isArray(statuses)
+      ? statuses.filter((status) => typeof status === 'string' && status !== '')
+      : [];
+    if (list.length === 0) return 0;
+    const placeholders = list.map(() => '?').join(',');
+    const row = this.#db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM reminders
+          WHERE scope = ?
+            AND status IN (${placeholders})
+            AND deleted_at IS NULL`,
+      )
+      .get(scopeKey, ...list);
+    return Number(row?.n ?? 0);
+  }
+
+  /**
    * v15（A4）：列出某 scope 下「已过期但还没通知过」的提醒。
    *
    * 只返回投递侧需要的最小字段；按 due_at 升序（NULL 排最后——理论上 expired

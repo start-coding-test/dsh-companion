@@ -59,6 +59,13 @@ const FACT_KINDS = new Set(STORE_FACT_KINDS);
 const SALIENCE = new Set(['trivial', 'normal', 'notable', 'explicit', 'pinned']);
 const PRIVACY = new Set(['normal', 'sensitive', 'secret']);
 const REMINDER_KINDS = new Set(['todo', 'schedule', 'repeat', 'commitment']);
+/**
+ * v0.7.19 T3.1：同一 scope 下「待触发」提醒的条数上限。已有 `>= 50` 条即拒绝新增
+ * （第 51 条被拦），提示用户先清理。`fired` 已触发、`done`/`cancelled`/`expired`
+ * 终态与软删行都不计入，口径见 `Store.countActiveReminders`。
+ */
+const REMINDER_ACTIVE_LIMIT = 50;
+const REMINDER_ACTIVE_STATUSES = Object.freeze(['pending', 'snoozed', 'delivering']);
 const THREAD_STATUSES = new Set(['active', 'archived', 'retired']);
 
 /** 投递给线程/worker 的目标长度上限（按 Unicode 码点计，L 级）。 */
@@ -640,6 +647,20 @@ export function createTools({
           kind = 'repeat';
         } else if (kind === 'repeat') {
           return { ok: false, reason: 'rrule_required', message: 'kind=repeat 需要 rrule' };
+        }
+
+        // T3.1（v0.7.19）：同 scope 待触发提醒条数护栏。计数走精确 COUNT(*)
+        // （listReminders 单 status + LIMIT 截断，数不准）；`>= 50` 即拒绝本次新增，
+        // 已有 50 条时第 51 条被拦。校验放在 insertReminder 之前，拒绝时不落行。
+        const activeCount = store.countActiveReminders(resolved.scope, REMINDER_ACTIVE_STATUSES);
+        if (activeCount >= REMINDER_ACTIVE_LIMIT) {
+          return {
+            ok: false,
+            reason: 'reminder_cap',
+            message: `同一 scope 待触发提醒已有 ${activeCount} 条（上限 ${REMINDER_ACTIVE_LIMIT} 条），请先用 reminder_done / reminder_cancel 清理不再需要的提醒，再新增`,
+            count: activeCount,
+            limit: REMINDER_ACTIVE_LIMIT,
+          };
         }
 
         const row = store.insertReminder({
