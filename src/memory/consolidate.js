@@ -22,7 +22,8 @@ import {
 } from './govern.js';
 import {
   DEFAULT_DEDUPE_ASK, DEFAULT_DEDUPE_SKIP, buildDedupeJudgePrompt,
-  classifyDraftFact, collectActiveFactsByKind, parseDedupeVerdicts,
+  buildKeyPhraseIndex, classifyDraftFact, collectActiveFactsByKind,
+  parseDedupeVerdicts, upgradeVerdictWithKeyPhrases,
 } from './dedupe.js';
 import { decayOf } from './reinforce.js';
 import { textBigrams, jaccard } from './similarity.js';
@@ -979,6 +980,7 @@ export function buildConsolidationPrompt(input = {}) {
  * +knowledge 的新增条数上限，最后做 H1 近似查重（同 kind active 事实比 bigram
  * Jaccard）：≥ dedupeSkip 直接强化旧条；dedupeAsk..dedupeSkip 之间**合成一次**
  * 模型裁决；低于 dedupeAsk 或没有同类事实就新写。
+ * L6（v0.7.21）：判 new 的事实再按跨 kind 关键串索引升级为 ask（只放大 ask，永不触发 skip）。
  *
  * 裁决调用失败（抛错/超时/不可解析）时该批按 new 保守写入并计数：宁可多一条，
  * 也不能因为一次判定失败丢掉整段巩固。
@@ -1032,10 +1034,16 @@ async function planFactWrites(input) {
   }
 
   const byKind = collectActiveFactsByKind(store, scope);
+  // L6（v0.7.21）：跨 kind 关键串倒排索引只建一次（纯内存，不新增 DB 查询）。
+  const keyPhraseIndex = buildKeyPhraseIndex(byKind);
   const plans = [];
   const askIndexes = [];
   for (const fact of allowed) {
-    const verdict = classifyDraftFact(fact, byKind, { dedupeSkip, dedupeAsk });
+    const verdict = upgradeVerdictWithKeyPhrases(
+      fact,
+      classifyDraftFact(fact, byKind, { dedupeSkip, dedupeAsk }),
+      keyPhraseIndex,
+    );
     if (verdict.verdict === 'skip') {
       plans.push({
         fact,
