@@ -126,7 +126,7 @@ health | archived | 体检 | 2026-10-20
 
 ```text
 /状态
-状态：entities 8 / episodes 120 / facts 96 / reminders 4 / state_board 2 / state_board_rev 9 / threads 3 / consolidations 21 / memory_events 310 / fts facts 96/episodes 120 / tokens 本轮 入 8000 出 1200（超预算 0 次）｜今日 0/3000000｜RSS ok 128MB｜向量：关
+状态：entities 8 / episodes 120 / facts 96 / reminders 4 / state_board 2 / state_board_rev 9 / threads 3 / consolidations 21 / memory_events 310 / fts facts 96/episodes 120 / tokens 本轮（估算） 入 8000 出 1200（超预算 0 次）｜今日 0/3000000｜RSS ok 128MB｜向量：关
 RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 最近压缩耗时：12.3s
 最近巩固耗时：31.0s
@@ -138,7 +138,7 @@ RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB
 最近 job：s2-purge ok upto_seq=0（2026-11-03 03:30）
 ```
 
-最后一段 `tokens 本轮 …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。「主会话：<id>（绑定 <mode>）」是当前提醒投递目标与绑定策略（`latest-user` 会跟随最新真实用户会话，`first` 保持首个，见[主会话绑定](#主会话绑定v044)）；宿主没有 `sessionController` 时多一行「线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）」（每次执行 `/状态` 时实时读取能力）。v0.4.12 起还会多一行「人格卡：<name> v<version>（内置默认 | <绝对路径> | 加载失败，已用内置：<原因>）」，来源、切换与兜底行为见[人格卡](#人格卡v11-p1v0412)。
+最后一段 `tokens 本轮（估算） …` 是当前轮工作记忆的 token 快照（入 = 上下文总量，出 = 本轮新增）；v0.7.21 起明确标注「（估算）」——数值是真实 usage 基线与启发式增量的混合估计，不是计费口径（压缩底、最近压后底等实测样本不标注）；没有 `tokenMeter` 能力时显示 `tokens 本轮 0`，不影响其它计数。`向量` 段在开启可选向量召回后变为「向量：开·dim 256·hash:256·已回填 N·最近命中 N·回填超时 N·占用 N」（local/remote 显示各自 id 与回填计数）。第二行「RSS 阈值」是当前生效的三档值，来自 `rssWarnGiB`/`rssStopGiB`/`rssMainOnlyGiB`（默认 2.95/3/3.15GiB，4G 机器建议 2.2/2.4/2.6，见[配置示例](#配置示例)）。「水位重锚」与「未巩固被压缩」只在实际发生外部压缩后出现，含义见[外部压缩与水位重锚](#外部压缩与水位重锚v040)。「主会话：<id>（绑定 <mode>）」是当前提醒投递目标与绑定策略（`latest-user` 会跟随最新真实用户会话，`first` 保持首个，见[主会话绑定](#主会话绑定v044)）；v0.7.21 起紧随其后有一行「插件：dsh-companion v<version>」，版本号取自插件包 `package.json`（读不到时整行省略，不影响其它行）。宿主没有 `sessionController` 时多一行「线程：宿主不支持（无 sessionController，线程工具调用返回 capability_missing）」（每次执行 `/状态` 时实时读取能力）。v0.4.12 起还会多一行「人格卡：<name> v<version>（内置默认 | <绝对路径> | 加载失败，已用内置：<原因>）」，来源、切换与兜底行为见[人格卡](#人格卡v11-p1v0412)。
 
 「最近压缩耗时」「最近巩固耗时」是 G0-9 的观测行：前者取最近一次实际压缩（`compactRegion` 调用及其后的重读 surface / 写库 / 发布看板），后者取最近一次实际巩固执行（从巩固任务入口到 `consolidate()` 返回，含选区与模型解析）；失败样本也记录，但成功/失败不进 `/状态`、只用于日志。没有样本时显示 `—`；超过 `timing.compactWarnMs`（默认 20000ms）/`timing.consolidateWarnMs`（默认 60000ms）时在值后标注「（超阈值）」，同时写一条 warn（同类在同一进程内只告警一次，出现一次不超阈值的样本后重置）。阈值只用于观测与告警，**没有硬超时、不会中止**压缩或巩固，详见[压缩/巩固耗时观测](#压缩巩固耗时观测g0-9v0411)。
 

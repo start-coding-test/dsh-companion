@@ -115,6 +115,8 @@ export function commandHintMessage(text) {
  *   /状态 明确显示「线程：宿主不支持」
  * @param {{id?: string|null, binding?: string}} [options.mainSession] V3-M2：
  *   当前主会话 id 与绑定模式（latest-user / first），/状态 展示用
+ * @param {string|null} [options.pluginVersion] v0.7.21 L5：插件版本（接线层从
+ *   package.json 读取）；null/空串时 /状态 整行省略「插件：」行
  * @param {boolean} [options.compactionSupported] C5-M1：宿主是否提供
  *   compaction.compactRegion（compaction-basic）；false 时 /状态 明确提示
  * @param {number} [options.pendingCompactions] C5-M1：待压缩区间数（仅展示用）
@@ -137,6 +139,8 @@ export function handleCommand({
   budget,
   threadsSupported,
   mainSession,
+  // v0.7.21 L5（可选）：插件版本行；null/空串时不输出，保持旧调用方格式。
+  pluginVersion,
   compactionSupported,
   pendingCompactions,
   threadAgentPreset,
@@ -204,6 +208,7 @@ export function handleCommand({
       prune,
       threadsSupported,
       mainSession,
+      pluginVersion,
       compactionSupported,
       pendingCompactions,
       threadAgentPreset,
@@ -768,6 +773,10 @@ function formatStatus(store, scope, metrics, timeZone, budget, options = {}) {
       : 'latest-user';
     const id = typeof mainSession.id === 'string' && mainSession.id !== '' ? mainSession.id : '未绑定';
     lines.push(`主会话：${id}（绑定 ${binding}）`);
+  }
+  // v0.7.21 L5（可选）：插件版本行紧跟在主会话之后；取不到包元数据时整行省略。
+  if (typeof options.pluginVersion === 'string' && options.pluginVersion.trim() !== '') {
+    lines.push(`插件：dsh-companion v${options.pluginVersion.trim()}`);
   }
   // V10-H1：线程 preset 是否来自配置；排障 preset_unknown 时先看这一行。
   const threadPreset = typeof options.threadAgentPreset === 'string'
@@ -1393,6 +1402,9 @@ function truncateText(value, max) {
  * 本轮 token / 每日配额 / RSS 快照（L6、M4）：metrics 缺失时显示 0，绝不 throw。
  * RSS 的 MB 优先用接线层传入的 state.rss（metrics 的 rssMB 是进程实时读数，
  * 与可注入的 rssReader 不是同一口径）。
+ * L5（v0.7.21）：正常分支的「本轮」数字是启发式估算（真实 usage 基线 + 启发式
+ * delta 的混合值），标注「（估算）」；压缩底/最近压后底是实测样本，不标注。
+ * 无 metrics 或 snapshot 抛错的兜底仍显示 `tokens 本轮 0`（不是估算，格式不变）。
  * @param {object} [metrics]
  * @param {object} [budget]
  * @returns {string}
@@ -1411,7 +1423,7 @@ function formatTokenSnapshot(metrics, budget) {
     const rssName = RSS_LEVEL_NAMES[rssCode] ?? 'ok';
     const rssMB = Number(budget?.rssMB ?? snapshot.rssMB) || 0;
     const slotText = formatThreadSlotText(snapshot);
-    return ` / tokens 本轮 入 ${tokensIn} 出 ${tokensOut}（超预算 ${overBudget} 次）`
+    return ` / tokens 本轮（估算） 入 ${tokensIn} 出 ${tokensOut}（超预算 ${overBudget} 次）`
       + `｜今日 ${daily}/${Number(budget?.dailyLimit) || DAILY_TOKEN_LIMIT}${tripped ? '（已熔断）' : ''}`
       + `｜RSS ${rssName} ${rssMB}MB`
       + slotText

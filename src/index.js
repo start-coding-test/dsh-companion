@@ -20,7 +20,7 @@
  *   deep-sleep 03:00 不再空转：遗忘降级 + 状态板重渲染（staged）+ 审计。
  */
 import { randomUUID } from 'node:crypto';
-import { copyFileSync, mkdirSync, readdirSync, unlinkSync } from 'node:fs';
+import { copyFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
 
 import { isQuietAt, normalizeConfig } from './config.js';
@@ -196,6 +196,24 @@ export const inject = ['systemPrompt', 'timer', 'commands', 'tools'];
 
 /** 默认/主会话作用域。 */
 const SCOPE = MAIN_SCOPE;
+
+/**
+ * v0.7.21 L5（可选）：/状态「插件：」行的版本号。
+ *
+ * 真源是包元数据 `package.json`，不在源码里硬编码（bump 只改 package.json
+ * 一处即可）。读取或解析失败（打包裁剪、权限、JSON 损坏）时返回 null，
+ * 命令层据此整行省略，绝不让 /状态 因版本读不到而失败。
+ * @returns {string|null}
+ */
+function readPluginVersion() {
+  try {
+    const raw = readFileSync(new URL('../package.json', import.meta.url), 'utf8');
+    const version = JSON.parse(raw)?.version;
+    return typeof version === 'string' && version.trim() !== '' ? version.trim() : null;
+  } catch {
+    return null;
+  }
+}
 
 /** 召回预算（R-SES-07：注入 ≤2050 tokens；总量由 config.workingMemoryTokens 控制）。 */
 const RECALL_BUDGET_TOKENS = 2050;
@@ -1381,6 +1399,8 @@ function registerCommands(platform, store, config, metrics, track, currentScope,
               id: currentMainSessionId(state),
               binding: mainBindingOf(config),
             },
+            // v0.7.21 L5（可选）：插件版本行；读不到包元数据时为 null（整行省略）。
+            pluginVersion: readPluginVersion(),
             // V10-H1：/状态 展示线程 preset 来源（配置值或宿主默认）。
             threadAgentPreset: config.thread?.agentPreset ?? null,
             // C5-M1：web-app 默认 compaction-basic disabled:true；能力位 false 时

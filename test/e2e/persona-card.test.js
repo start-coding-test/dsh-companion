@@ -110,7 +110,7 @@ const V0412_SECTION_SHA256 = Object.freeze({
  * 第一行含与本机进程内存有关的 `RSS ok <n>MB`，比较时单独用正则；其余逐行相等。
  */
 const V0412_STATUS_LINES = Object.freeze([
-  '状态：entities 0 / episodes 0 / facts 0 / reminders 0 / state_board 0 / state_board_rev 1 / threads 0 / consolidations 0 / memory_events 0 / fts 0/0 / tokens 本轮 入 0 出 0（超预算 0 次）｜今日 0/3000000｜RSS ok 0MB｜向量：关',
+  '状态：entities 0 / episodes 0 / facts 0 / reminders 0 / state_board 0 / state_board_rev 1 / threads 0 / consolidations 0 / memory_events 0 / fts 0/0 / tokens 本轮（估算） 入 0 出 0（超预算 0 次）｜今日 0/3000000｜RSS ok 0MB｜向量：关',
   'RSS 阈值：warn 2.95GiB / stop 3GiB / main_only 3.15GiB',
   '压缩：宿主已开启（compaction-basic 已启用）',
   '最近压缩耗时：—',
@@ -126,7 +126,7 @@ const V0412_STATUS_LINES = Object.freeze([
   '巩固：无可用模型',
 ]);
 
-const V0412_STATUS_HEAD = /^状态：entities 0 \/ episodes 0 \/ facts 0 \/ reminders 0 \/ state_board 0 \/ state_board_rev 1 \/ threads 0 \/ consolidations 0 \/ memory_events 0 \/ fts 0\/0 \/ tokens 本轮 入 0 出 0（超预算 0 次）｜今日 0\/3000000｜RSS ok \d+MB｜向量：关$/u;
+const V0412_STATUS_HEAD = /^状态：entities 0 \/ episodes 0 \/ facts 0 \/ reminders 0 \/ state_board 0 \/ state_board_rev 1 \/ threads 0 \/ consolidations 0 \/ memory_events 0 \/ fts 0\/0 \/ tokens 本轮（估算） 入 0 出 0（超预算 0 次）｜今日 0\/3000000｜RSS ok \d+MB｜向量：关$/u;
 
 const apply = (ctx, config, hooks) => applyCordis(strictCtx(ctx), config, hooks);
 
@@ -402,27 +402,30 @@ test('集成（v0.4.12 等价）：未配置卡时人格三段 SHA-256 一致，
     const receiptIndex = lines.findIndex((line) => line.startsWith('回执通道：'));
     assert.equal(receiptIndex, 3, '回执通道行紧随 token 用量行（R22-H1）');
     assert.match(lines[receiptIndex], /^回执通道：主会话（session-notice）/u, 'v0.7.15 P1：回执只投主会话');
-    assert.equal(personaIndex, 8, '人格卡行应插在线程 preset 与水位数之间');
+    assert.equal(personaIndex, 9, '人格卡行应插在线程 preset 与水位数之间');
     assert.equal(lines[personaIndex], '人格卡：珞然 v1（内置默认）');
+    // v0.7.21 L5（可选）：插件版本行紧随主会话行；版本取自包元数据，不硬编码。
+    assert.match(lines[7], /^插件：dsh-companion v\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/u, '插件行紧随主会话行');
     // P3-c：情绪行紧随人格卡行；未启用卡只显示「未启用」，不读写情绪表。
     const emotionIndex = lines.findIndex((line) => line.startsWith('情绪：'));
-    assert.equal(emotionIndex, 10, '部署人设行插在人格卡与情绪行之间');
+    assert.equal(emotionIndex, 11, '部署人设行插在人格卡与情绪行之间');
     assert.equal(lines[emotionIndex], '情绪：未启用');
     // P2（v0.4.13）：默认 off 也显式说明「宿主默认」，排障时不必猜配置。
-    assert.equal(lines[9], '部署人设：宿主默认');
+    assert.equal(lines[10], '部署人设：宿主默认');
     // V50-L3：装配记录紧随情绪行；未启用情绪时只有段/遮蔽信息，没有情绪句。
     const assemblyIndex = lines.findIndex((line) => line.startsWith('最近一次装配：'));
-    assert.equal(assemblyIndex, 11, '装配记录行插在情绪行之后、水位数之前');
+    assert.equal(assemblyIndex, 12, '装配记录行插在情绪行之后、水位数之前');
     assert.match(lines[assemblyIndex], /部署人设 宿主默认；prefix 未改写/u);
     assert.match(lines[assemblyIndex], /段 safety \d+\/[0-9a-f]{8}、core \d+\/[0-9a-f]{8}、protocol \d+\/[0-9a-f]{8}/u);
     assert.equal(lines[assemblyIndex].includes('情绪句'), false, '情绪未启用时不该有情绪句');
     // v0.6-E4：判定器行只在情绪启用时出现；内置卡情绪未启用，所以这里必须是「没有」。
     const appraiserIndex = lines.findIndex((line) => line.startsWith('判定器：'));
     assert.equal(appraiserIndex, -1, '情绪未启用时不该有判定器行');
-    assert.equal(lines.length, V0412_STATUS_LINES.length + 5, '/状态 应只多回执通道、人格卡、部署人设、情绪与装配记录五行');
+    assert.equal(lines.length, V0412_STATUS_LINES.length + 6, '/状态 应只多回执通道、插件版本、人格卡、部署人设、情绪与装配记录六行');
 
     const withoutInjected = lines.filter(
       (line) => !line.startsWith('回执通道：')
+        && !line.startsWith('插件：')
         && !line.startsWith('人格卡：')
         && !line.startsWith('部署人设：')
         && !line.startsWith('情绪：')
