@@ -5961,7 +5961,12 @@ async function judgeFactDuplicates(state, prompt) {
       usage = value;
     },
   });
-  recordModelUsage(state, { source: 'consolidate-dedupe', usage });
+  // v0.7.21 M3：`consolidate-dedupe` 不在 `TOKEN_USAGE_SOURCES`（token_usage.source
+  // 的 CHECK 枚举）里，旧写法每次查重裁决都被 store 拒绝、只留下 debug 的
+  // 「token ledger write failed」——用量实际全部丢失。source 归到既有的
+  // `consolidate`，用 request_id 区分是查重裁决这一路；scope 仍为 null
+  // （judgeFactDuplicates 拿不到 scope，不为它改四处接线）。
+  recordModelUsage(state, { source: 'consolidate', requestId: 'consolidate-dedupe', usage });
   return parseDraftJson(text);
 }
 
