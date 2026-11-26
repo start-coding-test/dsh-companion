@@ -217,8 +217,8 @@ test('thread_run：新建线程会话、写 threads 行并投递目标', async (
     // V10-H1：未配置 thread.agentPreset 时不传该参数，走宿主默认 preset。
     assert.equal(Object.hasOwn(harness.platform.sessions[0], 'agentPreset'), false);
     assert.equal(harness.platform.prompts[0].sessionId, 'sess-created');
-    // v0.7.19 T4.1：新建时 description 兜底为 goal，投递文本前面带一行常驻职责。
-    assert.equal(harness.platform.prompts[0].content[0].text, '线程职责：帮我找两居室\n帮我找两居室');
+    // v0.7.20 M1：没传 charter 的新建线程不注入职责行，投递文本回到 v0.7.18 的纯 goal。
+    assert.equal(harness.platform.prompts[0].content[0].text, '帮我找两居室');
 
     const thread = harness.store.getThread(result.key);
     assert.equal(thread.session_id, 'sess-created');

@@ -889,6 +889,11 @@ export function createTools({
             // v0.7.19 T4.1：复用时传了 charter 就覆盖常驻职责，不传沿用库里的值。
             // description 列 NOT NULL，upsert 展开 `...thread` 时显式覆盖即可。
             const description = charter ?? thread.description;
+            // v0.7.20 M1：只有显式设过 charter 的线程才注入「线程职责」行。存量线程的
+            // description 是当年第一条 goal，v0.7.19 把它当职责注入属于误导；标记存
+            // `schema_meta`（零 DDL），未设过的线程投递文本逐字回到 v0.7.18。
+            const withCharter = threadCharterActive(store, plan.key, charter);
+            if (charter !== undefined) markThreadCharterSet(store, plan.key);
             const charterPatch = charter === undefined ? {} : { description: charter };
             // SA-B2：有续派锚 → 走宿主 sendMessage（运行中下一 step 收、空闲开新
             // turn、冷目标在树根下恢复，`dsh-subagent/src/index.ts:356-375`）。
@@ -905,7 +910,7 @@ export function createTools({
                   await platform.sendToSubagent(
                     sender,
                     anchor,
-                    [{ type: 'text', text: `线程职责：${description}\n${goal}` }],
+                    [{ type: 'text', text: withCharter ? `线程职责：${description}\n${goal}` : goal }],
                     { signal: exec?.signal ?? deliverySignal({ requestId }) },
                   );
                   continued = true;
@@ -980,7 +985,7 @@ export function createTools({
               }
               await platform.prompt({
                 sessionId: thread.session_id,
-                content: [{ type: 'text', text: `线程职责：${description}\n${goal}` }],
+                content: [{ type: 'text', text: withCharter ? `线程职责：${description}\n${goal}` : goal }],
                 requestId,
               });
               store.upsertThread({
@@ -1039,6 +1044,10 @@ export function createTools({
 
           // v0.7.19 T4.1：新建时职责优先用 charter，其次 goal，最后兜底短名。
           const threadDescription = charter ?? goal ?? `线程：${plan.key}`;
+          // v0.7.20 M1：新建线程只有显式给了 charter 才注入职责行；没给就逐字回到
+          // v0.7.18（纯 goal），并把「设过 charter」标记写到 schema_meta。
+          const withCharter = charter !== undefined;
+          if (withCharter) markThreadCharterSet(store, plan.key);
           const thread = store.upsertThread({
             key: plan.key,
             name: name ?? plan.key,
@@ -1053,7 +1062,7 @@ export function createTools({
           if (goal !== undefined) {
             await platform.prompt({
               sessionId,
-              content: [{ type: 'text', text: `线程职责：${threadDescription}\n${goal}` }],
+              content: [{ type: 'text', text: withCharter ? `线程职责：${threadDescription}\n${goal}` : goal }],
               requestId,
             });
             prompted = true;
@@ -1084,7 +1093,19 @@ export function createTools({
           const hostName = normalizeSubagentName(threadSubagentName(threadKey));
           // v0.7.19 T4.1：startSubagent 的 prompt 在 upsert 之前，职责必须先算成
           // 局部变量（不能读库）；charter 直接从 execute 闭包取，不层层传参。
-          const threadDescription = charter ?? threadGoal ?? `线程：${threadKey}`;
+          // v0.7.20 M1：本函数也被「续派失败重建」复用，那时闭包里没有 charter，但
+          // 线程可能早就设过职责；此时要沿用库里的 description，否则首条 prompt 会
+          // 丢职责行，或把 goal 冒充成职责（`线程职责：<goal>` 正是本版要修的误导）。
+          const existingThread = typeof store?.getThread === 'function' ? store.getThread(threadKey) : null;
+          const withCharter = charter !== undefined
+            || (existingThread !== null && threadCharterActive(store, threadKey, undefined));
+          const threadDescription = charter
+            ?? (withCharter && existingThread !== null ? existingThread.description : null)
+            ?? threadGoal
+            ?? `线程：${threadKey}`;
+          // v0.7.20 M1：标记必须在 startSubagent（首条投递）之前写，否则续派失败
+          // 重建后的首条投递会丢职责行；prompt 本身回到 v0.7.18 的纯 threadGoal。
+          if (charter !== undefined) markThreadCharterSet(store, threadKey);
           let activation;
           try {
             activation = await platform.startSubagent({
@@ -1094,7 +1115,7 @@ export function createTools({
               maxDepth: 1,
               label: threadName ?? threadKey,
               ...(hostName === null ? {} : { name: hostName }),
-              prompt: [{ type: 'text', text: `线程职责：${threadDescription}\n${threadGoal}` }],
+              prompt: [{ type: 'text', text: withCharter ? `线程职责：${threadDescription}\n${threadGoal}` : threadGoal }],
               parent: sender,
               signal: exec?.signal ?? new AbortController().signal,
               ...(subagentModelResolved === null ? {} : { agentOptions: { model: subagentModelResolved } }),
@@ -1540,6 +1561,57 @@ export function createTools({
       },
     },
   ];
+}
+
+// ------------------------------------------------ v0.7.20 M1 线程职责标记
+
+/**
+ * 「该线程显式设过 charter」标记的 schema_meta 键（值 `'1'`）。零 DDL：沿用
+ * `thread_history:<key>` / `dedupe_judge:<scope>` 的每线程一键惯例。
+ * @param {string} key
+ * @returns {string}
+ */
+function threadCharterSetKey(key) {
+  return `thread_charter_set:${key}`;
+}
+
+/**
+ * v0.7.20 M1：本次投递是否该带「线程职责」行。
+ *
+ * 存量线程的 `threads.description` 是当年第一条 goal（不是职责），v0.7.19 每次
+ * 续派都把它前置成职责属于误导。所以只有「本次显式给了 charter」或「历史上设过
+ * charter（schema_meta 有标记）」才注入；读不到/坏值一律按没设过处理。
+ * @param {object} store
+ * @param {string} key
+ * @param {string|undefined} charter 本次调用显式传入的职责
+ * @returns {boolean}
+ */
+function threadCharterActive(store, key, charter) {
+  if (charter !== undefined) return true;
+  try {
+    if (store === null || typeof store !== 'object' || typeof store.getMeta !== 'function') {
+      return false;
+    }
+    return store.getMeta(threadCharterSetKey(key)) === '1';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * v0.7.20 M1：记下「该线程显式设过 charter」。写失败只影响下次续派是否带职责行，
+ * 绝不挡住本次投递（schema_meta 只是标记，真值仍在 `threads.description`）。
+ * @param {object} store
+ * @param {string} key
+ */
+function markThreadCharterSet(store, key) {
+  try {
+    if (store !== null && typeof store === 'object' && typeof store.setMeta === 'function') {
+      store.setMeta(threadCharterSetKey(key), '1');
+    }
+  } catch {
+    // 尽力而为：标记写不进去，下次续派退化成「不带职责行」，不会误注入旧 goal。
+  }
 }
 
 // ------------------------------------------------ v0.7.19 T4.3 线程投递历史
