@@ -444,6 +444,10 @@ function lastDetail(store, kind) {
   return null;
 }
 
+// v0.7.21 H2：bg_jobs.started_at/deadline 是 Unix 秒（insertBgJob 走 epochOr）；
+// 原种子直接把毫秒 TEST_NOW 写进秒字段，只是靠 monitor 的 nowMs 数值巧合才对上。
+const TEST_NOW_SEC = Math.floor(TEST_NOW / 1000);
+
 function seedJob(store, overrides = {}) {
   store.insertBgJob({
     id: 'bg-l5',
@@ -452,8 +456,8 @@ function seedJob(store, overrides = {}) {
     cwd: '/opt/work',
     child_session_id: 'child-1',
     pid_or_unit: 'dsh-bg-l5',
-    started_at: TEST_NOW - 10,
-    deadline: TEST_NOW + 600,
+    started_at: TEST_NOW_SEC - 10,
+    deadline: TEST_NOW_SEC + 600,
     log_path: '/opt/logs/bg-l5/output.log',
     ...overrides,
   });
@@ -466,7 +470,7 @@ test('L2 非真机证据：monitor 的兜底（主会话通道）不抹掉 timeo
   const state = {
     store,
     config,
-    platform: { now: () => TEST_NOW * 1000, log() {}, agentBySessionId: () => ({ id: 'agent-main' }), sendToSubagent: async () => { throw new Error('UNAUTHORIZED'); } },
+    platform: { now: () => TEST_NOW, log() {}, agentBySessionId: () => ({ id: 'agent-main' }), sendToSubagent: async () => { throw new Error('UNAUTHORIZED'); } },
     proactive: { enqueue: () => ({ queued: true, duplicate: false }), flush: async () => ({}) },
     im: { available: true, mode: 'session' },
     mainSessionId: 's-main',
@@ -475,7 +479,7 @@ test('L2 非真机证据：monitor 的兜底（主会话通道）不抹掉 timeo
     store,
     config,
     wake: (info) => wakeBgJob(state, info),
-    nowMs: TEST_NOW * 1000,
+    nowMs: TEST_NOW,
     launcher: {
       probeBgProcess: async () => ({ running: false, exited: true, exitCode: 143 }),
       unitResult: async () => 'timeout',
@@ -494,8 +498,8 @@ test('L2 非真机证据：monitor 的兜底（主会话通道）不抹掉 timeo
 
 test('L2 非真机证据：预算耗尽时 bg-jobs 的兜底也只在 woken 行降级（终态不被抹掉）', async () => {
   const arms = [
-    { exitCode: 0, deadline: TEST_NOW + 600, expect: BG_JOB_STATES.wokenFallback },
-    { exitCode: 143, deadline: TEST_NOW - 5, expect: BG_JOB_STATES.timeout },
+    { exitCode: 0, deadline: TEST_NOW_SEC + 600, expect: BG_JOB_STATES.wokenFallback },
+    { exitCode: 143, deadline: TEST_NOW_SEC - 5, expect: BG_JOB_STATES.timeout },
   ];
   for (const arm of arms) {
     const store = Store.open(':memory:');
@@ -506,7 +510,7 @@ test('L2 非真机证据：预算耗尽时 bg-jobs 的兜底也只在 woken 行�
       store,
       config,
       wake: async (info) => { wakes.push(info); return { delivered: true, channel: 'main' }; },
-      nowMs: TEST_NOW * 1000,
+      nowMs: TEST_NOW,
       launcher: {
         probeBgProcess: async () => ({ running: false, exited: true, exitCode: arm.exitCode }),
         unitResult: async () => 'timeout',
@@ -532,7 +536,7 @@ test('L2 非真机证据：failed / cancelled 行在 monitor 轮扫后原样保�
     store,
     config: normalizeConfig({}),
     wake: async () => ({ delivered: true }),
-    nowMs: TEST_NOW * 1000,
+    nowMs: TEST_NOW,
     launcher: { probeBgProcess: async () => { ran.push(1); return { running: true }; } },
   });
   assert.equal(summary.checked, 0, '只扫 running 行');
@@ -550,7 +554,7 @@ test('L5 非真机证据：lost + Result=timeout → 按 timeout 且 detail.unit
     store,
     config: normalizeConfig({}),
     wake: async (info) => { wakes.push(info); return { delivered: true }; },
-    nowMs: TEST_NOW * 1000,
+    nowMs: TEST_NOW,
     launcher: {
       probeBgProcess: async () => ({ running: false }),
       unitResult: async () => 'timeout',
@@ -575,7 +579,7 @@ test('L5 非真机证据：lost + 查询不到（null）→ state lost 且 detai
     store,
     config: normalizeConfig({}),
     wake: async () => ({ delivered: true }),
-    nowMs: TEST_NOW * 1000,
+    nowMs: TEST_NOW,
     launcher: {
       probeBgProcess: async () => ({ running: false }),
       unitResult: async () => null,
@@ -593,13 +597,13 @@ test('L5 非真机证据：lost + 查询不到（null）→ state lost 且 detai
 
 test('L5 非真机证据：exit 143 且已过 deadline（短路未查 Result）→ 无 unit_result 键', async () => {
   const store = Store.open(':memory:');
-  seedJob(store, { deadline: TEST_NOW - 5 });
+  seedJob(store, { deadline: TEST_NOW_SEC - 5 });
   let queried = 0;
   await monitorBgJobs({
     store,
     config: normalizeConfig({}),
     wake: async () => ({ delivered: true }),
-    nowMs: TEST_NOW * 1000,
+    nowMs: TEST_NOW,
     launcher: {
       probeBgProcess: async () => ({ running: false, exited: true, exitCode: 143 }),
       unitResult: async () => { queried += 1; return null; },
@@ -618,13 +622,13 @@ test('L5 非真机证据：exit 143 且已过 deadline（短路未查 Result）�
 
 test('L5 非真机证据：超时兜底分支（墙钟到期）同样不写 unit_result', async () => {
   const store = Store.open(':memory:');
-  seedJob(store, { deadline: TEST_NOW - 5 });
+  seedJob(store, { deadline: TEST_NOW_SEC - 5 });
   let queried = 0;
   await monitorBgJobs({
     store,
     config: normalizeConfig({}),
     wake: async () => ({ delivered: true }),
-    nowMs: TEST_NOW * 1000,
+    nowMs: TEST_NOW,
     graceMs: 0,
     launcher: {
       probeBgProcess: async () => ({ running: true }),
@@ -650,7 +654,7 @@ test('L3 非真机证据：取消回执只有一个生成器（两站点逐字�
     '[后台任务] bg-t1 训练 已取消（用户主动停止）\n命令：python3 /opt/work/train.py\n日志：/opt/logs/bg-t1/output.log',
   );
   const store = Store.open(':memory:');
-  store.insertBgJob({ id: 'bg-t1', label: '训练', argv: ['python3', '/opt/work/train.py'], cwd: '/opt/work', child_session_id: 'child-1', pid_or_unit: 'dsh-bg-t1', started_at: TEST_NOW - 1, deadline: TEST_NOW + 60, log_path: '/opt/logs/bg-t1/output.log' });
+  store.insertBgJob({ id: 'bg-t1', label: '训练', argv: ['python3', '/opt/work/train.py'], cwd: '/opt/work', child_session_id: 'child-1', pid_or_unit: 'dsh-bg-t1', started_at: TEST_NOW_SEC - 1, deadline: TEST_NOW_SEC + 60, log_path: '/opt/logs/bg-t1/output.log' });
   const receipts = [];
   const tools = createTools({
     store,
@@ -675,7 +679,7 @@ test('L3 非真机证据：取消回执只有一个生成器（两站点逐字�
     config: normalizeConfig({}),
     wake: async () => ({ delivered: true }),
     deliverCancel: async ({ job: settled }) => { delivered.push(buildCancelMessage(settled)); return { delivered: true }; },
-    nowMs: TEST_NOW * 1000,
+    nowMs: TEST_NOW,
     launcher: {
       probeBgProcess: async () => ({ running: false, exited: true, exitCode: 143 }),
       signalBgProcess: async () => true,

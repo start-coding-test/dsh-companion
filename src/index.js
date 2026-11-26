@@ -6435,7 +6435,11 @@ export function startScheduler(state) {
       await runBgJobMonitor(state);
     },
     's2-purge': () => {
-      const result = store.purge({ now: platform.now(), cutoffDays: config.purgeAfterDays });
+      // v0.7.21 H2：purge/审计按 Unix 秒，platform.now() 是毫秒，必须显式换算。
+      const result = store.purge({
+        now: Math.floor(platform.now() / 1000),
+        cutoffDays: config.purgeAfterDays,
+      });
       platform.log('info', '[dsh-companion] s2-purge done', result);
     },
     backup: () => {

@@ -98,6 +98,17 @@ export const SCHEMA_VERSION = '16';
 const EPISODE_SCRUB_MARKER = 'episode_scrub_v13';
 /** v13 scrub 的 rowid 批大小：大库分批复用同一游标，避免一次读全表。 */
 const EPISODE_SCRUB_BATCH = 200;
+/**
+ * v0.7.21 H2：存量 memory_events.PURGED.at 毫秒→秒的一次性修复标记。
+ * 存在即表示已修复过（含 0 行），再次 open 不再扫描/写审计。
+ */
+const PURGED_EVENT_AT_MARKER = 'purged_event_at_seconds_v0721';
+/**
+ * v0.7.21 H2：修复存量行时必须临时移除 append-only 触发器；修正后用这段
+ * 与 SCHEMA_SQL 完全一致的原 DDL 立即恢复。
+ */
+const EV_NO_UPDATE_TRIGGER_SQL =
+  "CREATE TRIGGER IF NOT EXISTS ev_no_update BEFORE UPDATE ON memory_events\nBEGIN SELECT RAISE(ABORT,'append-only'); END;";
 /** S2 物理删除默认冷静期（天）。 */
 const DEFAULT_PURGE_DAYS = 7;
 
@@ -634,8 +645,18 @@ function requireNonNegativeInteger(value, name) {
 }
 
 /**
+ * 数字时间戳→Unix 秒：>=1e11 视为毫秒（floor），否则按秒（trunc）。
+ * 口径与 forget.js 的 toEpochSeconds 一致。
+ * @param {number} num
+ * @returns {number}
+ */
+function secondsFromTimestamp(num) {
+  return Math.abs(num) < 1e11 ? Math.trunc(num) : Math.floor(num / 1000);
+}
+
+/**
  * 把 Date / 秒 / 毫秒时间戳转成 Unix 秒；null/undefined 原样返回。
- * 数字一律按秒处理（与 SQLite unixepoch() 对齐）；Date 自动取秒。
+ * 数字按 1e11 阈值区分秒与毫秒（与 forget.js 对齐）；Date 自动取秒。
  * @param {unknown} value
  * @returns {number|null}
  */
@@ -646,8 +667,8 @@ function toEpoch(value) {
     if (Number.isNaN(ms)) throw new TypeError('[store] invalid Date');
     return Math.floor(ms / 1000);
   }
-  if (typeof value === 'bigint') return Number(value);
-  if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
+  if (typeof value === 'bigint') return secondsFromTimestamp(Number(value));
+  if (typeof value === 'number' && Number.isFinite(value)) return secondsFromTimestamp(value);
   throw new TypeError(`[store] invalid timestamp: ${String(value)}`);
 }
 
@@ -1366,6 +1387,9 @@ export class Store {
       // v13（V10-L1）：存量 episode/FTS 一次性脱敏。旧库升级与「已有数据但还没
       // 打标记」的库都在这里补齐一次；已标记 / 空库直接跳过（幂等）。
       this.#scrubLegacyEpisodes({ atomic: !upgrading });
+      // v0.7.21 H2：一次性修正存量 PURGED.at（历史 s2-purge 误传毫秒）。
+      // 与 scrub 同范式：升级路径跟随外层事务，否则自开事务。
+      this.#repairLegacyPurgedEventAt({ atomic: !upgrading });
       if (upgrading) this.#db.exec('COMMIT');
     } catch (error) {
       if (upgrading) {
@@ -1845,6 +1869,72 @@ export class Store {
       });
       if (atomic) this.#db.exec('COMMIT');
       return { skipped: false, scanned, changed, eventId };
+    } catch (error) {
+      if (atomic) {
+        try {
+          this.#db.exec('ROLLBACK');
+        } catch {
+          // 回滚失败时保留原始错误
+        }
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * v0.7.21 H2：一次性修正存量 memory_events.PURGED.at 的毫秒值。
+   *
+   * 历史上真实 s2-purge 把 platform.now()（毫秒）直接传给 purge()，而
+   * memory_events.at 约定存秒，导致 PURGED 审计时间比真实时间晚约千年。
+   * 这里只修 action='PURGED' 且 at>=1e11 的行（floor(at/1000)）；非 PURGED、
+   * emotion_events / emotion_state / token_usage 等故意毫秒的表都不碰。
+   *
+   * memory_events 有 ev_no_update append-only 触发器，直接 UPDATE 必然失败；
+   * 用户已明确授权本函数在同一事务里临时 DROP TRIGGER IF EXISTS ev_no_update，
+   * 修正后立刻用原 SQL 恢复。这是本版唯一允许的 DDL 例外，不改表/列/CHECK，
+   * 不碰 ev_no_delete。失败时事务回滚，触发器与数据一起还原。
+   *
+   * 标记在数据落库之后写；0 行只写标记不写审计，避免新库审计噪音。
+   * 事务：升级路径由 migrate() 的 BEGIN IMMEDIATE 包住，否则自开事务。
+   *
+   * @param {{atomic?: boolean}} [options]
+   * @returns {{skipped: boolean, rows: number, eventId: number|null}}
+   */
+  #repairLegacyPurgedEventAt(options = {}) {
+    if (this.getMeta(PURGED_EVENT_AT_MARKER) !== null) {
+      return { skipped: true, rows: 0, eventId: null };
+    }
+    const atomic = options.atomic === true;
+    if (atomic) this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      // 唯一获授权的 DDL 例外：临时移除本表的 UPDATE 守卫，立即恢复。
+      this.#db.exec('DROP TRIGGER IF EXISTS ev_no_update');
+      const info = this.#db
+        .prepare(
+          `UPDATE memory_events SET at = CAST(at / 1000 AS INTEGER)
+            WHERE action = 'PURGED' AND at >= 100000000000`,
+        )
+        .run();
+      this.#db.exec(EV_NO_UPDATE_TRIGGER_SQL);
+      const rows = Number(info.changes);
+
+      // 标记在数据落库之后写；半修复不会留下标记。
+      const at = nowSeconds();
+      this.setMeta(PURGED_EVENT_AT_MARKER, String(at));
+      let eventId = null;
+      if (rows > 0) {
+        eventId = this.appendEvent({
+          at,
+          action: 'UPDATE',
+          table_name: 'memory_events',
+          row_id: null,
+          actor: 'migrator',
+          reason: 'v21-purged-at-ms-repair',
+          detail_json: { rows },
+        });
+      }
+      if (atomic) this.#db.exec('COMMIT');
+      return { skipped: false, rows, eventId };
     } catch (error) {
       if (atomic) {
         try {
