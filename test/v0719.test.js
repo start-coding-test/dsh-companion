@@ -170,8 +170,10 @@ function pruneStats(store, scope = 'main') {
 // ---------------------------------------------------------------- T1-001 调用顺序
 
 test('T1-001（v0.7.19 非真机证据）：compactRegion 之前先调 pruneSession，且传入 agent.session', async () => {
-  // 判别力：删掉 src/index.js:4484 的 `pruneBeforeCompact(state, payload?.agent);`
-  // （maybeCompact 主路径）→ 调用序列变成 [prune, compact]，紧邻压缩之前不再是 prune，本用例红。
+  // 判别力：删掉 maybeCompact 主路径的 `pruneBeforeCompact(state, payload?.agent);`
+  // → 调用序列变成 [prune, compact]，紧邻压缩之前不再是 prune，本用例红。
+  // v0.7.20 T1 起存量裁剪只认主会话：本用例的 session 是 main scope，因此
+  // 「启动存量裁剪 1 次 + 压缩前 1 次」的两次 prune 仍是**精确**口径（不是 >=）。
   const temp = makeTempStore();
   const ctx = makeCtx();
   const session = ctx.addSession({ id: 'session-t1-order', events: pairedEvents() });
@@ -199,7 +201,7 @@ test('T1-001（v0.7.19 非真机证据）：compactRegion 之前先调 pruneSess
     assert.equal(
       sequence.join(' → '),
       'prune → prune → compact',
-      `压缩之前紧邻的一步必须是 pruneSession，实际序列：${sequence.join(' → ')}`,
+      `压缩之前紧邻的一步必须是 pruneSession（主会话：存量裁剪 1 次 + 压缩前 1 次），实际序列：${sequence.join(' → ')}`,
     );
     assert.equal(seen.at(-1), session, '传进 pruneSession 的必须是 agent.session 对象本身');
   } finally {
@@ -211,8 +213,9 @@ test('T1-001（v0.7.19 非真机证据）：compactRegion 之前先调 pruneSess
 // ---------------------------------------------------------------- T1-002 缺服务降级
 
 test('T1-002（v0.7.19 非真机证据）：缺 toolResultPruner 不抛错、压缩照常、warn 只打一次', async () => {
-  // 判别力：删掉 src/index.js:4295 的 `state.prunerMissingWarned` 守卫 →
-  // 同一 turn 的两次查找（bootstrap + 压缩前）各 warn 一次，本用例的 warns===1 红。
+  // 判别力：删掉 pruneBeforeCompact 里的 `state.prunerMissingWarned` 守卫 →
+  // 同一 turn 的两次查找（启动存量裁剪 + 压缩前）各 warn 一次，本用例的 warns===1 红。
+  // v0.7.20 T1 起存量裁剪只认主会话：本用例是 main scope，查找次数因此是**精确 2 次**。
   const temp = makeTempStore();
   const ctx = makeCtx();
   const session = ctx.addSession({ id: 'session-t1-missing', events: pairedEvents() });
@@ -234,7 +237,7 @@ test('T1-002（v0.7.19 非真机证据）：缺 toolResultPruner 不抛错、压
     await preStep(ctx, session, 1, '继续。');
     await settle();
 
-    assert.ok(prunerLookups >= 2, `一个 turn 内应至少查找两次（bootstrap + 压缩前），实际 ${prunerLookups}`);
+    assert.equal(prunerLookups, 2, `主会话一个 turn 内恰好查找两次（存量裁剪 + 压缩前），实际 ${prunerLookups}`);
     const calls = ctx.callsOf('compaction.compactRegion');
     assert.equal(calls.length, 1, '缺 pruner 不能阻断压缩');
 
@@ -251,14 +254,14 @@ test('T1-002（v0.7.19 非真机证据）：缺 toolResultPruner 不抛错、压
 // ---------------------------------------------------------------- T1-003 审计与累计
 
 test('T1-003（v0.7.19 非真机证据）：pruned 非空才写审计并累加 prune_stats，空结果零副作用', async () => {
-  // 判别力：删掉 src/index.js:4303 的 `if (pruned.length === 0) return;` →
-  // 首次（bootstrap，空 pruned）也会多写一条 count:0 的审计，本用例的 events===1 红。
+  // 判别力：删掉 pruneBeforeCompact 里的 `if (pruned.length === 0) return;` →
+  // 首次（启动存量裁剪，空 pruned）也会多写一条 count:0 的审计，本用例的 events===1 红。
   const temp = makeTempStore();
   const ctx = makeCtx();
   const session = ctx.addSession({ id: 'session-t1-audit', events: pairedEvents() });
 
-  // 第一次调用来自 pre-step 兜底的 bootstrap（空结果），第二次来自压缩前 —— 同一个 turn 内
-  // 正好同时验证「空结果不写」与「非空结果按条累加」。
+  // 第一次调用来自主会话首个 pre-step 的存量裁剪（空结果），第二次来自压缩前 —— 同一个
+  // turn 内正好同时验证「空结果不写」与「非空结果按条累加」；次序是**精确** 2 次。
   let calls = 0;
   const resultSets = [
     { pruned: [], charsRemoved: 0 },
@@ -286,7 +289,7 @@ test('T1-003（v0.7.19 非真机证据）：pruned 非空才写审计并累加 p
     await preStep(ctx, session, 1, '继续。');
     await settle();
 
-    assert.ok(calls >= 2, `一个 turn 内应裁两次（bootstrap + 压缩前），实际 ${calls}`);
+    assert.equal(calls, 2, `主会话一个 turn 内裁两次（存量裁剪 + 压缩前），实际 ${calls}`);
 
     const events = temp.store.listEvents({ table_name: 'tool_prune' });
     assert.equal(events.length, 1, `空 pruned 不写审计，只有非空那一次落库，实际 ${events.length} 条`);
@@ -312,7 +315,7 @@ test('T1-003（v0.7.19 非真机证据）：pruned 非空才写审计并累加 p
 });
 
 test('T1-004（v0.7.19 非真机证据）：pruned 恒空时既不写审计也不动累计', async () => {
-  // 判别力：删掉 src/index.js:4303 的 `if (pruned.length === 0) return;` → 每次空裁都写一条
+  // 判别力：删掉 pruneBeforeCompact 里的 `if (pruned.length === 0) return;` → 每次空裁都写一条
   // count:0 的审计行，本用例的 events===0 红（累计不变是因为加了 0，那一条不构成判别）。
   const temp = makeTempStore();
   const ctx = makeCtx();
@@ -331,7 +334,7 @@ test('T1-004（v0.7.19 非真机证据）：pruned 恒空时既不写审计也�
     await preStep(ctx, session, 1, '继续。');
     await settle();
 
-    assert.ok(calls >= 1, 'pruneSession 应被调用（幂等由宿主保证，插件只负责不重复记账）');
+    assert.equal(calls, 2, 'pruneSession 应被调用（幂等由宿主保证，插件只负责不重复记账）');
     assert.equal(temp.store.listEvents({ table_name: 'tool_prune' }).length, 0, '无裁剪就不该有审计行');
     assert.deepEqual(pruneStats(temp.store), { count: 3, charsRemoved: 40 }, '累计值保持原样');
   } finally {
@@ -405,8 +408,10 @@ test('T1-006（v0.7.19 非真机证据）：生产接线把 prune_stats 累计�
 // ---------------------------------------------------------------- T1-007 首窗 bootstrap
 
 test('T1-007（v0.7.19 非真机证据）：启动后首个窗口只清一次存量（pre-step 缓存 agent 兜底）', async () => {
-  // 判别力：删掉 src/index.js:4390 的 `if (state.pruneBootstrapDone === true) return;` →
+  // 判别力：删掉 maybeBootstrapPrune 开头的 `if (state.pruneBootstrapDone === true) return;` →
   // 之后每个 60s tick 都会再裁一次，本用例第二次/第三次 tick 的计数红。
+  // v0.7.20 T1：idle-probe 的存量裁剪臂已删除（首个窗口一定还没有主会话 agent，恒不生效），
+  // 存量裁剪只由主会话首个 pre-step 触发；本用例仍覆盖「窗口不裁 / 首个 turn 裁一次 / 之后不裁」。
   const temp = makeTempStore();
   const ctx = makeCtx();
   const session = ctx.addSession({ id: 'session-t1-boot', events: [userEvent('你好。', 1)] });
@@ -419,16 +424,16 @@ test('T1-007（v0.7.19 非真机证据）：启动后首个窗口只清一次存
   };
   const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 20_000, compactMinRegionTokens: 0 });
   try {
-    // 1) 首个 idle 窗口先到，但还没有任何 turn → 没有 agent 句柄，不能凭空裁。
+    // 1) 首个 idle 窗口先到：idle-probe 已无存量裁剪臂（且此时没有任何 agent 句柄），不裁。
     ctx.advance(60_000);
     await ctx.fireTimers();
     await settle(50);
-    assert.equal(prunes, 0, '没有 agent 句柄时窗口路径不裁（不抛错、不阻断）');
+    assert.equal(prunes, 0, 'idle 窗口不触发存量裁剪（臂已删除；且无 agent 句柄，不抛错、不阻断）');
 
-    // 2) 首个 turn 到来：pre-step 兜底裁一次（缓存 agent + 置 done）。
+    // 2) 主会话首个 turn 到来：pre-step 兜底裁一次（缓存 agent + 置 done）。
     await preStep(ctx, session, 1, '继续。');
     await settle();
-    assert.equal(prunes, 1, '首个 turn 应兜底清一次存量');
+    assert.equal(prunes, 1, '主会话首个 turn 应兜底清一次存量');
 
     // 3) 之后两个 idle 窗口：done 已置位，不再重复裁。
     ctx.advance(60_000);

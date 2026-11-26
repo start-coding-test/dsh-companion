@@ -1981,10 +1981,12 @@ async function runPreStep(state, payload) {
   const scope = identity.scope ?? SCOPE;
   state.currentScope = scope;
   state.watermarkSeq = watermarkOf(state, scope);
-  // T1（v0.7.19）：idle-probe 的 job 回调拿不到 agent，这里缓存最近一个（子代理已在
-  // 上面早退，不会缓存到别人的会话）；同一 helper 兜底跑「启动后首个窗口」的存量裁剪，
-  // 与 idle-probe 共用 done 标志，只跑一次。
-  if (payload?.agent !== null && payload?.agent !== undefined) state.lastAgent = payload.agent;
+  // T1（v0.7.20）：启动存量裁剪只认主会话（scope=main）的 agent。线程会话的 pre-step
+  // 不覆盖缓存，否则首个 pre-step 若是线程会话，清的就是线程的 surface（线程在各自
+  // pruneBeforeCompact 里压缩前照常裁，不受影响）。
+  if (scope === SCOPE && payload?.agent !== null && payload?.agent !== undefined) {
+    state.lastAgent = payload.agent;
+  }
   maybeBootstrapPrune(state);
   if (state.lastConsolidationResult !== null) {
     // M3：上一轮 step 结束后跑的巩固在这里收账；失败只记录，不影响当前轮。
@@ -4606,11 +4608,11 @@ function withPruneStats(store, key, next) {
 }
 
 /**
- * T1（v0.7.19）：启动后**首个空闲窗口**清一次工具输出存量（含水位之前的旧工具输出）。
+ * T1（v0.7.20）：主会话首个 pre-step 清一次工具输出存量（含水位之前的旧工具输出）。
  *
- * `idle-probe` 的 job 回调没有 agent 句柄，所以用 pre-step 缓存的最近 agent；
- * pre-step 里同一 helper 兜底，保证启动后从未等到 idle tick 也能清。两处共用
- * `state.pruneBootstrapDone`，**只跑一次**。
+ * 只认 `scope=main` 的 agent：线程会话在各自 `pruneBeforeCompact`（压缩前）照常裁，
+ * 不该被启动存量裁剪提前动 surface。`state.pruneBootstrapDone` **只跑一次**；线程 scope
+ * 既不动缓存也不置位，等主会话首个 pre-step 再兜底。
  *
  * 已置 done 后再调用是纯空转（工具输出裁剪本身也幂等，这里是双保险）。
  *
@@ -4620,9 +4622,11 @@ function withPruneStats(store, key, next) {
 function maybeBootstrapPrune(state) {
   if (state === null || typeof state !== 'object') return;
   if (state.pruneBootstrapDone === true) return;
+  // 线程 scope 的 pre-step 不触发存量裁剪（T1：只在主会话做）。
+  if (state.currentScope !== SCOPE) return;
   const agent = state.lastAgent;
   if (agent === null || agent === undefined) return;
-  // 先置位再裁：裁剪链路里的意外不该让每个 60s tick 反复重试同一批内容。
+  // 先置位再裁：裁剪链路里的意外不该反复重试同一批内容。
   state.pruneBootstrapDone = true;
   pruneBeforeCompact(state, agent);
 }
@@ -6393,9 +6397,9 @@ export function startScheduler(state) {
 
   const jobs = {
     'idle-probe': async () => {
-      // T1（v0.7.19）：启动后首个空闲窗口清一次工具输出存量（阈值沿用宿主默认）。
-      // 必须放在 proactiveBlocked 早退之前：降级/熔断期间也要清。
-      maybeBootstrapPrune(state);
+      // T1（v0.7.20）：启动存量裁剪的 idle-probe 臂已删除 —— 它用 pre-step 缓存的 agent，
+      // 而缓存现在只收主会话，首个 idle 窗口一定还没有主会话 agent，恒不生效；改由主会话
+      // 首个 pre-step 兜底（maybeBootstrapPrune）。
       // t17：巩固失败的重试优先于闲聊/主动消息，且不受预算降级影响。
       maybeRetryConsolidation(state);
       // M4：每 60s 读一次 RSS；warn 只记 metric，stop_dispatch/main_only 降级。

@@ -616,3 +616,197 @@ test('H1-004（v0.7.20 非真机证据）：存量裁剪一次换掉大量节点
     temp.cleanup();
   }
 });
+
+// ---------------------------------------------------------------- T1 存量裁剪只在主会话
+
+const THREAD_KEY = 'deploy';
+const THREAD_SCOPE = `thread:${THREAD_KEY}`;
+const THREAD_SESSION_ID = 'sess-thread-t1';
+
+/** 只计数的 `pruneSession` 替身（不替换 surface）：用来证明「裁了没有 / 裁了几次」。 */
+function makeCountingPruner() {
+  const calls = [];
+  return {
+    calls,
+    pruneSession(target) {
+      calls.push(target);
+      return { pruned: [], charsRemoved: 0 };
+    },
+  };
+}
+
+/**
+ * 播种一条线程 scope 的「已巩固、可压缩」nap 行（独立连接，apply 之前调用）。
+ * `recoverPendingCompacts` 会按 consolidations 兜底为 `thread:<key>` 建 pending。
+ *
+ * @param {string} dbPath
+ * @param {{start: number, end: number}} region
+ */
+function seedThreadConsolidation(dbPath, { start, end }) {
+  const store = Store.open(dbPath);
+  try {
+    store.insertConsolidation({
+      scope: THREAD_SCOPE,
+      kind: 'nap',
+      status: 'written',
+      session_id: THREAD_SESSION_ID,
+      trigger: 'turn',
+      upto_seq: end,
+      turn_from: start,
+      turn_to: end,
+      compaction_start_seq: start,
+      started_at: Math.floor(TEST_NOW / 1000),
+      finished_at: Math.floor(TEST_NOW / 1000),
+    });
+  } finally {
+    store.close();
+  }
+}
+
+test('T1-001（v0.7.20 非真机证据）：首个 pre-step 是线程会话时不裁存量、不置 done，主会话随后仍兜底裁一次', async () => {
+  // 判别力：删掉 src/index.js `runPreStep` 里 `if (scope === SCOPE && payload?.agent !== null …)`
+  // 的 `scope === SCOPE` 条件，**并**删掉 `maybeBootstrapPrune` 开头的
+  // `if (state.currentScope !== SCOPE) return;`（两处是同一语义的纵深防线，只删一处会被
+  // 另一处遮蔽）→ 线程会话的首个 pre-step 就会裁存量并把 done 置位，本用例的
+  // prunes===0 / prune_stats:thread:deploy 为 null / 随后主会话仍裁一次 三条全红。
+  const temp = makeTempStore();
+  const ctx = makeCtx();
+  temp.store.upsertThread({
+    key: THREAD_KEY,
+    name: '部署',
+    description: '部署线程',
+    session_id: THREAD_SESSION_ID,
+    status: 'active',
+  });
+  const threadSession = ctx.addSession({ id: THREAD_SESSION_ID, events: pairedEvents() });
+  const mainSession = ctx.addSession({ id: 'sess-main-t1', events: pairedEvents() });
+  const pruner = makeCountingPruner();
+  ctx.toolResultPruner = pruner;
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 20_000, compactMinRegionTokens: 0 });
+  try {
+    // 1) 线程 scope 的首个 pre-step：不得触发启动存量裁剪（清的是线程 surface）。
+    await preStep(ctx, threadSession, 1, '线程里继续。');
+    await settle();
+    assert.equal(pruner.calls.length, 0, `线程 scope 的 pre-step 不得触发存量裁剪，实际 ${pruner.calls.length} 次`);
+    assert.equal(
+      temp.store.getMeta(`prune_stats:${THREAD_SCOPE}`),
+      null,
+      '线程 scope 不该留下 prune_stats（证明没在 thread scope 下裁）',
+    );
+    assert.deepEqual(
+      temp.store.listEvents({ table_name: 'tool_prune' }),
+      [],
+      '线程 scope 不该留下 tool_prune 审计行',
+    );
+
+    // 2) 线程 pre-step 不得把 pruneBootstrapDone 置位：主会话首个 pre-step 仍要兜底裁一次。
+    await preStep(ctx, mainSession, 1, '主会话继续。');
+    await settle();
+    assert.equal(pruner.calls.length, 1, `主会话首个 pre-step 必须兜底裁一次，实际 ${pruner.calls.length} 次`);
+    assert.equal(pruner.calls[0], mainSession, '存量裁剪必须裁主会话的 session，而不是线程的');
+
+    // 3) done 已置位：主会话第二个 pre-step 不再裁。
+    await preStep(ctx, mainSession, 2, '主会话第二问。');
+    await settle();
+    assert.equal(pruner.calls.length, 1, `done 置位后不得再裁，实际 ${pruner.calls.length} 次`);
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});
+
+test('T1-002（v0.7.20 非真机证据）：主会话首个 pre-step 的存量裁剪恰好一次，审计落 main scope', async () => {
+  // 判别力：删掉 `runPreStep` 里的 `maybeBootstrapPrune(state);` → 本用例 prunes===0 红；
+  // 删掉 `maybeBootstrapPrune` 里的 `if (state.pruneBootstrapDone === true) return;` →
+  // 第二个 pre-step 又裁一次，本用例第二次/第三次的 prunes===1 红。
+  const temp = makeTempStore();
+  const ctx = makeCtx();
+  const session = ctx.addSession({ id: 'sess-main-once', events: pairedEvents() });
+  // 真实替换一个节点（tool/result seq 3 → 100），让「裁在哪个 scope」有落库证据；
+  // 第二次起无计划（returns 空），反复调用也只会被计数，不会重复动 surface。
+  const pruner = makePruner(ctx, session, [
+    [{ originalSeq: 3, replacementSeq: 100 }],
+  ]);
+  ctx.toolResultPruner = pruner;
+  const compaction = makeCompaction(ctx, session);
+  ctx.compaction.compactRegion = compaction.compactRegion.bind(compaction);
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 20_000, compactMinRegionTokens: 0 });
+  try {
+    await preStep(ctx, session, 1, '第一问。');
+    await settle();
+    assert.equal(pruner.calls.length, 1, `主会话首个 pre-step 只裁一次存量，实际 ${pruner.calls.length} 次`);
+    assert.equal(pruner.calls[0].target, session, '裁的必须是当前主会话的 session');
+
+    const events = temp.store.listEvents({ table_name: 'tool_prune' });
+    assert.equal(events.length, 1, `非空裁剪只写一条审计，实际 ${events.length} 条`);
+    assert.equal(events[0].row_id, SCOPE, '存量裁剪必须记在 main scope 名下');
+    assert.deepEqual(pruneStats(temp.store), { count: 1, charsRemoved: 8988 }, '累计口径按 pruned 条数记账');
+
+    // 第二个 turn：done 已置位，不再裁。
+    await preStep(ctx, session, 2, '第二问。');
+    await settle();
+    assert.equal(pruner.calls.length, 1, `第二个 pre-step 不得再裁，实际 ${pruner.calls.length} 次`);
+
+    // idle 窗口也不再裁（v0.7.20 删除了 idle-probe 的存量裁剪臂）。
+    ctx.advance(60_000);
+    await ctx.fireTimers();
+    await settle(50);
+    assert.equal(pruner.calls.length, 1, `idle 窗口不得触发存量裁剪，实际 ${pruner.calls.length} 次`);
+    assert.deepEqual(pruneStats(temp.store), { count: 1, charsRemoved: 8988 }, '累计值保持原样');
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});
+
+test('T1-003（v0.7.20 非真机证据）：线程会话在各自压缩前照常裁（主会话限定不波及线程压缩路径）', async () => {
+  // 判别力：把主会话限定错误地下推到 `pruneBeforeCompact`（例如在它开头加
+  // `if (state.currentScope !== SCOPE) return;`）→ 线程压缩前不再裁，本用例的
+  // 序列 'prune → compact' 变成 'compact'，红。
+  const temp = makeTempStore();
+  const ctx = makeCtx();
+  temp.store.upsertThread({
+    key: THREAD_KEY,
+    name: '部署',
+    description: '部署线程',
+    session_id: THREAD_SESSION_ID,
+    status: 'active',
+  });
+  const session = ctx.addSession({ id: THREAD_SESSION_ID, events: pairedEvents() });
+  const sequence = [];
+  const pruner = makeCountingPruner();
+  const pushPrune = pruner.pruneSession.bind(pruner);
+  ctx.toolResultPruner = {
+    pruneSession(target) {
+      sequence.push('prune');
+      return pushPrune(target);
+    },
+  };
+  const compaction = makeCompaction(ctx, session);
+  const compactRegion = compaction.compactRegion.bind(compaction);
+  ctx.compaction.compactRegion = function patched(start, end, agent, signal) {
+    sequence.push('compact');
+    return compactRegion(start, end, agent, signal);
+  };
+  // 线程 scope 的 pending 压缩区间：end 落在 assistant tool-call(2) 上 → 收缩到 1 才平衡，
+  // 压缩一定发生（与 v0719 T1-001 同一手法，只是 scope 换成 thread:<key>）。
+  seedThreadConsolidation(temp.dbPath, { start: 1, end: 2 });
+  const handle = apply(ctx, { dbPath: temp.dbPath, retainTokens: 4, compactMinRegionTokens: 0 });
+  try {
+    await preStep(ctx, session, 1, '线程继续。');
+    await settle();
+
+    assert.equal(
+      sequence.join(' → '),
+      'prune → compact',
+      `线程压缩路径仍必须先裁再压（且只有压缩前那一次，没有主会话专属的存量裁剪），实际序列：${sequence.join(' → ')}`,
+    );
+    assert.equal(compaction.accepted.length, 1, '线程区间应真的被压缩');
+    assert.equal(pruner.calls.length, 1, '线程压缩前恰好裁一次');
+    assert.equal(pruner.calls[0], session, '裁的是线程自己的 session');
+    assert.deepEqual(pruneStats(temp.store), null, '线程裁剪不得记到 main scope 名下');
+  } finally {
+    handle.dispose();
+    temp.cleanup();
+  }
+});
