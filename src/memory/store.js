@@ -2642,21 +2642,40 @@ export class Store {
    * 行与 FTS 保留到 S2 purge（06 v3.3 §7.8「立即停读 → 7 天冷静期」）。
    * 已 tombstoned 或行不存在（含 dormant）返回 false，保持幂等。
    *
+   * v0.7.21 M4：成功迁移与 TOMBSTONE 审计同事务（`#atomic`）——先取行元数据，
+   * UPDATE 命中行后才 appendEvent；appendEvent 抛错（如非法 actor）时 UPDATE
+   * 一并回滚，绝不留「已删但无审计」或「有审计但未删」。审计 detail 只写
+   * `{kind,salience,scope}`（episode 的 kind 是字面量），不含正文/payload；
+   * `at` 与 `deleted_at` 共用同一秒。未发生迁移时不写事件。
+   *
    * @param {string} id
-   * @param {{at?: number|Date, payload?: unknown}} [options]
+   * @param {{at?: number|Date, payload?: unknown, actor?: string}} [options]
    * @returns {boolean} 是否发生状态迁移
    */
   forgetEpisode(id, options = {}) {
     const at = epochOr(options.at, nowSeconds());
     const payload = JSON.stringify(options.payload ?? {});
-    const info = this.#db
-      .prepare(
-        `UPDATE episodes
-            SET status = 'tombstoned', deleted_at = ?, purge_payload = ?
-          WHERE id = ? AND status = 'active'`,
-      )
-      .run(at, payload, id);
-    return Number(info.changes) > 0;
+    return this.#atomic(() => {
+      const meta = this.#db.prepare('SELECT salience, scope FROM episodes WHERE id = ?').get(id);
+      const info = this.#db
+        .prepare(
+          `UPDATE episodes
+              SET status = 'tombstoned', deleted_at = ?, purge_payload = ?
+            WHERE id = ? AND status = 'active' AND deleted_at IS NULL`,
+        )
+        .run(at, payload, id);
+      if (Number(info.changes) === 0) return false;
+      this.appendEvent({
+        at,
+        action: 'TOMBSTONE',
+        table_name: 'episodes',
+        row_id: id,
+        actor: options.actor ?? 'user',
+        reason: 'forget',
+        detail_json: { kind: 'episode', salience: meta?.salience ?? null, scope: meta?.scope ?? null },
+      });
+      return true;
+    });
   }
 
   // --------------------------------------------------------------- facts
@@ -3026,22 +3045,40 @@ export class Store {
    * 行与 FTS 保留到 S2 purge（06 v3.3 §7.8「立即停读 → 7 天冷静期」）。
    * 已 tombstoned 或行不存在返回 false，保持幂等。
    *
+   * v0.7.21 M4：成功迁移与 TOMBSTONE 审计同事务（`#atomic`）——SELECT 行元数据
+   * → UPDATE 命中行 → appendEvent（actor 默认 'user'，reason 'forget'，detail 只
+   * 写 `{kind,salience,scope}`，不含正文/payload）→ 清向量。appendEvent 抛错时
+   * UPDATE 与向量同步一并回滚；未发生迁移时不写事件。`at` 与 `deleted_at` 同秒。
+   *
    * @param {string} id
-   * @param {{at?: number|Date, payload?: unknown}} [options]
+   * @param {{at?: number|Date, payload?: unknown, actor?: string}} [options]
    * @returns {boolean} 是否发生状态迁移
    */
   forgetFact(id, options = {}) {
     const at = epochOr(options.at, nowSeconds());
     const payload = JSON.stringify(options.payload ?? {});
-    const info = this.#db
-      .prepare(
-        `UPDATE facts
-            SET status = 'tombstoned', deleted_at = ?, purge_payload = ?, updated_at = unixepoch()
-          WHERE id = ? AND status = 'active'`,
-      )
-      .run(at, payload, id);
-    if (Number(info.changes) > 0) this.#syncFactVector(id);
-    return Number(info.changes) > 0;
+    return this.#atomic(() => {
+      const meta = this.#db.prepare('SELECT kind, salience, scope FROM facts WHERE id = ?').get(id);
+      const info = this.#db
+        .prepare(
+          `UPDATE facts
+              SET status = 'tombstoned', deleted_at = ?, purge_payload = ?, updated_at = unixepoch()
+            WHERE id = ? AND status = 'active' AND deleted_at IS NULL`,
+        )
+        .run(at, payload, id);
+      if (Number(info.changes) === 0) return false;
+      this.appendEvent({
+        at,
+        action: 'TOMBSTONE',
+        table_name: 'facts',
+        row_id: id,
+        actor: options.actor ?? 'user',
+        reason: 'forget',
+        detail_json: { kind: meta?.kind ?? null, salience: meta?.salience ?? null, scope: meta?.scope ?? null },
+      });
+      this.#syncFactVector(id);
+      return true;
+    });
   }
 
   /**

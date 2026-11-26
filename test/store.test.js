@@ -650,8 +650,30 @@ test('forget 后满 7 天 purge：物理删除、其它 scope 不受影响、审
 
   assert.equal(store.forgetFact(fact.id, { at: now, payload: { salience: 'normal' } }), true);
   assert.equal(store.forgetEpisode(episode.id, { at: now, payload: { salience: 'normal' } }), true);
-  // S1 不写审计、不动巩固水位
-  assert.equal(store.stats().memory_events, eventsBefore);
+  // M4：S1 成功迁移同事务写 2 条 TOMBSTONE 审计（正文不进审计），不动巩固水位
+  assert.equal(store.stats().memory_events, eventsBefore + 2);
+  const s1Events = store
+    .listEvents({ action: 'TOMBSTONE', limit: 500 })
+    .filter((event) => event.row_id === fact.id || event.row_id === episode.id);
+  assert.equal(s1Events.length, 2, 'fact 与 episode 各一条 TOMBSTONE');
+  const factEvent = s1Events.find((event) => event.row_id === fact.id);
+  const episodeEvent = s1Events.find((event) => event.row_id === episode.id);
+  assert.equal(factEvent.table_name, 'facts');
+  assert.equal(episodeEvent.table_name, 'episodes');
+  for (const event of s1Events) {
+    assert.equal(event.actor, 'user');
+    assert.equal(event.reason, 'forget');
+    assert.equal(event.at, now, '审计与 deleted_at 同秒');
+  }
+  assert.deepEqual(JSON.parse(factEvent.detail_json), {
+    kind: 'other', salience: 'normal', scope: 'forget-purge',
+  });
+  assert.deepEqual(JSON.parse(episodeEvent.detail_json), {
+    kind: 'episode', salience: 'normal', scope: 'forget-purge',
+  });
+  for (const event of s1Events) {
+    assert.equal(JSON.stringify(event).includes('青柠计划'), false, '审计不得带正文');
+  }
   assert.equal(store.getWatermark('forget-purge'), watermarkBefore);
 
   const result = store.purge({ now: now + 8 * 86_400, cutoffDays: 7 });

@@ -5,7 +5,8 @@
  *   S1 立即停读：tombstone + deleted_at，检索/注入/提醒立刻查不到；
  *   冷静期：7 天内不物理删除，行仍在（status=tombstoned, deleted_at 已写）；
  *   S2 到期清理：store.purge 物理删除 facts/episodes + FTS 投影，并落
- *      action='PURGED' 审计；其它 scope 不受影响；
+ *      action='PURGED' 审计；S1 回到 active→tombstoned 时同事务落
+ *      action='TOMBSTONE' 审计；其它 scope 不受影响；
  *   清理后再过 30 天检索仍为 0；重复 purge 幂等。
  *
  * 生产命令层尚未实现，S1 由 test/e2e/helpers.js 的 forgetMemory 按上述语义
@@ -106,10 +107,28 @@ test('S1 立即停读：tombstone + deleted_at 后检索/注入/提醒立刻归�
   assert.deepEqual(store.purge({ now: clock.seconds() }), { facts: 0, episodes: 0 });
   assert.ok(store.getFact(seeded.factId));
   assert.ok(store.getEpisode(seeded.episodeId));
-  assert.equal(store.listEvents({ limit: 100 }).length, 0, '冷静期内不应有任何审计事件');
+  // M4：S1 成功行在同事务写 TOMBSTONE 审计；冷静期内只有这两条，且不含正文
+  const s1Events = store.listEvents({ limit: 100 });
+  assert.equal(s1Events.length, 2, '冷静期内只应有 2 条 TOMBSTONE，不应有 PURGED');
+  assert.ok(s1Events.every((event) => event.action === 'TOMBSTONE'));
+  assert.deepEqual(
+    new Set(s1Events.map((event) => event.table_name)),
+    new Set(['facts', 'episodes']),
+  );
+  assert.deepEqual(
+    new Set(s1Events.map((event) => event.row_id)),
+    new Set([seeded.factId, seeded.episodeId]),
+  );
+  for (const event of s1Events) {
+    assert.equal(event.actor, 'user');
+    assert.equal(event.reason, 'forget');
+    assert.equal(event.at, seconds, 'TOMBSTONE 与 deleted_at 同秒');
+    assert.ok(!event.detail_json.includes(SECRET), '审计 detail 不得含正文');
+    assert.ok(!event.detail_json.includes('蓝鲸'), '审计 detail 不得含事实内容');
+  }
 });
 
-test('满 7 天 purge：业务表与 FTS 清零、只留 PURGED 审计、scope 隔离、幂等', async (t) => {
+test('满 7 天 purge：业务表与 FTS 清零、留 TOMBSTONE+PURGED 审计、scope 隔离、幂等', async (t) => {
   const { store } = makeTempStore({ t });
   const clock = createClock();
 
@@ -169,12 +188,31 @@ test('满 7 天 purge：业务表与 FTS 清零、只留 PURGED 审计、scope �
   assert.equal(stats.fts_episodes, stats.episodes);
   assert.deepEqual(store.searchBigram(SECRET), []);
 
-  // 审计：只留 PURGED，且 detail_json 不含正文
+  // 审计：S1 的 2 条 TOMBSTONE + S2 的 2 条 PURGED，detail_json 不含正文
   const events = store.listEvents({ limit: 100 });
-  assert.equal(events.length, 2);
-  assert.deepEqual(events.map((event) => event.table_name).sort(), ['episodes', 'facts']);
-  for (const event of events) {
-    assert.equal(event.action, 'PURGED');
+  assert.equal(events.length, 4, '2 条 TOMBSTONE + 2 条 PURGED');
+  const tombstoneEvents = events.filter((event) => event.action === 'TOMBSTONE');
+  const purgedEvents = events.filter((event) => event.action === 'PURGED');
+  assert.equal(tombstoneEvents.length, 2);
+  assert.equal(purgedEvents.length, 2);
+  assert.deepEqual(
+    purgedEvents.map((event) => event.table_name).sort(),
+    ['episodes', 'facts'],
+  );
+  for (const event of tombstoneEvents) {
+    assert.equal(event.actor, 'user');
+    assert.equal(event.reason, 'forget');
+    assert.deepEqual(
+      Object.keys(JSON.parse(event.detail_json)).sort(),
+      ['kind', 'salience', 'scope'],
+      'TOMBSTONE detail 只留 kind/salience/scope',
+    );
+  }
+  assert.deepEqual(
+    new Set(tombstoneEvents.map((event) => event.row_id)),
+    new Set([work.factId, work.episodeId]),
+  );
+  for (const event of purgedEvents) {
     assert.equal(event.actor, 'scheduler');
     assert.equal(event.reason, 'purge');
     assert.deepEqual(JSON.parse(event.detail_json), { salience: 'normal' });
@@ -182,7 +220,7 @@ test('满 7 天 purge：业务表与 FTS 清零、只留 PURGED 审计、scope �
     assert.ok(!event.detail_json.includes('蓝鲸'), '审计 detail 不得含事实内容');
   }
   assert.deepEqual(
-    new Set(events.map((event) => event.row_id)),
+    new Set(purgedEvents.map((event) => event.row_id)),
     new Set([work.factId, work.episodeId]),
   );
 
@@ -203,13 +241,13 @@ test('满 7 天 purge：业务表与 FTS 清零、只留 PURGED 审计、scope �
   const gone = await recallInjection({ store, query: SECRET, scope: 'work', now: clock.now() });
   assert.deepEqual(gone.recalled.items, []);
   assert.ok(!gone.injected.includes(SECRET));
-  assert.equal(store.listEvents({ limit: 100 }).length, 2);
+  assert.equal(store.listEvents({ limit: 100 }).length, 4, '审计不因二次 purge 增长');
 
   // 幂等：重复 purge 不报错、计数不变
   assert.deepEqual(store.purge({ now: clock.seconds() }), { facts: 0, episodes: 0 });
   assert.equal(store.stats().facts, 1);
   assert.equal(store.stats().episodes, 1);
-  assert.equal(store.listEvents({ limit: 100 }).length, 2);
+  assert.equal(store.listEvents({ limit: 100 }).length, 4);
 });
 
 test('helpers：假模型草稿合法，可被巩固链路消费且同段不重复调用（不联网）', async (t) => {

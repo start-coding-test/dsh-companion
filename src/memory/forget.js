@@ -114,7 +114,7 @@ function planTargetedConsolidation({ store, kind, row, llm, scope, at }) {
  * @param {object} input
  * @returns {object} 结构化结果
  */
-function finishForget({ store, kind, row, id, scope, at, immediate, consolidation, warn }) {
+function finishForget({ store, kind, row, id, scope, at, immediate, consolidation, warn, actor = 'user' }) {
   const payload =
     kind === 'fact'
       ? { statement: row.statement, kind: row.kind, scope }
@@ -122,8 +122,8 @@ function finishForget({ store, kind, row, id, scope, at, immediate, consolidatio
 
   const tombstoned =
     kind === 'fact'
-      ? store.forgetFact(id, { at, payload })
-      : store.forgetEpisode(id, { at, payload });
+      ? store.forgetFact(id, { at, payload, actor })
+      : store.forgetEpisode(id, { at, payload, actor });
 
   if (!tombstoned) {
     const current = kind === 'fact' ? store.getFact(id) : store.getEpisode(id);
@@ -191,6 +191,7 @@ function finishForget({ store, kind, row, id, scope, at, immediate, consolidatio
  * @param {boolean} [input.confirm=false] immediate 的二次确认标记
  * @param {Function} [input.llm] 定向巩固用的模型回调（可选）
  * @param {{warn?: Function}} [input.logger] 诊断日志
+ * @param {string} [input.actor='user'] TOMBSTONE 审计 actor（不得传非法角色，如 'tool'）
  * @returns {object|Promise<object>} 无 llm/无需巩固时同步返回结构化结果
  */
 export function forgetMemory(input = {}) {
@@ -210,6 +211,7 @@ export function forgetMemory(input = {}) {
   const immediate = input.immediate === true;
   const confirm = input.confirm === true;
   const warn = resolveWarn(logger);
+  const actor = input.actor ?? 'user';
 
   const row = kind === 'fact' ? store.getFact(id) : store.getEpisode(id);
   if (!row) return { ok: false, reason: 'not_found', kind, id };
@@ -236,12 +238,12 @@ export function forgetMemory(input = {}) {
   const plan = planTargetedConsolidation({ store, kind, row, llm, scope, at });
   if (plan.skipped) {
     return finishForget({
-      store, kind, row, id, scope, at, immediate, consolidation: plan.skipped, warn,
+      store, kind, row, id, scope, at, immediate, consolidation: plan.skipped, warn, actor,
     });
   }
   return plan.promise
     .then((consolidation) =>
-      finishForget({ store, kind, row, id, scope, at, immediate, consolidation, warn }),
+      finishForget({ store, kind, row, id, scope, at, immediate, consolidation, warn, actor }),
     )
     .catch((error) => {
       warn('[forget] targeted consolidation failed; continuing with S1', error);
@@ -253,6 +255,7 @@ export function forgetMemory(input = {}) {
         scope,
         at,
         immediate,
+        actor,
         consolidation: {
           skipped: true,
           reason: 'failed',
@@ -325,6 +328,7 @@ function normalizeBatchIds(raw) {
  * @param {boolean} [input.immediate=false]
  * @param {boolean} [input.confirm=false]
  * @param {{warn?: Function}} [input.logger]
+ * @param {string} [input.actor='user'] TOMBSTONE 审计 actor（逐条透传；不得传非法角色）
  * @returns {object} 批量结果（同步，不含 Promise）
  */
 export function forgetMany(input = {}) {
@@ -342,6 +346,7 @@ export function forgetMany(input = {}) {
   const confirm = input.confirm === true;
   const guardScope = typeof input.scope === 'string' && input.scope !== '' ? input.scope : undefined;
   const warn = resolveWarn(logger);
+  const actor = input.actor ?? 'user';
 
   /** @type {Array<{id: string, ok: boolean, kind: string, reason?: string, deletedAt?: number, purgeAt?: number}>} */
   const results = [];
@@ -382,7 +387,7 @@ export function forgetMany(input = {}) {
         : { title: row.title, kind: 'episode', scope: rowScope };
     let tombstoned = false;
     try {
-      tombstoned = kind === 'fact' ? store.forgetFact(id, { at, payload }) : store.forgetEpisode(id, { at, payload });
+      tombstoned = kind === 'fact' ? store.forgetFact(id, { at, payload, actor }) : store.forgetEpisode(id, { at, payload, actor });
     } catch (error) {
       warn(`[forget] batch tombstone failed for ${id}`, error);
     }
