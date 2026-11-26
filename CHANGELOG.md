@@ -2,6 +2,44 @@
 
 本文件记录 dsh-companion 的用户可见变化。版本号遵循语义化版本；MVP 阶段仍为 `0.x`。
 
+## [0.7.21] - 2026-11-26
+
+修现网时间单位、遗忘审计、查重入账与巩固跨 kind 查重，另含四项低优先级排障改进。基线 v0.7.20（`58e951f`），`SCHEMA_VERSION` 保持 **16**；不加表、不加列、不改 CHECK。唯一 DDL 例外是 H2 存量审计修复：经用户 2026-11-26 明确授权，仅在同一事务内临时摘除并原样恢复 `memory_events.ev_no_update`，不改表结构，也不碰 `ev_no_delete`。
+
+### Fixed
+
+- **H2：s2-purge 不再把毫秒当秒。** v0.7.20 及以前，真实任务把 `platform.now()` 毫秒直接交给 `store.purge()`，而 `toEpoch` 对数字只截断：毫秒级 cutoff 让所有 tombstoned 行都满足 `deleted_at <= cutoff`，7 天冷静期实际不足 1 天；同一毫秒 cutoff 再乘 1000 后覆盖全部情绪事件，导致情绪痕迹与相关基线每晚清空，PURGED 审计时间也被写成毫秒（可格式化为数万年后）。本版在真实 `s2-purge` 接线层显式 `Math.floor(platform.now()/1000)`，并让 store 的时间归一化对绝对值 ≥1e11 的 number/BigInt 按毫秒换算；emotion_* 仍按既有毫秒口径保存，只保留 `cutoff*1000` 这一正确换算。实现落点：`src/index.js` 的真实 s2-purge 接线、`src/memory/store.js` 的 `secondsFromTimestamp` 与 `#repairLegacyPurgedEventAt`；完整 47 个外部调用点（加 2 个定义与 1 个内部转调共 50 个 grep 命中）均已逐行复核并在交付清单列出。`test/v0717.test.js` 的 bg_jobs 种子同步从误写的毫秒改为既有秒字段语义，monitor 时钟仍是毫秒，未放宽断言。
+- **H2 存量审计修复。** 开库时通过 schema_meta 标记一次性、幂等地把 `memory_events` 中 `action='PURGED' AND at>=1e11` 的历史行改为 `floor(at/1000)`；有实际修复才追加一条 `action='UPDATE' / actor='migrator'` 审计，detail 只含 `{rows}`，0 行只写标记不写审计。已物删的 facts/episodes、情绪事件与状态无法由本版恢复；本版只防止后续误删并修正历史审计时间。全仓 48 个 `toEpoch/epochOr` 入口已逐个复核，生产唯一毫秒误传是 s2-purge；`emotion_events.at`、`emotion_state.last_event_at`、`token_usage.at` 是设计上的毫秒，不做“修复”。
+- **M4：遗忘成功行与 TOMBSTONE 审计同事务。** `forgetFact` / `forgetEpisode` 只有在 active→tombstoned 实际成功时写一条 `action='TOMBSTONE' / reason='forget'`，actor 默认 user、可由调用方透传；`table_name` 与 `row_id` 指向目标，detail 只含 `{kind,salience,scope}`，不含 statement/title/payload 正文。单条、批量与命令路径共用同一 store 漏斗；not_found/already_deleted/scope_denied/dormant 不写事件，appendEvent 失败会回滚对应改行。immediate forget 仍会在物删时另写 PURGED，两种 action 分开计数。全仓没有 restoreFact/restoreEpisode、memory_restore 或命令入口，因此没有现存恢复路径需要补 RESTORE；本版不凭空新增恢复 API。
+- **M3：consolidate-dedupe 用量不再静默漏记。** 查重模型调用入账改用 CHECK 已有的 `source='consolidate'`，并以 `request_id='consolidate-dedupe'` 保留来源区分；不扩 TOKEN_USAGE_SOURCES、不改 DDL。此前该 source 必被 `recordTokenUsage` 拒绝，外层只写 debug，导致查重用量全部漏记、5 小时额度窗口低估。`/成本` 读的是 memory_events 巩固事件而非 token_usage，本修复不改变其既有口径。
+- **L6：巩固路径补齐跨 kind 关键串升级。** 巩固判定在同 kind Jaccard 后复用 `buildKeyPhraseIndex` / `upgradeVerdictWithKeyPhrases`，与工具写入口同口径；每个 scope 只建一次关键串索引，只允许 `new→ask`，不新增 skip，也不下调 `dedupeAsk=0.5`。后续仍走既有 judge，不另建跨 kind 更新规则。
+- **L3：提醒上限文案只引导到真实存在的 `reminder_done`。** 移除不存在的 `reminder_cancel`，返回 reason/count/limit 与拒绝时机不变。
+- **L4：回填压缩日志增加端到端耗时。** 选区时把 `selectedAtMs` 随 pending 写入现有 schema_meta JSON，压缩成功后的 `backfill chunk compacted` 日志增加 `duration_ms`，覆盖从选区到压缩完成的 wall-clock 时间；旧 pending 没有时间戳时省略该字段，时钟回拨夹为 0。只是现有 JSON 增加可选字段，不是 DDL。
+- **L5：/状态 的本轮 tokens 明示「估算」。** 现网中文为主会话的真实 usage 约为 chars/4 启发式的 **1.76 倍**，即启发式低估约 **43%**；当前显示还可能是 provider 真实基线与启发式增量的混合值。本版只标「估算」，不改估算公式，不把实测的压缩底/最近压后底误标为估算。后续公式方案：A. 显示层固定乘 1.76（简单但泛化差）；B. 按 Unicode 码点区分 CJK≈2.27 chars/token、非 CJK≈4（需自行计价并处理 emoji）；C. 按内容类型累计 provider usage/estimate 比值做 EWMA，先只校准显示、不改压缩与预算阈值（推荐）。
+
+### Added
+
+- `/状态` 增加 `插件：dsh-companion v<version>`，版本从包元数据读取；单独部署 src、读不到 package.json 时省略该行，不硬编码版本。
+- 仓库补 npm 11 生成的 `package-lock.json`（lockfileVersion 3），零依赖、可离线 `npm ci`；本地 `.npm-cache/` 加入忽略清单。
+
+### Tests
+
+按 H2 → M4 → M3 → L6 → L3 → L4 → L5 各自独立 commit，最后统一 bump 0.7.21 与 CHANGELOG。新增用例均标「v0.7.21 非真机证据」并做真实变异自验：
+
+- **H2（`test/v0721-h2.test.js`，6 例）**：真实 apply/scheduler catch-up 验证 6 天 tombstone 与 emotion 保留、8 天删除、PURGED.at 为秒；number/BigInt 毫秒防御；存量修复的精确筛选、migrator 审计、幂等、0 行与触发器原样恢复。接线改回毫秒、删 1e11 换算、去掉触发器保护均会按预期打红。
+- **M4（`test/v0721-m4.test.js`，5 例）**：单条 fact/episode、混合批量、事务回滚、重复遗忘零事件。既有 store/e2e golden 改为按 TOMBSTONE 与 PURGED 分开精确计数；删 appendEvent、去掉 #atomic、给 already_deleted 伪造事件均会打红。
+- **M3（`test/v0721-m3.test.js`，1 例）**：真实 memory_write ask → judgeFactDuplicates → usageRow → token_usage，断言行 source/request_id/用量及无 ledger debug；恢复非法 source 或漏 requestId 会打红。
+- **L6（`test/v0721-l6.test.js`，4 例）**：先证原 Jaccard 判 new，再证跨 kind 关键串进入 judge；不命中仍 insert、skip 不升级、judge=new 允许并存。删包装或断索引会打红。
+- **L3**：加强 `test/v0719-t3.test.js`，message 必须含 reminder_done 且不得含 reminder_cancel；改回旧文案会打红。
+- **L4（`test/v0721-l4.test.js`，4 例）**：真实两阶段选区→压缩，100ms 窗口间隔+150ms 压缩=250ms；旧 pending/null 省字段、时钟回拨为 0。删选区时间、持久化或日志字段均会打红。
+- **L5（`test/v0721-l5.test.js`，3 例）**：真实 apply/pre-step/status handler 锁「估算」、测量数值与 package.json 版本；实测压缩底不误标、无 metrics 兜底不变；无 package.json 的临时 src 部署省略版本行。删估算标注、硬编码版本或漏注入均会打红。
+
+```text
+ℹ tests 1802 / suites 68 / pass 1802 / fail 0
+```
+
+最终 tag 提交上，Windows（Node v24.9.0）与 Linux（Node v24.22.2，tx-yun 隔离目录）各三时区（UTC / Asia/Shanghai / America/New_York）三遍，共六遍均 exit=0；六遍均为 `tests 1802 / suites 68 / pass 1802 / fail 0`。
+
 ## [0.7.20] - 2026-11-26
 
 修 v0.7.19 评审遗留三项：H1 裁剪与选区顺序 / seq 锚点重映射、T1 存量裁剪目标、M1 旧线程职责注入。**零 DDL**（`SCHEMA_VERSION` 仍为 16，无新表/新列）；基线 `v0.7.19`（`050b6f5`），v0.7.19 tag 未改；本版 tag `v0.7.20` 为 annotated tag。
