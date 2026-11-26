@@ -674,7 +674,7 @@ export function createTools({
           return {
             ok: false,
             reason: 'reminder_cap',
-            message: `同一 scope 待触发提醒已有 ${activeCount} 条（上限 ${REMINDER_ACTIVE_LIMIT} 条），请先用 reminder_done / reminder_cancel 清理不再需要的提醒，再新增`,
+            message: `同一 scope 待触发提醒已有 ${activeCount} 条（上限 ${REMINDER_ACTIVE_LIMIT} 条），请先用 reminder_done 清理不再需要的提醒，再新增`,
             count: activeCount,
             limit: REMINDER_ACTIVE_LIMIT,
           };

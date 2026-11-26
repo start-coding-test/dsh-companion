@@ -80,6 +80,12 @@ test('T3-002（v0.7.19 非真机证据）：拒绝时 reason=reminder_cap、mess
   assert.equal(result.reason, 'reminder_cap');
   assert.match(result.message, /清理/u, 'message 必须提示先清理');
   assert.match(result.message, /50/u, 'message 带上限便于用户判断');
+  // L3（v0.7.21）：文案只能引导到真实注册的工具。仓里只有 reminder_add 与
+  // reminder_done，不存在 reminder_cancel；此前文案把用户引向不存在的工具。
+  // 这两条断言（正向点名 reminder_done、反向禁止 reminder_cancel）就是防止
+  // 该误导文案被改回去的判别力护栏。
+  assert.match(result.message, /reminder_done/u, 'message 必须点名真实存在的 reminder_done');
+  assert.doesNotMatch(result.message, /reminder_cancel/u, 'message 不得引导到不存在的 reminder_cancel');
 
   const after = store.listReminders({ scope: 'main' });
   assert.equal(after.length, 50, '被拒时不得插入新行');
