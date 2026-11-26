@@ -3362,23 +3362,26 @@ async function runBackfillJob(state, scope, pending) {
 async function runBackfillCompaction(state, payload, scope, pending) {
   const { platform } = state;
   if (!platform.capabilities?.compaction) return false;
+  // H1（v0.7.20）：同样先裁再选区（理由见 maybeCompact）。裁剪把 chunk 端点的旧 seq
+  // 换掉后，remapPrunedSeqs 会就地改写内存与 meta 里 chunk 的 startSeq/endSeq/nextSeq；
+  // 这里重读一次 pending，保证选区与 compactRegion 用的是裁剪后的 seq 空间。
+  pruneBeforeCompact(state, payload?.agent);
+  const current = pendingBackfillOf(state, scope) ?? pending;
   const snapshot = await refreshSurface(state, payload);
   const seqs = Array.isArray(snapshot?.seqs) ? snapshot.seqs : [];
-  const startIdx = seqs.indexOf(pending.chunk.startSeq);
-  const endIdx = seqs.indexOf(pending.chunk.endSeq);
+  const startIdx = seqs.indexOf(current.chunk.startSeq);
+  const endIdx = seqs.indexOf(current.chunk.endSeq);
   if (startIdx < 0 || endIdx < startIdx) {
     platform.log('warn', '[dsh-companion] backfill region expired; dropping pending', {
       scope,
-      startSeq: pending.chunk.startSeq,
-      endSeq: pending.chunk.endSeq,
+      startSeq: current.chunk.startSeq,
+      endSeq: current.chunk.endSeq,
     });
     forgetPendingBackfill(state, scope);
     return false;
   }
-  // T1（v0.7.19）：压缩前先裁工具输出（同步调用，失败不阻断回填）。
-  pruneBeforeCompact(state, payload?.agent);
   try {
-    await platform.compactRegion(pending.chunk.startSeq, pending.chunk.endSeq, payload?.agent);
+    await platform.compactRegion(current.chunk.startSeq, current.chunk.endSeq, payload?.agent);
   } catch (error) {
     platform.log('warn', '[dsh-companion] backfill compactRegion failed', {
       scope,
@@ -3387,7 +3390,7 @@ async function runBackfillCompaction(state, payload, scope, pending) {
     forgetPendingBackfill(state, scope);
     return false;
   }
-  advanceBackfillCursor(state, scope, pending);
+  advanceBackfillCursor(state, scope, current);
   bumpBackfillDay(state, scope);
   const next = await refreshSurface(state, payload, null, { forceRebuild: true });
   recordBackfillFloor(state, scope, next);
@@ -3395,10 +3398,10 @@ async function runBackfillCompaction(state, payload, scope, pending) {
   state.metrics?.inc?.('backfills');
   platform.log('info', '[dsh-companion] backfill chunk compacted', {
     scope,
-    startSeq: pending.chunk.startSeq,
-    endSeq: pending.chunk.endSeq,
-    tokens: pending.chunk.tokens,
-    atWatermark: pending.atWatermark === true,
+    startSeq: current.chunk.startSeq,
+    endSeq: current.chunk.endSeq,
+    tokens: current.chunk.tokens,
+    atWatermark: current.atWatermark === true,
   });
   return true;
 }
@@ -4370,6 +4373,207 @@ function pruneBeforeCompact(state, agent) {
       message: error instanceof Error ? error.message : String(error),
     });
   }
+
+  // H1（v0.7.20）：宿主裁完 tools 输出后，surface 里的旧 seq 已被新 seq（追加在日志
+  // 末尾）替换。插件持久化的 seq 锚点必须就地跟着搬，否则 `ensureWatermark` 会把它
+  // 当成「外部压缩导致水位失效」而按 `replacement-lost` 前挪，整段旧内容被重复巩固。
+  // 调用点（maybeCompact / runBackfillCompaction）的 refreshSurface 与选区都在
+  // pruneBeforeCompact 返回之后，所以此刻搬完锚点即可让它们看到一致的新 seq 空间。
+  remapPrunedSeqs(state, scope, pruned);
+}
+
+/**
+ * H1（v0.7.20）：按 `pruned[].originalSeq → replacementSeq` 就地重映射本 scope 的
+ * 所有**持久化 seq 锚点**（内存与库内都改）。
+ *
+ * 覆盖清单（v0.7.20 spec §2 H1.2）：
+ *   1. 内存水位 `state.watermarkByScope` / `state.watermarkSeq`（经 `setWatermark`）；
+ *   2. `watermark_anchor:<scope>`（`-1`/`0`/无效值不动）；
+ *   3. `consolidations.upto_seq`（现有列，零 DDL；含 forget_flush 行——回填去重按它判重）；
+ *   4. `pending_compact:<scope>`（内存 Map + meta）；
+ *   5. `compact_backfill:pending:<scope>` 的 `chunk.startSeq/endSeq/nextSeq`
+ *      （`startIdx/endIdx` 是位置索引，不动）；
+ *   6. `compact_backfill:cursor:<scope>` 与 `compact_backfill:done:<scope>`；
+ *   7. `state.prevSurfaceSeqsByScope`（`ensureWatermark` 的重锚依据）；
+ *   8. `state.surfaceSnapshotByScope` / `state.surfaceSnapshot` 的 `seqs`。
+ * 非 seq 的 meta（`compact_backfill:floor` / `compact_floor` / `compact_threshold_turns`
+ * / `prune_stats` / `compact_backfill:day` …）一律不动。
+ *
+ * 每一步独立 try/catch 只 warn：锚点没搬全也不能让压缩本身失败。
+ *
+ * @param {object} state
+ * @param {string} scope
+ * @param {object[]} pruned 平台 `pruneToolResults` 返回的 `pruned[]`
+ * @returns {void}
+ */
+function remapPrunedSeqs(state, scope, pruned) {
+  if (state === null || typeof state !== 'object') return;
+  const map = new Map();
+  for (const row of Array.isArray(pruned) ? pruned : []) {
+    const from = Number(row?.originalSeq);
+    const to = Number(row?.replacementSeq);
+    if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to) || from === to) continue;
+    map.set(from, to);
+  }
+  // 空映射：零副作用（平台可能只裁了不落在任何锚点上的节点）。
+  if (map.size === 0) return;
+  const { platform, store } = state;
+  const warn = (action, error) => {
+    try {
+      platform?.log?.('warn', '[dsh-companion] tool output prune seq remap failed', {
+        scope,
+        action,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+    } catch {
+      // 日志通道也坏了：不阻断压缩。
+    }
+  };
+
+  // 1. 内存水位（<= 0 或非整数不动）。
+  try {
+    const current = state.watermarkByScope instanceof Map ? Number(state.watermarkByScope.get(scope)) : NaN;
+    if (Number.isSafeInteger(current) && current > 0 && map.has(current)) {
+      setWatermark(state, scope, map.get(current));
+    }
+  } catch (error) {
+    warn('watermark', error);
+  }
+
+  // 2. 持久化水位锚点（-1 = 「已重锚到起点」哨兵，0 = 无水位，都不搬）。
+  try {
+    const anchor = readWatermarkAnchor(store, scope);
+    if (Number.isSafeInteger(anchor) && anchor > 0 && map.has(anchor)) {
+      writeWatermarkAnchor(store, scope, map.get(anchor));
+    }
+  } catch (error) {
+    warn('watermark_anchor', error);
+  }
+
+  // 3. consolidations.upto_seq：水位来源，也是回填去重的键。只 UPDATE 现有列。
+  try {
+    const db = store?.db;
+    if (db !== null && db !== undefined && typeof db.prepare === 'function') {
+      const rows = db
+        .prepare('SELECT id, upto_seq AS uptoSeq FROM consolidations WHERE scope = ?')
+        .all(scope) ?? [];
+      for (const row of rows) {
+        const seq = Number(row.uptoSeq);
+        if (!Number.isSafeInteger(seq) || !map.has(seq)) continue;
+        try {
+          store.retargetConsolidation(row.id, { uptoSeq: map.get(seq) });
+        } catch (error) {
+          // (scope, upto_seq, kind) 唯一键冲突等：放弃这一行，不影响其它锚点。
+          warn('consolidations.upto_seq', error);
+        }
+      }
+    }
+  } catch (error) {
+    warn('consolidations', error);
+  }
+
+  // 4. pending_compact（内存 Map + meta）。setPendingCompact 会重建条目，先展开再写。
+  try {
+    const pending = state.pendingCompact instanceof Map
+      ? peekPendingCompact(state.pendingCompact, scope)
+      : null;
+    if (pending !== null) {
+      const startSeq = remapSeqValue(map, pending.startSeq);
+      const endSeq = remapSeqValue(map, pending.endSeq);
+      if (startSeq !== pending.startSeq || endSeq !== pending.endSeq) {
+        const next = { ...pending, startSeq, endSeq };
+        setPendingCompact(state.pendingCompact, next);
+        persistPendingCompact(store, next);
+      }
+    }
+  } catch (error) {
+    warn('pending_compact', error);
+  }
+
+  // 5. 回填 pending：chunk 的两个端点 + 批内 nextSeq 游标（位置索引 startIdx/endIdx 不动）。
+  try {
+    const pending = pendingBackfillOf(state, scope);
+    if (pending !== null && pending !== undefined && typeof pending === 'object') {
+      let changed = false;
+      const chunk = pending.chunk;
+      if (chunk !== null && chunk !== undefined && typeof chunk === 'object') {
+        const startSeq = remapSeqValue(map, chunk.startSeq);
+        const endSeq = remapSeqValue(map, chunk.endSeq);
+        if (startSeq !== chunk.startSeq || endSeq !== chunk.endSeq) {
+          chunk.startSeq = startSeq;
+          chunk.endSeq = endSeq;
+          changed = true;
+        }
+      }
+      const nextSeq = remapSeqValue(map, pending.nextSeq);
+      if (nextSeq !== pending.nextSeq) {
+        pending.nextSeq = nextSeq;
+        changed = true;
+      }
+      if (changed) persistPendingBackfill(state, scope, pending);
+    }
+  } catch (error) {
+    warn('compact_backfill:pending', error);
+  }
+
+  // 6. 回填游标与「已完成到某个水位」哨兵。
+  for (const key of [`${BACKFILL_META_PREFIX}cursor:${scope}`, `${BACKFILL_META_PREFIX}done:${scope}`]) {
+    try {
+      const raw = store.getMeta(key);
+      if (typeof raw !== 'string' || raw === '') continue;
+      const seq = Number(raw);
+      if (!Number.isSafeInteger(seq) || !map.has(seq)) continue;
+      store.setMeta(key, String(map.get(seq)));
+    } catch (error) {
+      warn(key, error);
+    }
+  }
+
+  // 7. 上一版 surface seq：`ensureWatermark` 的重锚依据，必须落在裁剪后的 seq 空间。
+  try {
+    if (state.prevSurfaceSeqsByScope instanceof Map) {
+      const prev = state.prevSurfaceSeqsByScope.get(scope);
+      if (Array.isArray(prev) && prev.length > 0) {
+        state.prevSurfaceSeqsByScope.set(scope, remapSeqList(map, prev));
+      }
+    }
+  } catch (error) {
+    warn('prevSurfaceSeqsByScope', error);
+  }
+
+  // 8. 两个 surface 快照的 seqs。records/nodes 仍是裁剪前的内容，但两个调用点都在
+  //    本函数返回后立刻 refreshSurface 重建快照（不会拿混用的快照去选区）；这里只
+  //    保证「上一版 surface」这个锚点不会把旧 seq 写回 prevSurfaceSeqsByScope。
+  try {
+    const scoped = state.surfaceSnapshotByScope instanceof Map
+      ? state.surfaceSnapshotByScope.get(scope)
+      : null;
+    remapSnapshotSeqs(scoped, map);
+    if (state.surfaceSnapshot !== scoped) remapSnapshotSeqs(state.surfaceSnapshot, map);
+  } catch (error) {
+    warn('surfaceSnapshot', error);
+  }
+}
+
+/** seq 映射：不在表里（或不是整数）就原样返回。 */
+function remapSeqValue(map, value) {
+  const seq = Number(value);
+  if (!Number.isSafeInteger(seq)) return value;
+  return map.has(seq) ? map.get(seq) : value;
+}
+
+/** seq 列表映射（保序、保长度）。 */
+function remapSeqList(map, list) {
+  if (!Array.isArray(list)) return list;
+  return list.map((value) => remapSeqValue(map, value));
+}
+
+/** 就地改写一个 surface 快照的 `seqs`（没有 seqs 的快照不动）。 */
+function remapSnapshotSeqs(snapshot, map) {
+  if (snapshot === null || typeof snapshot !== 'object') return;
+  if (Array.isArray(snapshot.seqs) && snapshot.seqs.length > 0) {
+    snapshot.seqs = remapSeqList(map, snapshot.seqs);
+  }
 }
 
 /**
@@ -4450,7 +4654,7 @@ function pruneStatsOf(store, scope) {
 
 async function maybeCompact(state, payload, scope = SCOPE) {
   const { platform, store, config } = state;
-  const pending = peekPendingCompact(state.pendingCompact, scope);
+  let pending = peekPendingCompact(state.pendingCompact, scope);
   if (pending === null) return;
   // D21-M1（v0.7.10）：多个小区间合并而成的 pending 还在累积——先不压，
   // 等累计到 compactMinRegionTokens（合并发生在 rememberConsolidatedRegion）。
@@ -4470,6 +4674,16 @@ async function maybeCompact(state, payload, scope = SCOPE) {
     platform.log('debug', '[dsh-companion] compaction unavailable; keeping pending_compact');
     return;
   }
+
+  // H1（v0.7.20）：裁剪必须在 refreshSurface 与选区**之前**。宿主 `pruneSession` 用
+  // surfaceOp replace 把超阈值 tool/result 换成新 seq，原 seq 就此离开 surface；而
+  // 宿主 `validateSurfaceRegion` 要求两端点都在 surface，否则抛 not found。先选后裁
+  // 时终点常落在 tool/result 上 → 压缩失败 → 下个窗口走「区间过期」丢弃，已巩固区间
+  // 永不再压缩。宿主自己的顺序也是先裁再选区。
+  // pruneBeforeCompact 内部会调用 remapPrunedSeqs，把本 scope 的 seq 锚点（含 pending
+  // 区间端点）就地重映射；所以此处必须重读 pending：旧对象还拿着已被替换掉的旧 seq。
+  pruneBeforeCompact(state, payload?.agent);
+  pending = peekPendingCompact(state.pendingCompact, scope) ?? pending;
 
   const snapshot = await refreshSurface(state, payload);
   if (snapshot === null) return;
@@ -4507,9 +4721,6 @@ async function maybeCompact(state, payload, scope = SCOPE) {
 
   const start = seqs[startIdx];
   const end = seqs[stopIdx];
-  // T1（v0.7.19）：压缩前先裁工具输出（同步调用，失败不阻断压缩）。
-  // 放在 startedMs 之前：`/状态` 的压缩耗时仍旧只含 compactRegion 本身。
-  pruneBeforeCompact(state, payload?.agent);
   // V7-L2：压缩耗时用平台毫秒时钟单独计时；事件时间戳仍是秒级。
   const startedMs = platform.now();
   try {
