@@ -2979,6 +2979,10 @@ function pendingBackfillOf(state, scope) {
             count: Number(chunk.count) || 0,
           },
           stage: parsed?.stage === 'ready' ? 'ready' : 'consolidating',
+          // L4（v0.7.21）：选区时刻是 `schema_meta` JSON 里的可选字段（零 DDL）。
+          // `Number.isFinite` 而不是 `Number(...)`：旧 pending 没有该字段时保持 undefined，
+          // 压缩日志据此整条省略 `duration_ms`；也避免 `null` 被转成 0 算出天量耗时。
+          ...(Number.isFinite(parsed?.selectedAtMs) ? { selectedAtMs: parsed.selectedAtMs } : {}),
           consolidationId: Number.isInteger(parsed?.consolidationId) ? parsed.consolidationId : null,
           nextSeq: Number.isFinite(Number(parsed?.nextSeq)) ? Number(parsed.nextSeq) : null,
           atWatermark: parsed?.atWatermark === true,
@@ -3007,13 +3011,17 @@ function persistPendingBackfill(state, scope, pending) {
   if (!(state.pendingBackfillByScope instanceof Map)) state.pendingBackfillByScope = new Map();
   state.pendingBackfillByScope.set(scope, pending);
   try {
-    state.store.setMeta(`${BACKFILL_PENDING_PREFIX}${scope}`, JSON.stringify({
+    const persisted = {
       chunk: pending.chunk,
       stage: pending.stage,
       consolidationId: pending.consolidationId ?? null,
       nextSeq: Number.isFinite(pending.nextSeq) ? pending.nextSeq : null,
       atWatermark: pending.atWatermark === true,
-    }));
+    };
+    // L4（v0.7.21）：选区时刻随 pending 一起持久化（现有 JSON 的可选字段，零 DDL）。
+    // 旧 pending 没有该字段 → 不写这个键，避免伪造 0/null 冒充已知时刻。
+    if (Number.isFinite(pending.selectedAtMs)) persisted.selectedAtMs = pending.selectedAtMs;
+    state.store.setMeta(`${BACKFILL_PENDING_PREFIX}${scope}`, JSON.stringify(persisted));
   } catch (error) {
     state.platform.log('warn', '[dsh-companion] backfill pending persist failed', {
       scope,
@@ -3398,13 +3406,20 @@ async function runBackfillCompaction(state, payload, scope, pending) {
   recordBackfillFloor(state, scope, next);
   forgetPendingBackfill(state, scope);
   state.metrics?.inc?.('backfills');
-  platform.log('info', '[dsh-companion] backfill chunk compacted', {
+  const compactedLog = {
     scope,
     startSeq: current.chunk.startSeq,
     endSeq: current.chunk.endSeq,
     tokens: current.chunk.tokens,
     atWatermark: current.atWatermark === true,
-  });
+  };
+  // L4（v0.7.21）：用户字面要求 `duration_ms`（不是既有日志常用的 durationMs），
+  // 口径是「上一窗口选区 → 本窗口压缩完成」，不是 compactRegion 自身的调用耗时。
+  // 旧 pending 没有 selectedAtMs：整条省略该字段，绝不伪造 0；时钟回拨夹到 0。
+  if (Number.isFinite(current?.selectedAtMs)) {
+    compactedLog.duration_ms = Math.max(0, Math.round(platform.now() - current.selectedAtMs));
+  }
+  platform.log('info', '[dsh-companion] backfill chunk compacted', compactedLog);
   return true;
 }
 
@@ -3524,6 +3539,9 @@ async function maybeBackfill(state, payload, scope = SCOPE) {
     consolidationId: null,
     nextSeq,
     atWatermark: afterIdx >= plan.watermarkIdx,
+    // L4（v0.7.21）：真正选区发生在这里（不是 compactRegion 前的 startIdx/endIdx），
+    // 记下此刻毫秒，等下一窗口压缩成功后据它算 duration_ms。
+    selectedAtMs: platform.now(),
     snapshot,
     transcript: state.transcript.map((row) => ({ role: row.role, text: row.text })),
   };
